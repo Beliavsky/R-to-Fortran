@@ -187,66 +187,128 @@ def split_fortran_statements(code: str) -> List[str]:
     return out
 
 
+def join_continued_lines(lines: Iterable[str]) -> List[Tuple[int, str]]:
+    """Join free-form continuation lines and keep the originating start line."""
+    out: List[Tuple[int, str]] = []
+    cur_parts: List[str] = []
+    cur_start: Optional[int] = None
+    need_more = False
+
+    for lineno, raw in enumerate(lines, start=1):
+        code = strip_comment(raw).rstrip("\r\n")
+        seg = code.rstrip()
+        if not seg and not need_more:
+            continue
+
+        if cur_start is None:
+            cur_start = lineno
+
+        if cur_parts:
+            lead = seg.lstrip()
+            if lead.startswith("&"):
+                seg = lead[1:].lstrip()
+
+        seg = seg.rstrip()
+        has_trailing_cont = seg.endswith("&")
+        if has_trailing_cont:
+            seg = seg[:-1].rstrip()
+
+        if seg:
+            cur_parts.append(seg)
+
+        need_more = has_trailing_cont
+        if need_more:
+            continue
+
+        joined = " ".join(cur_parts).strip()
+        if joined:
+            out.append((cur_start, joined))
+        cur_parts = []
+        cur_start = None
+
+    if cur_parts and cur_start is not None:
+        joined = " ".join(cur_parts).strip()
+        if joined:
+            out.append((cur_start, joined))
+    return out
+
+
+def iter_fortran_statements(lines: Iterable[str]) -> List[Tuple[int, str]]:
+    """Return semicolon-split statements as (start_line, statement_text)."""
+    out: List[Tuple[int, str]] = []
+    for lineno, joined in join_continued_lines(lines):
+        for stmt in split_fortran_statements(joined):
+            if stmt:
+                out.append((lineno, stmt))
+    return out
+
+
+def split_statements_to_lines(lines: Iterable[str]) -> List[str]:
+    """Expand semicolon-delimited statements so each returned item is one statement."""
+    out: List[str] = []
+    for _lineno, stmt in iter_fortran_statements(lines):
+        out.append(stmt)
+    return out
+
+
 def parse_procedures(lines: List[str]) -> List[Procedure]:
     """Parse procedure blocks and metadata from preprocessed source lines."""
     stack: List[Procedure] = []
     out: List[Procedure] = []
     interface_depth = 0
 
-    for lineno, raw in enumerate(lines, start=1):
-        code = strip_comment(raw).rstrip()
-        for stmt in split_fortran_statements(code):
-            low = stmt.lower().strip()
+    for lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.lower().strip()
 
-            if re.match(r"^\s*(abstract\s+)?interface\b", low):
-                interface_depth += 1
-                continue
-            if re.match(r"^\s*end\s+interface\b", low):
-                if interface_depth > 0:
-                    interface_depth -= 1
-                continue
-
+        if re.match(r"^\s*(abstract\s+)?interface\b", low):
+            interface_depth += 1
+            continue
+        if re.match(r"^\s*end\s+interface\b", low):
             if interface_depth > 0:
-                continue
+                interface_depth -= 1
+            continue
 
-            m_start = PROC_START_RE.match(low)
-            if m_start:
-                attrs = set(m_start.group("prefix").split()) if m_start.group("prefix") else set()
-                parent = stack[-1].name if stack else None
-                dummy_names = parse_arglist(m_start.group("arglist"))
-                m_result = re.search(r"\bresult\s*\(\s*([a-z][a-z0-9_]*)\s*\)", low, re.IGNORECASE)
-                result_name = m_result.group(1).lower() if m_result else None
-                stack.append(
-                    Procedure(
-                        name=m_start.group("name"),
-                        kind=m_start.group("kind"),
-                        start=lineno,
-                        attrs=attrs,
-                        parent=parent,
-                        dummy_names=dummy_names,
-                        result_name=result_name,
-                    )
+        if interface_depth > 0:
+            continue
+
+        m_start = PROC_START_RE.match(low)
+        if m_start:
+            attrs = set(m_start.group("prefix").split()) if m_start.group("prefix") else set()
+            parent = stack[-1].name if stack else None
+            dummy_names = parse_arglist(m_start.group("arglist"))
+            m_result = re.search(r"\bresult\s*\(\s*([a-z][a-z0-9_]*)\s*\)", low, re.IGNORECASE)
+            result_name = m_result.group(1).lower() if m_result else None
+            stack.append(
+                Procedure(
+                    name=m_start.group("name"),
+                    kind=m_start.group("kind"),
+                    start=lineno,
+                    attrs=attrs,
+                    parent=parent,
+                    dummy_names=dummy_names,
+                    result_name=result_name,
                 )
-                continue
+            )
+            continue
 
-            if stack and low.startswith("end"):
-                toks = low.split()
-                is_proc_end = False
-                end_kind: Optional[str] = None
-                if len(toks) == 1:
-                    is_proc_end = True
-                elif len(toks) >= 2 and toks[1] in {"function", "subroutine"}:
-                    is_proc_end = True
-                    end_kind = toks[1]
-                if is_proc_end:
-                    top = stack[-1]
-                    if end_kind is None or end_kind == top.kind:
-                        top.end = lineno
-                        out.append(stack.pop())
-                        continue
+        if stack and low.startswith("end"):
+            toks = low.split()
+            is_proc_end = False
+            end_kind: Optional[str] = None
+            if len(toks) == 1:
+                is_proc_end = True
+            elif len(toks) >= 2 and toks[1] in {"function", "subroutine"}:
+                is_proc_end = True
+                end_kind = toks[1]
+            if is_proc_end:
+                top = stack[-1]
+                if end_kind is None or end_kind == top.kind:
+                    top.end = lineno
+                    out.append(stack.pop())
+                    continue
 
-            if stack:
-                stack[-1].body.append((lineno, stmt))
+        if stack:
+            stack[-1].body.append((lineno, stmt))
 
     while stack:
         top = stack.pop()
@@ -265,9 +327,8 @@ def parse_modules_and_generics(lines: List[str]) -> Tuple[Set[str], Set[str], Di
     interface_depth = 0
     current_generic: Optional[str] = None
     current_is_abstract = False
-    for raw in lines:
-        code = strip_comment(raw).strip()
-        low = code.lower()
+    for _lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.strip().lower()
         if not low:
             continue
         m_if = INTERFACE_START_RE.match(low)
