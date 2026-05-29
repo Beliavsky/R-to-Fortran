@@ -873,6 +873,47 @@ def _display_expr_to_fortran(expr: str) -> str:
     return r_expr_to_fortran(s)
 
 
+def _format_vec_call_from_paste(expr: str) -> str | None:
+    """Lower paste(sprintf(paste0("%.", d, "f"), x), collapse=" ") to a helper."""
+    ci = parse_call_text(expr.strip())
+    if ci is None or ci[0].lower() != "paste":
+        return None
+    pos = ci[1]
+    kw = ci[2]
+    if not pos:
+        return None
+    collapse = kw.get("collapse")
+    if collapse is None or _dequote_string_literal(collapse.strip()) != " ":
+        return None
+    sp = parse_call_text(pos[0].strip())
+    if sp is None or sp[0].lower() != "sprintf" or len(sp[1]) < 2:
+        return None
+    fmt_src = sp[1][0].strip()
+    val_src = sp[1][1].strip()
+    digits_src = "6"
+    fmt_call = parse_call_text(fmt_src)
+    if fmt_call is not None and fmt_call[0].lower() == "paste0" and len(fmt_call[1]) >= 3:
+        parts = fmt_call[1]
+        if _dequote_string_literal(parts[0].strip()) == "%." and _dequote_string_literal(parts[2].strip()) == "f":
+            digits_src = parts[1].strip()
+    val_f = r_expr_to_fortran(val_src)
+    digits_f = _int_bound_expr(r_expr_to_fortran(digits_src))
+    return f"r_format_vec(real({val_f}, kind=dp), {digits_f})"
+
+
+def _expr_returns_character(expr: str) -> bool:
+    """Conservative character-scalar result test for function returns."""
+    t = expr.strip()
+    if _dequote_string_literal(t) is not None:
+        return True
+    if _format_vec_call_from_paste(t) is not None:
+        return True
+    ci = parse_call_text(t)
+    if ci is None:
+        return False
+    return ci[0].lower() in {"paste", "paste0", "sprintf", "format", "sub", "substr"}
+
+
 def _sprintf_arg_items(expr: str) -> list[str] | None:
     """Lower sprintf(fmt, ...) into printable Fortran item expressions."""
     ci = parse_call_text(expr.strip())
@@ -1964,6 +2005,13 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^integer\s*\(", rhs_l):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^(rep|numeric|quantile|rowsums|colsums)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -2028,7 +2076,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3694,6 +3742,9 @@ def r_expr_to_fortran(expr: str) -> str:
     # paste(..., sep="...") / paste0(...) -> "a" // sep // "b" // ...
     c_paste = parse_call_text(s)
     if c_paste is not None and c_paste[0].lower() in {"paste", "paste0"}:
+        fmt_vec = _format_vec_call_from_paste(s)
+        if fmt_vec is not None:
+            return fmt_vec
         _nm_p, pos_p, kw_p = c_paste
         sep_src = kw_p.get("sep", '""' if c_paste[0].lower() == "paste0" else '" "')
         sep_f = r_expr_to_fortran(sep_src)
@@ -3815,8 +3866,30 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bNA_logical_\b", ".false.", s)
     s = re.sub(r"\bNA_real_\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     s = re.sub(r"\bNA\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
+    def _split_reduction_args(inner: str) -> tuple[str, bool]:
+        parts = split_top_level_commas(inner)
+        x_parts: list[str] = []
+        na_rm = False
+        for p in parts:
+            t = p.strip()
+            m_kw = re.match(r"^(na(?:\.|_)rm)\s*=\s*(.+)$", t, re.IGNORECASE)
+            if m_kw is not None:
+                v = m_kw.group(2).strip().lower()
+                na_rm = v in {"true", ".true.", "t", "1"}
+                continue
+            if t:
+                x_parts.append(t)
+        return (x_parts[0] if x_parts else ""), na_rm
+
+    def _non_na_pack_expr(x_f: str) -> str:
+        return f"pack({x_f}, .not. is_na({x_f}))"
+
     def _mean_to_fortran(inner: str) -> str:
-        inner_f = r_expr_to_fortran(inner)
+        x_src, na_rm = _split_reduction_args(inner)
+        inner_f = r_expr_to_fortran(x_src)
+        if na_rm:
+            packed = _non_na_pack_expr(inner_f)
+            return f"(sum({packed})/real(size({packed}), kind=dp))"
         return f"(sum({inner_f})/real(size({inner_f}), kind=dp))"
     s = _replace_balanced_func_calls(
         s,
@@ -3826,9 +3899,15 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(
         s,
         "sum",
-        lambda inner: f"count({r_expr_to_fortran(inner)})"
-        if re.match(r"^\s*is_na\s*\(.+\)\s*$", inner.strip(), re.IGNORECASE)
-        else f"sum({inner})",
+        lambda inner: (
+            f"count({r_expr_to_fortran(inner)})"
+            if re.match(r"^\s*is_na\s*\(.+\)\s*$", inner.strip(), re.IGNORECASE)
+            else (
+                f"sum({_non_na_pack_expr(r_expr_to_fortran(_split_reduction_args(inner)[0]))})"
+                if _split_reduction_args(inner)[1]
+                else f"sum({inner})"
+            )
+        ),
     )
     def _rowsums_to_fortran(inner: str) -> str:
         t = inner.strip()
@@ -5557,6 +5636,9 @@ def emit_function(
     rdecl = "real(kind=dp)"
     ret_rank = 0
     ret_expr_src = last.expr.strip()
+    ret_is_char = _expr_returns_character(ret_expr_src)
+    if ret_is_char:
+        can_be_pure = False
     if re.search(r"\b(rowSums|colSums|apply)\s*\(", ret_expr_src):
         ret_rank = 1
     elif re.search(r"\b(matrix|array|cbind|cbind2|outer)\s*\(", ret_expr_src):
@@ -5583,6 +5665,8 @@ def emit_function(
             rdecl = "real(kind=dp)"
     if ret_type_name is not None:
         rdecl = f"type({ret_type_name})"
+    elif ret_is_char:
+        rdecl = "character(len=:), allocatable"
     elif list_spec is None:
         if ret_rank == 0 and rk == "int":
             rdecl = "integer"
@@ -7806,6 +7890,7 @@ def transpile_r_to_fortran(
         "sd",
         "r_sd",
         "var",
+        "r_format_vec",
         "colMeans",
         "cov",
         "cor",
