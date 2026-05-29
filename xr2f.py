@@ -33,6 +33,7 @@ _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _NO_RECYCLE = False
+_R_SD_CALL_NAME = "sd"
 
 
 @dataclass
@@ -173,6 +174,294 @@ def helper_modules_from_files(paths: list[Path]) -> set[str]:
             if m:
                 mods.add(m.group(1).lower())
     return mods
+
+
+def _wrapped_public_line(names: set[str]) -> list[str]:
+    vals = sorted(names)
+    if not vals:
+        return ["public"]
+    out: list[str] = []
+    cur = "public :: "
+    for i, nm in enumerate(vals):
+        piece = nm if cur.endswith(":: ") else ", " + nm
+        if len(cur + piece) > 88:
+            out.append(cur + ", &")
+            cur = "   & " + nm
+        else:
+            cur += piece
+    out.append(cur)
+    return out
+
+
+def _r_mod_needed_public_names(f90: str) -> set[str]:
+    txt = re.sub(r"&\s*\n\s*&?", "", f90)
+    out: set[str] = set()
+    for m in re.finditer(r"^\s*use\s+r_mod\s*,\s*only\s*:\s*(.+)$", txt, re.IGNORECASE | re.MULTILINE):
+        for part in m.group(1).split(","):
+            nm = part.strip()
+            if "=>" in nm:
+                nm = nm.split("=>", 1)[1].strip()
+            if nm:
+                out.add(nm)
+    return out
+
+
+def _render_r_mod_only(names: set[str]) -> str:
+    rendered: list[str] = []
+    for nm in sorted(names):
+        if nm == "r_sd":
+            rendered.append("r_sd => sd")
+        elif nm == "print_matrix_rstyle":
+            rendered.append("print_matrix => print_matrix_rstyle")
+        else:
+            rendered.append(nm)
+    return ", ".join(rendered)
+
+
+def _extract_r_mod(txt: str) -> str | None:
+    m0 = re.search(r"^\s*module\s+r_mod\b", txt, re.IGNORECASE | re.MULTILINE)
+    if m0 is None:
+        return None
+    m1 = re.search(r"^\s*end\s+module\s+r_mod\b.*$", txt[m0.start():], re.IGNORECASE | re.MULTILINE)
+    if m1 is None:
+        return txt[m0.start():]
+    return txt[m0.start():m0.start() + m1.end()]
+
+
+def _parse_r_mod_runtime(module_txt: str) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+    lines = module_txt.splitlines()
+    contains_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*contains\s*$", ln, re.IGNORECASE)), -1)
+    if contains_idx < 0:
+        return lines, {}, {}, {}
+    header = lines[:contains_idx]
+    body = lines[contains_idx + 1:]
+
+    interfaces: dict[str, list[str]] = {}
+    procedures: dict[str, list[str]] = {}
+    types: dict[str, list[str]] = {}
+    header_out: list[str] = []
+    i = 0
+    while i < len(header):
+        ln = header[i]
+        m_int = re.match(r"^\s*interface\s+([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_int:
+            name = m_int.group(1)
+            block = [ln]
+            i += 1
+            while i < len(header):
+                block.append(header[i])
+                if re.match(r"^\s*end\s+interface\b", header[i], re.IGNORECASE):
+                    i += 1
+                    break
+                i += 1
+            interfaces[name.lower()] = block
+            continue
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_type:
+            name = m_type.group(1)
+            block = [ln]
+            i += 1
+            while i < len(header):
+                block.append(header[i])
+                if re.match(r"^\s*end\s+type\b", header[i], re.IGNORECASE):
+                    i += 1
+                    break
+                i += 1
+            types[name.lower()] = block
+            continue
+        if re.match(r"^\s*public\b", ln, re.IGNORECASE):
+            i += 1
+            while i < len(header) and header[i - 1].rstrip().endswith("&"):
+                i += 1
+            continue
+        header_out.append(ln)
+        i += 1
+
+    proc_start = re.compile(
+        r"^\s*(?!end\b)(?:(?:pure|elemental|recursive|integer|logical|real(?:\([^)]*\))?|character(?:\([^)]*\))?|type\([^)]*\))\s+)*"
+        r"(function|subroutine)\s+([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    proc_end = re.compile(r"^\s*end\s+(function|subroutine)\b", re.IGNORECASE)
+    i = 0
+    while i < len(body):
+        m = proc_start.match(body[i])
+        if not m:
+            i += 1
+            continue
+        name = m.group(2)
+        block = [body[i]]
+        i += 1
+        while i < len(body):
+            block.append(body[i])
+            if proc_end.match(body[i]):
+                i += 1
+                break
+            i += 1
+        procedures[name.lower()] = block
+    return header_out, interfaces, types, procedures
+
+
+def _interface_procedures(block: list[str]) -> set[str]:
+    out: set[str] = set()
+    for ln in block:
+        m = re.match(r"^\s*module\s+procedure\s+(.+)$", ln, re.IGNORECASE)
+        if not m:
+            continue
+        for part in m.group(1).split(","):
+            nm = part.strip().rstrip("&").strip()
+            if nm:
+                out.add(nm.lower())
+    return out
+
+
+def _declared_names_in_fortran_line(line: str) -> set[str]:
+    code = fscan.strip_comment(line).strip()
+    if "::" not in code:
+        return set()
+    lhs, rhs = code.split("::", 1)
+    if re.match(r"^\s*(public|private|use|interface|module\s+procedure)\b", lhs, re.IGNORECASE):
+        return set()
+    out: set[str] = set()
+    for part in split_top_level_commas(rhs):
+        item = part.strip()
+        if not item:
+            continue
+        item = item.split("=", 1)[0].strip()
+        m = re.match(r"^([A-Za-z]\w*)", item)
+        if m:
+            out.add(m.group(1).lower())
+    return out
+
+
+def prune_r_mod_runtime(module_txt: str, public_needed: set[str]) -> str:
+    header, interfaces, types, procedures = _parse_r_mod_runtime(module_txt)
+    proc_names = set(procedures)
+    iface_members = {name: _interface_procedures(block) for name, block in interfaces.items()}
+    needed_public_l = {n.lower() for n in public_needed}
+    keep_procs: set[str] = set()
+    keep_ifaces: set[str] = set()
+
+    def add_name(name_l: str) -> None:
+        if name_l in interfaces:
+            keep_ifaces.add(name_l)
+            keep_procs.update(iface_members.get(name_l, set()))
+        elif name_l in procedures:
+            keep_procs.add(name_l)
+
+    for nm in needed_public_l:
+        add_name(nm)
+
+    changed = True
+    while changed:
+        changed = False
+        scan = "\n".join("\n".join(procedures[p]) for p in sorted(keep_procs) if p in procedures)
+        for pname in sorted(proc_names - keep_procs):
+            if re.search(rf"\b{re.escape(pname)}\s*\(", scan, re.IGNORECASE):
+                keep_procs.add(pname)
+                changed = True
+        for iname, members in interfaces.items():
+            if iname in keep_ifaces:
+                continue
+            if re.search(rf"\b{re.escape(iname)}\s*\(", scan, re.IGNORECASE):
+                keep_ifaces.add(iname)
+                before = len(keep_procs)
+                keep_procs.update(members)
+                changed = changed or len(keep_procs) != before
+
+    kept_text = "\n".join("\n".join(procedures[p]) for p in sorted(keep_procs) if p in procedures)
+    keep_types = {n for n in types if n in needed_public_l or re.search(rf"\btype\s*\(\s*{re.escape(n)}\s*\)", kept_text, re.IGNORECASE)}
+    public_out = {n for n in public_needed if n.lower() in keep_ifaces or n.lower() in keep_procs or n.lower() in keep_types}
+    used_header_names = {
+        nm.lower()
+        for nm in re.findall(r"\b[A-Za-z]\w*\b", kept_text + "\n" + "\n".join("\n".join(types[t]) for t in keep_types))
+    }
+
+    out: list[str] = []
+    i_head = 0
+    while i_head < len(header):
+        ln = header[i_head]
+        m_iso = re.match(r"^(\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\s*,\s*only\s*:\s*)(.*)$", ln, re.IGNORECASE)
+        if m_iso:
+            imports = ["real64"]
+            if "int64" in used_header_names:
+                imports.append("int64")
+            out.append(m_iso.group(1) + ", ".join(imports))
+            i_head += 1
+            continue
+        m_ieee = re.match(r"^(\s*use\s*,\s*intrinsic\s*::\s*ieee_arithmetic\s*,\s*only\s*:\s*)(.*)$", ln, re.IGNORECASE)
+        if m_ieee:
+            block = [ln]
+            i_head += 1
+            while block[-1].rstrip().endswith("&") and i_head < len(header):
+                block.append(header[i_head])
+                i_head += 1
+            imports_txt = " ".join(block)
+            imports_txt = imports_txt.replace("&", " ")
+            imports = []
+            m_only = re.search(r"\bonly\s*:\s*(.*)$", imports_txt, re.IGNORECASE)
+            if m_only:
+                for part in m_only.group(1).split(","):
+                    nm = part.strip()
+                    if nm and nm.lower() in used_header_names:
+                        imports.append(nm)
+            if imports:
+                out.append(m_ieee.group(1) + ", ".join(imports))
+            continue
+        names = _declared_names_in_fortran_line(ln)
+        if names and "dp" not in names and not (names & used_header_names):
+            i_head += 1
+            continue
+        out.append(ln)
+        i_head += 1
+    # Keep all simple module state declarations; procedures may depend on them.
+    out.extend(_wrapped_public_line(public_out))
+    for t in sorted(keep_types):
+        out.append("")
+        out.extend(types[t])
+    for iface in sorted(keep_ifaces):
+        out.append("")
+        block = interfaces[iface]
+        members = iface_members.get(iface, set()) & keep_procs
+        if members:
+            new_block: list[str] = [block[0]]
+            emitted_members = False
+            for ln in block[1:]:
+                if re.match(r"^\s*module\s+procedure\b", ln, re.IGNORECASE):
+                    if not emitted_members:
+                        for pln in _wrapped_public_line(members):
+                            new_block.append(pln.replace("public ::", "   module procedure"))
+                        emitted_members = True
+                elif re.match(r"^\s*end\s+interface\b", ln, re.IGNORECASE):
+                    new_block.append(ln)
+            out.extend(new_block)
+        else:
+            out.extend(block)
+    out.append("")
+    out.append("contains")
+    for p in sorted(keep_procs):
+        out.append("")
+        out.extend(procedures[p])
+    out.append("")
+    out.append("end module r_mod")
+    return "\n".join(normalize_fortran_lines(out, max_consecutive_blank=1)) + "\n"
+
+
+def prepend_self_contained_runtime(f90: str, helper_paths: list[Path]) -> str:
+    """Prepend a pruned r_mod runtime source so the emitted file can compile alone."""
+    needed = _r_mod_needed_public_names(f90)
+    runtime_parts: list[str] = []
+    for hp in helper_paths:
+        try:
+            txt = hp.read_text(encoding="utf-8")
+        except Exception:
+            txt = hp.read_text(encoding="utf-8", errors="replace")
+        mod_txt = _extract_r_mod(txt)
+        if mod_txt is not None:
+            runtime_parts.append(prune_r_mod_runtime(mod_txt, needed).rstrip())
+    if not runtime_parts:
+        return f90
+    return "\n\n".join(runtime_parts) + "\n\n" + f90
 
 
 @dataclass
@@ -2442,6 +2731,10 @@ def _looks_integer_fortran_expr(expr: str) -> bool:
         return True
     if re.match(r"^[A-Za-z]\w*$", t):
         return True
+    if re.match(r"^[A-Za-z]\w*(?:\s*[\+\-\*/]\s*[A-Za-z]\w*)+$", t):
+        return True
+    if re.match(r"^\d+(?:\s*\*\*\s*\d+)+$", t):
+        return True
     if re.match(r"^size\s*\(.+\)$", t, re.IGNORECASE):
         return True
     if re.match(r"^int\s*\(.+\)$", t, re.IGNORECASE):
@@ -2654,6 +2947,7 @@ def _list_return_specs(funcs: list[FuncDef]) -> dict[str, ListReturnSpec]:
 
 
 def r_expr_to_fortran(expr: str) -> str:
+    global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
     s = re.sub(r"(?i)\.machine\s*\$\s*double\.xmin", "tiny(1.0_dp)", s)
@@ -2662,7 +2956,7 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?i)\bties\.method\s*=", "ties_method=", s)
     # Drop namespace qualifiers (e.g., stats::sd -> sd) in this subset.
     s = re.sub(r"\b[A-Za-z]\w*::", "", s)
-    s = re.sub(r"(?i)\bsd\s*\(", "r_sd(", s)
+    s = re.sub(r"(?i)\bsd\s*\(", f"{_R_SD_CALL_NAME}(", s)
     # R expression-form if: if (cond) a else b
     ih_expr = _parse_if_head(s)
     if ih_expr is not None:
@@ -4159,6 +4453,22 @@ def emit_stmts(
                         if nsrc is None:
                             raise NotImplementedError("matrix(rnorm(...)) requires n argument")
                         n_f = _int_bound_expr(r_expr_to_fortran(nsrc))
+                        if nrow_src is None:
+                            nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
+                            nr_f = f"(({n_f} + ({nc_f}) - 1) / ({nc_f}))"
+                        else:
+                            nr_f = _int_bound_expr(r_expr_to_fortran(nrow_src))
+                            if ncol_src is None:
+                                nc_f = f"(({n_f} + ({nr_f}) - 1) / ({nr_f}))"
+                            else:
+                                nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
+                        byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
+                        explicit_shape = nrow_src is not None and ncol_src is not None
+                        if has_r_mod and (not byrow_true) and explicit_shape:
+                            _wstmt(f"{st.name} = rnorm_mat({nr_f}, {nc_f})", st.comment)
+                            need_r_mod.add("rnorm_mat")
+                            need_rnorm["used"] = True
+                            continue
                         o.w("block")
                         o.push()
                         o.w("real(kind=dp), allocatable :: tmp_m(:)")
@@ -4167,7 +4477,6 @@ def emit_stmts(
                             need_r_mod.add("rnorm_vec")
                         else:
                             o.w(f"call rnorm_vec({n_f}, tmp_m)")
-                        byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
                         if byrow_true:
                             _wstmt(
                                 f"{st.name} = transpose(reshape(tmp_m, [{nc_f}, {nr_f}], pad=tmp_m))",
@@ -4268,6 +4577,13 @@ def emit_stmts(
                     n_f = _int_bound_expr(r_expr_to_fortran(n_src))
                     mean_f = r_expr_to_fortran(kw_i.get("mean", "0.0"))
                     sd_f = r_expr_to_fortran(kw_i.get("sd", "1.0"))
+                    if rhs.strip() == rn_call and has_r_mod:
+                        if mean_f == "0.0_dp" and sd_f == "1.0_dp":
+                            o.w(f"{st.name} = rnorm_vec({n_f})")
+                        else:
+                            o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * rnorm_vec({n_f})")
+                        need_r_mod.add("rnorm_vec")
+                        continue
                     o.w("block")
                     o.push()
                     o.w("real(kind=dp), allocatable :: rn_tmp(:)")
@@ -4496,6 +4812,18 @@ def emit_stmts(
                 if len(st.args) == 1:
                     one = st.args[0].strip()
                     c_one = parse_call_text(one)
+                    if has_r_mod and c_one is not None and c_one[0].lower() in {"paste", "paste0"} and len(c_one[1]) >= 2:
+                        first_arg = c_one[1][0].strip()
+                        second_arg = c_one[1][1].strip()
+                        second_call = parse_call_text(second_arg)
+                        second_is_matrix = _expr_rank_for_print(second_arg) == 2 or (
+                            second_call is not None and second_call[0].lower() in {"cor", "cov"}
+                        )
+                        if second_is_matrix:
+                            _wstmt(f"print *, {r_expr_to_fortran(first_arg)}", st.comment)
+                            _wstmt(f"call print_matrix({r_expr_to_fortran(second_arg)})", "")
+                            need_r_mod.add("print_matrix_rstyle")
+                            continue
                     if (not has_r_mod) and c_one is not None and c_one[0].lower() in {"runif", "rnorm"}:
                         nm_rng = c_one[0].lower()
                         pos_rng, kw_rng = c_one[1], c_one[2]
@@ -4531,7 +4859,7 @@ def emit_stmts(
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
                             _wstmt(f"call print_matrix({one_f})", st.comment)
-                            need_r_mod.add("print_matrix")
+                            need_r_mod.add("print_matrix_rstyle")
                         else:
                             o.w("block")
                             o.push()
@@ -4580,7 +4908,7 @@ def emit_stmts(
                             o.w("real(kind=dp), allocatable :: v_pr(:)")
                             o.w(f"v_pr = {one_f}")
                             _wstmt("call print_matrix(reshape(v_pr, [size(v_pr), 1]))", st.comment)
-                            need_r_mod.add("print_matrix")
+                            need_r_mod.add("print_matrix_rstyle")
                             o.pop()
                             o.w("end block")
                         else:
@@ -4599,7 +4927,7 @@ def emit_stmts(
                             )
                             if use_helper_print:
                                 _wstmt(f"call print_matrix({one_f})", st.comment)
-                                need_r_mod.add("print_matrix")
+                                need_r_mod.add("print_matrix_rstyle")
                             else:
                                 o.w("block")
                                 o.push()
@@ -4628,7 +4956,7 @@ def emit_stmts(
                                 one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                                 if has_r_mod:
                                     _wstmt(f"call print_matrix({one_f})", st.comment)
-                                    need_r_mod.add("print_matrix")
+                                    need_r_mod.add("print_matrix_rstyle")
                                 else:
                                     o.w("block")
                                     o.push()
@@ -4647,7 +4975,7 @@ def emit_stmts(
                                 one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                                 if has_r_mod:
                                     _wstmt(f"call print_matrix({one_f})", st.comment)
-                                    need_r_mod.add("print_matrix")
+                                    need_r_mod.add("print_matrix_rstyle")
                                 else:
                                     o.w("block")
                                     o.push()
@@ -4666,7 +4994,7 @@ def emit_stmts(
                         if one in int_matrix_vars:
                             if has_r_mod:
                                 _wstmt(f"call print_matrix({one})", st.comment)
-                                need_r_mod.add("print_matrix")
+                                need_r_mod.add("print_matrix_rstyle")
                             else:
                                 o.w("block")
                                 o.push()
@@ -4682,7 +5010,7 @@ def emit_stmts(
                         if one in real_matrix_vars:
                             if has_r_mod:
                                 _wstmt(f"call print_matrix({one})", st.comment)
-                                need_r_mod.add("print_matrix")
+                                need_r_mod.add("print_matrix_rstyle")
                             else:
                                 o.w("block")
                                 o.push()
@@ -4695,11 +5023,18 @@ def emit_stmts(
                                 o.pop()
                                 o.w("end block")
                             continue
-                    m_sum = re.match(r"^summary\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
+                    m_sum = re.match(r"^summary\s*\((.*)\)\s*$", one, re.IGNORECASE)
                     if m_sum:
-                        _wstmt(f"call print_lm_summary({m_sum.group(1)})", st.comment)
-                        if helper_ctx is not None:
-                            helper_ctx["need_lm"] = True
+                        sum_arg = m_sum.group(1).strip()
+                        if re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in lm_terms_by_fit:
+                            _wstmt(f"call print_lm_summary({sum_arg})", st.comment)
+                            if helper_ctx is not None:
+                                helper_ctx["need_lm"] = True
+                        elif has_r_mod:
+                            _wstmt(f"call print_summary({r_expr_to_fortran(sum_arg)})", st.comment)
+                            need_r_mod.add("print_summary")
+                        else:
+                            _wstmt(f"print *, summary({r_expr_to_fortran(sum_arg)})", st.comment)
                         continue
                     m_coef = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
                     if m_coef:
@@ -5992,6 +6327,7 @@ def transpile_r_to_fortran(
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _KNOWN_VECTOR_NAMES
     global _NO_RECYCLE
+    global _R_SD_CALL_NAME
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -6005,6 +6341,15 @@ def transpile_r_to_fortran(
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts)
+    sd_name_collision = "sd" in {n.lower() for n in infer_assigned_names(main_stmts)}
+    for f in funcs:
+        if f.name.lower() == "sd" or any(a.lower() == "sd" for a in f.args):
+            sd_name_collision = True
+            break
+        if "sd" in {n.lower() for n in infer_assigned_names(f.body)}:
+            sd_name_collision = True
+            break
+    _R_SD_CALL_NAME = "r_sd" if sd_name_collision else "sd"
     fn_arg_order = {f.name: list(f.args) for f in funcs}
     fn_arg_defaults = {f.name: dict(f.defaults) for f in funcs}
     for f in funcs:
@@ -7294,10 +7639,13 @@ def transpile_r_to_fortran(
         "runif_vec",
         "rnorm1",
         "rnorm_vec",
+        "rnorm_mat",
         "random_choice2_prob",
         "sample_int",
         "sample_int1",
         "quantile",
+        "median",
+        "summary",
         "dnorm",
         "tail",
         "cbind2",
@@ -7334,8 +7682,10 @@ def transpile_r_to_fortran(
         "is_na",
         "r_typeof",
         "print_matrix",
+        "print_matrix_rstyle",
         "print_real_scalar",
         "print_real_vector",
+        "print_summary",
         "lm_coef",
         "set_print_int_like",
         "set_recycle_warn",
@@ -7380,6 +7730,14 @@ def transpile_r_to_fortran(
             mod_needed.add(hn)
         if re.search(rf"\b{re.escape(hn)}\s*\(", main_text_now):
             main_needed.add(hn)
+    if "r_sd" in mod_needed:
+        mod_needed.discard("sd")
+    if "r_sd" in main_needed:
+        main_needed.discard("sd")
+    if "print_matrix_rstyle" in mod_needed:
+        mod_needed.discard("print_matrix")
+    if "print_matrix_rstyle" in main_needed:
+        main_needed.discard("print_matrix")
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("lm_fit_t")
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", main_text_now, re.IGNORECASE):
@@ -7412,7 +7770,7 @@ def transpile_r_to_fortran(
     if need_ieee_mod:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
     if ("r_mod" in helper_modules) and mod_needed:
-        o.w("use r_mod, only: " + ", ".join(sorted(mod_needed)))
+        o.w("use r_mod, only: " + _render_r_mod_only(mod_needed))
     o.w("implicit none")
     if need_pi_mod:
         o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
@@ -7573,7 +7931,7 @@ def transpile_r_to_fortran(
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
-            o.w("use r_mod, only: " + ", ".join(sorted(main_needed)))
+            o.w("use r_mod, only: " + _render_r_mod_only(main_needed))
         o.w("implicit none")
         o.lines.extend(pbody.lines)
         o.w(f"end program {unit_name}")
@@ -7592,7 +7950,7 @@ def transpile_r_to_fortran(
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
-            o.w("use r_mod, only: " + ", ".join(sorted(main_needed)))
+            o.w("use r_mod, only: " + _render_r_mod_only(main_needed))
         o.w("implicit none")
         if main_needs_pi:
             o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
@@ -7980,6 +8338,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--via-core-r")
     if args.allow_library:
         cmd.append("--allow-library")
+    if args.self_contained:
+        cmd.append("--self-contained")
     if args.out_dir:
         cmd.extend(["--out-dir", args.out_dir])
     if args.real_print_fmt != "f0.6":
@@ -8194,6 +8554,11 @@ def main() -> int:
         "--allow-library",
         action="store_true",
         help="allow R `library(...)`/`require(...)` statements (warn and continue best-effort); default is fail-fast",
+    )
+    ap.add_argument(
+        "--self-contained",
+        action="store_true",
+        help="prepend the r_mod runtime to the emitted Fortran and compile without an external r.f90 helper",
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
@@ -8452,6 +8817,8 @@ def main() -> int:
     if r_comments:
         migrated_block = "\n".join(f"! {c}" for c in r_comments) + "\n"
     f90 = f"! transpiled by xr2f.py from {in_path.name} on {stamp}\n" + migrated_block + f90
+    if args.self_contained:
+        f90 = prepend_self_contained_runtime(f90, helper_paths)
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
@@ -8484,7 +8851,8 @@ def main() -> int:
     if args.compile or args.run:
         cparts = shlex.split(args.compiler)
         exe = out_path.with_suffix(".exe")
-        cmd = cparts + [str(h.resolve()) for h in helper_paths] + [str(out_path)]
+        build_helpers = [] if args.self_contained else [str(h.resolve()) for h in helper_paths]
+        cmd = cparts + build_helpers + [str(out_path)]
         if args.run:
             cmd += ["-o", str(exe)]
         if args.time:
