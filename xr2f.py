@@ -32,6 +32,8 @@ _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
+_KNOWN_MATRIX_NAMES: set[str] = set()
+_KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 
@@ -179,7 +181,7 @@ def helper_modules_from_files(paths: list[Path]) -> set[str]:
 def _wrapped_public_line(names: set[str]) -> list[str]:
     vals = sorted(names)
     if not vals:
-        return ["public"]
+        return []
     out: list[str] = []
     cur = "public :: "
     for i, nm in enumerate(vals):
@@ -515,6 +517,8 @@ def _looks_vector_expr_for_recycle(expr: str) -> bool:
     t = fscan.strip_redundant_outer_parens_expr(expr.strip())
     if not t:
         return False
+    if re.match(r"^[A-Za-z]\w*$", t) and t.lower() in _KNOWN_MATRIX_NAMES:
+        return False
     if t.startswith("[") and t.endswith("]"):
         return True
     if _split_top_level_colon(t) is not None:
@@ -545,6 +549,16 @@ def _looks_vector_expr_for_recycle(expr: str) -> bool:
         "r_mul",
         "r_div",
     }
+
+
+def _looks_matrix_expr(expr: str) -> bool:
+    t = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    if re.match(r"^[A-Za-z]\w*$", t) and t.lower() in _KNOWN_MATRIX_NAMES:
+        return True
+    c = parse_call_text(t)
+    if c is None:
+        return False
+    return c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t"}
 
 
 def _parse_if_head(line: str) -> tuple[str, str] | None:
@@ -3003,6 +3017,8 @@ def r_expr_to_fortran(expr: str) -> str:
         if mm_op is not None:
             a_txt = mm_op[0].strip()
             b_txt = mm_op[1].strip()
+            if a_txt and b_txt and _looks_matrix_expr(a_txt) and _looks_matrix_expr(b_txt):
+                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
             a_vec = _looks_vector_expr_for_recycle(a_txt) if a_txt else False
             b_vec = _looks_vector_expr_for_recycle(b_txt) if b_txt else False
             if a_txt and b_txt and a_vec and b_vec:
@@ -3747,6 +3763,10 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "nrow", _nrow_inner)
     s = _replace_balanced_func_calls(s, "ncol", _ncol_inner)
     s = _replace_balanced_func_calls(s, "as.matrix", lambda inner: inner.strip())
+    def _as_vector_to_fortran(inner: str) -> str:
+        x_f = r_expr_to_fortran(inner.strip())
+        return f"reshape({x_f}, [size({x_f})])"
+    s = _replace_balanced_func_calls(s, "as.vector", _as_vector_to_fortran)
     s = _replace_balanced_func_calls(s, "as.integer", lambda inner: f"int({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
@@ -3963,6 +3983,7 @@ def r_expr_to_fortran(expr: str) -> str:
     prev_neg = None
     pat_neg_vec = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*-\s*c\(([^][]+)\)\s*\]")
     pat_neg_vec_lit = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*-\s*\[([^\[\]]+)\]\s*\]")
+    pat_neg_vec_dbl = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*\[([^\[\]]+)\]\s*\]")
     pat_neg_one = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*-\s*([^\[\],]+?)\s*\]")
     while prev_neg != s:
         prev_neg = s
@@ -3982,6 +4003,16 @@ def r_expr_to_fortran(expr: str) -> str:
             + "])",
             s,
         )
+        s = pat_neg_vec_dbl.sub(
+            lambda m: "r_drop_indices("
+            + m.group(1)
+            + ", ["
+            + ", ".join(f"int(abs({r_expr_to_fortran(v.strip())}))" for v in split_top_level_commas(m.group(2)) if v.strip().startswith("-"))
+            + "])"
+            if all(v.strip().startswith("-") for v in split_top_level_commas(m.group(2)) if v.strip())
+            else m.group(0),
+            s,
+        )
         s = pat_neg_one.sub(
             lambda m: f"r_drop_index({m.group(1)}, int({r_expr_to_fortran(m.group(2).strip())}))",
             s,
@@ -3995,7 +4026,12 @@ def r_expr_to_fortran(expr: str) -> str:
         # Logical masking for 1D vectors: x[mask] -> pack(x, mask)
         if "," not in inner:
             il = inner.lower()
-            if any(op in il for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or.")):
+            if (
+                il in _KNOWN_LOGICAL_VECTOR_NAMES
+                or re.match(r"^is_na\s*\(", il)
+                or re.match(r"^is\.na\s*\(", il)
+                or any(op in il for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+            ):
                 return f"pack({base}, {r_expr_to_fortran(inner)})"
         return f"{base}({_index_inner_to_fortran(inner, base=base)})"
     while prev != s:
@@ -4163,6 +4199,15 @@ def emit_stmts(
             return 1
         if m_r_ix and (m_r_ix.group(1) in int_vector_vars or m_r_ix.group(1) in real_vector_vars):
             inner = m_r_ix.group(2).strip()
+            inner_l = inner.lower()
+            if (
+                inner.startswith("-")
+                or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                or re.match(r"^is\.na\s*\(", inner_l)
+                or re.match(r"^is_na\s*\(", inner_l)
+                or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", "&", "|", ".and.", ".or."))
+            ):
+                return 1
             if inner and ":" not in inner and _split_top_level_colon(inner) is None:
                 return 0
             return 1
@@ -4216,6 +4261,8 @@ def emit_stmts(
                 "quantile",
                 "tail",
                 "pack",
+                "r_drop_index",
+                "r_drop_indices",
             }:
                 return 1
             if nm_c == "r_matmul":
@@ -4627,6 +4674,21 @@ def emit_stmts(
                     lhs_b = f"spread({lhs_fv}, dim=2, ncopies=size({rhs_fm},2))"
                     rhs_f = f"{lhs_b} {op} {rhs_fm}"
                     break
+            m_lhs_mask = re.match(r"^([A-Za-z]\w*)\s*\[\s*(.+)\s*\]$", st.name)
+            if m_lhs_mask is not None:
+                base_lhs = m_lhs_mask.group(1)
+                inner_lhs = m_lhs_mask.group(2).strip()
+                if "," not in inner_lhs:
+                    inner_l = inner_lhs.lower()
+                    if (
+                        inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                        or re.match(r"^is\.na\s*\(", inner_l)
+                        or re.match(r"^is_na\s*\(", inner_l)
+                        or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+                    ):
+                        mask_f = r_expr_to_fortran(inner_lhs)
+                        _wstmt(f"where ({mask_f}) {base_lhs} = {rhs_f}", st.comment)
+                        continue
             if rhs_f == st.name:
                 # identity cast/normalization (e.g. x <- as.numeric(x))
                 continue
@@ -5378,8 +5440,24 @@ def emit_stmts(
                         continue
             asn = split_top_level_assignment(st.expr.strip())
             if asn is not None:
-                lhs = r_expr_to_fortran(asn[0].strip())
                 rhs = r_expr_to_fortran(asn[1].strip())
+                lhs_src = asn[0].strip()
+                m_lhs_mask = re.match(r"^([A-Za-z]\w*)\s*\[\s*(.+)\s*\]$", lhs_src)
+                if m_lhs_mask is not None:
+                    base_lhs = m_lhs_mask.group(1)
+                    inner_lhs = m_lhs_mask.group(2).strip()
+                    if "," not in inner_lhs:
+                        inner_l = inner_lhs.lower()
+                        if (
+                            inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                            or re.match(r"^is\.na\s*\(", inner_l)
+                            or re.match(r"^is_na\s*\(", inner_l)
+                            or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+                        ):
+                            mask_f = r_expr_to_fortran(inner_lhs)
+                            _wstmt(f"where ({mask_f}) {base_lhs} = {rhs}", st.comment)
+                            continue
+                lhs = r_expr_to_fortran(lhs_src)
                 _wstmt(f"{lhs} = {rhs}", st.comment)
                 continue
             # In R, a bare expression at statement level is evaluated and printed.
@@ -6201,6 +6279,37 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
     return out
 
 
+def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set[str]:
+    """Find rank-1 logical mask variables assigned from vector predicates."""
+    out: set[str] = set()
+
+    def _walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                rhs_l = rhs.lower()
+                is_logical_vec = False
+                if re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
+                    is_logical_vec = True
+                elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
+                    names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
+                    is_logical_vec = bool(names & array_names)
+                if is_logical_vec:
+                    out.add(st.name)
+            elif isinstance(st, IfStmt):
+                _walk(st.then_body)
+                _walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                _walk(st.body)
+            elif isinstance(st, WhileStmt):
+                _walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                _walk(st.body)
+
+    _walk(stmts)
+    return out
+
+
 def infer_main_real_matrices(stmts: list[object]) -> set[str]:
     """Find variables that should be declared as rank-2 real allocatables."""
     out: set[str] = set()
@@ -6222,6 +6331,8 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
         if isinstance(st, Assign):
             rhs = st.expr.strip()
             low = rhs.lower()
+            if _split_top_level_token(rhs, "%*%", from_right=True) is not None:
+                out.add(st.name)
             if low.startswith("matrix("):
                 out.add(st.name)
             if low.startswith("cbind(") or low.startswith("cbind2("):
@@ -6325,7 +6436,7 @@ def transpile_r_to_fortran(
     recycle_stop: bool = False,
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
-    global _KNOWN_VECTOR_NAMES
+    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
     unit_name = _fortran_ident(stem)
@@ -6448,7 +6559,13 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
+    logical_arrays = infer_main_logical_arrays(
+        main_stmts,
+        set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
+    )
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
+    _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices))}
+    _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     # Promote main-scope names referenced by local functions to module scope.
     main_name_map: dict[str, str] = {}
     for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | int_matrices:
@@ -6644,6 +6761,12 @@ def transpile_r_to_fortran(
         int_arrays.discard(nm)
         real_arrays.discard(nm)
         params.pop(nm, None)
+    for nm in logical_arrays:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        params.pop(nm, None)
     for nm in logical_scalars:
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -6679,6 +6802,8 @@ def transpile_r_to_fortran(
         pbody.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars)))
     if char_arrays:
         pbody.w("character(len=:), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(char_arrays)))
+    if logical_arrays:
+        pbody.w("logical, allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(logical_arrays)))
     if logical_scalars:
         pbody.w("logical :: " + ", ".join(sorted(logical_scalars)))
     if list_vars:
