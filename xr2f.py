@@ -2296,6 +2296,50 @@ def _rename_stmt_obj(st: object, mapping: dict[str, str]) -> object:
     return st
 
 
+def _assigned_names_in_stmts(stmts: list[object]) -> set[str]:
+    out: set[str] = set()
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                out.add(st.name)
+            elif isinstance(st, ForStmt):
+                out.add(st.var)
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+
+    walk(stmts)
+    return out
+
+
+def rename_reserved_main_names(stmts: list[object]) -> list[object]:
+    """Rename main-scope R names that collide with generated Fortran names."""
+    reserved = {"dp"}
+    assigned = _assigned_names_in_stmts(stmts)
+    mapping: dict[str, str] = {}
+    used = {nm.lower() for nm in assigned} | reserved
+    for nm in sorted(assigned):
+        if nm.lower() not in reserved:
+            continue
+        base = f"{nm}_r"
+        cand = base
+        i = 2
+        while cand.lower() in used:
+            cand = f"{base}_{i}"
+            i += 1
+        mapping[nm] = cand
+        used.add(cand.lower())
+    if not mapping:
+        return stmts
+    return [_rename_stmt_obj(st, mapping) for st in stmts]
+
+
 def _stmt_tree_has_side_effect_ops(ss: list[object]) -> bool:
     """Conservative impurity test for R-subset function bodies."""
     bad_call_names = {"set.seed", "cat", "print"}
@@ -5960,6 +6004,7 @@ def transpile_r_to_fortran(
     _VOID_FUNCTION_LIKE = {f.name.lower() for f in funcs if (not f.body or not isinstance(f.body[-1], ExprStmt))}
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     main_stmts = expand_data_frame_assignments(main_stmts)
+    main_stmts = rename_reserved_main_names(main_stmts)
     fn_arg_order = {f.name: list(f.args) for f in funcs}
     fn_arg_defaults = {f.name: dict(f.defaults) for f in funcs}
     for f in funcs:
@@ -7363,13 +7408,12 @@ def transpile_r_to_fortran(
 
     o = FEmit()
     o.w(f"module {module_name}")
-    o.w("use, intrinsic :: iso_fortran_env, only: real64")
+    o.w("use, intrinsic :: iso_fortran_env, only: dp => real64")
     if need_ieee_mod:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
     if ("r_mod" in helper_modules) and mod_needed:
         o.w("use r_mod, only: " + ", ".join(sorted(mod_needed)))
     o.w("implicit none")
-    o.w("integer, parameter :: dp = real64")
     if need_pi_mod:
         o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
     if promoted_params:
@@ -7544,14 +7588,12 @@ def transpile_r_to_fortran(
             main_needs_dp = True
         o.w(f"program {unit_name}")
         if main_needs_dp:
-            o.w("use, intrinsic :: iso_fortran_env, only: real64")
+            o.w("use, intrinsic :: iso_fortran_env, only: dp => real64")
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
             o.w("use r_mod, only: " + ", ".join(sorted(main_needed)))
         o.w("implicit none")
-        if main_needs_dp:
-            o.w("integer, parameter :: dp = real64")
         if main_needs_pi:
             o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
         o.lines.extend(pbody.lines)
