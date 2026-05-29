@@ -1276,6 +1276,13 @@ def _split_top_level_colon(s: str) -> tuple[str, str] | None:
 
 def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -> tuple[str, str] | None:
     """Split `text` at top-level `token` outside (), [], {}, and quotes."""
+    def _is_exponent_sign(pos: int) -> bool:
+        if token not in {"+", "-"} or pos <= 0 or pos + 1 >= len(text):
+            return False
+        if text[pos - 1] not in {"e", "E"} or not text[pos + 1].isdigit():
+            return False
+        return pos >= 2 and (text[pos - 2].isdigit() or text[pos - 2] == ".")
+
     in_single = False
     in_double = False
     esc = False
@@ -1329,6 +1336,9 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
                 i += 1
                 continue
             if pdepth == 0 and bdepth == 0 and cdepth == 0 and text.startswith(token, i):
+                if _is_exponent_sign(i):
+                    i += 1
+                    continue
                 hits.append(i)
                 i += len(token)
                 continue
@@ -1341,6 +1351,13 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
 
 def _find_top_level_addsub(s: str) -> tuple[int, str] | None:
     """Find first top-level binary + or - (outside parens/strings)."""
+    def _is_exponent_sign(pos: int) -> bool:
+        if pos <= 0 or pos + 1 >= len(s):
+            return False
+        if s[pos - 1] not in {"e", "E"} or not s[pos + 1].isdigit():
+            return False
+        return pos >= 2 and (s[pos - 2].isdigit() or s[pos - 2] == ".")
+
     depth = 0
     in_single = False
     in_double = False
@@ -1361,6 +1378,9 @@ def _find_top_level_addsub(s: str) -> tuple[int, str] | None:
             depth -= 1
             continue
         if depth == 0 and ch in {"+", "-"}:
+            if _is_exponent_sign(i):
+                prev_nonspace = ch
+                continue
             # skip unary signs
             if prev_nonspace == "" or prev_nonspace in {"(", ",", ":", "+", "-", "*", "/", "^"}:
                 prev_nonspace = ch
@@ -1747,6 +1767,15 @@ def classify_vars(
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
+                elif re.search(r"\bdnorm\s*\(", rhs, re.IGNORECASE) and any(
+                    re.search(rf"\b{re.escape(a)}\b", rhs) for a in known_arrays
+                ):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^[A-Za-z]\w*\s*\[[^\]]+\]\s*$", rhs):
                     m_idx_rhs = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs)
                     idx_rhs = m_idx_rhs.group(2).strip() if m_idx_rhs else ""
@@ -7118,6 +7147,8 @@ def transpile_r_to_fortran(
                             o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                         else:
                             o.w(f"real(kind=dp), allocatable :: {k}(:)")
+                    elif txt.startswith("cbind(") or txt.startswith("cbind2("):
+                        o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif parse_call_text(txt) is not None:
                         c_txt = parse_call_text(txt)
                         _cn, pos_cn, kw_cn = c_txt if c_txt is not None else ("", [], {})
@@ -7133,8 +7164,6 @@ def transpile_r_to_fortran(
                             o.w(f"integer, allocatable :: {k}(:)")
                         else:
                             o.w(f"real(kind=dp) :: {k}")
-                    elif txt.startswith("cbind(") or txt.startswith("cbind2("):
-                        o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif k in {"resp", "responsibilities", "log_r"}:
                         o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif k in {"pi", "mu", "sigma", "x", "z", "weights", "means", "sds", "vars", "loglik", "nk"}:
