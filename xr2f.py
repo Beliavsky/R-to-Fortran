@@ -1572,6 +1572,15 @@ def _ifelse_integer_coded(rhs: str) -> bool:
     return _is_int_literal(a) and _is_int_literal(b)
 
 
+def _return_call_arg(expr: str) -> str | None:
+    c = parse_call_text(expr.strip())
+    if c is None or c[0].lower() != "return":
+        return None
+    if not c[1]:
+        return ""
+    return c[1][0].strip()
+
+
 def classify_vars(
     stmts: list[object], assign_counts: dict[str, int], known_arrays: set[str] | None = None
 ) -> tuple[set[str], set[str], set[str], set[str], dict[str, str]]:
@@ -1643,7 +1652,9 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^pack\s*\(\s*r_seq_len\s*\(", rhs_l):
+                elif re.match(r"^pack\s*\(\s*r_seq_(?:int|len|int_by|int_length)\s*\(", rhs_l) or re.match(
+                    r"^pack\s*\(\s*r_seq_(?:int|len|int_by|int_length)\s*\(", rhs_f.strip().lower()
+                ):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -2637,6 +2648,18 @@ def r_expr_to_fortran(expr: str) -> str:
             if repl == "" and pat is not None and pat.startswith("^"):
                 prefix = pat[1:]
                 return f"{x_f}({len(prefix) + 1}:)"
+    c_filter = parse_call_text(s)
+    if c_filter is not None and c_filter[0].lower() == "filter":
+        _nm_filter, pos_filter, kw_filter = c_filter
+        pred_src = pos_filter[0] if pos_filter else kw_filter.get("f")
+        x_src = pos_filter[1] if len(pos_filter) >= 2 else kw_filter.get("x")
+        if pred_src is None or x_src is None:
+            raise NotImplementedError("Filter requires predicate and vector arguments")
+        pred = pred_src.strip()
+        if not re.match(r"^[A-Za-z]\w*$", pred):
+            raise NotImplementedError("Filter currently requires a named predicate function")
+        x_f = r_expr_to_fortran(x_src)
+        return f"pack({x_f}, {pred}({x_f}))"
     for op, fn in [("+", "r_add"), ("-", "r_sub"), ("*", "r_mul"), ("/", "r_div")]:
         mm_op = _split_top_level_token(s, op, from_right=True)
         if mm_op is not None:
@@ -3743,6 +3766,11 @@ def emit_stmts(
         ll = helper_ctx.get("list_locals")
         if isinstance(ll, dict):
             list_locals = ll
+    return_var = ""
+    if helper_ctx is not None:
+        rv = helper_ctx.get("return_var")
+        if isinstance(rv, str):
+            return_var = rv
 
     def _emit_alloc_1d(name: str, extent: str) -> None:
         if name in alloc_seen:
@@ -3784,6 +3812,21 @@ def emit_stmts(
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
+            return 1
+        m_r_ix = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\]]+)\]$", t)
+        if m_r_ix and (m_r_ix.group(1) in int_matrix_vars or m_r_ix.group(1) in real_matrix_vars):
+            dims = _split_index_dims(m_r_ix.group(2).strip())
+            if len(dims) >= 2:
+                scalar_dims = [
+                    d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None
+                    for d in dims
+                ]
+                return 0 if all(scalar_dims) else 2
+            return 1
+        if m_r_ix and (m_r_ix.group(1) in int_vector_vars or m_r_ix.group(1) in real_vector_vars):
+            inner = m_r_ix.group(2).strip()
+            if inner and ":" not in inner and _split_top_level_colon(inner) is None:
+                return 0
             return 1
         mm_t = _split_top_level_token(t, "%*%", from_right=True)
         if mm_t is not None:
@@ -3860,6 +3903,14 @@ def emit_stmts(
             if len(dims) >= 2:
                 return 2
             if len(dims) == 1:
+                return 1
+        if m_ix and (m_ix.group(1) in int_vector_vars or m_ix.group(1) in real_vector_vars):
+            inside = t[t.find("(") + 1 : -1]
+            dims = _split_index_dims(inside)
+            if len(dims) == 1:
+                inner = dims[0].strip()
+                if inner and ":" not in inner and _split_top_level_colon(inner) is None:
+                    return 0
                 return 1
         # Non-call arithmetic expressions that reference known matrix/vector vars.
         if not re.search(r"\b[A-Za-z]\w*\s*\(", t):
@@ -4867,6 +4918,14 @@ def emit_stmts(
             if st.expr.strip() == "next":
                 o.w("cycle")
                 continue
+            ret_arg = _return_call_arg(st.expr.strip())
+            if ret_arg is not None:
+                if not return_var:
+                    raise NotImplementedError("return(...) is only supported inside functions")
+                if ret_arg:
+                    _wstmt(f"{return_var} = {r_expr_to_fortran(ret_arg)}", st.comment)
+                o.w("return")
+                continue
             c_expr = parse_call_text(st.expr.strip())
             if c_expr is not None and c_expr[0].lower() in {"seq", "seq.int", "seq_along", "seq_len"}:
                 _wstmt(f"print *, {r_expr_to_fortran(st.expr.strip())}", st.comment)
@@ -5434,6 +5493,7 @@ def emit_function(
                 local_vector_vars.add(x)
         helper_ctx_loc["matrix_vars"] = local_matrix_vars
         helper_ctx_loc["vector_vars"] = local_vector_vars
+        helper_ctx_loc["return_var"] = rname
         emit_stmts(o, hoisted_checks + body_rest, need_rnorm_local, set(params.keys()), helper_ctx=helper_ctx_loc)
     elif arg_local_init_lines:
         for ln in arg_local_init_lines:
@@ -5444,6 +5504,9 @@ def emit_function(
         rename_all.update(arg_local_map)
         rename_all.update(local_rename_map)
         ret_expr = _replace_idents(last.expr, rename_all) if rename_all else last.expr
+        ret_arg = _return_call_arg(ret_expr)
+        if ret_arg is not None:
+            ret_expr = ret_arg if ret_arg else last.expr
         o.w(f"{rname} = {r_expr_to_fortran(ret_expr)}")
     else:
         ret_alias_m = re.match(r"^[A-Za-z]\w*$", last.expr.strip())
@@ -7266,6 +7329,7 @@ def transpile_r_to_fortran(
     ) + " " + " ".join(v[2] for v in promoted_array_params.values())
     need_ieee_mod = bool(ieee_pat.search(mod_text_now) or ieee_pat.search(mod_decl_text))
     need_ieee_main = bool(ieee_pat.search(main_text_now))
+    need_pi_mod = bool(re.search(r"\bpi\b", mod_text_now) or re.search(r"\bpi\b", mod_decl_text))
     for hn in helper_names:
         if re.search(rf"\b{re.escape(hn)}\s*\(", mod_text_now):
             mod_needed.add(hn)
@@ -7306,7 +7370,8 @@ def transpile_r_to_fortran(
         o.w("use r_mod, only: " + ", ".join(sorted(mod_needed)))
     o.w("implicit none")
     o.w("integer, parameter :: dp = real64")
-    o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
+    if need_pi_mod:
+        o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
     if promoted_params:
         rhs = ", ".join(f"{k} = {v}" for k, v in sorted(promoted_params.items()))
         o.w(f"integer, parameter :: {rhs}")
@@ -7342,12 +7407,14 @@ def transpile_r_to_fortran(
         o.w(ln)
     need_lm = bool(helper_ctx_main.get("need_lm")) or bool(helper_ctx_mod.get("need_lm"))
     if need_lm and ("r_mod" not in helper_modules):
+        o.w("")
         o.w("type :: lm_fit_t")
         o.push()
         o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:)")
         o.w("real(kind=dp) :: sigma, r_squared, adj_r_squared")
         o.pop()
         o.w("end type lm_fit_t")
+        o.w("")
     # Derived types for list-return functions and main list constructors.
     emitted_types: set[str] = set()
     all_list_specs: dict[str, ListReturnSpec] = {}
@@ -7361,6 +7428,7 @@ def transpile_r_to_fortran(
                 continue
             emitted_types.add(tname)
             fields = spec.nested_types[path]
+            o.w("")
             o.w(f"type :: {tname}")
             o.push()
             for k, v in fields.items():
@@ -7423,6 +7491,7 @@ def transpile_r_to_fortran(
                             o.w(f"real(kind=dp) :: {k}")
             o.pop()
             o.w(f"end type {tname}")
+            o.w("")
     need_contains = (
         bool(funcs)
         or emit_local_rnorm
@@ -7466,7 +7535,10 @@ def transpile_r_to_fortran(
         o.w(f"end program {unit_name}")
     else:
         o = FEmit()
-        main_needs_dp = bool(re.search(r"\b(?:real|complex)\s*\(\s*kind\s*=\s*dp\s*\)|_dp\b", main_text_now, re.IGNORECASE))
+        combined_main_text = main_text_now + "\n" + "\n".join(pbody.lines)
+        main_needs_dp = bool(
+            re.search(r"\bkind\s*=\s*dp\b|_dp\b", combined_main_text, re.IGNORECASE)
+        )
         main_needs_pi = bool(re.search(r"\bpi\b", main_text_now))
         if main_needs_pi:
             main_needs_dp = True
@@ -7512,6 +7584,54 @@ def normalize_fortran_lines(lines: list[str], max_consecutive_blank: int = 1) ->
         out.pop(0)
     while out and out[-1] == "":
         out.pop()
+    return out
+
+
+def format_derived_type_blocks(lines: list[str]) -> list[str]:
+    """Keep derived type definitions visually separated and indented."""
+    out: list[str] = []
+    in_type = False
+    type_start_re = re.compile(r"^\s*type\s*(?:,\s*[^:]*)?::\s*[A-Za-z]\w*\s*$", re.IGNORECASE)
+    type_end_re = re.compile(r"^\s*end\s+type\b", re.IGNORECASE)
+
+    for raw in lines:
+        code = fscan.strip_comment(raw).strip()
+        if not in_type and type_start_re.match(code):
+            if out and out[-1].strip() != "":
+                out.append("")
+            out.append(raw.strip())
+            in_type = True
+            continue
+
+        if in_type:
+            if type_end_re.match(code):
+                out.append(raw.strip())
+                out.append("")
+                in_type = False
+            elif raw.strip() == "":
+                out.append("")
+            else:
+                out.append("   " + raw.strip())
+            continue
+
+        out.append(raw)
+
+    return normalize_fortran_lines(out, max_consecutive_blank=1)
+
+
+def simplify_write_g0_outer_parens(lines: list[str]) -> list[str]:
+    """Drop redundant outer parens in scalar g0 write payloads."""
+    out: list[str] = []
+    pat = re.compile(r'^(\s*write\s*\(\s*\*\s*,\s*"\(g0\)"\s*\)\s+)(.+?)(\s*)$', re.IGNORECASE)
+    for raw in lines:
+        code, comment = fscan._split_code_comment(raw)  # type: ignore[attr-defined]
+        m = pat.match(code.rstrip())
+        if m is None:
+            out.append(raw)
+            continue
+        expr = fscan.strip_redundant_outer_parens_expr(m.group(2).strip())
+        suffix = f" {comment.strip()}" if comment.strip() else ""
+        out.append(f"{m.group(1)}{expr}{suffix}")
     return out
 
 
@@ -8268,7 +8388,7 @@ def main() -> int:
     f90_lines = fscan.compact_repeated_edit_descriptors(f90_lines)
     # Keep component declarations in derived types intact; generic coalescing can
     # collapse mixed-rank fields onto one line and change semantics.
-    # f90_lines = fscan.coalesce_simple_declarations(f90_lines, max_len=80)
+    f90_lines = fscan.coalesce_simple_declarations(f90_lines, max_len=80)
     f90_lines = fscan.wrap_long_declaration_lines(f90_lines, max_len=80)
     f90_lines = fscan.ensure_space_before_inline_comments(f90_lines)
     f90_lines = split_long_inline_comments(f90_lines, max_len=80)
@@ -8281,6 +8401,8 @@ def main() -> int:
     f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
+    f90_lines = format_derived_type_blocks(f90_lines)
+    f90_lines = simplify_write_g0_outer_parens(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
