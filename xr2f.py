@@ -3270,6 +3270,20 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("order requires an argument")
         return f"order_real({r_expr_to_fortran(x_src)})"
+    c_rank = parse_call_text(s)
+    if c_rank is not None and c_rank[0].lower() == "rank":
+        _nr, pos_rank, kw_rank = c_rank
+        x_src = pos_rank[0] if pos_rank else kw_rank.get("x")
+        if x_src is None:
+            raise NotImplementedError("rank requires an argument")
+        ties_src = kw_rank.get("ties.method", kw_rank.get("ties_method", '"average"')).strip()
+        ties = (_dequote_string_literal(ties_src) or ties_src).lower().replace("_", ".")
+        x_f = r_expr_to_fortran(x_src)
+        if ties == "first":
+            return f"rank_first({x_f})"
+        if ties == "average":
+            return f"rank_average({x_f})"
+        raise NotImplementedError(f"unsupported rank ties.method: {ties_src}")
     c_tail = parse_call_text(s)
     if c_tail is not None and c_tail[0].lower() == "tail":
         _nt, pos_tl, kw_tl = c_tail
@@ -3601,6 +3615,8 @@ def r_expr_to_fortran(expr: str) -> str:
                     "quantile",
                     "sample_int",
                     "order_real",
+                    "rank_average",
+                    "rank_first",
                 }
             return False
 
@@ -4392,6 +4408,8 @@ def emit_stmts(
                 "r_drop_indices",
                 "diff",
                 "match",
+                "rank_average",
+                "rank_first",
             }:
                 return 1
             if nm_c == "r_matmul":
@@ -7442,6 +7460,10 @@ def transpile_r_to_fortran(
         any("order_real(" in ln for ln in pbody.lines)
         or any("order_real(" in ln for ln in mprocs.lines)
     )
+    emit_local_rank = (
+        any("rank_average(" in ln or "rank_first(" in ln for ln in pbody.lines)
+        or any("rank_average(" in ln or "rank_first(" in ln for ln in mprocs.lines)
+    )
     if emit_local_command_args:
         mprocs.w("function r_command_args() result(out)")
         mprocs.w("character(len=:), allocatable :: out(:)")
@@ -7889,6 +7911,51 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.w("end function order_real")
         mprocs.w("")
+    if emit_local_rank:
+        mprocs.w("pure function rank_first(x) result(out)")
+        mprocs.w("real(kind=dp), intent(in) :: x(:)")
+        mprocs.w("real(kind=dp), allocatable :: out(:)")
+        mprocs.w("integer, allocatable :: ord(:)")
+        mprocs.w("integer :: i")
+        mprocs.w("allocate(out(size(x)))")
+        mprocs.w("if (size(x) <= 0) return")
+        mprocs.w("ord = order_real(x)")
+        mprocs.w("do i = 1, size(ord)")
+        mprocs.push()
+        mprocs.w("out(ord(i)) = real(i, kind=dp)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function rank_first")
+        mprocs.w("")
+        mprocs.w("pure function rank_average(x) result(out)")
+        mprocs.w("real(kind=dp), intent(in) :: x(:)")
+        mprocs.w("real(kind=dp), allocatable :: out(:)")
+        mprocs.w("integer, allocatable :: ord(:)")
+        mprocs.w("integer :: first, i, last")
+        mprocs.w("real(kind=dp) :: r")
+        mprocs.w("allocate(out(size(x)))")
+        mprocs.w("if (size(x) <= 0) return")
+        mprocs.w("ord = order_real(x)")
+        mprocs.w("first = 1")
+        mprocs.w("do while (first <= size(ord))")
+        mprocs.push()
+        mprocs.w("last = first")
+        mprocs.w("do while (last < size(ord) .and. x(ord(last + 1)) == x(ord(first)))")
+        mprocs.push()
+        mprocs.w("last = last + 1")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("r = 0.5_dp * real(first + last, kind=dp)")
+        mprocs.w("do i = first, last")
+        mprocs.push()
+        mprocs.w("out(ord(i)) = r")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("first = last + 1")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function rank_average")
+        mprocs.w("")
     if emit_local_drop:
         mprocs.w("pure function r_drop_index_real(x, k) result(out)")
         mprocs.w("real(kind=dp), intent(in) :: x(:)")
@@ -8034,6 +8101,8 @@ def transpile_r_to_fortran(
         "nchar",
         "is_na",
         "r_typeof",
+        "rank_average",
+        "rank_first",
         "print_matrix",
         "print_matrix_rstyle",
         "print_real_scalar",
