@@ -1866,6 +1866,10 @@ def _normalize_r_int_literal(txt: str) -> str:
     return re.sub(r"([0-9])[lL](?=(?:_[A-Za-z]\w*)?$)", r"\1", t)
 
 
+def _expr_uses_int64(txt: str) -> bool:
+    return re.search(r"\bint64\b|_int64\b", txt, re.IGNORECASE) is not None
+
+
 def _is_real_literal(txt: str) -> bool:
     t = txt.strip()
     return (
@@ -2150,6 +2154,17 @@ def classify_vars(
                         known_arrays.discard(st.name)
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
+                elif "%%" in rhs or re.match(r"^mod\s*\(", rhs_f.strip(), re.IGNORECASE):
+                    if any(re.search(rf"\b{re.escape(nm)}\b", rhs) for nm in real_scalars) or re.search(r"_dp\b|\.\d", rhs_f):
+                        real_scalars.add(st.name)
+                        ints.discard(st.name)
+                    else:
+                        ints.add(st.name)
+                        real_scalars.discard(st.name)
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
                 elif re.match(r"^(sum|mean|sd)\s*\(", rhs):
                     real_scalars.add(st.name)
                     params.pop(st.name, None)
@@ -2229,6 +2244,13 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
+                elif re.fullmatch(r"2\s*(?:\^|\*\*)\s*31", rhs):
+                    real_scalars.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
                 elif _is_int_literal(rhs):
                     # Do not force integer typing for variables already inferred real.
                     if st.name in real_scalars or st.name in real_arrays:
@@ -3030,6 +3052,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 f"merge({r_expr_to_fortran(then_src)}, "
                 f"{r_expr_to_fortran(else_src)}, {r_expr_to_fortran(cond_src)})"
             )
+    if re.fullmatch(r"2\s*(?:\^|\*\*)\s*31", s):
+        return "2147483648.0_dp"
     if re.fullmatch(r"2\s*\^\s*31\s*-\s*1[Ll]?", s):
         return "2147483647"
     if re.fullmatch(r"2\s*\*\*\s*31\s*-\s*1", s):
@@ -5639,7 +5663,9 @@ def emit_function(
     ret_is_char = _expr_returns_character(ret_expr_src)
     if ret_is_char:
         can_be_pure = False
-    if re.search(r"\b(rowSums|colSums|apply)\s*\(", ret_expr_src):
+    if ret_expr_src.startswith("c(") or (ret_expr_src.startswith("[") and ret_expr_src.endswith("]")):
+        ret_rank = 1
+    elif re.search(r"\b(rowSums|colSums|apply)\s*\(", ret_expr_src):
         ret_rank = 1
     elif re.search(r"\b(matrix|array|cbind|cbind2|outer)\s*\(", ret_expr_src):
         ret_rank = 2
@@ -5700,6 +5726,7 @@ def emit_function(
     is_elemental = (
         can_be_pure
         and list_spec is None
+        and ret_rank == 0
         and all(arg_rank.get(a, 0) == 0 for a in fn.args)
     )
     pref = "pure elemental " if is_elemental else ("pure " if can_be_pure else "")
@@ -5946,8 +5973,29 @@ def emit_function(
             int_arrays.discard(cs)
             real_arrays.discard(cs)
             params.pop(cs, None)
+        int64_locals: set[str] = {p for p, v in params.items() if _expr_uses_int64(v)}
+        def _walk_int64_assigns(ss_i64: list[object]) -> None:
+            for st_i64 in ss_i64:
+                if isinstance(st_i64, Assign):
+                    rhs_i64 = st_i64.expr.strip()
+                    if "%%" in rhs_i64 or _expr_uses_int64(rhs_i64):
+                        int64_locals.add(st_i64.name)
+                elif isinstance(st_i64, IfStmt):
+                    _walk_int64_assigns(st_i64.then_body)
+                    _walk_int64_assigns(st_i64.else_body)
+                elif isinstance(st_i64, ForStmt):
+                    _walk_int64_assigns(st_i64.body)
+                elif isinstance(st_i64, WhileStmt):
+                    _walk_int64_assigns(st_i64.body)
+                elif isinstance(st_i64, RepeatStmt):
+                    _walk_int64_assigns(st_i64.body)
+        _walk_int64_assigns(body_use)
+        int64_locals &= ints
         for p, v in sorted(params.items()):
-            o.w(f"integer, parameter :: {p} = {v}")
+            if _expr_uses_int64(v):
+                o.w(f"integer(kind=int64), parameter :: {p} = {v}")
+            else:
+                o.w(f"integer, parameter :: {p} = {v}")
         for lv in sorted(local_list_types):
             o.w(f"type({local_list_types[lv]}) :: {lv}")
         local_ranks: dict[str, int] = {}
@@ -6006,8 +6054,10 @@ def emit_function(
                         local_ranks[nm] = rk_new
                         changed = True
                     break
-        if ints:
-            o.w("integer :: " + ", ".join(sorted(ints)))
+        if ints - int64_locals:
+            o.w("integer :: " + ", ".join(sorted(ints - int64_locals)))
+        if int64_locals:
+            o.w("integer(kind=int64) :: " + ", ".join(sorted(int64_locals)))
         if int_arrays:
             decls_i: list[str] = []
             for x in sorted(int_arrays):
@@ -6621,6 +6671,22 @@ def transpile_r_to_fortran(
     fn_int_array_names: dict[str, set[str]] = {f.name: infer_function_integer_array_names(f) for f in funcs}
     fn_real_array_names: dict[str, set[str]] = {f.name: infer_function_real_array_names(f) for f in funcs}
     fn_real_matrix_names: dict[str, set[str]] = {f.name: infer_function_real_matrix_names(f) for f in funcs}
+    fn_return_array_kind: dict[str, str] = {}
+    for f_ret in funcs:
+        if not (f_ret.body and isinstance(f_ret.body[-1], ExprStmt)):
+            continue
+        ret_expr = f_ret.body[-1].expr.strip()
+        if ret_expr.startswith("c(") or (ret_expr.startswith("[") and ret_expr.endswith("]")):
+            fn_return_array_kind[f_ret.name.lower()] = "real"
+            continue
+        m_ret = re.match(r"^([A-Za-z]\w*)$", ret_expr)
+        if not m_ret:
+            continue
+        ret_name = m_ret.group(1)
+        if ret_name in fn_int_array_names.get(f_ret.name, set()):
+            fn_return_array_kind[f_ret.name.lower()] = "integer"
+        elif ret_name in fn_real_array_names.get(f_ret.name, set()) or ret_name in fn_real_matrix_names.get(f_ret.name, set()):
+            fn_return_array_kind[f_ret.name.lower()] = "real"
     _USER_FUNC_ARG_KIND = {}
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ELEMENTAL = set()
@@ -6631,7 +6697,11 @@ def transpile_r_to_fortran(
         fn_int_arrs = fn_int_array_names.get(f.name, set())
         arg_rank_f = {a: infer_arg_rank(f, a) for a in f.args}
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
-        if (not _stmt_tree_has_side_effect_ops(f_body_eff)) and all(arg_rank_f.get(a, 0) == 0 for a in f.args):
+        if (
+            f.name.lower() not in fn_return_array_kind
+            and (not _stmt_tree_has_side_effect_ops(f_body_eff))
+            and all(arg_rank_f.get(a, 0) == 0 for a in f.args)
+        ):
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
             idx[a.lower()] = i
@@ -6663,6 +6733,44 @@ def transpile_r_to_fortran(
 
     assign_counts = infer_assigned_names(main_stmts)
     ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+    for st_ret in main_stmts:
+        if not isinstance(st_ret, Assign):
+            continue
+        call_ret = parse_call_text(st_ret.expr.strip())
+        if call_ret is None:
+            continue
+        ret_kind = fn_return_array_kind.get(call_ret[0].lower())
+        if ret_kind == "integer":
+            int_arrays.add(st_ret.name)
+            ints.discard(st_ret.name)
+            real_scalars.discard(st_ret.name)
+            real_arrays.discard(st_ret.name)
+            params.pop(st_ret.name, None)
+        elif ret_kind == "real":
+            real_arrays.add(st_ret.name)
+            ints.discard(st_ret.name)
+            real_scalars.discard(st_ret.name)
+            int_arrays.discard(st_ret.name)
+            params.pop(st_ret.name, None)
+    changed_main_arrays = True
+    while changed_main_arrays:
+        changed_main_arrays = False
+        known_main_arrays = set(int_arrays) | set(real_arrays)
+        for st_arr in main_stmts:
+            if not isinstance(st_arr, Assign):
+                continue
+            if st_arr.name in known_main_arrays:
+                continue
+            rhs_arr = st_arr.expr.strip()
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs_arr) for nm in known_main_arrays):
+                if re.search(r"\bas\.\s*numeric\s*\(|/|\.\d|[0-9]_dp|_dp|rnorm|runif", rhs_arr, re.IGNORECASE):
+                    real_arrays.add(st_arr.name)
+                else:
+                    int_arrays.add(st_arr.name)
+                ints.discard(st_arr.name)
+                real_scalars.discard(st_arr.name)
+                params.pop(st_arr.name, None)
+                changed_main_arrays = True
     array_params = infer_main_array_params(main_stmts, assign_counts)
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
@@ -6748,8 +6856,14 @@ def transpile_r_to_fortran(
         size_name_for_n[nsz] = cand
         int_param_pairs.append((cand, str(nsz)))
     if int_param_pairs:
-        rhs = ", ".join(f"{k} = {v}" for k, v in int_param_pairs)
-        pbody.w(f"integer, parameter :: {rhs}")
+        int64_param_pairs = [(k, v) for k, v in int_param_pairs if _expr_uses_int64(v)]
+        default_param_pairs = [(k, v) for k, v in int_param_pairs if not _expr_uses_int64(v)]
+        if default_param_pairs:
+            rhs = ", ".join(f"{k} = {v}" for k, v in default_param_pairs)
+            pbody.w(f"integer, parameter :: {rhs}")
+        if int64_param_pairs:
+            rhs = ", ".join(f"{k} = {v}" for k, v in int64_param_pairs)
+            pbody.w(f"integer(kind=int64), parameter :: {rhs}")
     for nm, (knd, nsz, expr_f) in sorted(array_params.items()):
         n_decl = size_name_for_n.get(nsz, str(nsz))
         if knd == "integer":
@@ -7964,6 +8078,10 @@ def transpile_r_to_fortran(
     need_ieee_mod = bool(ieee_pat.search(mod_text_now) or ieee_pat.search(mod_decl_text))
     need_ieee_main = bool(ieee_pat.search(main_text_now))
     need_pi_mod = bool(re.search(r"\bpi\b", mod_text_now) or re.search(r"\bpi\b", mod_decl_text))
+    need_int64_mod = bool(
+        re.search(r"\bint64\b|_int64\b", mod_text_now, re.IGNORECASE)
+        or re.search(r"\bint64\b|_int64\b", mod_decl_text, re.IGNORECASE)
+    )
     for hn in helper_names:
         if re.search(rf"\b{re.escape(hn)}\s*\(", mod_text_now):
             mod_needed.add(hn)
@@ -8005,7 +8123,10 @@ def transpile_r_to_fortran(
 
     o = FEmit()
     o.w(f"module {module_name}")
-    o.w("use, intrinsic :: iso_fortran_env, only: dp => real64")
+    iso_imports_mod = "dp => real64"
+    if need_int64_mod:
+        iso_imports_mod += ", int64"
+    o.w(f"use, intrinsic :: iso_fortran_env, only: {iso_imports_mod}")
     if need_ieee_mod:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
     if ("r_mod" in helper_modules) and mod_needed:
@@ -8014,8 +8135,14 @@ def transpile_r_to_fortran(
     if need_pi_mod:
         o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
     if promoted_params:
-        rhs = ", ".join(f"{k} = {v}" for k, v in sorted(promoted_params.items()))
-        o.w(f"integer, parameter :: {rhs}")
+        promoted_int64_params = [(k, v) for k, v in sorted(promoted_params.items()) if _expr_uses_int64(v)]
+        promoted_default_params = [(k, v) for k, v in sorted(promoted_params.items()) if not _expr_uses_int64(v)]
+        if promoted_default_params:
+            rhs = ", ".join(f"{k} = {v}" for k, v in promoted_default_params)
+            o.w(f"integer, parameter :: {rhs}")
+        if promoted_int64_params:
+            rhs = ", ".join(f"{k} = {v}" for k, v in promoted_int64_params)
+            o.w(f"integer(kind=int64), parameter :: {rhs}")
     for nm, (knd, nsz, expr_f) in sorted(promoted_array_params.items()):
         if knd == "integer":
             o.w(f"integer, parameter :: {nm}({nsz}) = {expr_f}")
@@ -8180,12 +8307,18 @@ def transpile_r_to_fortran(
         main_needs_dp = bool(
             re.search(r"\bkind\s*=\s*dp\b|_dp\b", combined_main_text, re.IGNORECASE)
         )
+        main_needs_int64 = bool(re.search(r"\bint64\b|_int64\b", combined_main_text, re.IGNORECASE))
         main_needs_pi = bool(re.search(r"\bpi\b", main_text_now))
         if main_needs_pi:
             main_needs_dp = True
         o.w(f"program {unit_name}")
-        if main_needs_dp:
-            o.w("use, intrinsic :: iso_fortran_env, only: dp => real64")
+        if main_needs_dp or main_needs_int64:
+            iso_imports_main: list[str] = []
+            if main_needs_dp:
+                iso_imports_main.append("dp => real64")
+            if main_needs_int64:
+                iso_imports_main.append("int64")
+            o.w("use, intrinsic :: iso_fortran_env, only: " + ", ".join(iso_imports_main))
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
