@@ -188,6 +188,7 @@ def _split_top_level_else(text: str) -> tuple[str, str] | None:
     in_double = False
     esc = False
     depth = 0
+    bdepth = 0
     i = 0
     while i < len(text):
         ch = text[i]
@@ -266,6 +267,7 @@ def _parse_if_head(line: str) -> tuple[str, str] | None:
         return None
     i = m.end() - 1
     depth = 0
+    bdepth = 0
     in_single = False
     in_double = False
     esc = False
@@ -308,6 +310,7 @@ def _parse_while_head(line: str) -> tuple[str, str] | None:
         return None
     i = m.end() - 1
     depth = 0
+    bdepth = 0
     in_single = False
     in_double = False
     esc = False
@@ -349,6 +352,7 @@ def _parse_function_assign_head(line: str) -> tuple[str, str, str] | None:
     fname = m.group(1)
     i = m.end() - 1
     depth = 0
+    bdepth = 0
     in_single = False
     in_double = False
     esc = False
@@ -1359,6 +1363,7 @@ def _find_top_level_addsub(s: str) -> tuple[int, str] | None:
         return pos >= 2 and (s[pos - 2].isdigit() or s[pos - 2] == ".")
 
     depth = 0
+    bdepth = 0
     in_single = False
     in_double = False
     prev_nonspace = ""
@@ -1377,7 +1382,13 @@ def _find_top_level_addsub(s: str) -> tuple[int, str] | None:
         if ch == ")" and depth > 0:
             depth -= 1
             continue
-        if depth == 0 and ch in {"+", "-"}:
+        if ch == "[":
+            bdepth += 1
+            continue
+        if ch == "]" and bdepth > 0:
+            bdepth -= 1
+            continue
+        if depth == 0 and bdepth == 0 and ch in {"+", "-"}:
             if _is_exponent_sign(i):
                 prev_nonspace = ch
                 continue
@@ -1654,6 +1665,23 @@ def classify_vars(
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif rhs_l.startswith("as.numeric("):
+                    c_asn = parse_call_text(rhs)
+                    arg0 = c_asn[1][0].strip() if c_asn is not None and c_asn[1] else ""
+                    if arg0 in (known_arrays | int_arrays | real_arrays):
+                        real_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
+                    else:
+                        real_scalars.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        known_arrays.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_arrays.discard(st.name)
                 elif re.match(r"^[A-Za-z]\w*\s*\$\s*[A-Za-z]\w*$", rhs):
                     fld = rhs.split("$", 1)[1].strip().lower()
                     vec_fields = {
@@ -1783,6 +1811,8 @@ def classify_vars(
                         (":" in idx_rhs)
                         or ("," in idx_rhs)
                         or ("c(" in idx_rhs.lower())
+                        or ("is.finite(" in idx_rhs.lower())
+                        or ("is.na(" in idx_rhs.lower())
                         or any(op in idx_rhs for op in ["==", "!=", ">=", "<=", ">", "<"])
                         or bool(re.match(r"^[A-Za-z]\w*$", idx_rhs))
                     )
@@ -1814,7 +1844,7 @@ def classify_vars(
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
-                elif any(re.search(rf"\b{re.escape(a)}\b", rhs) for a in known_arrays):
+                elif any(re.search(rf"\b{re.escape(a)}\b", rhs) for a in (known_arrays | int_arrays | real_arrays)):
                     # Array references can still yield scalar results via reductions/indexing.
                     if st.name in known_arrays or st.name in real_arrays or st.name in int_arrays:
                         real_arrays.add(st.name)
@@ -1858,6 +1888,13 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
+                elif st.name in {"i", "j", "k", "it", "iter"} and _is_integerish_expr_with_names(rhs):
+                    ints.add(st.name)
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                    real_arrays.discard(st.name)
                 else:
                     real_scalars.add(st.name)
                     params.pop(st.name, None)
@@ -2493,6 +2530,15 @@ def _type_name_for_path(fn_name: str, path: tuple[str, ...]) -> str:
 def _list_return_specs(funcs: list[FuncDef]) -> dict[str, ListReturnSpec]:
     specs: dict[str, ListReturnSpec] = {}
 
+    def _add_field_path(fields: dict[str, object], path: list[str], rhs_expr: str) -> None:
+        cur = fields
+        for p in path[:-1]:
+            v = cur.get(p)
+            if not isinstance(v, dict):
+                cur[p] = {}
+            cur = cur[p]  # type: ignore[assignment]
+        cur[path[-1]] = rhs_expr
+
     def _collect_list_aliases(ss: list[object], out_map: dict[str, dict[str, object]]) -> None:
         for st in ss:
             if isinstance(st, Assign):
@@ -2507,6 +2553,17 @@ def _list_return_specs(funcs: list[FuncDef]) -> dict[str, ListReturnSpec]:
                     src_nm = m_alias.group(1)
                     if src_nm in out_map:
                         out_map[lhs_nm] = out_map[src_nm]
+            elif isinstance(st, ExprStmt):
+                mm = re.match(
+                    r"^([A-Za-z]\w*(?:\$[A-Za-z]\w+)+)\s*(?:<-|=)\s*(.+)$",
+                    st.expr.strip(),
+                )
+                if mm:
+                    lhs = mm.group(1).strip()
+                    rhs = mm.group(2).strip()
+                    parts = lhs.split("$")
+                    if len(parts) >= 2 and parts[0] in out_map:
+                        _add_field_path(out_map[parts[0]], parts[1:], rhs)
             elif isinstance(st, IfStmt):
                 _collect_list_aliases(st.then_body, out_map)
                 _collect_list_aliases(st.else_body, out_map)
@@ -2570,6 +2627,16 @@ def r_expr_to_fortran(expr: str) -> str:
         return "huge(1.0_dp)"
     if re.match(r"^-Inf$", s, re.IGNORECASE):
         return "-huge(1.0_dp)"
+    c_pre = parse_call_text(s)
+    if c_pre is not None and c_pre[0].lower() == "sub":
+        _nm_sub, pos_sub, _kw_sub = c_pre
+        if len(pos_sub) >= 3:
+            pat = _dequote_string_literal(pos_sub[0].strip())
+            repl = _dequote_string_literal(pos_sub[1].strip())
+            x_f = r_expr_to_fortran(pos_sub[2].strip())
+            if repl == "" and pat is not None and pat.startswith("^"):
+                prefix = pat[1:]
+                return f"{x_f}({len(prefix) + 1}:)"
     for op, fn in [("+", "r_add"), ("-", "r_sub"), ("*", "r_mul"), ("/", "r_div")]:
         mm_op = _split_top_level_token(s, op, from_right=True)
         if mm_op is not None:
@@ -3323,6 +3390,27 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "typeof", lambda inner: f"r_typeof({r_expr_to_fortran(inner)})")
+    s = _replace_balanced_func_calls(s, "commandArgs", lambda inner: "r_command_args()")
+    def _startswith_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            return f"(index({r_expr_to_fortran(parts[0].strip())}, {r_expr_to_fortran(parts[1].strip())}) == 1)"
+        return f"startsWith({inner})"
+    s = _replace_balanced_func_calls(s, "startsWith", _startswith_to_fortran)
+    def _nzchar_to_fortran(inner: str) -> str:
+        return f"(len_trim({r_expr_to_fortran(inner.strip())}) > 0)"
+    s = _replace_balanced_func_calls(s, "nzchar", _nzchar_to_fortran)
+    def _sub_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 3:
+            pat = _dequote_string_literal(parts[0].strip())
+            repl = _dequote_string_literal(parts[1].strip())
+            x_f = r_expr_to_fortran(parts[2].strip())
+            if repl == "" and pat is not None and pat.startswith("^"):
+                prefix = pat[1:]
+                return f"{x_f}({len(prefix) + 1}:)"
+        return f"sub({inner})"
+    s = _replace_balanced_func_calls(s, "sub", _sub_to_fortran)
     def _substr_to_fortran(inner: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) >= 3:
@@ -3333,7 +3421,12 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"substr({inner})"
     s = _replace_balanced_func_calls(s, "substr", _substr_to_fortran)
     s = _replace_balanced_func_calls(s, "is.finite", lambda inner: f"ieee_is_finite({inner.strip()})")
-    s = _replace_balanced_func_calls(s, "is.null", lambda inner: f"({inner.strip()} == -1)")
+    def _is_null_to_fortran(inner: str) -> str:
+        txt = inner.strip()
+        if "$out" in txt or "%out" in txt:
+            return f"(len_trim({r_expr_to_fortran(txt)}) == 0)"
+        return f"({txt} == -1)"
+    s = _replace_balanced_func_calls(s, "is.null", _is_null_to_fortran)
     s = re.sub(r"\bNULL\b", "-1", s)
     s = re.sub(r"\bNaN\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     s = re.sub(r"\bNA_integer_\b", "-huge(0.0_dp)", s)
@@ -3791,7 +3884,9 @@ def emit_stmts(
                             if isinstance(vv, dict):
                                 _emit_list_assign(f"{prefix}%{kk}", vv)
                             else:
-                                _wstmt(f"{prefix}%{kk} = {r_expr_to_fortran(str(vv))}", st.comment)
+                                vv_txt = str(vv).strip()
+                                rhs_f = '""' if kk == "out" and vv_txt.upper() == "NULL" else r_expr_to_fortran(vv_txt)
+                                _wstmt(f"{prefix}%{kk} = {rhs_f}", st.comment)
 
                     _emit_list_assign(st.name, fields)
                     continue
@@ -4663,7 +4758,11 @@ def emit_stmts(
                     raise NotImplementedError("write.table requires file= argument")
                 data_f = r_expr_to_fortran(data_src)
                 file_f = r_expr_to_fortran(file_src)
-                o.w(f"call write_table_real_matrix({file_f}, {data_f})")
+                data_rank = _expr_rank_for_print(data_f)
+                data_arg = data_f
+                if data_rank == 1 or re.search(r"%\s*(?:x|z|loglik|pi|mu|sigma)\b", data_f):
+                    data_arg = f"reshape({data_f}, [size({data_f}), 1])"
+                o.w(f"call write_table_real_matrix({file_f}, {data_arg})")
                 if helper_ctx is not None:
                     helper_ctx["need_table_writer"] = True
                 continue
@@ -4986,10 +5085,20 @@ def emit_function(
     local_rename_map: dict[str, str] = {}
     arg_local_decl_lines: list[str] = []
     arg_local_init_lines: list[str] = []
+    fn_char_scalars = infer_function_character_scalars(fn)
+    fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     for a in fn.args:
         dflt = fn.defaults.get(a, "")
         intent = "in"
         opt = ", optional" if dflt.strip() else ""
+        if a in fn_char_arrays:
+            o.w(f"character(len=*), intent({intent}){opt} :: {a}(:)")
+            arg_type[a] = "char_array"
+            continue
+        if a in fn_char_scalars:
+            o.w(f"character(len=*), intent({intent}){opt} :: {a}")
+            arg_type[a] = "char"
+            continue
         if a in {"n", "k", "seed", "max_iter", "it"}:
             o.w(f"integer, intent(in){opt} :: {a}")
             arg_type[a] = "integer"
@@ -5108,6 +5217,8 @@ def emit_function(
         ints, real_scalars, int_arrays, real_arrays, params = classify_vars(
             body_use, infer_assigned_names(body_use), known_arrays=known_arrays
         )
+        char_scalars_loc = set(fn_char_scalars) - set(fn.args)
+        char_arrays_loc = set(fn_char_arrays) - set(fn.args)
         logical_arrays: set[str] = set()
         array_name_pool = set(known_arrays) | set(int_arrays) | set(real_arrays)
         def _collect_logical_array_targets(ss_la: list[object]) -> None:
@@ -5185,6 +5296,8 @@ def emit_function(
             real_scalars.discard(a)
             int_arrays.discard(a)
             real_arrays.discard(a)
+            char_scalars_loc.discard(a)
+            char_arrays_loc.discard(a)
             params.pop(a, None)
         for loc in arg_local_map.values():
             ints.discard(loc)
@@ -5197,8 +5310,16 @@ def emit_function(
             real_scalars.discard(lv)
             int_arrays.discard(lv)
             real_arrays.discard(lv)
+            char_scalars_loc.discard(lv)
+            char_arrays_loc.discard(lv)
             logical_arrays.discard(lv)
             params.pop(lv, None)
+        for cs in set(char_scalars_loc) | set(char_arrays_loc):
+            ints.discard(cs)
+            real_scalars.discard(cs)
+            int_arrays.discard(cs)
+            real_arrays.discard(cs)
+            params.pop(cs, None)
         for p, v in sorted(params.items()):
             o.w(f"integer, parameter :: {p} = {v}")
         for lv in sorted(local_list_types):
@@ -5281,6 +5402,10 @@ def emit_function(
             o.w("logical, allocatable :: " + ", ".join(decls_l))
         if real_scalars:
             o.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
+        if char_scalars_loc:
+            o.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars_loc)))
+        if char_arrays_loc:
+            o.w("character(len=:), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(char_arrays_loc)))
         for ln in arg_local_init_lines:
             o.w(ln)
         helper_ctx_loc = dict(helper_ctx or {})
@@ -5321,6 +5446,12 @@ def emit_function(
         ret_expr = _replace_idents(last.expr, rename_all) if rename_all else last.expr
         o.w(f"{rname} = {r_expr_to_fortran(ret_expr)}")
     else:
+        ret_alias_m = re.match(r"^[A-Za-z]\w*$", last.expr.strip())
+        if ret_alias_m is not None:
+            o.w(f"{rname} = {ret_alias_m.group(0)}")
+            o.w(f"end function {fn.name}")
+            return bool(need_rnorm_local["used"])
+
         def _emit_assign(prefix: str, fields: dict[str, object]) -> None:
             for k, v in fields.items():
                 if isinstance(v, dict):
@@ -5330,7 +5461,9 @@ def emit_function(
                     rename_all.update(arg_local_map)
                     rename_all.update(local_rename_map)
                     vv = _replace_idents(str(v), rename_all) if rename_all else str(v)
-                    o.w(f"{prefix}%{k} = {r_expr_to_fortran(vv)}")
+                    vv_txt = str(vv).strip()
+                    rhs_f = '""' if k == "out" and vv_txt.upper() == "NULL" else r_expr_to_fortran(vv_txt)
+                    o.w(f"{prefix}%{k} = {rhs_f}")
         _emit_assign(rname, list_spec.root_fields)
     o.w(f"end function {fn.name}")
     return bool(need_rnorm_local["used"])
@@ -5509,6 +5642,9 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
             continue
         rhs = st.expr.strip()
         low = rhs.lower()
+        if low.startswith("commandargs("):
+            out.add(st.name)
+            continue
         if not low.startswith("c("):
             continue
         cinfo = parse_call_text(rhs)
@@ -5528,6 +5664,86 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
             break
         if all_chr:
             out.add(st.name)
+    return out
+
+
+def infer_function_character_scalars(fn: FuncDef) -> set[str]:
+    """Infer character scalar locals from string comparisons and string helpers."""
+    out: set[str] = set()
+
+    def _scan(ss: list[object]) -> None:
+        for st in ss:
+            texts: list[str] = []
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                if _dequote_string_literal(rhs) is not None:
+                    out.add(st.name)
+                if re.match(r"^(sub|substr)\s*\(", rhs, re.IGNORECASE):
+                    out.add(st.name)
+                texts.append(rhs)
+            elif isinstance(st, IfStmt):
+                texts.append(st.cond)
+                _scan(st.then_body)
+                _scan(st.else_body)
+            elif isinstance(st, WhileStmt):
+                texts.append(st.cond)
+                _scan(st.body)
+            elif isinstance(st, ForStmt):
+                texts.append(st.iter_expr)
+                _scan(st.body)
+            elif isinstance(st, RepeatStmt):
+                _scan(st.body)
+            elif isinstance(st, CallStmt):
+                texts.extend(st.args)
+            elif isinstance(st, ExprStmt):
+                texts.append(st.expr)
+            for txt in texts:
+                for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:==|!=)\s*(['\"])", txt):
+                    out.add(m.group(1))
+                for m in re.finditer(r"\b(?:startsWith|nzchar)\s*\(\s*([A-Za-z]\w*)\b", txt, re.IGNORECASE):
+                    out.add(m.group(1))
+
+    body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
+    _scan(body_no_ret)
+    changed = True
+    while changed:
+        changed = False
+        for st in body_no_ret:
+            if not isinstance(st, Assign) or st.name not in out:
+                continue
+            m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", st.expr.strip())
+            if m_idx and m_idx.group(1) not in out:
+                # The base is an array, handled by infer_function_character_array_names.
+                continue
+    return out
+
+
+def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | None = None) -> set[str]:
+    """Infer character vector names, including commandArgs() and vectors indexed to char scalars."""
+    out: set[str] = set()
+    scalars = set(char_scalars or set())
+
+    def _scan(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                if rhs.lower().startswith("commandargs("):
+                    out.add(st.name)
+                m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
+                if m_idx and st.name in scalars:
+                    out.add(m_idx.group(1))
+            elif isinstance(st, IfStmt):
+                _scan(st.then_body)
+                _scan(st.else_body)
+            elif isinstance(st, WhileStmt):
+                _scan(st.body)
+            elif isinstance(st, ForStmt):
+                _scan(st.body)
+            elif isinstance(st, RepeatStmt):
+                _scan(st.body)
+
+    body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
+    _scan(body_no_ret)
     return out
 
 
@@ -6416,10 +6632,37 @@ def transpile_r_to_fortran(
         any("r_typeof(" in ln for ln in pbody.lines)
         or any("r_typeof(" in ln for ln in mprocs.lines)
     ))
+    emit_local_command_args = (
+        any("r_command_args(" in ln for ln in pbody.lines)
+        or any("r_command_args(" in ln for ln in mprocs.lines)
+    )
     emit_local_order = (
         any("order_real(" in ln for ln in pbody.lines)
         or any("order_real(" in ln for ln in mprocs.lines)
     )
+    if emit_local_command_args:
+        mprocs.w("function r_command_args() result(out)")
+        mprocs.w("character(len=:), allocatable :: out(:)")
+        mprocs.w("integer :: i, n, stat")
+        mprocs.w("character(len=4096) :: buf")
+        mprocs.w("n = command_argument_count()")
+        mprocs.w("allocate(character(len=4096) :: out(n))")
+        mprocs.w("do i = 1, n")
+        mprocs.push()
+        mprocs.w("call get_command_argument(i, buf, status=stat)")
+        mprocs.w("if (stat == 0) then")
+        mprocs.push()
+        mprocs.w("out(i) = trim(buf)")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w('out(i) = ""')
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function r_command_args")
+        mprocs.w("")
     if emit_local_seq:
         mprocs.w("pure function r_seq_int(a, b) result(out)")
         mprocs.w("integer, intent(in) :: a, b")
@@ -7138,6 +7381,8 @@ def transpile_r_to_fortran(
                         o.w(f"integer :: {k}")
                     elif txt in {"TRUE", "FALSE"}:
                         o.w(f"logical :: {k}")
+                    elif k == "out" or _dequote_string_literal(txt) is not None or re.match(r"^(sub|substr)\s*\(", txt, re.IGNORECASE):
+                        o.w(f"character(len=:), allocatable :: {k}")
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_ints:
                         o.w(f"integer :: {k}")
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_int_arrays:
@@ -7190,6 +7435,7 @@ def transpile_r_to_fortran(
         or emit_local_rep
         or emit_local_numeric
         or emit_local_typeof
+        or emit_local_command_args
     )
     module_required = (
         bool(mod_needed)
