@@ -3888,6 +3888,30 @@ def r_expr_to_fortran(expr: str) -> str:
         "sqrt",
         lambda inner: f"sqrt(real({r_expr_to_fortran(inner)}, kind=dp))",
     )
+    def _sign_to_fortran(inner: str) -> str:
+        x_f = r_expr_to_fortran(inner.strip())
+        xr = f"real({x_f}, kind=dp)"
+        return f"merge(1.0_dp, merge(-1.0_dp, 0.0_dp, ({xr}) < 0.0_dp), ({xr}) > 0.0_dp)"
+
+    def _round_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if not parts:
+            return "round()"
+        x_f = r_expr_to_fortran(parts[0].strip())
+        xr = f"real({x_f}, kind=dp)"
+        if len(parts) >= 2 and parts[1].strip():
+            digits_f = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
+            scale = f"(10.0_dp ** ({digits_f}))"
+            return f"(anint(({xr}) * {scale}) / {scale})"
+        return f"anint({xr})"
+
+    s = _replace_balanced_func_calls(s, "sign", _sign_to_fortran)
+    s = _replace_balanced_func_calls(s, "round", _round_to_fortran)
+    s = _replace_balanced_func_calls(
+        s,
+        "trunc",
+        lambda inner: f"real(int(real({r_expr_to_fortran(inner.strip())}, kind=dp)), kind=dp)",
+    )
     # Broadcast vector factors in reduced matrix products:
     # sum(A * v, dim=1) -> sum(A * spread(v, dim=2, ncopies=size(A,2)), dim=1)
     # sum(v * A, dim=1) -> sum(spread(v, dim=2, ncopies=size(A,2)) * A, dim=1)
@@ -4263,6 +4287,8 @@ def emit_stmts(
                 "pack",
                 "r_drop_index",
                 "r_drop_indices",
+                "diff",
+                "match",
             }:
                 return 1
             if nm_c == "r_matmul":
@@ -7779,6 +7805,7 @@ def transpile_r_to_fortran(
         "pmax",
         "sd",
         "r_sd",
+        "var",
         "colMeans",
         "cov",
         "cor",
@@ -7799,8 +7826,10 @@ def transpile_r_to_fortran(
         "r_sub",
         "r_mul",
         "r_div",
+        "match",
         "cumsum",
         "cumprod",
+        "diff",
         "diag",
         "sort",
         "nchar",
