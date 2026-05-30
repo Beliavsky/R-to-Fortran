@@ -651,7 +651,7 @@ def _parse_while_head(line: str) -> tuple[str, str] | None:
 
 def _parse_function_assign_head(line: str) -> tuple[str, str, str] | None:
     s = line.strip()
-    m = re.match(r"^([A-Za-z]\w*)\s*(?:<-|=)\s*function\s*\(", s)
+    m = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*(?:<-|=)\s*function\s*\(", s)
     if not m:
         return None
     fname = m.group(1)
@@ -2368,6 +2368,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bmax\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bmin\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\b(?:sd|r_sd)\s*\(\s*{re.escape(arg)}\b"),
+        re.compile(rf"\bas\.numeric\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\b{re.escape(arg)}\s*\["),
     ]
 
@@ -5924,10 +5925,20 @@ def emit_function(
     arg_local_init_lines: list[str] = []
     fn_char_scalars = infer_function_character_scalars(fn)
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
+    s3_receiver_type: str | None = None
+    if "_" in fn.name and fn.args:
+        for spec_name in sorted(list_specs, key=len, reverse=True):
+            if fn.name.endswith("_" + spec_name):
+                s3_receiver_type = _type_name_for_path(spec_name, ())
+                break
     for a in fn.args:
         dflt = fn.defaults.get(a, "")
         intent = "in"
         opt = ", optional" if dflt.strip() else ""
+        if s3_receiver_type is not None and a == fn.args[0]:
+            o.w(f"type({s3_receiver_type}), intent(in){opt} :: {a}")
+            arg_type[a] = "s3_object"
+            continue
         if a in fn_char_arrays:
             o.w(f"character(len=*), intent({intent}){opt} :: {a}(:)")
             arg_type[a] = "char_array"
@@ -6772,6 +6783,123 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
     return out
 
 
+def _parse_s3_class_assignment(expr: str) -> tuple[str, str] | None:
+    m = re.match(
+        r"^class\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*([\"'])([A-Za-z]\w*)\2\s*$",
+        expr.strip(),
+    )
+    if not m:
+        return None
+    return m.group(1), m.group(3)
+
+
+def _is_s3_usemethod_function(fn: FuncDef) -> str | None:
+    if len(fn.body) != 1 or not isinstance(fn.body[0], ExprStmt):
+        return None
+    cinfo = parse_call_text(fn.body[0].expr.strip())
+    if cinfo is None or cinfo[0].lower() != "usemethod" or not cinfo[1]:
+        return None
+    generic = _dequote_string_literal(cinfo[1][0].strip())
+    return generic if generic else None
+
+
+def _minimal_s3_constructor_class(fn: FuncDef) -> str | None:
+    if not fn.body or not isinstance(fn.body[-1], ExprStmt):
+        return None
+    ret = fn.body[-1].expr.strip()
+    if not re.match(r"^[A-Za-z]\w*$", ret):
+        return None
+    for st in fn.body[:-1]:
+        if not isinstance(st, ExprStmt):
+            continue
+        ca = _parse_s3_class_assignment(st.expr)
+        if ca is not None and ca[0] == ret:
+            return ca[1]
+    return None
+
+
+def _rewrite_minimal_s3_expr(expr: str, generics: set[str], var_class: dict[str, str]) -> str:
+    out = expr
+    for generic in sorted(generics, key=len, reverse=True):
+        def repl(inner: str) -> str:
+            args = split_top_level_commas(inner.strip()) if inner.strip() else []
+            if not args:
+                return f"{generic}()"
+            first = args[0].strip()
+            cls = var_class.get(first)
+            method = f"{generic}_{cls}" if cls else f"{generic}_default"
+            return f"{method}(" + ", ".join(args) + ")"
+
+        out = _replace_balanced_func_calls(out, generic, repl)
+    for nm, cls in sorted(var_class.items(), key=lambda kv: len(kv[0]), reverse=True):
+        out = _replace_balanced_func_calls(
+            out,
+            "class",
+            lambda inner, nm=nm, cls=cls: _fortran_str_literal(cls) if inner.strip() == nm else f"class({inner.strip()})",
+        )
+    return out
+
+
+def _lower_minimal_s3(stmts: list[object]) -> list[object]:
+    """Lower a deliberately small S3 subset to existing static Fortran machinery.
+
+    Supports a generic `g <- function(x) UseMethod("g")`, methods named
+    `g.class`/`g.default`, constructors that assign one string class to the
+    returned list object, and main-scope calls where the receiver class is
+    known from such a constructor call.
+    """
+    funcs = [st for st in stmts if isinstance(st, FuncDef)]
+    generics = {g for fn in funcs if (g := _is_s3_usemethod_function(fn))}
+    if not generics:
+        return stmts
+
+    constructor_class: dict[str, str] = {}
+    for fn in funcs:
+        cls = _minimal_s3_constructor_class(fn)
+        if cls is not None:
+            constructor_class[fn.name] = cls
+
+    out: list[object] = []
+    var_class: dict[str, str] = {}
+    for st in stmts:
+        if isinstance(st, FuncDef):
+            if _is_s3_usemethod_function(st) is not None:
+                continue
+            body = [
+                b for b in st.body
+                if not (isinstance(b, ExprStmt) and _parse_s3_class_assignment(b.expr) is not None)
+            ]
+            name = st.name
+            m_method = re.match(r"^([A-Za-z]\w*)\.([A-Za-z]\w*)$", name)
+            if m_method is not None and m_method.group(1) in generics:
+                name = f"{m_method.group(1)}_{m_method.group(2)}"
+            out.append(FuncDef(name=name, args=st.args, defaults=st.defaults, body=body))
+            continue
+        if isinstance(st, Assign):
+            rhs = _rewrite_minimal_s3_expr(st.expr, generics, var_class)
+            cinfo = parse_call_text(rhs.strip())
+            if cinfo is not None and cinfo[0] in constructor_class:
+                var_class[st.name] = constructor_class[cinfo[0]]
+            out.append(Assign(name=st.name, expr=rhs, comment=st.comment))
+            continue
+        if isinstance(st, CallStmt):
+            out.append(CallStmt(
+                name=st.name,
+                args=[_rewrite_minimal_s3_expr(a, generics, var_class) for a in st.args],
+                comment=st.comment,
+            ))
+            continue
+        if isinstance(st, ExprStmt):
+            ca = _parse_s3_class_assignment(st.expr)
+            if ca is not None:
+                var_class[ca[0]] = ca[1]
+                continue
+            out.append(ExprStmt(expr=_rewrite_minimal_s3_expr(st.expr, generics, var_class), comment=st.comment))
+            continue
+        out.append(st)
+    return out
+
+
 def transpile_r_to_fortran(
     src: str,
     stem: str,
@@ -6793,6 +6921,7 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    stmts = _lower_minimal_s3(stmts)
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     _VOID_FUNCTION_LIKE = {f.name.lower() for f in funcs if (not f.body or not isinstance(f.body[-1], ExprStmt))}
@@ -8628,6 +8757,16 @@ def transpile_r_to_fortran(
                     elif parse_call_text(txt) is not None:
                         c_txt = parse_call_text(txt)
                         _cn, pos_cn, kw_cn = c_txt if c_txt is not None else ("", [], {})
+                        if _cn.lower() == "as.numeric" and pos_cn:
+                            src_cn = pos_cn[0].strip()
+                            if re.match(r"^[A-Za-z]\w*$", src_cn) and src_cn in fn_real_arrays:
+                                o.w(f"real(kind=dp), allocatable :: {k}(:)")
+                                continue
+                            if re.match(r"^[A-Za-z]\w*$", src_cn) and src_cn in fn_int_arrays:
+                                o.w(f"real(kind=dp), allocatable :: {k}(:)")
+                                continue
+                            o.w(f"real(kind=dp), allocatable :: {k}(:)")
+                            continue
                         if _cn.lower() == "tail":
                             n_cn = pos_cn[1] if len(pos_cn) >= 2 else kw_cn.get("n", "")
                             if str(n_cn).strip().upper() in {"1", "1L"}:
