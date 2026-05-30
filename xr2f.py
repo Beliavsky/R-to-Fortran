@@ -38,6 +38,9 @@ _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
+_PRETTY_FLOAT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([+-]?\d+\.\d+(?:[eEdD][+-]?\d+)?)"
+)
 
 
 @dataclass
@@ -8873,6 +8876,47 @@ def _norm_output(s: str) -> list[str]:
     return lines
 
 
+def _split_pretty_float_token(token: str) -> tuple[str, str]:
+    mant = token
+    exp = ""
+    for ch in ("e", "E", "d", "D"):
+        if ch in mant:
+            p = mant.find(ch)
+            exp = mant[p:]
+            mant = mant[:p]
+            break
+    return mant, exp
+
+
+def _trim_pretty_float_token(token: str) -> str:
+    mant, exp = _split_pretty_float_token(token)
+    if "." not in mant:
+        return token
+    head, frac = mant.split(".", 1)
+    frac = frac.rstrip("0")
+    return f"{head}.{frac}{exp}" if frac else f"{head}.{exp}"
+
+
+def _pretty_float_token(token: str) -> str:
+    try:
+        val = float(token.replace("d", "e").replace("D", "E"))
+    except ValueError:
+        return _trim_pretty_float_token(token)
+    out = f"{val:.15g}"
+    if "." not in out and "e" not in out and "E" not in out:
+        out = f"{out}.0"
+    return out
+
+
+def _pretty_output_text(text: str) -> str:
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    s = _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _pretty_float_token(m.group(1)), s)
+    lines = [" ".join(ln.split()) for ln in s.split("\n")]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
 def normalize_fortran_lines(lines: list[str], max_consecutive_blank: int = 1) -> list[str]:
     out: list[str] = []
     blank_run = 0
@@ -9089,12 +9133,19 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
     )
 
 
-def _print_captured(cp: subprocess.CompletedProcess[str], normalize_num_output: bool = False) -> None:
+def _print_captured(
+    cp: subprocess.CompletedProcess[str],
+    normalize_num_output: bool = False,
+    pretty: bool = False,
+) -> None:
     out = cp.stdout or ""
     err = cp.stderr or ""
     if normalize_num_output:
         out = fscan.normalize_numeric_leading_zeros_text(out)
         err = fscan.normalize_numeric_leading_zeros_text(err)
+    if pretty:
+        out = _pretty_output_text(out)
+        err = _pretty_output_text(err)
     if out.strip():
         txt = out.rstrip()
         try:
@@ -9232,6 +9283,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--no-format-print")
     if args.normalize_num_output:
         cmd.append("--normalize-num-output")
+    if args.pretty:
+        cmd.append("--pretty")
     if args.disp_real:
         cmd.append("--disp-real")
     if args.no_recycle:
@@ -9430,6 +9483,11 @@ def main() -> int:
         "--normalize-num-output",
         action="store_true",
         help="normalize Fortran run output numeric tokens like .5/-.5 to 0.5/-0.5",
+    )
+    ap.add_argument(
+        "--pretty",
+        action="store_true",
+        help="pretty-format displayed Fortran runtime output",
     )
     ap.add_argument(
         "--disp-real",
@@ -9782,7 +9840,11 @@ def main() -> int:
                 _print_captured(frun)
                 return frun.returncode
             print("Run: PASS")
-            _print_captured(frun, normalize_num_output=args.normalize_num_output)
+            _print_captured(
+                frun,
+                normalize_num_output=args.normalize_num_output,
+                pretty=args.pretty,
+            )
 
             if args.run_diff and r_run is not None:
                 r_lines = _norm_output((r_run.stdout or "") + (("\n" + r_run.stderr) if r_run.stderr else ""))
