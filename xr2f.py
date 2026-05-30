@@ -34,6 +34,8 @@ _VOID_FUNCTION_LIKE: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
+_NAMED_VECTOR_NAMES: dict[str, str] = {}
+_NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 
@@ -780,6 +782,61 @@ def _dequote_string_literal(s: str) -> str | None:
     t = s.strip()
     if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
         return t[1:-1]
+    return None
+
+
+def _strip_named_actual_value(txt: str) -> str:
+    """Return the value side for simple R named actuals such as `a = 10`."""
+    asn = split_top_level_assignment(txt.strip())
+    if asn is None:
+        return txt.strip()
+    lhs, rhs = asn[0].strip(), asn[1].strip()
+    if re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", lhs):
+        return rhs
+    return txt.strip()
+
+
+def _parse_named_c_vector(expr: str) -> tuple[list[str], list[str]] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "c":
+        return None
+    _nm, pos, kw = cinfo
+    if pos or not kw:
+        return None
+    labels: list[str] = []
+    values: list[str] = []
+    for lab, val in kw.items():
+        if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", lab):
+            return None
+        labels.append(lab)
+        values.append(val.strip())
+    return labels, values
+
+
+def _name_indices_from_subscript(base: str, inner: str) -> list[int] | None:
+    labels = _NAMED_VECTOR_LABELS.get(base.lower())
+    if not labels:
+        return None
+    t = inner.strip()
+    one = _dequote_string_literal(t)
+    if one is not None:
+        try:
+            return [labels.index(one) + 1]
+        except ValueError:
+            return None
+    cinfo = parse_call_text(t)
+    if cinfo is not None and cinfo[0].lower() == "c":
+        vals = cinfo[1] + list(cinfo[2].values())
+        out: list[int] = []
+        for v in vals:
+            lab = _dequote_string_literal(v.strip())
+            if lab is None:
+                return None
+            try:
+                out.append(labels.index(lab) + 1)
+            except ValueError:
+                return None
+        return out
     return None
 
 
@@ -2542,6 +2599,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if t.startswith("c(") or (t.startswith("[") and t.endswith("]")):
         return False
+    if re.match(r"^t\s*\(", t, re.IGNORECASE):
+        return False
     if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
@@ -3063,6 +3122,15 @@ def r_expr_to_fortran(expr: str) -> str:
     if re.match(r"^-Inf$", s, re.IGNORECASE):
         return "-huge(1.0_dp)"
     c_pre = parse_call_text(s)
+    if c_pre is not None:
+        nm_pre = c_pre[0].lower()
+        pos_pre = c_pre[1]
+        if nm_pre == "names" and len(pos_pre) == 1:
+            src_nm = pos_pre[0].strip()
+            if src_nm.lower() in _NAMED_VECTOR_NAMES:
+                return _NAMED_VECTOR_NAMES[src_nm.lower()]
+        if nm_pre == "unname" and len(pos_pre) == 1:
+            return r_expr_to_fortran(pos_pre[0])
     if c_pre is not None and c_pre[0].lower() == "sub":
         _nm_sub, pos_sub, _kw_sub = c_pre
         if len(pos_sub) >= 3:
@@ -3284,6 +3352,21 @@ def r_expr_to_fortran(expr: str) -> str:
         if ties == "average":
             return f"rank_average({x_f})"
         raise NotImplementedError(f"unsupported rank ties.method: {ties_src}")
+    c_det = parse_call_text(s)
+    if c_det is not None and c_det[0].lower() == "det":
+        _nd, pos_d, kw_d = c_det
+        x_src = pos_d[0] if pos_d else kw_d.get("x")
+        if x_src is None:
+            raise NotImplementedError("det requires an argument")
+        return f"det_real({r_expr_to_fortran(x_src)})"
+    c_solve = parse_call_text(s)
+    if c_solve is not None and c_solve[0].lower() == "solve":
+        _ns, pos_s, kw_s = c_solve
+        a_src = pos_s[0] if pos_s else kw_s.get("a")
+        b_src = pos_s[1] if len(pos_s) >= 2 else kw_s.get("b")
+        if a_src is None or b_src is None:
+            raise NotImplementedError("solve(a, b) requires both arguments in this subset")
+        return f"solve_real({r_expr_to_fortran(a_src)}, {r_expr_to_fortran(b_src)})"
     c_tail = parse_call_text(s)
     if c_tail is not None and c_tail[0].lower() == "tail":
         _nt, pos_tl, kw_tl = c_tail
@@ -3617,6 +3700,7 @@ def r_expr_to_fortran(expr: str) -> str:
                     "order_real",
                     "rank_average",
                     "rank_first",
+                    "solve_real",
                 }
             return False
 
@@ -4102,12 +4186,24 @@ def r_expr_to_fortran(expr: str) -> str:
         return "rnorm(" + inner + ")"
     s = _replace_balanced_func_calls(s, "runif", _repl_runif_expr)
     s = _replace_balanced_func_calls(s, "rnorm", _repl_rnorm_expr)
+    # Named-vector string subscripts must be resolved before c("a", "b") becomes
+    # a Fortran character constructor.
+    def _repl_named_c_sub(m: re.Match[str]) -> str:
+        base = m.group(1)
+        inner = "c(" + m.group(2).strip() + ")"
+        idx = _name_indices_from_subscript(base, inner)
+        if idx is None:
+            return m.group(0)
+        if len(idx) == 1:
+            return f"{base}({idx[0]})"
+        return f"{base}([" + ", ".join(str(i) for i in idx) + "])"
+    s = re.sub(r"([A-Za-z]\w*)\s*\[\s*c\(([^][]*)\)\s*\]", _repl_named_c_sub, s)
     # c(...) -> [...] (also for nested occurrences).
     def _repl_c(inner: str) -> str:
         parts = split_top_level_commas(inner.strip())
         vals = []
         for p in parts:
-            t = p.strip()
+            t = _strip_named_actual_value(p)
             if _is_int_literal(t):
                 vals.append(f"{t}.0_dp")
             elif _is_real_literal(t) and "_dp" not in t:
@@ -4166,6 +4262,11 @@ def r_expr_to_fortran(expr: str) -> str:
     def _repl_idx(m: re.Match[str]) -> str:
         base = m.group(1)
         inner = m.group(2).strip()
+        name_idx = _name_indices_from_subscript(base, inner)
+        if name_idx is not None:
+            if len(name_idx) == 1:
+                return f"{base}({name_idx[0]})"
+            return f"{base}([" + ", ".join(str(i) for i in name_idx) + "])"
         # Logical masking for 1D vectors: x[mask] -> pack(x, mask)
         if "," not in inner:
             il = inner.lower()
@@ -4381,6 +4482,10 @@ def emit_stmts(
                     if ranks:
                         return max(ranks)
                 return 0
+            if nm_c == "names" and len(c[1]) == 1 and c[1][0].strip().lower() in _NAMED_VECTOR_NAMES:
+                return 1
+            if nm_c == "unname" and len(c[1]) == 1:
+                return _expr_rank_for_print(c[1][0])
             if nm_c in {"matrix", "array", "cbind", "cbind2", "cov", "cor", "crossprod", "tcrossprod", "t"}:
                 return 2
             if nm_c == "c":
@@ -4410,6 +4515,7 @@ def emit_stmts(
                 "match",
                 "rank_average",
                 "rank_first",
+                "solve_real",
             }:
                 return 1
             if nm_c == "r_matmul":
@@ -4452,6 +4558,46 @@ def emit_stmts(
             if names & (int_vector_vars | real_vector_vars):
                 return 1
         return None
+
+    def _named_vector_print_parts(expr_txt: str) -> tuple[str, str, bool] | None:
+        """Return (value_expr, names_expr, value_is_scalar) for printable named vectors."""
+        t = expr_txt.strip()
+        cinfo = parse_call_text(t)
+        if cinfo is not None and cinfo[0].lower() == "unname":
+            return None
+        if re.match(r"^[A-Za-z]\w*$", t) and t.lower() in _NAMED_VECTOR_NAMES:
+            return r_expr_to_fortran(t), _NAMED_VECTOR_NAMES[t.lower()], False
+        m_ix = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\]]+)\]$", t)
+        if m_ix and m_ix.group(1).lower() in _NAMED_VECTOR_NAMES:
+            base = m_ix.group(1)
+            inner = m_ix.group(2).strip()
+            base_names = _NAMED_VECTOR_NAMES[base.lower()]
+            idx = _name_indices_from_subscript(base, inner)
+            if idx is not None:
+                if len(idx) == 1:
+                    return r_expr_to_fortran(t), f"{base_names}({idx[0]}:{idx[0]})", True
+                idx_expr = "[" + ", ".join(str(i) for i in idx) + "]"
+                return r_expr_to_fortran(t), f"{base_names}({idx_expr})", False
+            if inner and ":" not in inner and _split_top_level_colon(inner) is None:
+                idx_f = _index_inner_to_fortran(inner, base=base)
+                return r_expr_to_fortran(t), f"{base_names}({idx_f}:{idx_f})", True
+            return r_expr_to_fortran(t), f"{base_names}({_index_inner_to_fortran(inner, base=base)})", False
+        if cinfo is not None and len(cinfo[1]) == 1 and not cinfo[2]:
+            nm = cinfo[0].lower()
+            arg = cinfo[1][0].strip()
+            if nm in {"sqrt", "log", "exp", "abs"} and arg.lower() in _NAMED_VECTOR_NAMES:
+                return r_expr_to_fortran(t), _NAMED_VECTOR_NAMES[arg.lower()], False
+        expr_names = [n for n in re.findall(r"\b[A-Za-z]\w*\b", t) if n.lower() in _NAMED_VECTOR_NAMES]
+        if cinfo is None and expr_names:
+            return r_expr_to_fortran(t), _NAMED_VECTOR_NAMES[expr_names[0].lower()], False
+        return None
+
+    def _names_call_print_arg(expr_txt: str) -> str | None:
+        cinfo = parse_call_text(expr_txt.strip())
+        if cinfo is None or cinfo[0].lower() != "names" or len(cinfo[1]) != 1:
+            return None
+        src = cinfo[1][0].strip()
+        return _NAMED_VECTOR_NAMES.get(src.lower())
 
     for st in stmts:
         if isinstance(st, Assign):
@@ -5062,6 +5208,26 @@ def emit_stmts(
                         _wstmt('write(*,"(*(g0,1x))") v_pr', st.comment)
                         o.pop()
                         o.w("end block")
+                        continue
+                    names_arg = _names_call_print_arg(one)
+                    if has_r_mod and names_arg is not None:
+                        _wstmt(f"call print_char_vector({names_arg})", st.comment)
+                        need_r_mod.add("print_char_vector")
+                        continue
+                    named_parts = _named_vector_print_parts(one)
+                    if has_r_mod and named_parts is not None:
+                        val_expr, name_expr, scalar_val = named_parts
+                        if scalar_val:
+                            _wstmt(
+                                f"call print_named_real_vector([real({val_expr}, kind=dp)], {name_expr})",
+                                st.comment,
+                            )
+                        else:
+                            _wstmt(
+                                f"call print_named_real_vector(real({val_expr}, kind=dp), {name_expr})",
+                                st.comment,
+                            )
+                        need_r_mod.add("print_named_real_vector")
                         continue
                     rank_one = _expr_rank_for_print(one)
                     if rank_one == 2:
@@ -6515,6 +6681,8 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
                 out.add(st.name)
             if low.startswith("cbind(") or low.startswith("cbind2("):
                 out.add(st.name)
+            if low.startswith("t("):
+                out.add(st.name)
             if low.startswith("outer("):
                 cinfo_o = parse_call_text(rhs)
                 is_int_outer = False
@@ -6615,6 +6783,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
     unit_name = _fortran_ident(stem)
@@ -6653,6 +6822,15 @@ def transpile_r_to_fortran(
         elif isinstance(st, ExprStmt):
             st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
     main_stmts = inline_single_use_temporaries(main_stmts)
+    named_vectors: dict[str, tuple[list[str], list[str]]] = {}
+    for st_nv in main_stmts:
+        if not isinstance(st_nv, Assign):
+            continue
+        parsed_nv = _parse_named_c_vector(st_nv.expr.strip())
+        if parsed_nv is not None:
+            named_vectors[st_nv.name] = parsed_nv
+    _NAMED_VECTOR_NAMES = {nm.lower(): f"{nm}_names" for nm in named_vectors}
+    _NAMED_VECTOR_LABELS = {nm.lower(): labels for nm, (labels, _vals) in named_vectors.items()}
     list_specs = _list_return_specs(funcs)
     fn_alias_return_type: dict[str, str] = {}
     for f_alias in funcs:
@@ -6747,6 +6925,8 @@ def transpile_r_to_fortran(
         "real_matrix_vars": set(),
         "int_vector_vars": set(),
         "real_vector_vars": set(),
+        "named_vector_names": dict(_NAMED_VECTOR_NAMES),
+        "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
     }
 
     assign_counts = infer_assigned_names(main_stmts)
@@ -6888,6 +7068,16 @@ def transpile_r_to_fortran(
             pbody.w(f"integer, parameter :: {nm}({n_decl}) = {expr_f}")
         else:
             pbody.w(f"real(kind=dp), parameter :: {nm}({n_decl}) = {expr_f}")
+    for nm, (labels, _vals) in sorted(named_vectors.items()):
+        if not labels:
+            continue
+        name_nm = _NAMED_VECTOR_NAMES.get(nm.lower(), f"{nm}_names")
+        max_len = max(1, max(len(x) for x in labels))
+        arr = ", ".join(_fortran_str_literal(x) for x in labels)
+        pbody.w(
+            f"character(len={max_len}), parameter :: {name_nm}({len(labels)}) = "
+            f"[character(len={max_len}) :: {arr}]"
+        )
 
     # Variables assigned from list-return function calls or main-scope list(...) constructors.
     list_vars: dict[str, str] = {}
@@ -7464,6 +7654,14 @@ def transpile_r_to_fortran(
         any("rank_average(" in ln or "rank_first(" in ln for ln in pbody.lines)
         or any("rank_average(" in ln or "rank_first(" in ln for ln in mprocs.lines)
     )
+    emit_local_det = (
+        any("det_real(" in ln for ln in pbody.lines)
+        or any("det_real(" in ln for ln in mprocs.lines)
+    )
+    emit_local_solve = (
+        any("solve_real(" in ln for ln in pbody.lines)
+        or any("solve_real(" in ln for ln in mprocs.lines)
+    )
     if emit_local_command_args:
         mprocs.w("function r_command_args() result(out)")
         mprocs.w("character(len=:), allocatable :: out(:)")
@@ -7956,6 +8154,132 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.w("end function rank_average")
         mprocs.w("")
+    if emit_local_det:
+        mprocs.w("pure function det_real(x) result(out)")
+        mprocs.w("real(kind=dp), intent(in) :: x(:,:)")
+        mprocs.w("real(kind=dp) :: out")
+        mprocs.w("real(kind=dp), allocatable :: a(:)")
+        mprocs.w("integer :: i, j, k, n, p")
+        mprocs.w("real(kind=dp) :: fac, piv, t")
+        mprocs.w("n = size(x, 1)")
+        mprocs.w("out = 0.0_dp")
+        mprocs.w("if (n /= size(x, 2)) return")
+        mprocs.w("if (n == 0) then")
+        mprocs.push()
+        mprocs.w("out = 1.0_dp")
+        mprocs.w("return")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("allocate(a(n*n))")
+        mprocs.w("a = reshape(x, [n*n])")
+        mprocs.w("out = 1.0_dp")
+        mprocs.w("do k = 1, n")
+        mprocs.push()
+        mprocs.w("p = k")
+        mprocs.w("piv = abs(a((k - 1)*n + k))")
+        mprocs.w("do i = k + 1, n")
+        mprocs.push()
+        mprocs.w("if (abs(a((i - 1)*n + k)) > piv) then")
+        mprocs.push()
+        mprocs.w("p = i")
+        mprocs.w("piv = abs(a((i - 1)*n + k))")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("if (piv <= tiny(1.0_dp)) then")
+        mprocs.push()
+        mprocs.w("out = 0.0_dp")
+        mprocs.w("return")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("if (p /= k) then")
+        mprocs.push()
+        mprocs.w("do j = k, n")
+        mprocs.push()
+        mprocs.w("t = a((k - 1)*n + j)")
+        mprocs.w("a((k - 1)*n + j) = a((p - 1)*n + j)")
+        mprocs.w("a((p - 1)*n + j) = t")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("out = -out")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("out = out * a((k - 1)*n + k)")
+        mprocs.w("do i = k + 1, n")
+        mprocs.push()
+        mprocs.w("fac = a((i - 1)*n + k) / a((k - 1)*n + k)")
+        mprocs.w("do j = k + 1, n")
+        mprocs.push()
+        mprocs.w("a((i - 1)*n + j) = a((i - 1)*n + j) - fac * a((k - 1)*n + j)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function det_real")
+        mprocs.w("")
+    if emit_local_solve:
+        mprocs.w("pure function solve_real(a, b) result(x)")
+        mprocs.w("real(kind=dp), intent(in) :: a(:,:), b(:)")
+        mprocs.w("real(kind=dp), allocatable :: x(:)")
+        mprocs.w("real(kind=dp), allocatable :: aa(:,:), bb(:)")
+        mprocs.w("integer :: i, j, k, n, p")
+        mprocs.w("real(kind=dp) :: fac, piv, s, t")
+        mprocs.w("n = size(b)")
+        mprocs.w("allocate(x(n))")
+        mprocs.w("x = 0.0_dp")
+        mprocs.w("if (size(a, 1) /= n .or. size(a, 2) /= n) return")
+        mprocs.w("aa = a")
+        mprocs.w("bb = b")
+        mprocs.w("do k = 1, n")
+        mprocs.push()
+        mprocs.w("p = k")
+        mprocs.w("piv = abs(aa(k, k))")
+        mprocs.w("do i = k + 1, n")
+        mprocs.push()
+        mprocs.w("if (abs(aa(i, k)) > piv) then")
+        mprocs.push()
+        mprocs.w("p = i")
+        mprocs.w("piv = abs(aa(i, k))")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("if (piv <= tiny(1.0_dp)) return")
+        mprocs.w("if (p /= k) then")
+        mprocs.push()
+        mprocs.w("do j = k, n")
+        mprocs.push()
+        mprocs.w("t = aa(k, j)")
+        mprocs.w("aa(k, j) = aa(p, j)")
+        mprocs.w("aa(p, j) = t")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("t = bb(k)")
+        mprocs.w("bb(k) = bb(p)")
+        mprocs.w("bb(p) = t")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("do i = k + 1, n")
+        mprocs.push()
+        mprocs.w("fac = aa(i, k) / aa(k, k)")
+        mprocs.w("aa(i, k:n) = aa(i, k:n) - fac * aa(k, k:n)")
+        mprocs.w("bb(i) = bb(i) - fac * bb(k)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("do i = n, 1, -1")
+        mprocs.push()
+        mprocs.w("s = bb(i)")
+        mprocs.w("if (i < n) s = s - sum(aa(i, i+1:n) * x(i+1:n))")
+        mprocs.w("x(i) = s / aa(i, i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function solve_real")
+        mprocs.w("")
     if emit_local_drop:
         mprocs.w("pure function r_drop_index_real(x, k) result(out)")
         mprocs.w("real(kind=dp), intent(in) :: x(:)")
@@ -8103,6 +8427,8 @@ def transpile_r_to_fortran(
         "r_typeof",
         "rank_average",
         "rank_first",
+        "det_real",
+        "solve_real",
         "print_matrix",
         "print_matrix_rstyle",
         "print_real_scalar",
