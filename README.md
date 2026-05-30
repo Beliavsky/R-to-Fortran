@@ -9,31 +9,31 @@ This is not a complete R implementation.  It is useful for numeric scripts that 
 Translate an R script:
 
 ```bat
-python xr2f.py xrnorm_stats.r
+python xr2f.py xhello.r
 ```
 
 Compile the generated Fortran:
 
 ```bat
-python xr2f.py xrnorm_stats.r --compile
+python xr2f.py xhello.r --compile
 ```
 
 Compile and run the generated Fortran:
 
 ```bat
-python xr2f.py xrnorm_stats.r --run
+python xr2f.py xhello.r --run
 ```
 
 Run both the original R script and the generated Fortran:
 
 ```bat
-python xr2f.py xrnorm_stats.r --run-both
+python xr2f.py xhello.r --run-both
 ```
 
 Create a single self-contained Fortran file with the needed runtime support prepended:
 
 ```bat
-python xr2f.py xrnorm_stats.r --self-contained --compile
+python xr2f.py xrunif.r --self-contained --compile
 ```
 
 ## Example
@@ -41,24 +41,40 @@ python xr2f.py xrnorm_stats.r --self-contained --compile
 Input R:
 
 ```r
-x = rnorm(10^5)
-print(mean(x))
-print(sd(x))
+x <- 3
+y <- c(1.0, 4.0, 9.0)
+print(x)
+for (v in y) {
+  print(v)
+}
+for (i in 1:3) {
+  print(i)
+}
 ```
 
 Generated Fortran:
 
 ```fortran
-program xrnorm_stats
+program xr2f_smoke
 use, intrinsic :: iso_fortran_env, only: dp => real64
-use r_mod, only: rnorm_vec, sd
 implicit none
-real(kind=dp), allocatable :: x(:)
+integer, parameter :: x = 3
+real(kind=dp), parameter :: y(3) = [1.0_dp, 4.0_dp, 9.0_dp]
+integer :: i
+real(kind=dp) :: v
 
-x = rnorm_vec(10**5)
-write(*,"(g0)") sum(x)/real(size(x), kind=dp)
-write(*,"(g0)") sd(x)
-end program xrnorm_stats
+write(*,"(i0)") x
+block
+   integer :: i_v
+   do i_v = 1, size(y)
+      v = y(i_v)
+      write(*,"(f0.6)") v
+   end do
+end block
+do i = 1, 3
+   write(*,"(i0)") i
+end do
+end program xr2f_smoke
 ```
 
 ## Requirements
@@ -73,7 +89,9 @@ end program xrnorm_stats
 - `xr2f.py`: main R-to-Fortran transpiler.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
 - `r.f90`: Fortran runtime helper module.
-- `fortran_scan.py`, `fortran_post.py`: Fortran scanning and postprocessing helpers used by the transpiler.
+- `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
+- `tests/`: pytest tests for the standalone command-line tools.
+- `x*.r`, `xr2f_smoke.R`: small R examples used by the pytest suite.
 
 Generated files normally use the suffix `_r.f90`, for example `foo.r` becomes `foo_r.f90`.
 
@@ -146,6 +164,22 @@ Save batch output to a results file:
 ```bat
 python xr2f_batch.py examples\*.R --compile --tee
 ```
+
+## Tests
+
+The repository includes a focused pytest suite and small R fixture scripts:
+
+```bat
+pytest -q
+```
+
+At the time this README was updated, the suite collected 25 tests:
+
+```bat
+pytest --collect-only -q
+```
+
+The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.
 
 ## Comparing R and Fortran Output
 
