@@ -2091,6 +2091,13 @@ def classify_vars(
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif rhs_l.startswith("double("):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif rhs_l.startswith("as.numeric("):
                     c_asn = parse_call_text(rhs)
                     arg0 = c_asn[1][0].strip() if c_asn is not None and c_asn[1] else ""
@@ -3504,6 +3511,11 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"reshape({data_f}, [{nr_f}, {nc_f}], pad={data_f})"
     # runif(...) / rnorm(...) as expressions
     c_rng = parse_call_text(s)
+    if c_rng is not None and c_rng[0].lower() == "double":
+        _nd, pos_d, kw_d = c_rng
+        n_src = pos_d[0] if pos_d else kw_d.get("length", kw_d.get("n", "0"))
+        n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        return f"numeric({n_f})"
     if c_rng is not None and c_rng[0].lower() == "integer":
         _ni, pos_i, kw_i = c_rng
         n_src = pos_i[0] if pos_i else kw_i.get("n", "0")
@@ -5703,6 +5715,10 @@ def emit_stmts(
                     # R options(...) at statement scope is configuration metadata;
                     # skip in generated Fortran for now.
                     continue
+                if nm_expr == "declare":
+                    # compiler::declare(...) is R-side type metadata; the
+                    # translator infers/declarers Fortran types separately.
+                    continue
                 is_matrix_expr = nm_expr in {"array", "matrix", "cbind", "cbind2"} or (
                     nm_expr in {"cov", "cor"} and len(c_expr[1]) <= 1
                 )
@@ -5894,7 +5910,15 @@ def emit_function(
     else:
         rdecl = f"type({_type_name_for_path(fn.name, ())})"
     rname = f"{fn.name}_result"
+    s3_receiver_type: str | None = None
+    if "_" in fn.name and fn.args:
+        for spec_name in sorted(list_specs, key=len, reverse=True):
+            if fn.name.endswith("_" + spec_name):
+                s3_receiver_type = _type_name_for_path(spec_name, ())
+                break
     arg_rank = {a: infer_arg_rank(fn, a) for a in fn.args}
+    if s3_receiver_type is not None and fn.args:
+        arg_rank[fn.args[0]] = 0
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
         for a in fn.args:
@@ -5928,12 +5952,6 @@ def emit_function(
     arg_local_init_lines: list[str] = []
     fn_char_scalars = infer_function_character_scalars(fn)
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
-    s3_receiver_type: str | None = None
-    if "_" in fn.name and fn.args:
-        for spec_name in sorted(list_specs, key=len, reverse=True):
-            if fn.name.endswith("_" + spec_name):
-                s3_receiver_type = _type_name_for_path(spec_name, ())
-                break
     for a in fn.args:
         dflt = fn.defaults.get(a, "")
         intent = "in"
