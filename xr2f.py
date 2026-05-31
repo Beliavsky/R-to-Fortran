@@ -2098,7 +2098,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif rhs_l.startswith("as.numeric("):
+                elif rhs_l.startswith("as.numeric(") or rhs_l.startswith("as.double("):
                     c_asn = parse_call_text(rhs)
                     arg0 = c_asn[1][0].strip() if c_asn is not None and c_asn[1] else ""
                     if arg0 in (known_arrays | int_arrays | real_arrays):
@@ -2133,21 +2133,21 @@ def classify_vars(
                         known_arrays.discard(st.name)
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
-                elif re.match(r"^(matrix|array|cbind|cbind2|outer)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colSums|rowSums|r_rep_real|runif_vec|rnorm_vec)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colSums|rowSums|rev|r_rep_real|runif_vec|rnorm_vec)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|dim|order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -2454,7 +2454,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
     pat_idx2 = re.compile(rf"\b{nm}\s*\[\s*[^,\]]*?\s*,")
     pat_lhs_idx2 = re.compile(rf"^\s*{nm}\s*\[\s*[^,\]]*?\s*,")
     pat_mat_rhs = re.compile(
-        rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|outer)\s*\(",
+        rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer)\s*\(",
         re.IGNORECASE,
     )
     pat_mat_call_rhs = re.compile(
@@ -3342,6 +3342,42 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("t requires an argument")
         return f"transpose({r_expr_to_fortran(x_src)})"
+    c_rb = parse_call_text(s)
+    if c_rb is not None and c_rb[0].lower() == "rbind":
+        args = [r_expr_to_fortran(a) for a in c_rb[1]]
+        if len(args) < 2 or len(args) > 3:
+            raise NotImplementedError("rbind currently supports two or three vector rows")
+        return "transpose(cbind(" + ", ".join(args) + "))"
+    c_rev = parse_call_text(s)
+    if c_rev is not None and c_rev[0].lower() == "rev":
+        _nr, pos_rv, kw_rv = c_rev
+        x_src = pos_rv[0] if pos_rv else kw_rv.get("x")
+        if x_src is None:
+            raise NotImplementedError("rev requires an argument")
+        x_f = r_expr_to_fortran(x_src)
+        return f"{x_f}(size({x_f}):1:-1)"
+    c_dim = parse_call_text(s)
+    if c_dim is not None and c_dim[0].lower() == "dim":
+        _ndm, pos_dm, kw_dm = c_dim
+        x_src = pos_dm[0] if pos_dm else kw_dm.get("x")
+        if x_src is None:
+            raise NotImplementedError("dim requires an argument")
+        return f"shape({r_expr_to_fortran(x_src)})"
+    c_drop = parse_call_text(s)
+    if c_drop is not None and c_drop[0].lower() == "drop":
+        _ndr, pos_dr, kw_dr = c_drop
+        x_src = pos_dr[0] if pos_dr else kw_dr.get("x")
+        if x_src is None:
+            raise NotImplementedError("drop requires an argument")
+        return r_expr_to_fortran(x_src)
+    c_wm = parse_call_text(s)
+    if c_wm is not None and c_wm[0].lower() in {"which.max", "which.min"}:
+        _nwm, pos_wm, kw_wm = c_wm
+        x_src = pos_wm[0] if pos_wm else kw_wm.get("x")
+        if x_src is None:
+            raise NotImplementedError(f"{c_wm[0]} requires an argument")
+        fn_wm = "maxloc" if c_wm[0].lower() == "which.max" else "minloc"
+        return f"{fn_wm}({r_expr_to_fortran(x_src)}, dim=1)"
     c_ord = parse_call_text(s)
     if c_ord is not None and c_ord[0].lower() == "order":
         _no, pos_o, kw_o = c_ord
@@ -3767,6 +3803,62 @@ def r_expr_to_fortran(expr: str) -> str:
             args_out.append(f"len_out={_int_bound_expr(r_expr_to_fortran(len_src))}")
 
         return f"{rep_fn}(" + ", ".join(args_out) + ")"
+    c_repint = parse_call_text(s)
+    if c_repint is not None and c_repint[0].lower() == "rep.int":
+        _nm_ri, pos_ri, kw_ri = c_repint
+        x_src = pos_ri[0] if pos_ri else kw_ri.get("x", "0")
+        times_src = pos_ri[1] if len(pos_ri) >= 2 else kw_ri.get("times", "1")
+        x_f_raw = r_expr_to_fortran(x_src)
+        def _repint_is_vectorish(txt: str) -> bool:
+            t = txt.strip()
+            if t.startswith("[") and t.endswith("]"):
+                return True
+            m_fun = re.match(r"^([a-z][a-z0-9_]*)\s*\(", t, re.IGNORECASE)
+            return bool(m_fun and m_fun.group(1).lower() in {
+                "r_seq_int",
+                "r_seq_len",
+                "r_rep_int",
+                "r_rep_real",
+                "runif_vec",
+                "rnorm_vec",
+                "numeric",
+            })
+
+        def _repint_looks_int_vec(txt: str) -> bool:
+            t = txt.strip().lower()
+            if t.startswith("r_seq_int(") or t.startswith("r_seq_len(") or t.startswith("r_rep_int("):
+                return True
+            if t.startswith("[") and t.endswith("]"):
+                vals = split_top_level_commas(t[1:-1].strip()) if t[1:-1].strip() else []
+                return bool(vals) and all(_is_int_literal(v.strip()) for v in vals)
+            return False
+
+        def _repint_times_vec(src: str) -> str | None:
+            t = src.strip()
+            tv_seq = _split_top_level_colon(t)
+            if tv_seq is not None:
+                return f"r_seq_int({_int_bound_expr(r_expr_to_fortran(tv_seq[0].strip()))}, {_int_bound_expr(r_expr_to_fortran(tv_seq[1].strip()))})"
+            if t.startswith("c(") and t.endswith(")"):
+                inner_t = t[2:-1].strip()
+                parts_t = split_top_level_commas(inner_t) if inner_t else []
+                vals_t = ", ".join(_int_bound_expr(r_expr_to_fortran(p.strip())) for p in parts_t if p.strip())
+                return f"[{vals_t}]"
+            tf = r_expr_to_fortran(src)
+            if _repint_is_vectorish(tf):
+                return tf
+            return None
+
+        if x_f_raw.strip().startswith("[") and x_f_raw.strip().endswith("]"):
+            x_f = x_f_raw
+        elif _is_int_literal(x_src.strip()):
+            x_f = f"[{_int_bound_expr(x_f_raw)}]"
+        else:
+            x_f = f"[{x_f_raw}]"
+        fn = "r_rep_int" if _is_int_literal(x_src.strip()) or _repint_looks_int_vec(x_f) else "r_rep_real"
+        times_vec = _repint_times_vec(times_src)
+        if times_vec is not None:
+            return f"{fn}({x_f}, times_vec={times_vec})"
+        return f"{fn}({x_f}, times={_int_bound_expr(r_expr_to_fortran(times_src))})"
     # seq/seq.int family
     c_seq = parse_call_text(s)
     if c_seq is not None and c_seq[0].lower() in {"seq", "seq.int"}:
@@ -3960,6 +4052,7 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "as.vector", _as_vector_to_fortran)
     s = _replace_balanced_func_calls(s, "as.integer", lambda inner: f"int({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
+    s = _replace_balanced_func_calls(s, "as.double", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "typeof", lambda inner: f"r_typeof({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "commandArgs", lambda inner: "r_command_args()")
@@ -4047,6 +4140,15 @@ def r_expr_to_fortran(expr: str) -> str:
                 if _split_reduction_args(inner)[1]
                 else f"sum({inner})"
             )
+        ),
+    )
+    s = _replace_balanced_func_calls(
+        s,
+        "prod",
+        lambda inner: (
+            f"product({_non_na_pack_expr(r_expr_to_fortran(_split_reduction_args(inner)[0]))})"
+            if _split_reduction_args(inner)[1]
+            else f"product({r_expr_to_fortran(_split_reduction_args(inner)[0])})"
         ),
     )
     def _rowsums_to_fortran(inner: str) -> str:
@@ -4230,8 +4332,9 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "c", _repl_c)
     # decorate bare real literals
     s = re.sub(r"(?<![\w.])(\d+\.\d*([eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?![\w.])", r"\1_dp", s)
-    # R list member access: a$b$c -> a%b%c
+    # R list/S4 member access: a$b$c and a@b@c -> a%b%c
     s = s.replace("$", "%")
+    s = s.replace("@", "%")
     # R full subscript: x[] -> x(:)
     s = re.sub(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*\]", r"\1(:)", s)
     # Negative subscripts: x[-k], x[-c(i,j)], x[-[i,j]] -> helper calls.
@@ -4502,9 +4605,11 @@ def emit_stmts(
                 return 1
             if nm_c == "unname" and len(c[1]) == 1:
                 return _expr_rank_for_print(c[1][0])
-            if nm_c in {"matrix", "array", "cbind", "cbind2", "cov", "cor", "crossprod", "tcrossprod", "t"}:
+            if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "crossprod", "tcrossprod", "t"}:
                 return 2
             if nm_c == "c":
+                return 1
+            if nm_c in {"dim", "rev", "rep.int"}:
                 return 1
             if nm_c in {
                 "r_seq_int",
@@ -6711,7 +6816,7 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
                 out.add(st.name)
             if low.startswith("matrix("):
                 out.add(st.name)
-            if low.startswith("cbind(") or low.startswith("cbind2("):
+            if low.startswith("cbind(") or low.startswith("cbind2(") or low.startswith("rbind("):
                 out.add(st.name)
             if low.startswith("t("):
                 out.add(st.name)
@@ -6831,6 +6936,293 @@ def _parse_s3_class_assignment(expr: str) -> tuple[str, list[str]] | None:
     if classes is None:
         return None
     return m.group(1), classes
+
+
+def _unwrap_s4_metadata_expr(expr: str) -> str:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is not None and cinfo[0].lower() == "invisible" and len(cinfo[1]) == 1 and not cinfo[2]:
+        return cinfo[1][0].strip()
+    return expr.strip()
+
+
+def _parse_s4_setclass(expr: str) -> tuple[str, list[str], list[str]] | None:
+    cinfo = parse_call_text(_unwrap_s4_metadata_expr(expr))
+    if cinfo is None or cinfo[0].lower() != "setclass" or not cinfo[1]:
+        return None
+    cls = _dequote_string_literal(cinfo[1][0].strip())
+    if cls is None or not re.match(r"^[A-Za-z]\w*$", cls):
+        return None
+    parents: list[str] = []
+    contains_expr = cinfo[2].get("contains", "")
+    parent_one = _dequote_string_literal(contains_expr.strip()) if contains_expr else None
+    if parent_one is not None:
+        if not re.match(r"^[A-Za-z]\w*$", parent_one):
+            return None
+        parents.append(parent_one)
+    elif contains_expr:
+        contains_call = parse_call_text(contains_expr.strip())
+        if contains_call is None or contains_call[0].lower() != "c" or contains_call[2]:
+            return None
+        for p in contains_call[1]:
+            parent = _dequote_string_literal(p.strip())
+            if parent is None or not re.match(r"^[A-Za-z]\w*$", parent):
+                return None
+            parents.append(parent)
+    slots_expr = cinfo[2].get("slots", "")
+    if not slots_expr:
+        return cls, parents, []
+    slots_call = parse_call_text(slots_expr.strip())
+    if slots_call is None or slots_call[0].lower() != "c" or not slots_call[2]:
+        return None
+    slots: list[str] = []
+    for nm, typ in slots_call[2].items():
+        slot_type = _dequote_string_literal(typ.strip())
+        if slot_type is None or slot_type.lower() != "numeric":
+            return None
+        if not re.match(r"^[A-Za-z]\w*$", nm):
+            return None
+        slots.append(nm)
+    return cls, parents, slots
+
+
+def _parse_s4_setgeneric(expr: str) -> str | None:
+    cinfo = parse_call_text(_unwrap_s4_metadata_expr(expr))
+    if cinfo is None or cinfo[0].lower() != "setgeneric" or not cinfo[1]:
+        return None
+    generic = _dequote_string_literal(cinfo[1][0].strip())
+    if generic is None or not re.match(r"^[A-Za-z]\w*$", generic):
+        return None
+    return generic
+
+
+def _parse_s4_function_literal(src: str) -> tuple[list[str], list[object]] | None:
+    m = re.match(r"^function\s*\(([^)]*)\)\s*(.+)$", src.strip(), re.IGNORECASE | re.DOTALL)
+    if m is None:
+        return None
+    args = [a.strip() for a in split_top_level_commas(m.group(1)) if a.strip()]
+    if any(not re.match(r"^[A-Za-z]\w*$", a) for a in args):
+        return None
+    body_src = m.group(2).strip()
+    if body_src.startswith("{") and body_src.endswith("}"):
+        body_src = body_src[1:-1].strip()
+    if not body_src:
+        return None
+    return args, [ExprStmt(body_src)]
+
+
+def _parse_s4_setmethod(expr: str) -> tuple[str, str, list[str], list[object]] | None:
+    cinfo = parse_call_text(_unwrap_s4_metadata_expr(expr))
+    if cinfo is None or cinfo[0].lower() != "setmethod" or len(cinfo[1]) < 3:
+        return None
+    generic = _dequote_string_literal(cinfo[1][0].strip())
+    cls = _dequote_string_literal(cinfo[1][1].strip())
+    if (
+        generic is None
+        or cls is None
+        or not re.match(r"^[A-Za-z]\w*$", generic)
+        or not re.match(r"^[A-Za-z]\w*$", cls)
+    ):
+        return None
+    fn = _parse_s4_function_literal(cinfo[1][2])
+    if fn is None:
+        return None
+    args, body = fn
+    return generic, cls, args, body
+
+
+def _rewrite_minimal_s4_expr(
+    expr: str,
+    class_slots: dict[str, list[str]],
+    class_ancestors: dict[str, list[str]],
+    generics: set[str],
+    var_classes: dict[str, str],
+    method_classes: set[tuple[str, str]],
+) -> str:
+    out = expr
+
+    def repl_new(inner: str) -> str:
+        cinfo = parse_call_text("new(" + inner + ")")
+        if cinfo is None or not cinfo[1]:
+            return "new(" + inner + ")"
+        cls = _dequote_string_literal(cinfo[1][0].strip())
+        if cls is None or cls not in class_slots:
+            return "new(" + inner + ")"
+        args: list[str] = []
+        pos_tail = list(cinfo[1][1:])
+        for slot in class_slots[cls]:
+            if slot in cinfo[2]:
+                args.append(cinfo[2][slot])
+            elif pos_tail:
+                args.append(pos_tail.pop(0))
+            else:
+                return "new(" + inner + ")"
+        return f"{cls}(" + ", ".join(args) + ")"
+
+    out = _replace_balanced_func_calls(out, "new", repl_new)
+    for nm, cls in sorted(var_classes.items(), key=lambda kv: len(kv[0]), reverse=True):
+        out = _replace_balanced_func_calls(
+            out,
+            "class",
+            lambda inner, nm=nm, cls=cls: (
+                _fortran_str_literal(cls) if inner.strip() == nm else f"class({inner.strip()})"
+            ),
+        )
+        out = _replace_balanced_func_calls(
+            out,
+            "is",
+            lambda inner, nm=nm, cls=cls: _rewrite_minimal_s4_is_call(inner, nm, cls, class_ancestors),
+        )
+    for generic in sorted(generics, key=len, reverse=True):
+        def repl_generic(inner: str, generic: str = generic) -> str:
+            args = split_top_level_commas(inner.strip()) if inner.strip() else []
+            if not args:
+                return f"{generic}()"
+            first = args[0].strip()
+            cls = var_classes.get(first)
+            if cls is None or (generic, cls) not in method_classes:
+                return f"{generic}(" + ", ".join(args) + ")"
+            return f"{generic}_{cls}(" + ", ".join(args) + ")"
+
+        out = _replace_balanced_func_calls(out, generic, repl_generic)
+    return out
+
+
+def _rewrite_minimal_s4_is_call(
+    inner: str,
+    var_name: str,
+    var_class: str,
+    class_ancestors: dict[str, list[str]],
+) -> str:
+    args = split_top_level_commas(inner.strip()) if inner.strip() else []
+    if len(args) != 2 or args[0].strip() != var_name:
+        return f"is({inner.strip()})"
+    target = _dequote_string_literal(args[1].strip())
+    if target is None:
+        return f"is({inner.strip()})"
+    return "TRUE" if target in class_ancestors.get(var_class, [var_class]) else "FALSE"
+
+
+def _lower_minimal_s4(stmts: list[object]) -> list[object]:
+    """Lower a static S4 subset to constructor functions and direct method calls."""
+    class_own_slots: dict[str, list[str]] = {}
+    class_parents: dict[str, list[str]] = {}
+    generics: set[str] = set()
+    method_defs: dict[tuple[str, str], FuncDef] = {}
+
+    for st in stmts:
+        if not isinstance(st, ExprStmt):
+            continue
+        sc = _parse_s4_setclass(st.expr)
+        if sc is not None:
+            class_own_slots[sc[0]] = sc[2]
+            class_parents[sc[0]] = sc[1]
+            continue
+        sg = _parse_s4_setgeneric(st.expr)
+        if sg is not None:
+            generics.add(sg)
+            continue
+        sm = _parse_s4_setmethod(st.expr)
+        if sm is not None:
+            generic, cls, args, body = sm
+            method_defs[(generic, cls)] = FuncDef(name=f"{generic}_{cls}", args=args, defaults={}, body=body)
+
+    if not class_own_slots and not method_defs:
+        return stmts
+
+    def _ancestors(cls: str, seen: set[str] | None = None) -> list[str]:
+        seen = set(seen or set())
+        if cls in seen:
+            return [cls]
+        seen.add(cls)
+        out = [cls]
+        for parent in class_parents.get(cls, []):
+            for anc in _ancestors(parent, seen):
+                if anc not in out:
+                    out.append(anc)
+        return out
+
+    class_ancestors = {cls: _ancestors(cls) for cls in class_own_slots}
+
+    def _flattened_slots(cls: str) -> list[str]:
+        slots: list[str] = []
+        for parent in class_parents.get(cls, []):
+            for slot in _flattened_slots(parent):
+                if slot not in slots:
+                    slots.append(slot)
+        for slot in class_own_slots.get(cls, []):
+            if slot not in slots:
+                slots.append(slot)
+        return slots
+
+    class_slots = {cls: _flattened_slots(cls) for cls in class_own_slots}
+
+    for cls, ancestors in class_ancestors.items():
+        for generic in generics:
+            if (generic, cls) in method_defs:
+                continue
+            for parent in ancestors[1:]:
+                parent_fn = method_defs.get((generic, parent))
+                if parent_fn is None:
+                    continue
+                method_defs[(generic, cls)] = FuncDef(
+                    name=f"{generic}_{cls}",
+                    args=list(parent_fn.args),
+                    defaults=dict(parent_fn.defaults),
+                    body=list(parent_fn.body),
+                )
+                break
+    method_classes = set(method_defs)
+
+    constructors = [
+        FuncDef(
+            name=cls,
+            args=list(slots),
+            defaults={},
+            body=[ExprStmt("list(" + ", ".join(f"{slot} = as.numeric({slot})" for slot in slots) + ")")],
+        )
+        for cls, slots in class_slots.items()
+    ]
+
+    out: list[object] = constructors + list(method_defs.values())
+    var_classes: dict[str, str] = {}
+    for st in stmts:
+        if isinstance(st, ExprStmt) and (
+            _parse_s4_setclass(st.expr) is not None
+            or _parse_s4_setgeneric(st.expr) is not None
+            or _parse_s4_setmethod(st.expr) is not None
+        ):
+            continue
+        if isinstance(st, Assign):
+            rhs = _rewrite_minimal_s4_expr(
+                st.expr, class_slots, class_ancestors, generics, var_classes, method_classes
+            )
+            cinfo = parse_call_text(rhs.strip())
+            if cinfo is not None and cinfo[0] in class_slots:
+                var_classes[st.name] = cinfo[0]
+            out.append(Assign(name=st.name, expr=rhs, comment=st.comment))
+            continue
+        if isinstance(st, CallStmt):
+            out.append(CallStmt(
+                name=st.name,
+                args=[
+                    _rewrite_minimal_s4_expr(
+                        a, class_slots, class_ancestors, generics, var_classes, method_classes
+                    )
+                    for a in st.args
+                ],
+                comment=st.comment,
+            ))
+            continue
+        if isinstance(st, ExprStmt):
+            out.append(ExprStmt(
+                expr=_rewrite_minimal_s4_expr(
+                    st.expr, class_slots, class_ancestors, generics, var_classes, method_classes
+                ),
+                comment=st.comment,
+            ))
+            continue
+        out.append(st)
+    return out
 
 
 def _is_s3_usemethod_function(fn: FuncDef) -> str | None:
@@ -7009,6 +7401,7 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
