@@ -2147,7 +2147,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|dim|order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -2609,6 +2609,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
     if _is_int_literal(t) or _is_real_literal(t) or t in {"TRUE", "FALSE"}:
         return False
     if t.startswith("c(") or (t.startswith("[") and t.endswith("]")):
+        return False
+    if re.match(r"^(array|character|raw)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^t\s*\(", t, re.IGNORECASE):
         return False
@@ -3581,6 +3583,16 @@ def r_expr_to_fortran(expr: str) -> str:
         n_src = pos_l[0] if pos_l else kw_l.get("n", "0")
         n_f = _int_bound_expr(r_expr_to_fortran(n_src))
         return f"(r_rep_int([0], times={n_f}) /= 0)"
+    if c_rng is not None and c_rng[0].lower() == "raw":
+        _nrw, pos_rw, kw_rw = c_rng
+        n_src = pos_rw[0] if pos_rw else kw_rw.get("n", "0")
+        n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        return f"r_rep_int([0], times={n_f})"
+    if c_rng is not None and c_rng[0].lower() == "character":
+        _nch, pos_ch, kw_ch = c_rng
+        n_src = pos_ch[0] if pos_ch else kw_ch.get("length", kw_ch.get("n", "0"))
+        n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        return f"r_character({n_f})"
     if c_rng is not None and c_rng[0].lower() == "replicate":
         _nm_rep, pos_rep, kw_rep = c_rng
         n_src = pos_rep[0] if pos_rep else kw_rep.get("n", "1")
@@ -4751,6 +4763,43 @@ def emit_stmts(
         src = cinfo[1][0].strip()
         return _NAMED_VECTOR_NAMES.get(src.lower())
 
+    def _print_only_loop_body_with_value(ss: list[object], var: str, value_expr: str) -> list[object] | None:
+        if not ss:
+            return None
+        out_ss: list[object] = []
+        for b in ss:
+            if isinstance(b, PrintStmt):
+                out_ss.append(_replace_name_in_stmt(b, var, value_expr))
+                continue
+            if isinstance(b, CallStmt) and b.name.lower() in {"cat", "print"}:
+                out_ss.append(_replace_name_in_stmt(b, var, value_expr))
+                continue
+            return None
+        return out_ss
+
+    def _emit_direct_print_only_loop_body(
+        ss: list[object],
+        var: str,
+        value_expr: str,
+        scalar_fmt: str | None = None,
+    ) -> bool:
+        if not ss:
+            return False
+        for b in ss:
+            if not isinstance(b, PrintStmt):
+                return False
+        for b in ss:
+            args = [_replace_idents(a, {var: value_expr}) for a in b.args]
+            if args:
+                vals = [r_expr_to_fortran(_rewrite_predict_expr(a)) for a in args]
+                if scalar_fmt is not None and len(vals) == 1:
+                    _wstmt(f'write(*,"({scalar_fmt})") {vals[0]}', b.comment)
+                else:
+                    _wstmt("print *, " + ", ".join(vals), b.comment)
+            else:
+                _wstmt("print *", b.comment)
+        return True
+
     for st in stmts:
         if isinstance(st, Assign):
             if st.name in list_locals:
@@ -5742,6 +5791,7 @@ def emit_stmts(
             elif (parse_call_text(it) is not None) and (parse_call_text(it)[0].lower() in {"seq", "seq.int"}):
                 arr = r_expr_to_fortran(it)
                 idx = f"i_{st.var}"
+                direct_body = _print_only_loop_body_with_value(st.body, st.var, f"seq_for_{st.var}({idx})")
                 o.w("block")
                 o.push()
                 o.w(f"integer :: {idx}")
@@ -5749,8 +5799,13 @@ def emit_stmts(
                 o.w(f"seq_for_{st.var} = {arr}")
                 o.w(f"do {idx} = 1, size(seq_for_{st.var})")
                 o.push()
-                o.w(f"{st.var} = seq_for_{st.var}({idx})")
-                emit_stmts(o, st.body, need_rnorm, params, alloc_seen, helper_ctx)
+                if _emit_direct_print_only_loop_body(st.body, st.var, f"seq_for_{st.var}({idx})", "i0"):
+                    pass
+                elif direct_body is not None:
+                    emit_stmts(o, direct_body, need_rnorm, params, alloc_seen, helper_ctx)
+                else:
+                    o.w(f"{st.var} = seq_for_{st.var}({idx})")
+                    emit_stmts(o, st.body, need_rnorm, params, alloc_seen, helper_ctx)
                 o.pop()
                 o.w("end do")
                 o.pop()
@@ -5759,13 +5814,20 @@ def emit_stmts(
             elif re.match(r"^[A-Za-z]\w*$", it):
                 arr = it
                 idx = f"i_{st.var}"
+                direct_body = _print_only_loop_body_with_value(st.body, st.var, f"{arr}({idx})")
                 o.w("block")
                 o.push()
                 o.w(f"integer :: {idx}")
                 o.w(f"do {idx} = 1, size({arr})")
                 o.push()
-                o.w(f"{st.var} = {arr}({idx})")
-                emit_stmts(o, st.body, need_rnorm, params, alloc_seen, helper_ctx)
+                scalar_fmt = "i0" if arr in int_vector_vars else ("f0.6" if arr in real_vector_vars else None)
+                if _emit_direct_print_only_loop_body(st.body, st.var, f"{arr}({idx})", scalar_fmt):
+                    pass
+                elif direct_body is not None:
+                    emit_stmts(o, direct_body, need_rnorm, params, alloc_seen, helper_ctx)
+                else:
+                    o.w(f"{st.var} = {arr}({idx})")
+                    emit_stmts(o, st.body, need_rnorm, params, alloc_seen, helper_ctx)
                 o.pop()
                 o.w("end do")
                 o.pop()
@@ -6677,6 +6739,9 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
         if low.startswith("commandargs("):
             out.add(st.name)
             continue
+        if low.startswith("character("):
+            out.add(st.name)
+            continue
         if not low.startswith("c("):
             continue
         cinfo = parse_call_text(rhs)
@@ -6895,6 +6960,15 @@ def infer_main_integer_matrices(stmts: list[object]) -> set[str]:
             continue
         rhs = st.expr.strip()
         cinfo_o = parse_call_text(rhs)
+        if cinfo_o is not None and cinfo_o[0].lower() == "array":
+            data_src = cinfo_o[1][0] if cinfo_o[1] else cinfo_o[2].get("data", "")
+            data_txt = data_src.strip()
+            if (
+                _split_top_level_colon(data_txt) is not None
+                or data_txt.lower().startswith(("integer(", "raw(", "r_seq_int(", "r_seq_len(", "r_rep_int("))
+            ):
+                out.add(st.name)
+                continue
         if cinfo_o is None or cinfo_o[0].lower() != "outer":
             continue
         fun_src = cinfo_o[2].get("FUN", "").strip()
@@ -6937,6 +7011,35 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
             continue
         for k, v in kw.items():
             out.append(Assign(name=f"{st.name}_{k}", expr=v, comment=st.comment))
+    return out
+
+
+def _parse_dim_assignment(expr: str) -> tuple[str, str] | None:
+    m = re.match(r"^dim\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*(.+)$", expr.strip(), re.IGNORECASE)
+    if m is None:
+        return None
+    return m.group(1), m.group(2).strip()
+
+
+def _lower_dim_assignments(stmts: list[object]) -> list[object]:
+    """Fold simple `dim(x) <- c(...)` reshapes into the preceding assignment."""
+    out: list[object] = []
+    last_assign_idx: dict[str, int] = {}
+    for st in stmts:
+        if isinstance(st, Assign):
+            last_assign_idx[st.name] = len(out)
+            out.append(st)
+            continue
+        if isinstance(st, ExprStmt):
+            da = _parse_dim_assignment(st.expr)
+            if da is not None:
+                nm, dims = da
+                idx = last_assign_idx.get(nm)
+                if idx is not None and isinstance(out[idx], Assign):
+                    prev = out[idx]
+                    out[idx] = Assign(name=prev.name, expr=f"array({prev.expr}, dim={dims})", comment=prev.comment)
+                    continue
+        out.append(st)
     return out
 
 
@@ -7432,6 +7535,7 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    stmts = _lower_dim_assignments(stmts)
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
 
@@ -8283,6 +8387,10 @@ def transpile_r_to_fortran(
         any("r_typeof(" in ln for ln in pbody.lines)
         or any("r_typeof(" in ln for ln in mprocs.lines)
     ))
+    emit_local_character = ((not has_r_mod_emit) and (
+        any("r_character(" in ln for ln in pbody.lines)
+        or any("r_character(" in ln for ln in mprocs.lines)
+    ))
     emit_local_command_args = (
         any("r_command_args(" in ln for ln in pbody.lines)
         or any("r_command_args(" in ln for ln in mprocs.lines)
@@ -8325,6 +8433,13 @@ def transpile_r_to_fortran(
         mprocs.pop()
         mprocs.w("end do")
         mprocs.w("end function r_command_args")
+        mprocs.w("")
+    if emit_local_character:
+        mprocs.w("function r_character(n) result(out)")
+        mprocs.w("integer, intent(in) :: n")
+        mprocs.w("character(len=:), allocatable :: out(:)")
+        mprocs.w("allocate(character(len=0) :: out(max(0, n)))")
+        mprocs.w("end function r_character")
         mprocs.w("")
     if emit_local_seq:
         mprocs.w("pure function r_seq_int(a, b) result(out)")
@@ -9066,6 +9181,7 @@ def transpile_r_to_fortran(
         "nchar",
         "is_na",
         "r_typeof",
+        "r_character",
         "rank_average",
         "rank_first",
         "det_real",
