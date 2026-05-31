@@ -3344,10 +3344,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"transpose({r_expr_to_fortran(x_src)})"
     c_rb = parse_call_text(s)
     if c_rb is not None and c_rb[0].lower() == "rbind":
-        args = [r_expr_to_fortran(a) for a in c_rb[1]]
-        if len(args) < 2 or len(args) > 3:
-            raise NotImplementedError("rbind currently supports two or three vector rows")
-        return "transpose(cbind(" + ", ".join(args) + "))"
+        rows = [r_expr_to_fortran(a) for a in c_rb[1]]
+        if len(rows) < 1:
+            raise NotImplementedError("rbind requires at least one row")
+        nrow = len(rows)
+        first = rows[0]
+        ncol = len(split_top_level_commas(first[1:-1])) if first.strip().startswith("[") and first.strip().endswith("]") else f"size({first})"
+        flat = ", ".join(rows)
+        return f"transpose(reshape([{flat}], [{ncol}, {nrow}]))"
     c_rev = parse_call_text(s)
     if c_rev is not None and c_rev[0].lower() == "rev":
         _nr, pos_rv, kw_rv = c_rev
@@ -3378,6 +3382,21 @@ def r_expr_to_fortran(expr: str) -> str:
             raise NotImplementedError(f"{c_wm[0]} requires an argument")
         fn_wm = "maxloc" if c_wm[0].lower() == "which.max" else "minloc"
         return f"{fn_wm}({r_expr_to_fortran(x_src)}, dim=1)"
+    c_complex_real = parse_call_text(s)
+    if c_complex_real is not None and c_complex_real[0] in {"Mod", "Re", "Im", "Conj", "Arg"}:
+        nm_cr = c_complex_real[0]
+        pos_cr, kw_cr = c_complex_real[1], c_complex_real[2]
+        z_src = pos_cr[0] if pos_cr else kw_cr.get("z")
+        if z_src is None:
+            raise NotImplementedError(f"{nm_cr} requires an argument")
+        z_f = r_expr_to_fortran(z_src)
+        if nm_cr == "Mod":
+            return f"abs({z_f})"
+        if nm_cr in {"Re", "Conj"}:
+            return z_f
+        if nm_cr == "Im":
+            return f"(0.0_dp * real({z_f}, kind=dp))"
+        return f"merge(acos(-1.0_dp), 0.0_dp, real({z_f}, kind=dp) < 0.0_dp)"
     c_ord = parse_call_text(s)
     if c_ord is not None and c_ord[0].lower() == "order":
         _no, pos_o, kw_o = c_ord
@@ -3808,7 +3827,19 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_ri, pos_ri, kw_ri = c_repint
         x_src = pos_ri[0] if pos_ri else kw_ri.get("x", "0")
         times_src = pos_ri[1] if len(pos_ri) >= 2 else kw_ri.get("times", "1")
-        x_f_raw = r_expr_to_fortran(x_src)
+        def _repint_int_c_literal(src: str) -> str | None:
+            ci = parse_call_text(src.strip())
+            if ci is None or ci[0].lower() != "c" or ci[2]:
+                return None
+            vals: list[str] = []
+            for p in ci[1]:
+                v = _strip_named_actual_value(p)
+                if not _is_int_literal(v):
+                    return None
+                vals.append(_int_bound_expr(r_expr_to_fortran(v)))
+            return "[" + ", ".join(vals) + "]" if vals else None
+
+        x_f_raw = _repint_int_c_literal(x_src) or r_expr_to_fortran(x_src)
         def _repint_is_vectorish(txt: str) -> bool:
             t = txt.strip()
             if t.startswith("[") and t.endswith("]"):
