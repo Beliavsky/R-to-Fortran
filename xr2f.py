@@ -6804,14 +6804,33 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
     return out
 
 
-def _parse_s3_class_assignment(expr: str) -> tuple[str, str] | None:
+def _parse_s3_class_rhs(rhs: str) -> list[str] | None:
+    one = _dequote_string_literal(rhs.strip())
+    if one is not None and re.match(r"^[A-Za-z]\w*$", one):
+        return [one]
+    cinfo = parse_call_text(rhs.strip())
+    if cinfo is None or cinfo[0].lower() != "c" or cinfo[2]:
+        return None
+    out: list[str] = []
+    for p in cinfo[1]:
+        cls = _dequote_string_literal(p.strip())
+        if cls is None or not re.match(r"^[A-Za-z]\w*$", cls):
+            return None
+        out.append(cls)
+    return out or None
+
+
+def _parse_s3_class_assignment(expr: str) -> tuple[str, list[str]] | None:
     m = re.match(
-        r"^class\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*([\"'])([A-Za-z]\w*)\2\s*$",
+        r"^class\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*(.+)$",
         expr.strip(),
     )
     if not m:
         return None
-    return m.group(1), m.group(3)
+    classes = _parse_s3_class_rhs(m.group(2).strip())
+    if classes is None:
+        return None
+    return m.group(1), classes
 
 
 def _is_s3_usemethod_function(fn: FuncDef) -> str | None:
@@ -6824,7 +6843,7 @@ def _is_s3_usemethod_function(fn: FuncDef) -> str | None:
     return generic if generic else None
 
 
-def _minimal_s3_constructor_class(fn: FuncDef) -> str | None:
+def _minimal_s3_constructor_classes(fn: FuncDef) -> list[str] | None:
     if not fn.body or not isinstance(fn.body[-1], ExprStmt):
         return None
     ret = fn.body[-1].expr.strip()
@@ -6839,7 +6858,25 @@ def _minimal_s3_constructor_class(fn: FuncDef) -> str | None:
     return None
 
 
-def _rewrite_minimal_s3_expr(expr: str, generics: set[str], var_class: dict[str, str]) -> str:
+def _s3_method_name_for_call(
+    generic: str,
+    classes: list[str] | None,
+    method_classes: set[tuple[str, str]],
+) -> str:
+    for cls in classes or []:
+        if (generic, cls) in method_classes:
+            return f"{generic}_{cls}"
+    if (generic, "default") in method_classes:
+        return f"{generic}_default"
+    return f"{generic}_default"
+
+
+def _rewrite_minimal_s3_expr(
+    expr: str,
+    generics: set[str],
+    var_classes: dict[str, list[str]],
+    method_classes: set[tuple[str, str]],
+) -> str:
     out = expr
     for generic in sorted(generics, key=len, reverse=True):
         def repl(inner: str) -> str:
@@ -6847,16 +6884,18 @@ def _rewrite_minimal_s3_expr(expr: str, generics: set[str], var_class: dict[str,
             if not args:
                 return f"{generic}()"
             first = args[0].strip()
-            cls = var_class.get(first)
-            method = f"{generic}_{cls}" if cls else f"{generic}_default"
+            method = _s3_method_name_for_call(generic, var_classes.get(first), method_classes)
             return f"{method}(" + ", ".join(args) + ")"
 
         out = _replace_balanced_func_calls(out, generic, repl)
-    for nm, cls in sorted(var_class.items(), key=lambda kv: len(kv[0]), reverse=True):
+    for nm, classes in sorted(var_classes.items(), key=lambda kv: len(kv[0]), reverse=True):
+        cls_text = " ".join(classes)
         out = _replace_balanced_func_calls(
             out,
             "class",
-            lambda inner, nm=nm, cls=cls: _fortran_str_literal(cls) if inner.strip() == nm else f"class({inner.strip()})",
+            lambda inner, nm=nm, cls_text=cls_text: (
+                _fortran_str_literal(cls_text) if inner.strip() == nm else f"class({inner.strip()})"
+            ),
         )
     return out
 
@@ -6865,24 +6904,49 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
     """Lower a deliberately small S3 subset to existing static Fortran machinery.
 
     Supports a generic `g <- function(x) UseMethod("g")`, methods named
-    `g.class`/`g.default`, constructors that assign one string class to the
-    returned list object, and main-scope calls where the receiver class is
-    known from such a constructor call.
+    `g.class`/`g.default`, constructors that assign one string class or a
+    class vector to the returned list object, main-scope calls where the
+    receiver class is known, and inherited parent methods over child objects
+    when the child derived type has the same referenced fields.
     """
     funcs = [st for st in stmts if isinstance(st, FuncDef)]
     generics = {g for fn in funcs if (g := _is_s3_usemethod_function(fn))}
     if not generics:
         return stmts
 
-    constructor_class: dict[str, str] = {}
+    constructor_classes: dict[str, list[str]] = {}
+    method_defs: dict[tuple[str, str], FuncDef] = {}
     for fn in funcs:
-        cls = _minimal_s3_constructor_class(fn)
-        if cls is not None:
-            constructor_class[fn.name] = cls
+        classes = _minimal_s3_constructor_classes(fn)
+        if classes is not None:
+            constructor_classes[fn.name] = classes
+        m_method = re.match(r"^([A-Za-z]\w*)\.([A-Za-z]\w*)$", fn.name)
+        if m_method is not None and m_method.group(1) in generics:
+            method_defs[(m_method.group(1), m_method.group(2))] = fn
+
+    inherited_methods: list[FuncDef] = []
+    for classes in constructor_classes.values():
+        for i, cls in enumerate(classes):
+            for generic in generics:
+                if (generic, cls) in method_defs:
+                    continue
+                for parent in classes[i + 1:]:
+                    parent_fn = method_defs.get((generic, parent))
+                    if parent_fn is None:
+                        continue
+                    inherited_methods.append(FuncDef(
+                        name=f"{generic}.{cls}",
+                        args=list(parent_fn.args),
+                        defaults=dict(parent_fn.defaults),
+                        body=list(parent_fn.body),
+                    ))
+                    method_defs[(generic, cls)] = inherited_methods[-1]
+                    break
+    method_classes = set(method_defs)
 
     out: list[object] = []
-    var_class: dict[str, str] = {}
-    for st in stmts:
+    var_classes: dict[str, list[str]] = {}
+    for st in list(stmts) + inherited_methods:
         if isinstance(st, FuncDef):
             if _is_s3_usemethod_function(st) is not None:
                 continue
@@ -6897,25 +6961,28 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
             out.append(FuncDef(name=name, args=st.args, defaults=st.defaults, body=body))
             continue
         if isinstance(st, Assign):
-            rhs = _rewrite_minimal_s3_expr(st.expr, generics, var_class)
+            rhs = _rewrite_minimal_s3_expr(st.expr, generics, var_classes, method_classes)
             cinfo = parse_call_text(rhs.strip())
-            if cinfo is not None and cinfo[0] in constructor_class:
-                var_class[st.name] = constructor_class[cinfo[0]]
+            if cinfo is not None and cinfo[0] in constructor_classes:
+                var_classes[st.name] = constructor_classes[cinfo[0]]
             out.append(Assign(name=st.name, expr=rhs, comment=st.comment))
             continue
         if isinstance(st, CallStmt):
             out.append(CallStmt(
                 name=st.name,
-                args=[_rewrite_minimal_s3_expr(a, generics, var_class) for a in st.args],
+                args=[_rewrite_minimal_s3_expr(a, generics, var_classes, method_classes) for a in st.args],
                 comment=st.comment,
             ))
             continue
         if isinstance(st, ExprStmt):
             ca = _parse_s3_class_assignment(st.expr)
             if ca is not None:
-                var_class[ca[0]] = ca[1]
+                var_classes[ca[0]] = ca[1]
                 continue
-            out.append(ExprStmt(expr=_rewrite_minimal_s3_expr(st.expr, generics, var_class), comment=st.comment))
+            out.append(ExprStmt(
+                expr=_rewrite_minimal_s3_expr(st.expr, generics, var_classes, method_classes),
+                comment=st.comment,
+            ))
             continue
         out.append(st)
     return out
