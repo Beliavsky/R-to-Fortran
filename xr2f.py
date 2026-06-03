@@ -2043,6 +2043,9 @@ def _index_dim_to_fortran(base: str, dimno: int, d: str) -> str:
         return ":"
     if dimno == 2 and dt == "price_names":
         return "price_names + 1"
+    m_seq_len = re.match(r"^r_seq_len\s*\(\s*(.+)\s*\)$", dt, re.IGNORECASE)
+    if m_seq_len is not None:
+        return f"1:{_int_bound_expr(m_seq_len.group(1).strip())}"
     m_seq_int = re.match(r"^r_seq_int\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)$", dt, re.IGNORECASE)
     if m_seq_int is not None:
         return f"{_int_bound_expr(m_seq_int.group(1).strip())}:{_int_bound_expr(m_seq_int.group(2).strip())}"
@@ -2424,6 +2427,16 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif (
+                    re.match(r"^[A-Za-z]\w*\s*\[[^\]]+\]\s*$", rhs)
+                    and (re.match(r"^([A-Za-z]\w*)\s*\[", rhs).group(1) if re.match(r"^([A-Za-z]\w*)\s*\[", rhs) else "") in int_arrays
+                ):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif any(tok in rhs_f for tok in ("r_seq_int(", "r_seq_len(", "r_seq_int_by(", "r_seq_int_length(", "r_seq_real_by(", "r_seq_real_length(")):
                     if rhs_f.strip().startswith(("r_seq_int(", "r_seq_len(", "r_seq_int_by(", "r_seq_int_length(")):
                         int_arrays.add(st.name)
@@ -2541,11 +2554,15 @@ def classify_vars(
                         or bool(re.match(r"^[A-Za-z]\w*$", idx_rhs))
                     )
                     if vector_like:
-                        real_arrays.add(st.name)
+                        if base_idx in int_arrays:
+                            int_arrays.add(st.name)
+                            real_arrays.discard(st.name)
+                        else:
+                            real_arrays.add(st.name)
+                            int_arrays.discard(st.name)
                         known_arrays.add(st.name)
                         params.pop(st.name, None)
                         ints.discard(st.name)
-                        int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
                     else:
                         real_scalars.add(st.name)
@@ -6092,12 +6109,23 @@ def emit_stmts(
             m_pack = re.match(rf"^{re.escape(st.name)}\s*\[\s*(.+)\s*\]\s*$", rhs)
             if m_pack:
                 inner = m_pack.group(1).strip()
+                inner_f = r_expr_to_fortran(inner)
+                inner_l = inner.strip().lower()
+                is_mask = (
+                    inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                    or re.match(r"^is\.na\s*\(", inner_l)
+                    or re.match(r"^is_na\s*\(", inner_l)
+                    or re.match(r"^is\.finite\s*\(", inner_l)
+                    or re.match(r"^ieee_is_finite\s*\(", inner_l)
+                    or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+                )
                 if ":" in inner:
                     sec = r_expr_to_fortran(inner)
                     o.w(f"{st.name} = {st.name}({sec})")
+                elif not is_mask:
+                    o.w(f"{st.name} = {st.name}({_index_inner_to_fortran(inner_f, base=st.name)})")
                 else:
-                    mask = r_expr_to_fortran(inner)
-                    o.w(f"{st.name} = pack({st.name}, {mask})")
+                    o.w(f"{st.name} = pack({st.name}, {inner_f})")
                 continue
             m_if_runif = re.match(r"^ifelse\s*\(\s*runif\((.+)\)\s*<\s*(.+)\s*,\s*(.+)\s*,\s*(.+)\s*\)\s*$", rhs)
             if m_if_runif:
@@ -8056,8 +8084,9 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
     def _scan_text(txt: str) -> None:
         for m in re.finditer(r"\b(?:nrow|ncol)\s*\(\s*([A-Za-z]\w*)\s*\)", txt):
             out.add(m.group(1))
-        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\[[^\]]*,", txt):
-            out.add(m.group(1))
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\[([^\]]+)\]", txt):
+            if len(_split_index_dims(m.group(2))) >= 2:
+                out.add(m.group(1))
         m_wr = re.match(r"^\s*write\.table\s*\((.*)\)\s*$", txt, re.IGNORECASE)
         if m_wr:
             cinfo = parse_call_text("write.table(" + m_wr.group(1).strip() + ")")
