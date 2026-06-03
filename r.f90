@@ -7,16 +7,16 @@ implicit none
 private
 public :: runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
-   & pmax, sd, r_sd, var, r_format_vec, colMeans, count_ws_tokens, read_real_vector, read_table_real_matrix, &
+   & pmax, sd, r_sd, var, r_format_vec, colMeans, count_ws_tokens, read_real_vector, read_table_real_matrix, read_csv_real_matrix, &
    & write_table_real_matrix, lm_fit_t, lm_fit_general, lm_predict_general, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, cov, cor, r_seq_int, r_seq_len, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
    & r_rep_real, r_rep_int, r_array_real, r_array_int, r_array_char, matrix, &
-   & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, print_matrix_rstyle, print_real_scalar, print_real_vector, print_char_vector, &
+   & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, print_real_vector, print_char_vector, &
    & print_named_real_vector, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
-   & kmeans_result_t, kmeans, max_col, tabulate, match, cumsum, cumprod, diff, diag, sort, &
-   & nchar, is_na, r_typeof, order_real, rank_average, rank_first, det_real, solve_real
+   & kmeans_result_t, kmeans, max_col, tabulate, match, findInterval, cumsum, cumprod, diff, diag, toeplitz, chol, backsolve, sort, &
+   & nchar, is_na, r_typeof, r_character, order_real, rank_average, rank_first, det_real, solve_real, nested_matrix_list_len
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -36,6 +36,11 @@ interface cov
    module procedure cov_vec
    module procedure cov_mat
 end interface cov
+
+interface var
+   module procedure var_vec
+   module procedure var_mat
+end interface var
 
 interface cor
    module procedure cor_vec
@@ -138,6 +143,7 @@ end interface cumprod
 
 interface diff
    module procedure diff_real
+   module procedure diff_mat_real
    module procedure diff_int
 end interface diff
 
@@ -146,12 +152,18 @@ interface diag
    module procedure diag_vec_real
    module procedure diag_mat_int
    module procedure diag_vec_int
+   module procedure diag_scalar_int
 end interface diag
 
 interface sort
    module procedure sort_real
    module procedure sort_int
 end interface sort
+
+interface solve_real
+   module procedure solve_real_vec
+   module procedure solve_real_mat
+end interface solve_real
 
 interface is_na
    module procedure is_na_real_scalar
@@ -174,6 +186,14 @@ interface r_typeof
 end interface r_typeof
 
 contains
+
+function r_character(n) result(out)
+! Allocate an R-like character vector initialized to empty strings.
+integer, intent(in) :: n
+character(len=:), allocatable :: out(:)
+allocate(character(len=0) :: out(max(0, n)))
+end function r_character
+
 
 subroutine set_print_int_like(flag)
 ! Enable/disable integer-like rendering for real matrix printing.
@@ -279,7 +299,7 @@ out%centers = c
 out%cluster = cl
 end function kmeans
 
-function max_col(x, ties_method) result(idx)
+pure function max_col(x, ties_method) result(idx)
 ! Return 1-based column index of row-wise maxima (ties -> first).
 real(kind=dp), intent(in) :: x(:,:)
 character(len=*), intent(in), optional :: ties_method
@@ -337,6 +357,17 @@ do i = 1, size(x)
 end do
 end function tabulate_real
 
+pure function nested_matrix_list_len(x) result(n)
+! Count non-padding matrix slices in a ragged nested list lowered to rank 3.
+real(kind=dp), intent(in) :: x(:,:,:)
+integer :: n
+integer :: j
+n = 0
+do j = 1, size(x, 3)
+   if (any(ieee_is_finite(x(:,:,j)))) n = j
+end do
+end function nested_matrix_list_len
+
 pure function match_int(x, table) result(out)
 ! Return first 1-based match positions, or a sentinel for NA.
 integer, intent(in) :: x(:), table(:)
@@ -371,10 +402,11 @@ do i = 1, size(x)
 end do
 end function match_real
 
-function r_format_vec(x, digits) result(out)
-! Format a real vector like paste(sprintf("%.<digits>f", x), collapse=" ").
+function r_format_vec(x, digits, sep) result(out)
+! Format a real vector like paste(sprintf("%.<digits>f", x), collapse=sep).
 real(kind=dp), intent(in) :: x(:)
 integer, intent(in) :: digits
+character(len=*), intent(in), optional :: sep
 character(len=:), allocatable :: out
 character(len=64) :: fmt, buf
 integer :: i, d
@@ -383,7 +415,13 @@ write(fmt, '("(f0.", i0, ")")') d
 out = ""
 do i = 1, size(x)
    write(buf, fmt) x(i)
-   if (i > 1) out = out // " "
+   if (i > 1) then
+      if (present(sep)) then
+         out = out // sep
+      else
+         out = out // " "
+      end if
+   end if
    out = out // trim(adjustl(buf))
 end do
 end function r_format_vec
@@ -1148,7 +1186,7 @@ do k = 1, n
 end do
 end function det_real
 
-pure function solve_real(a, b) result(x)
+pure function solve_real_vec(a, b) result(x)
 ! Return the solution of a square linear system a %*% x = b.
 real(kind=dp), intent(in) :: a(:,:), b(:)
 real(kind=dp), allocatable :: x(:)
@@ -1192,7 +1230,22 @@ do i = n, 1, -1
    if (i < n) s = s - sum(aa(i, i+1:n) * x(i+1:n))
    x(i) = s / aa(i, i)
 end do
-end function solve_real
+end function solve_real_vec
+
+pure function solve_real_mat(a, b) result(x)
+! Return the solution of a square linear system a %*% x = b for matrix b.
+real(kind=dp), intent(in) :: a(:,:), b(:,:)
+real(kind=dp), allocatable :: x(:,:)
+integer :: j, n, m
+n = size(a, 1)
+m = size(b, 2)
+allocate(x(n, m))
+x = 0.0_dp
+if (size(a, 2) /= n .or. size(b, 1) /= n) return
+do j = 1, m
+   x(:, j) = solve_real_vec(a, b(:, j))
+end do
+end function solve_real_mat
 
 pure function cumsum_real(x) result(out)
 ! Return cumulative sums of a real vector.
@@ -1219,6 +1272,20 @@ do i = 2, size(x)
    out(i) = out(i - 1) + x(i)
 end do
 end function cumsum_int
+
+pure function findInterval(x, vec) result(out)
+! Return R-style interval counts for each x against sorted breakpoints vec.
+real(kind=dp), intent(in) :: x(:), vec(:)
+integer, allocatable :: out(:)
+integer :: i, j
+allocate(out(size(x)))
+do i = 1, size(x)
+   out(i) = 0
+   do j = 1, size(vec)
+      if (x(i) >= vec(j)) out(i) = j
+   end do
+end do
+end function findInterval
 
 pure function cumprod_real(x) result(out)
 ! Return cumulative products of a real vector.
@@ -1255,6 +1322,17 @@ n = size(x)
 allocate(out(max(0, n - 1)))
 if (n > 1) out = x(2:n) - x(1:n - 1)
 end function diff_real
+
+pure function diff_mat_real(x) result(out)
+! First row differences of a real matrix, matching R diff() on matrices.
+real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: n, p
+n = size(x, 1)
+p = size(x, 2)
+allocate(out(max(0, n - 1), p))
+if (n > 1) out = x(2:n, :) - x(1:n - 1, :)
+end function diff_mat_real
 
 pure function diff_int(x) result(out)
 ! First differences of an integer vector.
@@ -1315,6 +1393,86 @@ do i = 1, n
    out(i, i) = v(i)
 end do
 end function diag_vec_int
+
+pure function diag_scalar_int(n) result(out)
+! Create an n by n integer identity matrix, matching R diag(n).
+integer, intent(in) :: n
+integer, allocatable :: out(:,:)
+integer :: i
+allocate(out(n, n))
+out = 0
+do i = 1, n
+   out(i, i) = 1
+end do
+end function diag_scalar_int
+
+pure function toeplitz(x) result(out)
+! Symmetric Toeplitz matrix from first column/row vector x.
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j, n
+n = size(x)
+allocate(out(n, n))
+do j = 1, n
+   do i = 1, n
+      out(i, j) = x(abs(i - j) + 1)
+   end do
+end do
+end function toeplitz
+
+pure function chol(a) result(r)
+! Upper-triangular Cholesky factor for a symmetric positive-definite matrix.
+real(kind=dp), intent(in) :: a(:,:)
+real(kind=dp), allocatable :: r(:,:)
+real(kind=dp) :: s
+integer :: i, j, k, n
+n = size(a, 1)
+allocate(r(n, n))
+r = 0.0_dp
+do j = 1, n
+   s = a(j, j)
+   if (j > 1) s = s - sum(r(1:j-1, j)**2)
+   r(j, j) = sqrt(max(s, 0.0_dp))
+   do k = j + 1, n
+      s = a(j, k)
+      if (j > 1) s = s - sum(r(1:j-1, j) * r(1:j-1, k))
+      if (r(j, j) > 0.0_dp) r(j, k) = s / r(j, j)
+   end do
+end do
+end function chol
+
+pure function backsolve(r, b, transpose) result(x)
+! Solve R x = b for upper-triangular R; transpose=.true. solves R^T x = b.
+real(kind=dp), intent(in) :: r(:,:), b(:,:)
+logical, intent(in), optional :: transpose
+real(kind=dp), allocatable :: x(:,:)
+logical :: tr
+integer :: i, j, n, m
+real(kind=dp) :: s
+n = size(r, 1)
+m = size(b, 2)
+allocate(x(n, m))
+x = 0.0_dp
+tr = .false.
+if (present(transpose)) tr = transpose
+if (tr) then
+   do j = 1, m
+      do i = 1, n
+         s = b(i, j)
+         if (i > 1) s = s - sum(r(1:i-1, i) * x(1:i-1, j))
+         x(i, j) = s / r(i, i)
+      end do
+   end do
+else
+   do j = 1, m
+      do i = n, 1, -1
+         s = b(i, j)
+         if (i < n) s = s - sum(r(i, i+1:n) * x(i+1:n, j))
+         x(i, j) = s / r(i, i)
+      end do
+   end do
+end if
+end function backsolve
 
 pure integer function nchar(s) result(out)
 ! Return character length (R-like nchar scalar subset).
@@ -2032,7 +2190,7 @@ m = sum(x) / real(n, kind=dp)
 out = sqrt(sum((x - m)**2) / real(n - 1, kind=dp))
 end function sd
 
-pure function var(x) result(out)
+pure function var_vec(x) result(out)
 ! Sample variance (n-1 denominator).
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp) :: out, m
@@ -2044,7 +2202,14 @@ if (n <= 1) then
 end if
 m = sum(x) / real(n, kind=dp)
 out = sum((x - m)**2) / real(n - 1, kind=dp)
-end function var
+end function var_vec
+
+pure function var_mat(x) result(out)
+! Column covariance matrix, matching R var(matrix).
+real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), allocatable :: out(:,:)
+out = cov_mat(x)
+end function var_mat
 
 pure function r_sd(x) result(out)
 ! Alias for sd(x), used by transpiled code to avoid local-name collisions.
@@ -2241,6 +2406,53 @@ end do
 close(fp)
 end subroutine read_table_real_matrix
 
+subroutine read_csv_real_matrix(file_path, x)
+! Read a comma-delimited numeric CSV with one header row into a matrix.
+character(len=*), intent(in) :: file_path
+real(kind=dp), allocatable, intent(out) :: x(:,:)
+integer :: fp, ios, nrow, ncol, i, k
+character(len=4096) :: line
+nrow = 0
+ncol = 0
+open(newunit=fp, file=file_path, status="old", action="read")
+read(fp, "(A)", iostat=ios) line
+if (ios /= 0) then
+   allocate(x(0,0))
+   close(fp)
+   return
+end if
+ncol = 1
+do k = 1, len_trim(line)
+   if (line(k:k) == ",") ncol = ncol + 1
+end do
+do
+   read(fp, "(A)", iostat=ios) line
+   if (ios /= 0) exit
+   if (len_trim(line) == 0) cycle
+   nrow = nrow + 1
+end do
+if (nrow <= 0 .or. ncol <= 0) then
+   allocate(x(0,0))
+   close(fp)
+   return
+end if
+allocate(x(nrow, ncol))
+rewind(fp)
+read(fp, "(A)", iostat=ios) line
+i = 0
+do
+   read(fp, "(A)", iostat=ios) line
+   if (ios /= 0) exit
+   if (len_trim(line) == 0) cycle
+   do k = 1, len_trim(line)
+      if (line(k:k) == ",") line(k:k) = " "
+   end do
+   i = i + 1
+   read(line, *) x(i, 1:ncol)
+end do
+close(fp)
+end subroutine read_csv_real_matrix
+
 subroutine write_table_real_matrix(file_path, x)
 ! Write a numeric matrix as a whitespace-delimited table.
 character(len=*), intent(in) :: file_path
@@ -2317,6 +2529,26 @@ do i = 1, size(x, 1)
    write(*,'(*(es12.5,1x))') x(i, :)
 end do
 end subroutine print_matrix_rstyle_real
+
+subroutine print_matrix_rstyle_named(x, names)
+! Print a real matrix with R-like row labels and provided column names.
+real(kind=dp), intent(in) :: x(:,:)
+character(len=*), intent(in) :: names(:)
+integer :: i
+write(*,'(7x)', advance='no')
+do i = 1, size(x, 2)
+   if (i <= size(names)) then
+      write(*,'(a12,1x)', advance='no') trim(names(i))
+   else
+      write(*,'("[,",i0,"]",8x)', advance='no') i
+   end if
+end do
+write(*,*)
+do i = 1, size(x, 1)
+   write(*,'("[",i0,",]",1x)', advance='no') i
+   write(*,'(*(f12.4,1x))') x(i, :)
+end do
+end subroutine print_matrix_rstyle_named
 
 subroutine print_matrix_int(x)
 ! Print an integer matrix row-by-row.
