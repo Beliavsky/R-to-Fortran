@@ -9403,6 +9403,198 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
     return out
 
 
+def _r_declare_type_call(kind: str) -> str:
+    if kind == "integer":
+        return "integer()"
+    if kind == "logical":
+        return "logical()"
+    if kind == "character":
+        return "character()"
+    return "double()"
+
+
+def _format_declare_block(specs: list[tuple[str, str]], indent: str) -> list[str]:
+    if not specs:
+        return []
+    out = [f"{indent}declare(type("]
+    for i, (name, kind) in enumerate(specs):
+        comma = "," if i + 1 < len(specs) else ""
+        out.append(f"{indent}  {name} = {_r_declare_type_call(kind)}{comma}")
+    out.append(f"{indent}))")
+    return out
+
+
+def _raw_r_name_map_from_source(src: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in src.splitlines():
+        code, _cmt = split_r_code_comment(raw)
+        for nm in re.findall(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)+\b", code):
+            out.setdefault(_sanitize_r_var_name(nm), nm)
+            out.setdefault(_sanitize_fortran_kwarg_name(nm), nm)
+    return out
+
+
+def _collect_func_open_lines(src: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    acc = ""
+    start_line = 0
+    for i, raw in enumerate(src.splitlines(), start=1):
+        code, _cmt = split_r_code_comment(raw)
+        t = code.strip()
+        if not t:
+            continue
+        if not acc:
+            start_line = i
+            acc = t
+        else:
+            acc += " " + t
+        if "function" not in acc:
+            acc = ""
+            continue
+        if "{" not in acc and not _balanced_parens(acc):
+            continue
+        m = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*(?:<-|=)\s*function\s*\(", acc)
+        if m is not None and "{" in acc:
+            out.setdefault(_sanitize_r_var_name(m.group(1)), i)
+            out.setdefault(_fortran_ident(m.group(1)), i)
+            out.setdefault(_sanitize_fortran_kwarg_name(m.group(1)), i)
+            acc = ""
+            start_line = 0
+        elif _balanced_parens(acc):
+            acc = ""
+            start_line = 0
+    return out
+
+
+def _balanced_parens(txt: str) -> bool:
+    depth = 0
+    in_single = False
+    in_double = False
+    esc = False
+    for ch in txt:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+    return depth == 0 and not in_single and not in_double
+
+
+def _annotation_kind_maps_for_function(fn: FuncDef) -> dict[str, str]:
+    body_eff = fn.body[:-1] if (fn.body and isinstance(fn.body[-1], ExprStmt)) else fn.body
+    known_arrays = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
+    assign_counts = infer_assigned_names(body_eff)
+    ints, real_scalars, int_arrays, real_arrays, params = classify_vars(body_eff, assign_counts, known_arrays=known_arrays)
+    char_scalars = infer_function_character_scalars(fn)
+    char_arrays = infer_function_character_array_names(fn, char_scalars)
+    logical_arrays: set[str] = set()
+    kinds: dict[str, str] = {}
+    fn_ints = infer_function_integer_names(fn)
+    fn_int_arrays = infer_function_integer_array_names(fn)
+    for a in fn.args:
+        dflt = fn.defaults.get(a, "").strip()
+        if a in fn_ints or a in fn_int_arrays or _is_int_literal(dflt):
+            kinds[a] = "integer"
+        elif dflt in {"TRUE", "FALSE"}:
+            kinds[a] = "logical"
+        elif a in char_scalars or a in char_arrays:
+            kinds[a] = "character"
+        else:
+            kinds[a] = "double"
+    for nm in sorted(set(params) | ints | int_arrays):
+        kinds.setdefault(nm, "integer")
+    for nm in sorted(real_scalars | real_arrays):
+        kinds.setdefault(nm, "double")
+    for nm in sorted(char_scalars | char_arrays):
+        kinds.setdefault(nm, "character")
+    for nm in sorted(logical_arrays):
+        kinds.setdefault(nm, "logical")
+    return kinds
+
+
+def annotate_r_source_with_declares(src: str, stem: str) -> str:
+    comment_lookup = build_r_comment_lookup(src)
+    lines = preprocess_r_lines(src)
+    stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+    if i != len(lines):
+        raise NotImplementedError("could not parse full source for R annotation")
+    stmts = _lower_dim_assignments(stmts)
+    stmts = attach_function_adjacent_comments(stmts)
+    funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+    raw_name = _raw_r_name_map_from_source(src)
+
+    func_specs: dict[str, list[tuple[str, str]]] = {}
+    for fn in funcs:
+        kinds = _annotation_kind_maps_for_function(fn)
+        ordered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for nm in list(fn.args) + sorted(k for k in kinds if k not in fn.args):
+            raw_nm = raw_name.get(nm, nm)
+            if raw_nm in seen:
+                continue
+            seen.add(raw_nm)
+            ordered.append((raw_nm, kinds[nm]))
+        if ordered:
+            func_specs[fn.name] = ordered
+
+    assign_counts = infer_assigned_names(main_stmts)
+    ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+    array_params = infer_main_array_params(main_stmts, assign_counts)
+    char_scalars = infer_main_character_scalars(main_stmts)
+    char_arrays = infer_main_character_arrays(main_stmts)
+    logical_scalars = infer_main_logical_scalars(main_stmts)
+    main_kinds: dict[str, str] = {}
+    for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
+        main_kinds[nm] = "integer"
+    for nm in sorted(real_scalars | real_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind != "integer"}):
+        main_kinds.setdefault(nm, "double")
+    for nm in sorted(char_scalars | char_arrays):
+        main_kinds.setdefault(nm, "character")
+    for nm in sorted(logical_scalars):
+        main_kinds.setdefault(nm, "logical")
+    main_specs = [(raw_name.get(nm, nm), kind) for nm, kind in sorted(main_kinds.items())]
+
+    func_open_lines = _collect_func_open_lines(src)
+    insert_after: dict[int, list[str]] = {}
+    for fn in funcs:
+        specs = func_specs.get(fn.name)
+        line_no = func_open_lines.get(fn.name)
+        if not specs or line_no is None:
+            continue
+        insert_after.setdefault(line_no, []).extend(_format_declare_block(specs, "  "))
+
+    raw_lines = src.splitlines()
+    first_code_line = 1
+    for i_line, raw in enumerate(raw_lines, start=1):
+        code, _cmt = split_r_code_comment(raw)
+        if code.lstrip("\ufeff").strip():
+            first_code_line = i_line
+            break
+    out: list[str] = []
+    for i_line, raw in enumerate(raw_lines, start=1):
+        if main_specs and i_line == first_code_line:
+            out.extend(_format_declare_block(main_specs, ""))
+            out.append("")
+        out.append(raw)
+        if i_line in insert_after:
+            out.extend(insert_after[i_line])
+    return "\n".join(out) + ("\n" if src.endswith("\n") else "")
+
+
 def transpile_r_to_fortran(
     src: str,
     stem: str,
@@ -12203,6 +12395,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--via-python")
     if args.out_python:
         cmd.extend(["--out-python", args.out_python])
+    if args.annotate_r is not None:
+        cmd.append("--annotate-r")
+        if args.annotate_r:
+            cmd.append(args.annotate_r)
     if args.if_const_aggressive:
         cmd.append("--if-const-aggressive")
     if args.no_format_print:
@@ -12373,6 +12569,13 @@ def main() -> int:
     )
     ap.add_argument("--out", help="output .f90 path (default: <input>_r.f90)")
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
+    ap.add_argument(
+        "--annotate-r",
+        nargs="?",
+        const="",
+        metavar="OUT.r",
+        help="write an R copy annotated with inferred declare(type(...)) statements; default: <input>_annotated.r",
+    )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
     ap.add_argument("--run-both", action="store_true", help="run original R and transpiled Fortran")
@@ -12516,6 +12719,9 @@ def main() -> int:
             if args.out:
                 print("When input uses globbing with multiple matches, --out is not supported.")
                 return 1
+            if args.annotate_r:
+                print("When input uses globbing with multiple matches, explicit --annotate-r OUT.r is not supported.")
+                return 1
             rc = 0
             summary_rows: list[dict[str, object]] = []
             total = len(matches)
@@ -12580,6 +12786,16 @@ def main() -> int:
     out_path = out_path.resolve()
     artifact_dir = Path(args.out_dir).resolve() if args.out_dir else out_path.parent.resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    annotate_r_path: Path | None = None
+    if args.annotate_r is not None:
+        if args.annotate_r:
+            ann_cand = Path(args.annotate_r)
+            if args.out_dir and not ann_cand.is_absolute():
+                annotate_r_path = (Path(args.out_dir) / ann_cand).resolve()
+            else:
+                annotate_r_path = ann_cand.resolve()
+        else:
+            annotate_r_path = (artifact_dir / f"{in_path.stem}_annotated.r").resolve()
     py_out_path: Path | None = None
     if args.via_python:
         if args.out_python:
@@ -12670,6 +12886,15 @@ def main() -> int:
             print("Warning: package import detected; continuing with best-effort translation:")
             for ln, stmt in lib_calls:
                 print(f"  line {ln}: {stmt}")
+        if annotate_r_path is not None:
+            try:
+                annotated_r = annotate_r_source_with_declares(src, in_path.stem)
+            except NotImplementedError as e:
+                print(f"Annotate R: FAIL ({e})")
+                return 1
+            annotate_r_path.parent.mkdir(parents=True, exist_ok=True)
+            annotate_r_path.write_text(annotated_r, encoding="utf-8")
+            print(f"wrote {annotate_r_path}")
         try:
             f90 = transpile_r_to_fortran(
                 src,
@@ -12683,6 +12908,15 @@ def main() -> int:
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
             return 1
+    elif annotate_r_path is not None:
+        try:
+            annotated_r = annotate_r_source_with_declares(src, in_path.stem)
+        except NotImplementedError as e:
+            print(f"Annotate R: FAIL ({e})")
+            return 1
+        annotate_r_path.parent.mkdir(parents=True, exist_ok=True)
+        annotate_r_path.write_text(annotated_r, encoding="utf-8")
+        print(f"wrote {annotate_r_path}")
     # Reuse shared Fortran cleanup for redundant int(...) casts.
     f90_lines = f90.splitlines()
     f90_lines = fscan.remove_redundant_int_casts(f90_lines)
