@@ -76,6 +76,8 @@ class RunResult:
     stderr: str
     elapsed: float
     command: list[str]
+    compile_elapsed: float | None = None
+    run_elapsed: float | None = None
 
 
 def word_re(words: set[str]) -> re.Pattern[str]:
@@ -356,26 +358,30 @@ def run_fortran_source(fortran: str, *, mode: str, run_dir: Path, timeout: float
         source.write_text(fortran, encoding="utf-8")
         sources = [*helper_paths_for_fortran(fortran), source]
         compile_cmd = compiler_command(mode, sources, exe)
+        compile_start = time.perf_counter()
         try:
             cp = subprocess.run(compile_cmd, cwd=run_dir, text=True, capture_output=True, timeout=timeout)
         except FileNotFoundError:
             elapsed = time.perf_counter() - start
-            return RunResult(False, "", f"{compile_cmd[0]} was not found on PATH", elapsed, compile_cmd)
+            return RunResult(False, "", f"{compile_cmd[0]} was not found on PATH", elapsed, compile_cmd, elapsed, None)
         except subprocess.TimeoutExpired as exc:
             elapsed = time.perf_counter() - start
-            return RunResult(False, exc.stdout or "", f"{mode} compile timed out after {exc.timeout} seconds", elapsed, compile_cmd)
+            return RunResult(False, exc.stdout or "", f"{mode} compile timed out after {exc.timeout} seconds", elapsed, compile_cmd, elapsed, None)
+        compile_elapsed = time.perf_counter() - compile_start
         if cp.returncode != 0:
             elapsed = time.perf_counter() - start
-            return RunResult(False, cp.stdout or "", cp.stderr or "", elapsed, compile_cmd)
+            return RunResult(False, cp.stdout or "", cp.stderr or "", elapsed, compile_cmd, compile_elapsed, None)
         run_cmd = [str(exe)]
+        run_start = time.perf_counter()
         try:
             rp = subprocess.run(run_cmd, cwd=run_dir, text=True, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             elapsed = time.perf_counter() - start
-            return RunResult(False, exc.stdout or "", f"{mode} run timed out after {exc.timeout} seconds", elapsed, run_cmd)
+            return RunResult(False, exc.stdout or "", f"{mode} run timed out after {exc.timeout} seconds", elapsed, run_cmd, compile_elapsed, None)
+        run_elapsed = time.perf_counter() - run_start
         elapsed = time.perf_counter() - start
         diagnostics = "\n".join(part.rstrip() for part in (cp.stdout, cp.stderr, rp.stderr) if part and part.strip())
-        return RunResult(rp.returncode == 0, rp.stdout or "", diagnostics, elapsed, run_cmd)
+        return RunResult(rp.returncode == 0, rp.stdout or "", diagnostics, elapsed, run_cmd, compile_elapsed, run_elapsed)
 
 
 def make_scrolled_text(parent: tk.Widget, *, wrap: str = tk.NONE) -> tk.Text:
@@ -435,6 +441,7 @@ class Xr2fIde:
         self.source_to_fortran_lines: dict[int, set[int]] = {}
         self.update_job: str | None = None
         self.highlight_job: str | None = None
+        self.output_equalize_job: str | None = None
         self.raw_r_output = ""
         self.raw_fortran_output = ""
 
@@ -443,7 +450,8 @@ class Xr2fIde:
         self.output_decimals = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Ready")
         self.elapsed_r_var = tk.StringVar(value="")
-        self.elapsed_f_var = tk.StringVar(value="")
+        self.elapsed_f_compile_var = tk.StringVar(value="")
+        self.elapsed_f_run_var = tk.StringVar(value="")
         self.pretty_var = tk.BooleanVar(value=True)
         self.show_r_output = tk.BooleanVar(value=True)
 
@@ -522,15 +530,18 @@ class Xr2fIde:
         self.fortran_output_frame.grid_columnconfigure(0, weight=1)
         self.fortran_output = make_scrolled_text(self.fortran_output_frame, wrap=tk.WORD)
         self.fortran_output.container.grid(row=0, column=0, sticky="nsew")  # type: ignore[attr-defined]
+        self.output_pane.bind("<Configure>", self.schedule_equalize_output_panes)
         self.update_output_layout()
 
         status = ttk.Frame(self.root, padding=(6, 2))
         status.grid(row=2, column=0, sticky="ew")
         ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
-        ttk.Label(status, textvariable=self.elapsed_r_var).pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Label(status, text="R").pack(side=tk.RIGHT)
-        ttk.Label(status, textvariable=self.elapsed_f_var).pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Label(status, text="Fortran").pack(side=tk.RIGHT)
+        ttk.Label(status, textvariable=self.elapsed_f_run_var).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Label(status, text="Fortran run").pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Label(status, textvariable=self.elapsed_f_compile_var).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Label(status, text="Fortran compile").pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Label(status, textvariable=self.elapsed_r_var).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Label(status, text="R").pack(side=tk.RIGHT, padx=(8, 0))
 
     def timeout_seconds(self) -> float | None:
         raw = self.timeout_var.get().strip()
@@ -603,8 +614,7 @@ class Xr2fIde:
             self.status_var.set(f"Translation failed in {result.elapsed:.3f}s")
 
     def run_r_current(self) -> None:
-        self.show_r_output.set(True)
-        self.update_output_layout()
+        self.show_both_output_panes()
         result = run_r_source(
             self.source_text(),
             rscript=self.rscript,
@@ -624,12 +634,25 @@ class Xr2fIde:
             run_dir=self.run_dir(),
             timeout=self.timeout_seconds(),
         )
-        self.elapsed_f_var.set(f"{result.elapsed:.3f}s")
+        self.elapsed_f_compile_var.set(
+            f"{result.compile_elapsed:.3f}s" if result.compile_elapsed is not None else ""
+        )
+        self.elapsed_f_run_var.set(
+            f"{result.run_elapsed:.3f}s" if result.run_elapsed is not None else ""
+        )
         self.set_output(self.fortran_output, self.format_run_output(result))
 
     def run_both(self) -> None:
+        self.show_both_output_panes()
         self.run_r_current()
         self.run_fortran_current()
+        self.show_both_output_panes()
+
+    def show_both_output_panes(self) -> None:
+        self.show_r_output.set(True)
+        self.update_output_layout()
+        self.root.update_idletasks()
+        self.equalize_output_panes()
 
     def ensure_fortran(self) -> bool:
         if self.current_fortran.strip():
@@ -715,7 +738,8 @@ class Xr2fIde:
         self.set_output(self.r_output, "")
         self.set_output(self.fortran_output, "")
         self.elapsed_r_var.set("")
-        self.elapsed_f_var.set("")
+        self.elapsed_f_compile_var.set("")
+        self.elapsed_f_run_var.set("")
 
     def update_output_layout(self) -> None:
         panes = set(self.output_pane.panes())
@@ -728,6 +752,27 @@ class Xr2fIde:
         if self.show_r_output.get():
             self.output_pane.add(self.r_output_frame, weight=1)
         self.output_pane.add(self.fortran_output_frame, weight=1)
+        self.schedule_equalize_output_panes()
+
+    def schedule_equalize_output_panes(self, _event: tk.Event | None = None) -> None:
+        if self.output_equalize_job is not None:
+            self.root.after_cancel(self.output_equalize_job)
+        self.output_equalize_job = self.root.after_idle(self.equalize_output_panes)
+
+    def equalize_output_panes(self) -> None:
+        self.output_equalize_job = None
+        if not self.show_r_output.get():
+            return
+        if len(self.output_pane.panes()) < 2:
+            return
+        width = self.output_pane.winfo_width()
+        height = self.output_pane.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+        try:
+            self.output_pane.sashpos(0, width // 2)
+        except tk.TclError:
+            return
 
     def open_source(self) -> None:
         path = filedialog.askopenfilename(title="Open R source", filetypes=R_FILETYPES)
