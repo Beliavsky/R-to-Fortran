@@ -3521,6 +3521,19 @@ def _is_inline_temp_rhs(expr: str) -> bool:
     return True
 
 
+def _stmt_uses_name_as_reducer_arg(st: object, name: str) -> bool:
+    pat = re.compile(rf"\b(?:mean|sd)\s*\(\s*{re.escape(name)}\s*\)", re.IGNORECASE)
+    if isinstance(st, Assign):
+        return pat.search(st.expr) is not None
+    if isinstance(st, PrintStmt):
+        return any(pat.search(a) for a in st.args)
+    if isinstance(st, CallStmt):
+        return any(pat.search(a) for a in st.args)
+    if isinstance(st, ExprStmt):
+        return pat.search(st.expr) is not None
+    return False
+
+
 def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
     """Inline simple single-use temporaries (`t = expr`) into their sole later use."""
     out = list(stmts)
@@ -3583,6 +3596,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
                     use_j = j
                     break
             if blocked or use_j < 0:
+                i += 1
+                continue
+            if parse_call_text(st.expr.strip()) is not None and _stmt_uses_name_as_reducer_arg(out[use_j], name):
                 i += 1
                 continue
             out[use_j] = _replace_name_in_stmt(out[use_j], name, st.expr)
