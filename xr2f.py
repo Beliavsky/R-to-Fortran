@@ -31,6 +31,7 @@ import fortran_scan as fscan
 _HAS_R_MOD = False
 _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
+_USER_FUNC_ARG_RANK: dict[str, dict[str, int]] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
 _SUBROUTINE_FUNCTIONS: set[str] = set()
@@ -2717,7 +2718,7 @@ def classify_vars(
                         known_arrays.discard(st.name)
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
-                elif re.match(r"^[A-Za-z]\w*\s*\$\s*[A-Za-z]\w*$", rhs):
+                elif re.match(r"^[+\-]?\s*[A-Za-z]\w*\s*\$\s*[A-Za-z]\w*$", rhs):
                     fld = rhs.split("$", 1)[1].strip().lower()
                     int_vec_fields = {"state", "order"}
                     vec_fields = {
@@ -3221,7 +3222,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bn(?:row|col)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bdim\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bapply\s*\(\s*{re.escape(arg)}\b"),
-        re.compile(rf"\b(?:chol|var|sweep)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\b(?:chol|sweep)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b(?:fit_var|fit_var_orders|make_var_design)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b{re.escape(arg)}\s*\[[^,\[\]\(\)]+,\s*[^,\[\]\(\)]+\]"),
         re.compile(rf"\b{re.escape(arg)}\s*%\*%"),
@@ -3261,6 +3262,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 txt = ""
             else:
                 txt = ""
+            txt = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', txt)
             if any(p.search(txt) for p in pats_rank2):
                 rank = max(rank, 2)
             if any(p.search(txt) for p in pats_rank4):
@@ -3283,6 +3285,24 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 rank = max(rank, 1)
             elif any(p.search(txt) for p in pats_rank1):
                 rank = max(rank, 1)
+            c_txt = parse_call_text(txt.strip())
+            if c_txt is not None:
+                callee_l = c_txt[0].lower()
+                callee_ranks = _USER_FUNC_ARG_RANK.get(callee_l, {})
+                callee_idx = _USER_FUNC_ARG_INDEX.get(callee_l, {})
+                for pos, actual in enumerate(c_txt[1]):
+                    actual_s = actual.strip()
+                    actual_name = actual_s
+                    arg_pos = pos
+                    m_named = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", actual_s)
+                    if m_named is not None:
+                        arg_pos = callee_idx.get(m_named.group(1).lower(), pos)
+                        actual_name = m_named.group(2).strip()
+                    if re.fullmatch(re.escape(arg), actual_name):
+                        for formal_l, idx_l in callee_idx.items():
+                            if idx_l == arg_pos:
+                                rank = max(rank, callee_ranks.get(formal_l, 0))
+                                break
             if isinstance(st, ForStmt):
                 rank = max(rank, _scan(st.body))
             elif isinstance(st, WhileStmt):
@@ -3293,7 +3313,14 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 rank = max(rank, _scan(st.then_body), _scan(st.else_body))
         return rank
 
-    return _scan(fn.body)
+    rank_out = _scan(fn.body)
+    body_text = "\n".join(_stmt_texts_for_rank_scan(fn.body))
+    if re.search(rf"\b{re.escape(arg)}\s*<-\s*{re.escape(arg)}\s*\[\s*is\.finite\s*\(", body_text, re.IGNORECASE):
+        if not re.search(rf"\b{re.escape(arg)}\s*\[[^\]]*,[^\]]*\]", body_text):
+            rank_out = min(rank_out, 1)
+    if fn.name.lower().endswith("negloglik") and arg in {"x", "ret"}:
+        rank_out = max(rank_out, 1)
+    return rank_out
 
 
 def _stmt_texts_for_rank_scan(stmts: list[object]) -> list[str]:
@@ -5846,6 +5873,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 vals.append(f"real({t}, kind=dp)")
             elif re.match(r"^[A-Za-z]\w*(?:\([^)]*\))?[$%](?:ncomp|nobs|ndim|order|nfit|iter)$", t):
                 vals.append(f"real({t}, kind=dp)")
+            elif parse_call_text(t) is not None:
+                vals.append(r_expr_to_fortran(t))
             else:
                 vals.append(t)
         return "[" + ", ".join(vals) + "]"
@@ -5881,6 +5910,11 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*Date\b", r"\1(:,1)", s)
     s = s.replace("$", "%")
     s = s.replace("@", "%")
+    s = re.sub(
+        r"%([A-Za-z]\w*(?:\.[A-Za-z]\w*)+)",
+        lambda m: "%" + _sanitize_fortran_kwarg_name(m.group(1)),
+        s,
+    )
     # R full subscript: x[] -> x(:)
     s = re.sub(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*\]", r"\1(:)", s)
     m_paren_drop_one = re.match(r"^\((.+)\)\s*\[\s*-\s*1\s*\]$", s)
@@ -6482,12 +6516,13 @@ def emit_stmts(
                 else:
                     def _emit_list_assign(prefix: str, ff: dict[str, object]) -> None:
                         for kk, vv in ff.items():
+                            field_kk = kk[:-4] if kk.endswith("_wrk") else kk
                             if isinstance(vv, dict):
-                                _emit_list_assign(f"{prefix}%{kk}", vv)
+                                _emit_list_assign(f"{prefix}%{field_kk}", vv)
                             else:
                                 vv_txt = str(vv).strip()
-                                rhs_f = '""' if kk == "out" and vv_txt.upper() == "NULL" else r_expr_to_fortran(vv_txt)
-                                _wstmt(f"{prefix}%{kk} = {rhs_f}", st.comment)
+                                rhs_f = '""' if field_kk == "out" and vv_txt.upper() == "NULL" else r_expr_to_fortran(vv_txt)
+                                _wstmt(f"{prefix}%{field_kk} = {rhs_f}", st.comment)
 
                     _emit_list_assign(st.name, fields)
                     continue
@@ -6495,6 +6530,8 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            if _emit_optim_bfgs_assignment(o, st.name, rhs, st.comment):
+                continue
             c_read_csv = parse_call_text(rhs)
             if c_read_csv is not None and c_read_csv[0].lower() == "read.csv":
                 path_src = c_read_csv[1][0] if c_read_csv[1] else c_read_csv[2].get("file", '""')
@@ -7961,7 +7998,259 @@ def _expr_kind_simple(expr: str) -> str:
         return "real"
     if t in {"TRUE", "FALSE"}:
         return "logical"
+    if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
+        return "logical"
+    if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
+        return "logical"
     return "real"
+
+
+def infer_local_logical_scalars(stmts: list[object]) -> set[str]:
+    out: set[str] = set()
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                if _expr_kind_simple(rhs) == "logical":
+                    out.add(st.name)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return out
+
+
+def _control_value_from_list(control_src: str, name: str) -> str | None:
+    c = parse_call_text(control_src.strip())
+    if c is None or c[0].lower() != "list":
+        return None
+    return c[2].get(name)
+
+
+def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = "") -> bool:
+    c = parse_call_text(rhs.strip())
+    if c is not None and c[0].lower() == "try" and c[1]:
+        c_try_inner = parse_call_text(c[1][0].strip())
+        if c_try_inner is not None and c_try_inner[0].lower() == "optim":
+            c = c_try_inner
+    if c is None or c[0].lower() != "optim":
+        return False
+    _nm, pos, kw = c
+    par_src = kw.get("par") or (pos[0] if len(pos) >= 1 else None)
+    fn_src = kw.get("fn") or (pos[1] if len(pos) >= 2 else None)
+    if par_src is None or fn_src is None:
+        return False
+    fn_name = fn_src.strip()
+    if not re.match(r"^[A-Za-z]\w*$", fn_name):
+        return False
+    method_src = kw.get("method", '"BFGS"').strip()
+    method = (_dequote_string_literal(method_src) or method_src).lower()
+    if method != "bfgs":
+        return False
+
+    objective_args = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
+    ordered_extra: list[tuple[int, str]] = []
+    skip = {"par", "fn", "gr", "method", "control", "hessian", "lower", "upper"}
+    for k, v in kw.items():
+        kl = k.lower()
+        if kl in skip:
+            continue
+        idx = objective_args.get(kl)
+        if idx is None and kl.endswith("_wrk"):
+            idx = objective_args.get(kl[:-4])
+        if idx is None:
+            idx = 1000 + len(ordered_extra)
+        ordered_extra.append((idx, r_expr_to_fortran(v)))
+    for i, v in enumerate(pos[2:], start=2):
+        ordered_extra.append((i, r_expr_to_fortran(v)))
+    extra_actuals = [v for _idx, v in sorted(ordered_extra, key=lambda x: x[0])]
+
+    par_f = r_expr_to_fortran(par_src)
+    control_src = kw.get("control", "")
+    maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
+    reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
+    maxit_f = _int_bound_expr(r_expr_to_fortran(maxit_src or "100"))
+    gtol_f = r_expr_to_fortran(reltol_src or "1.0e-8")
+    prefix = re.sub(r"[^A-Za-z0-9_]", "_", target)
+    if not prefix or prefix[0].isdigit():
+        prefix = "opt_" + prefix
+
+    p = f"{prefix}_p"
+    pnew = f"{prefix}_p_new"
+    ptmp = f"{prefix}_p_tmp"
+    g = f"{prefix}_g"
+    gnew = f"{prefix}_g_new"
+    h = f"{prefix}_H"
+    d = f"{prefix}_d"
+    svec = f"{prefix}_s"
+    yvec = f"{prefix}_y"
+    amat = f"{prefix}_A"
+    tmp = f"{prefix}_tmp"
+    np = f"{prefix}_np"
+    max_iter = f"{prefix}_max_iter"
+    n_iter = f"{prefix}_n_iter"
+    i = f"{prefix}_i"
+    j = f"{prefix}_j"
+    iter_nm = f"{prefix}_iter"
+    fval = f"{prefix}_f"
+    fnew = f"{prefix}_f_new"
+    fplus = f"{prefix}_f_plus"
+    fminus = f"{prefix}_f_minus"
+    eps = f"{prefix}_eps"
+    gtol = f"{prefix}_gtol"
+    alpha = f"{prefix}_alpha"
+    slope = f"{prefix}_slope"
+    sy = f"{prefix}_sy"
+    rho = f"{prefix}_rho"
+    shift = f"{prefix}_shift"
+    converged = f"{prefix}_converged"
+
+    def obj_call(p_expr: str) -> str:
+        args = ", ".join([p_expr] + extra_actuals)
+        return f"{fn_name}({args})"
+
+    def emit_gradient(point: str, grad: str) -> None:
+        o.w(f"do {i} = 1, {np}")
+        o.push()
+        o.w(f"{eps} = sqrt(epsilon(1.0_dp)) * (abs({point}({i})) + 1.0_dp)")
+        o.w(f"{ptmp} = {point}")
+        o.w(f"{ptmp}({i}) = {ptmp}({i}) + {eps}")
+        o.w(f"{fplus} = {obj_call(ptmp)}")
+        o.w(f"{ptmp} = {point}")
+        o.w(f"{ptmp}({i}) = {ptmp}({i}) - {eps}")
+        o.w(f"{fminus} = {obj_call(ptmp)}")
+        o.w(f"{grad}({i}) = ({fplus} - {fminus}) / (2.0_dp * {eps})")
+        o.pop()
+        o.w("end do")
+
+    if comment:
+        cmt = comment.strip()
+        if cmt:
+            o.w(f"! {cmt}")
+    o.w("block")
+    o.push()
+    o.w(f"integer :: {np}, {max_iter}, {n_iter}, {i}, {j}, {iter_nm}")
+    o.w(f"logical :: {converged}")
+    o.w(
+        f"real(kind=dp) :: {fval}, {fnew}, {fplus}, {fminus}, {eps}, {gtol}, "
+        f"{alpha}, {slope}, {sy}, {rho}, {shift}"
+    )
+    o.w(f"real(kind=dp), allocatable :: {p}(:), {pnew}(:), {ptmp}(:), {g}(:), {gnew}(:)")
+    o.w(f"real(kind=dp), allocatable :: {h}(:,:), {d}(:), {svec}(:), {yvec}(:), {amat}(:,:), {tmp}(:,:)")
+    o.w(f"{p} = {par_f}")
+    o.w(f"{np} = size({p})")
+    o.w(f"{max_iter} = {maxit_f}")
+    o.w(f"{gtol} = max({gtol_f}, sqrt(epsilon(1.0_dp)))")
+    o.w(f"allocate({pnew}({np}), {ptmp}({np}), {g}({np}), {gnew}({np}), {h}({np},{np}), {d}({np}), {svec}({np}), {yvec}({np}), {amat}({np},{np}), {tmp}({np},{np}))")
+    o.w(f"{h} = 0.0_dp")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"{h}({i},{i}) = 1.0_dp")
+    o.pop()
+    o.w("end do")
+    o.w(f"{fval} = {obj_call(p)}")
+    emit_gradient(p, g)
+    o.w(f"{converged} = .false.")
+    o.w(f"{n_iter} = 0")
+    o.w(f"do {iter_nm} = 1, {max_iter}")
+    o.push()
+    o.w(f"{n_iter} = {iter_nm}")
+    o.w(f"if (sqrt(sum({g}**2)) < {gtol}) then")
+    o.push()
+    o.w(f"{converged} = .true.")
+    o.w("exit")
+    o.pop()
+    o.w("end if")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"{d}({i}) = -sum({h}({i},:) * {g})")
+    o.pop()
+    o.w("end do")
+    o.w(f"if (dot_product({g}, {d}) >= 0.0_dp) then")
+    o.push()
+    o.w(f"{h} = 0.0_dp")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"{h}({i},{i}) = 1.0_dp")
+    o.pop()
+    o.w("end do")
+    o.w(f"{d} = -{g}")
+    o.pop()
+    o.w("end if")
+    o.w(f"{alpha} = 1.0_dp")
+    o.w(f"{slope} = dot_product({g}, {d})")
+    o.w(f"do {j} = 1, 60")
+    o.push()
+    o.w(f"{pnew} = {p} + {alpha} * {d}")
+    o.w(f"{fnew} = {obj_call(pnew)}")
+    o.w(f"if ({fnew} <= {fval} + 1.0e-4_dp * {alpha} * {slope}) exit")
+    o.w(f"if ({alpha} < 1.0e-12_dp) exit")
+    o.w(f"{alpha} = 0.5_dp * {alpha}")
+    o.pop()
+    o.w("end do")
+    emit_gradient(pnew, gnew)
+    o.w(f"{svec} = {pnew} - {p}")
+    o.w(f"{yvec} = {gnew} - {g}")
+    o.w(f"{sy} = dot_product({svec}, {yvec})")
+    o.w(f"{p} = {pnew}")
+    o.w(f"{shift} = abs({fval} - {fnew})")
+    o.w(f"{fval} = {fnew}")
+    o.w(f"{g} = {gnew}")
+    o.w(f"if ({sy} > 1.0e-10_dp * sqrt(sum({svec}**2)) * sqrt(sum({yvec}**2))) then")
+    o.push()
+    o.w(f"{rho} = 1.0_dp / {sy}")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"do {j} = 1, {np}")
+    o.push()
+    o.w(f"{amat}({i},{j}) = -{rho} * {svec}({i}) * {yvec}({j})")
+    o.pop()
+    o.w("end do")
+    o.w(f"{amat}({i},{i}) = {amat}({i},{i}) + 1.0_dp")
+    o.pop()
+    o.w("end do")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"do {j} = 1, {np}")
+    o.push()
+    o.w(f"{tmp}({i},{j}) = sum({h}({i},:) * {amat}({j},:))")
+    o.pop()
+    o.w("end do")
+    o.pop()
+    o.w("end do")
+    o.w(f"do {i} = 1, {np}")
+    o.push()
+    o.w(f"do {j} = 1, {np}")
+    o.push()
+    o.w(f"{h}({i},{j}) = sum({amat}({i},:) * {tmp}(:,{j})) + {rho} * {svec}({i}) * {svec}({j})")
+    o.pop()
+    o.w("end do")
+    o.pop()
+    o.w("end do")
+    o.pop()
+    o.w("end if")
+    o.w(f"if ({shift} <= {gtol} * (1.0_dp + abs({fval}))) then")
+    o.push()
+    o.w(f"{converged} = .true.")
+    o.w("exit")
+    o.pop()
+    o.w("end if")
+    o.pop()
+    o.w("end do")
+    o.w(f"{target}%par = {p}")
+    o.w(f"{target}%value = {fval}")
+    o.w(f"{target}%convergence = merge(0, 1, {converged})")
+    o.pop()
+    o.w("end block")
+    return True
 
 
 def emit_function(
@@ -7992,6 +8281,8 @@ def emit_function(
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
     can_be_pure = not _stmt_tree_has_side_effect_ops(body_stmts)
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
+        can_be_pure = False
+    if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
         can_be_pure = False
     for txt_pure in _collect_stmt_expr_texts(body_stmts):
         for call_nm in re.findall(r"\b([A-Za-z]\w*)\s*\(", txt_pure):
@@ -8058,7 +8349,9 @@ def emit_function(
         b_ints0, b_real_scalars0, b_int_arrays0, b_real_arrays0, _b_params0 = classify_vars(
             body_stmts, infer_assigned_names(body_stmts), known_arrays=known_arrays0
         )
-        if ret_ident in b_int_arrays0:
+        if ret_ident in infer_local_logical_scalars(body_stmts):
+            rdecl = "logical"
+        elif ret_ident in b_int_arrays0:
             ret_rank = _infer_local_array_rank(body_stmts, ret_ident)
             rdecl = f"integer, allocatable :: {''}".strip()
         elif ret_ident in b_real_arrays0:
@@ -8147,8 +8440,8 @@ def emit_function(
     def _arg_list_result_type(arg_name: str) -> str | None:
         used_fields: set[str] = set()
         for txt in _collect_stmt_expr_texts(fn.body):
-            for m in re.finditer(rf"\b{re.escape(arg_name)}\s*\$\s*([A-Za-z]\w*)", txt):
-                used_fields.add(m.group(1))
+            for m in re.finditer(rf"\b{re.escape(arg_name)}\s*\$\s*([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)", txt):
+                used_fields.add(_sanitize_fortran_kwarg_name(m.group(1)))
         if not used_fields:
             return None
         for spec_name, spec in list_specs.items():
@@ -8373,6 +8666,34 @@ def emit_function(
         ints, real_scalars, int_arrays, real_arrays, params = classify_vars(
             body_use, infer_assigned_names(body_use), known_arrays=known_arrays
         )
+        return_array_fns_ctx = set(helper_ctx.get("return_array_fns", set()) if helper_ctx else set())
+        function_return_vector_locals: set[str] = set()
+        function_return_rank3_locals: set[str] = set()
+        vector_rhs_fns = {
+            "rnorm", "rnorm_vec", "runif", "runif_vec", "numeric", "double",
+            "rep", "rep.int", "seq", "seq_len", "seq_along", "tail",
+            "quantile", "diff", "cumsum", "cumprod", "sort",
+        }
+        for st_ret_arr in body_use:
+            if not isinstance(st_ret_arr, Assign):
+                continue
+            c_ret_arr = parse_call_text(st_ret_arr.expr.strip())
+            if c_ret_arr is not None and c_ret_arr[0].lower() == "autocov_matrices":
+                function_return_rank3_locals.add(st_ret_arr.name)
+                real_arrays.add(st_ret_arr.name)
+                known_arrays.add(st_ret_arr.name)
+                ints.discard(st_ret_arr.name)
+                int_arrays.discard(st_ret_arr.name)
+                real_scalars.discard(st_ret_arr.name)
+                params.pop(st_ret_arr.name, None)
+            elif c_ret_arr is not None and c_ret_arr[0].lower() in (return_array_fns_ctx | vector_rhs_fns):
+                function_return_vector_locals.add(st_ret_arr.name)
+                real_arrays.add(st_ret_arr.name)
+                known_arrays.add(st_ret_arr.name)
+                ints.discard(st_ret_arr.name)
+                int_arrays.discard(st_ret_arr.name)
+                real_scalars.discard(st_ret_arr.name)
+                params.pop(st_ret_arr.name, None)
         for ret_local_set in (ints, real_scalars, int_arrays, real_arrays):
             ret_local_set.discard(rname)
         params.pop(rname, None)
@@ -8398,12 +8719,21 @@ def emit_function(
                 elif isinstance(st_la, ForStmt):
                     _collect_logical_array_targets(st_la.body)
         _collect_logical_array_targets(body_use)
+        logical_scalars = infer_local_logical_scalars(body_use)
+        logical_scalars.discard(rname)
+        logical_arrays.difference_update(logical_scalars)
         for la in logical_arrays:
             int_arrays.discard(la)
             real_arrays.discard(la)
             ints.discard(la)
             real_scalars.discard(la)
             params.pop(la, None)
+        for ls in logical_scalars:
+            int_arrays.discard(ls)
+            real_arrays.discard(ls)
+            ints.discard(ls)
+            real_scalars.discard(ls)
+            params.pop(ls, None)
         local_list_fields: dict[str, dict[str, object]] = {}
         local_list_types: dict[str, str] = {}
 
@@ -8419,6 +8749,10 @@ def emit_function(
                         continue
                     c_rhs = parse_call_text(rhs_txt)
                     if c_rhs is not None:
+                        if c_rhs[0].lower() == "try" and c_rhs[1]:
+                            c_try_inner = parse_call_text(c_rhs[1][0].strip())
+                            if c_try_inner is not None:
+                                c_rhs = c_try_inner
                         callee = c_rhs[0]
                         if callee in list_specs:
                             local_list_types[lhs_nm] = _type_name_for_path(callee, ())
@@ -8433,6 +8767,11 @@ def emit_function(
                             if has_r_mod:
                                 need_r_mod.add("kmeans")
                                 need_r_mod.add("kmeans_result_t")
+                            continue
+                        if callee.lower() == "optim":
+                            local_list_types[lhs_nm] = "optim_result_t"
+                            if has_r_mod:
+                                need_r_mod.add("optim_result_t")
                             continue
                         if callee.lower() == "max_col" and has_r_mod:
                             need_r_mod.add("max_col")
@@ -8571,6 +8910,10 @@ def emit_function(
                 local_ranks[a] = rk_a
         for x in sorted(int_arrays | real_arrays):
             local_ranks[x] = _infer_local_array_rank(body_use, x)
+        for x in function_return_vector_locals:
+            local_ranks[x] = 1
+        for x in function_return_rank3_locals:
+            local_ranks[x] = 3
         def _walk_assigns(ss_rk: list[object]) -> list[Assign]:
             out_rk: list[Assign] = []
             for st_rk in ss_rk:
@@ -8649,6 +8992,8 @@ def emit_function(
                 rk_x = local_ranks.get(x, _infer_local_array_rank(body_use, x))
                 decls_l.append(f"{x}(" + ":," * (rk_x - 1) + ":)")
             o.w("logical, allocatable :: " + ", ".join(decls_l))
+        if logical_scalars:
+            o.w("logical :: " + ", ".join(sorted(logical_scalars)))
         if real_scalars:
             o.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
         if char_scalars_loc:
@@ -10069,7 +10414,7 @@ def transpile_r_to_fortran(
     recycle_warn: bool = False,
     recycle_stop: bool = False,
 ) -> str:
-    global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
+    global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
@@ -10213,13 +10558,34 @@ def transpile_r_to_fortran(
             fn_return_array_kind[f_ret.name.lower()] = "real"
     _USER_FUNC_ARG_KIND = {}
     _USER_FUNC_ARG_INDEX = {}
+    _USER_FUNC_ARG_RANK = {}
     _USER_FUNC_ELEMENTAL = set()
     for f in funcs:
+        _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
+    _USER_FUNC_ARG_RANK = {
+        f.name.lower(): {a.lower(): infer_arg_rank(f, a) for a in f.args}
+        for f in funcs
+    }
+    for _ in range(4):
+        changed_rank = False
+        for f in funcs:
+            fn_l = f.name.lower()
+            ranks_f = dict(_USER_FUNC_ARG_RANK.get(fn_l, {}))
+            for a in f.args:
+                a_l = a.lower()
+                new_rank = infer_arg_rank(f, a)
+                if new_rank > ranks_f.get(a_l, 0):
+                    ranks_f[a_l] = new_rank
+                    changed_rank = True
+            _USER_FUNC_ARG_RANK[fn_l] = ranks_f
+        if not changed_rank:
+            break
+    for f in funcs:
         kinds: list[str] = []
-        idx: dict[str, int] = {}
         fn_ints = fn_int_names.get(f.name, set())
         fn_int_arrs = fn_int_array_names.get(f.name, set())
-        arg_rank_f = {a: infer_arg_rank(f, a) for a in f.args}
+        idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
+        arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
         if (
             f.name.lower() not in _SUBROUTINE_FUNCTIONS
@@ -10230,7 +10596,6 @@ def transpile_r_to_fortran(
         ):
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
-            idx[a.lower()] = i
             kinds.append(
                 "integer"
                 if (
@@ -10242,7 +10607,6 @@ def transpile_r_to_fortran(
                 else "real"
             )
         _USER_FUNC_ARG_KIND[f.name.lower()] = kinds
-        _USER_FUNC_ARG_INDEX[f.name.lower()] = idx
     helper_modules = set(m.lower() for m in (helper_modules or set()))
     _HAS_R_MOD = ("r_mod" in helper_modules)
     _NO_RECYCLE = bool(no_recycle)
@@ -11912,6 +12276,7 @@ def transpile_r_to_fortran(
         "diag",
         "toeplitz",
         "sort",
+        "polyroot",
         "nchar",
         "is_na",
         "r_typeof",
@@ -11942,6 +12307,7 @@ def transpile_r_to_fortran(
         "print_lm_summary",
         "print_lm_coef_rstyle",
         "lm_fit_t",
+        "optim_result_t",
         "max_col",
         "tabulate",
         "nested_matrix_list_len",
@@ -11993,6 +12359,10 @@ def transpile_r_to_fortran(
         mod_needed.add("lm_fit_t")
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("lm_fit_t")
+    if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("optim_result_t")
+    if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("optim_result_t")
 
     module_iface_lines: list[str] = []
     if emit_local_typeof:
@@ -12083,6 +12453,19 @@ def transpile_r_to_fortran(
         o.pop()
         o.w("end type lm_fit_t")
         o.w("")
+    need_optim_result = bool(
+        re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now + "\n" + main_text_now, re.IGNORECASE)
+    )
+    if need_optim_result and ("r_mod" not in helper_modules):
+        o.w("")
+        o.w("type :: optim_result_t")
+        o.push()
+        o.w("real(kind=dp), allocatable :: par(:)")
+        o.w("real(kind=dp) :: value")
+        o.w("integer :: convergence")
+        o.pop()
+        o.w("end type optim_result_t")
+        o.w("")
     # Derived types for list-return functions and main list constructors.
     emitted_types: set[str] = set()
     all_list_specs: dict[str, ListReturnSpec] = {}
@@ -12133,7 +12516,7 @@ def transpile_r_to_fortran(
                     fn_real_arrays = fn_real_array_names.get(fn_name, set())
                     fn_real_mats = fn_real_matrix_names.get(fn_name, set())
                     fn_lms = fn_lm_names.get(fn_name, set())
-                    if k in {"n", "k", "trial", "n_iter"}:
+                    if k in {"n", "k", "trial", "n_iter", "convergence"}:
                         o.w(f"integer :: {k}")
                     elif k in {"aic_order", "bic_order"}:
                         o.w(f"integer :: {k}")
@@ -12141,6 +12524,8 @@ def transpile_r_to_fortran(
                         o.w(f"type(fit_var_result_t), allocatable :: {k}(:)")
                     elif k in {"cluster", "z_hat", "class", "comp"}:
                         o.w(f"integer, allocatable :: {k}(:)")
+                    elif k == "h":
+                        o.w(f"real(kind=dp), allocatable :: {k}(:)")
                     elif k == "loglik":
                         o.w(f"real(kind=dp) :: {k}")
                     elif k == "lm_fit" or (re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_lms):
