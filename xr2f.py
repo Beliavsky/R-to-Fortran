@@ -6601,6 +6601,16 @@ def emit_stmts(
                     o.w("end block")
                     need_rnorm["used"] = True
                     continue
+            c_numeric_assign = parse_call_text(rhs)
+            if c_numeric_assign is not None and c_numeric_assign[0].lower() in {"numeric", "double"}:
+                _nnm, pos_num, kw_num = c_numeric_assign
+                n_src = pos_num[0] if pos_num else kw_num.get("length", kw_num.get("n", "0"))
+                n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+                if st.name in alloc_seen:
+                    _wstmt(f"if (allocated({st.name})) deallocate({st.name})", "")
+                _wstmt(f"allocate({st.name}(max(0, {n_f})), source=0.0_dp)", st.comment)
+                alloc_seen.add(st.name)
+                continue
             rhs_f = r_expr_to_fortran(_rewrite_predict_expr(rhs))
             c_rhs_exp = parse_call_text(rhs)
             if c_rhs_exp is not None and c_rhs_exp[0].lower() == "exp" and len(c_rhs_exp[1]) == 1:
