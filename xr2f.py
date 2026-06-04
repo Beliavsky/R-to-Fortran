@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import glob
+import hashlib
 import re
 import shlex
 import subprocess
@@ -42,6 +43,7 @@ _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
+_R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
@@ -99,11 +101,17 @@ class ExprStmt:
 
 
 @dataclass
+class CommentStmt:
+    text: str
+
+
+@dataclass
 class FuncDef:
     name: str
     args: list[str]
     defaults: dict[str, str]
     body: list[object]
+    leading_comments: tuple[str, ...] = ()
 
 
 def _collect_stmt_expr_texts(stmts: list[object]) -> list[str]:
@@ -1323,26 +1331,14 @@ def _normalize_r_code_key(code: str) -> str:
 
 def build_r_comment_lookup(src: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
-    pending: list[str] = []
-    seen_code = False
     for raw in src.splitlines():
         code, cmt = split_r_code_comment(raw)
         tcode = code.strip()
         tcmt = cmt.strip()
         if not tcode:
-            if tcmt:
-                if seen_code:
-                    pending.append(tcmt)
             continue
-        seen_code = True
-        key = _normalize_r_code_key(tcode)
-        merged_parts: list[str] = []
-        if pending:
-            merged_parts.append(" | ".join(pending))
-            pending = []
         if tcmt:
-            merged_parts.append(tcmt)
-        out.setdefault(key, []).append(" | ".join(merged_parts))
+            out.setdefault(_normalize_r_code_key(tcode), []).append(tcmt)
     return out
 
 
@@ -1532,16 +1528,35 @@ def _r_statement_continues(txt: str) -> bool:
 
 
 def preprocess_r_lines(src: str) -> list[str]:
-    lines0 = [strip_r_comment(ln) for ln in src.splitlines()]
-    lines0 = [ln for ln in lines0 if ln.strip()]
+    lines0: list[str] = []
+    seen_code = False
+    for raw in src.splitlines():
+        code, cmt = split_r_code_comment(raw)
+        tcode = code.strip()
+        tcmt = cmt.strip()
+        if tcode:
+            lines0.append(tcode)
+            seen_code = True
+        elif tcmt and seen_code:
+            lines0.append(_R_COMMENT_SENTINEL + tcmt)
     # Join multiline statements by balanced parentheses.
     joined: list[str] = []
     cur = ""
     depth = 0
     in_single = False
     in_double = False
+    pending_comments: list[str] = []
     for ln in lines0:
         txt = ln.strip()
+        if txt.startswith(_R_COMMENT_SENTINEL):
+            if cur.strip():
+                pending_comments.append(txt)
+            else:
+                joined.append(txt)
+            continue
+        if pending_comments and not cur.strip():
+            joined.extend(pending_comments)
+            pending_comments = []
         if not cur:
             cur = txt
         else:
@@ -1562,11 +1577,19 @@ def preprocess_r_lines(src: str) -> list[str]:
         if depth == 0 and not in_single and not in_double and not _r_statement_continues(cur):
             joined.append(cur)
             cur = ""
+            if pending_comments:
+                joined.extend(pending_comments)
+                pending_comments = []
     if cur.strip():
         joined.append(cur)
+    if pending_comments:
+        joined.extend(pending_comments)
     lines0 = joined
     out: list[str] = []
     for ln in lines0:
+        if ln.startswith(_R_COMMENT_SENTINEL):
+            out.append(ln)
+            continue
         # split top-level semicolon-separated statements
         semis = split_top_level_semicolons(ln) if ";" in ln else [ln]
         for ln_part in semis:
@@ -1669,6 +1692,12 @@ def parse_block(
     i = i0
     while i < len(lines):
         ln = lines[i].strip()
+        if ln.startswith(_R_COMMENT_SENTINEL):
+            txt = ln[len(_R_COMMENT_SENTINEL) :].strip()
+            if txt:
+                stmts.append(CommentStmt(text=txt))
+            i += 1
+            continue
         if ln == "}":
             if stop_at_rbrace:
                 return stmts, i + 1
@@ -1904,6 +1933,55 @@ def infer_assigned_names(stmts: list[object], out: dict[str, int] | None = None)
         elif isinstance(st, FuncDef):
             # separate scope
             continue
+    return out
+
+
+def collect_assignment_comments(stmts: list[object], out: dict[str, str] | None = None) -> dict[str, str]:
+    if out is None:
+        out = {}
+    for st in stmts:
+        if isinstance(st, Assign):
+            cmt = st.comment.strip()
+            if cmt and st.name not in out:
+                out[st.name] = cmt
+        elif isinstance(st, ForStmt):
+            collect_assignment_comments(st.body, out)
+        elif isinstance(st, WhileStmt):
+            collect_assignment_comments(st.body, out)
+        elif isinstance(st, RepeatStmt):
+            collect_assignment_comments(st.body, out)
+        elif isinstance(st, IfStmt):
+            collect_assignment_comments(st.then_body, out)
+            collect_assignment_comments(st.else_body, out)
+        elif isinstance(st, FuncDef):
+            continue
+    return out
+
+
+def attach_function_adjacent_comments(stmts: list[object]) -> list[object]:
+    out: list[object] = []
+    pending_comments: list[str] = []
+    for st in stmts:
+        if isinstance(st, CommentStmt):
+            pending_comments.append(st.text)
+            continue
+        if isinstance(st, FuncDef) and pending_comments:
+            st = FuncDef(
+                name=st.name,
+                args=list(st.args),
+                defaults=dict(st.defaults),
+                body=list(st.body),
+                leading_comments=tuple(list(st.leading_comments) + pending_comments),
+            )
+            pending_comments = []
+            out.append(st)
+            continue
+        if pending_comments:
+            out.extend(CommentStmt(text=c) for c in pending_comments)
+            pending_comments = []
+        out.append(st)
+    if pending_comments:
+        out.extend(CommentStmt(text=c) for c in pending_comments)
     return out
 
 
@@ -5663,6 +5741,11 @@ def emit_stmts(
         else:
             o.w(stmt_line)
 
+    def _wcomment(text: str) -> None:
+        t = text.strip()
+        if t:
+            o.w(f"! {t}")
+
     def _rewrite_predict_expr(expr: str) -> str:
         c = parse_call_text(expr.strip())
         if c is None or c[0].lower() != "predict":
@@ -5984,6 +6067,9 @@ def emit_stmts(
         return True
 
     for st in stmts:
+        if isinstance(st, CommentStmt):
+            _wcomment(st.text)
+            continue
         if isinstance(st, Assign):
             if st.name == "coef_names":
                 continue
@@ -7484,13 +7570,17 @@ def emit_function(
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
             need_r_mod = nr
-    if not fn.body:
+    fn_body = list(fn.body)
+    opening_comments: list[str] = []
+    while fn_body and isinstance(fn_body[0], CommentStmt):
+        opening_comments.append(fn_body.pop(0).text)
+    if not fn_body:
         raise NotImplementedError(f"empty function body not supported: {fn.name}")
-    has_explicit_return = isinstance(fn.body[-1], ExprStmt)
-    last = fn.body[-1] if has_explicit_return else ExprStmt(expr="0.0")
+    has_explicit_return = isinstance(fn_body[-1], ExprStmt)
+    last = fn_body[-1] if has_explicit_return else ExprStmt(expr="0.0")
     list_spec = list_specs.get(fn.name)
     need_rnorm_local = {"used": False}
-    body_stmts = fn.body[:-1] if has_explicit_return else fn.body
+    body_stmts = fn_body[:-1] if has_explicit_return else fn_body
     can_be_pure = not _stmt_tree_has_side_effect_ops(body_stmts)
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
         can_be_pure = False
@@ -7618,7 +7708,15 @@ def emit_function(
         and all(arg_rank.get(a, 0) == 0 for a in fn.args)
     )
     pref = "pure elemental " if is_elemental else ("pure " if can_be_pure else "")
+    for cmt in fn.leading_comments:
+        c = cmt.strip()
+        if c:
+            o.w(f"! {c}")
     o.w(f"{pref}function {fn.name}({', '.join(fn.args)}) result({rname})")
+    for cmt in opening_comments:
+        c = cmt.strip()
+        if c:
+            o.w(f"! {c}")
     # argument declarations (first-pass heuristics)
     written_args = infer_written_args(fn)
     arg_type: dict[str, str] = {}
@@ -8009,11 +8107,14 @@ def emit_function(
                     _walk_int64_assigns(st_i64.body)
         _walk_int64_assigns(body_use)
         int64_locals &= ints
+        param_comments = collect_assignment_comments(body_use)
         for p, v in sorted(params.items()):
+            cmt = param_comments.get(p, "").strip()
+            suffix = f" ! {cmt}" if cmt else ""
             if _expr_uses_int64(v):
-                o.w(f"integer(kind=int64), parameter :: {p} = {v}")
+                o.w(f"integer(kind=int64), parameter :: {p} = {v}{suffix}")
             else:
-                o.w(f"integer, parameter :: {p} = {v}")
+                o.w(f"integer, parameter :: {p} = {v}{suffix}")
         for lv in sorted(local_list_types):
             o.w(f"type({local_list_types[lv]}) :: {lv}")
         for lv, typ in sorted(object_list_locals.items()):
@@ -9246,6 +9347,7 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
                         args=list(parent_fn.args),
                         defaults=dict(parent_fn.defaults),
                         body=list(parent_fn.body),
+                        leading_comments=parent_fn.leading_comments,
                     ))
                     method_defs[(generic, cls)] = inherited_methods[-1]
                     break
@@ -9265,7 +9367,13 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
             m_method = re.match(r"^([A-Za-z]\w*)\.([A-Za-z]\w*)$", name)
             if m_method is not None and m_method.group(1) in generics:
                 name = f"{m_method.group(1)}_{m_method.group(2)}"
-            out.append(FuncDef(name=name, args=st.args, defaults=st.defaults, body=body))
+            out.append(FuncDef(
+                name=name,
+                args=st.args,
+                defaults=st.defaults,
+                body=body,
+                leading_comments=st.leading_comments,
+            ))
             continue
         if isinstance(st, Assign):
             rhs = _rewrite_minimal_s3_expr(st.expr, generics, var_classes, method_classes)
@@ -9321,6 +9429,7 @@ def transpile_r_to_fortran(
     stmts = _lower_dim_assignments(stmts)
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
+    stmts = attach_function_adjacent_comments(stmts)
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     _VOID_FUNCTION_LIKE = {
@@ -9601,6 +9710,7 @@ def transpile_r_to_fortran(
 
     # Main program declarations/body (without header/footer).
     pbody = FEmit()
+    main_param_comments = collect_assignment_comments(main_stmts)
     int_param_pairs: list[tuple[str, str]] = sorted((p, v) for p, v in params.items())
     # Reuse named size constants when multiple array-parameters share extent.
     size_groups: dict[int, list[str]] = {}
@@ -9623,18 +9733,27 @@ def transpile_r_to_fortran(
     if int_param_pairs:
         int64_param_pairs = [(k, v) for k, v in int_param_pairs if _expr_uses_int64(v)]
         default_param_pairs = [(k, v) for k, v in int_param_pairs if not _expr_uses_int64(v)]
-        if default_param_pairs:
-            rhs = ", ".join(f"{k} = {v}" for k, v in default_param_pairs)
+        default_plain = [(k, v) for k, v in default_param_pairs if not main_param_comments.get(k, "").strip()]
+        default_commented = [(k, v) for k, v in default_param_pairs if main_param_comments.get(k, "").strip()]
+        int64_plain = [(k, v) for k, v in int64_param_pairs if not main_param_comments.get(k, "").strip()]
+        int64_commented = [(k, v) for k, v in int64_param_pairs if main_param_comments.get(k, "").strip()]
+        if default_plain:
+            rhs = ", ".join(f"{k} = {v}" for k, v in default_plain)
             pbody.w(f"integer, parameter :: {rhs}")
-        if int64_param_pairs:
-            rhs = ", ".join(f"{k} = {v}" for k, v in int64_param_pairs)
+        for k, v in default_commented:
+            pbody.w(f"integer, parameter :: {k} = {v} ! {main_param_comments[k].strip()}")
+        if int64_plain:
+            rhs = ", ".join(f"{k} = {v}" for k, v in int64_plain)
             pbody.w(f"integer(kind=int64), parameter :: {rhs}")
+        for k, v in int64_commented:
+            pbody.w(f"integer(kind=int64), parameter :: {k} = {v} ! {main_param_comments[k].strip()}")
     for nm, (knd, nsz, expr_f) in sorted(array_params.items()):
         n_decl = size_name_for_n.get(nsz, str(nsz))
+        suffix = f" ! {main_param_comments[nm].strip()}" if main_param_comments.get(nm, "").strip() else ""
         if knd == "integer":
-            pbody.w(f"integer, parameter :: {nm}({n_decl}) = {expr_f}")
+            pbody.w(f"integer, parameter :: {nm}({n_decl}) = {expr_f}{suffix}")
         else:
-            pbody.w(f"real(kind=dp), parameter :: {nm}({n_decl}) = {expr_f}")
+            pbody.w(f"real(kind=dp), parameter :: {nm}({n_decl}) = {expr_f}{suffix}")
     for nm, (labels, _vals) in sorted(named_vectors.items()):
         if not labels:
             continue
@@ -11901,6 +12020,41 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
     )
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cached_runtime_object(
+    helper: Path,
+    cparts: list[str],
+) -> tuple[Path, Path, subprocess.CompletedProcess[str] | None]:
+    """Return cached object/include dir for r.f90, compiling it on cache miss."""
+    helper = helper.resolve()
+    src_hash = _sha256_file(helper)
+    key_src = "\0".join(["xr2f-rmod-v1", str(helper), src_hash, *cparts])
+    key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
+    cache_dir = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key
+    obj = cache_dir / "r.o"
+    mod = cache_dir / "r_mod.mod"
+    if obj.exists() and mod.exists():
+        return obj, cache_dir, None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cmd = cparts + ["-J", str(cache_dir), "-c", str(helper), "-o", str(obj)]
+    cp = _run_capture(cmd, cwd=cache_dir)
+    if cp.returncode != 0:
+        return obj, cache_dir, cp
+    if not mod.exists():
+        # Case-preserving filesystems can produce uppercase module names.
+        mods = list(cache_dir.glob("*.mod"))
+        if not any(p.name.lower() == "r_mod.mod" for p in mods):
+            return obj, cache_dir, subprocess.CompletedProcess(cmd, 1, "", "r_mod.mod was not produced\n")
+    return obj, cache_dir, cp
+
+
 def _print_captured(
     cp: subprocess.CompletedProcess[str],
     normalize_num_output: bool = False,
@@ -12623,14 +12777,30 @@ def main() -> int:
     if args.compile or args.run:
         cparts = shlex.split(args.compiler)
         exe = out_path.with_suffix(".exe")
-        build_helpers = [] if args.self_contained else [str(h.resolve()) for h in helper_paths]
-        cmd = cparts + build_helpers + [str(out_path)]
+        t0 = time.perf_counter()
+        build_helpers: list[str] = []
+        include_dirs: list[str] = []
+        if not args.self_contained:
+            use_runtime_cache = bool(cparts) and "gfortran" in Path(cparts[0]).name.lower()
+            for hp in helper_paths:
+                if use_runtime_cache and hp.name.lower() == "r.f90":
+                    obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts)
+                    if helper_cp is not None and helper_cp.returncode != 0:
+                        print("Build helper:", " ".join(cparts + ["-c", str(hp.resolve()), "-o", str(obj)]))
+                        timings["compile"] = time.perf_counter() - t0
+                        print(f"Build: FAIL (exit {helper_cp.returncode})")
+                        _print_captured(helper_cp)
+                        return helper_cp.returncode
+                    include_dirs.extend(["-I", str(inc_dir)])
+                    build_helpers.append(str(obj))
+                else:
+                    build_helpers.append(str(hp.resolve()))
+        cmd = cparts + include_dirs + build_helpers + [str(out_path)]
         if args.run:
             cmd += ["-o", str(exe)]
         if args.time:
             print("Compile options:", " ".join(cparts[1:]) if len(cparts) > 1 else "<none>")
         print("Build:", " ".join(cmd))
-        t0 = time.perf_counter()
         cp = _run_capture(cmd, cwd=artifact_dir)
         timings["compile"] = time.perf_counter() - t0
         if cp.returncode != 0:
