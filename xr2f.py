@@ -3699,6 +3699,82 @@ def rename_reserved_main_names(stmts: list[object]) -> list[object]:
     return [_rename_stmt_obj(st, mapping) for st in stmts]
 
 
+def _find_r_for_line(src: str, var: str) -> int | None:
+    for i, raw in enumerate(src.splitlines(), start=1):
+        code, _cmt = split_r_code_comment(raw)
+        for cand in _r_name_candidates(var):
+            if re.search(rf"\bfor\s*\(\s*{re.escape(cand)}\s+in\b", code):
+                return i
+    return None
+
+
+def rename_conflicting_loop_vars(
+    stmts: list[object],
+    warnings: list[tuple[str, str, int | None]] | None = None,
+    src: str = "",
+) -> list[object]:
+    """Rename loop variables that collide with earlier assignments in a block.
+
+    R permits `j <- numeric(3); for (j in 1:k) ...`, where the loop scalar
+    overwrites the prior binding. In Fortran this can otherwise become an
+    allocatable array declaration plus `do j = ...`, which is invalid.
+    """
+    used = _assigned_names_in_stmts(stmts)
+
+    def fresh(base: str) -> str:
+        cand = f"{base}_loop"
+        i = 2
+        used_l = {u.lower() for u in used}
+        while cand.lower() in used_l:
+            cand = f"{base}_loop_{i}"
+            i += 1
+        used.add(cand)
+        return cand
+
+    def walk_block(ss: list[object]) -> list[object]:
+        seen_assigns: set[str] = set()
+        out: list[object] = []
+        for st in ss:
+            if isinstance(st, Assign):
+                seen_assigns.add(st.name)
+                out.append(st)
+                continue
+            if isinstance(st, ForStmt):
+                body = walk_block(st.body)
+                var = st.var
+                if var in seen_assigns:
+                    new_var = fresh(var)
+                    if warnings is not None:
+                        warnings.append((var, new_var, _find_r_for_line(src, var) if src else None))
+                    body = [_rename_stmt_obj(b, {var: new_var}) for b in body]
+                    var = new_var
+                seen_assigns.add(var)
+                out.append(ForStmt(var=var, iter_expr=st.iter_expr, body=body))
+                continue
+            if isinstance(st, WhileStmt):
+                out.append(WhileStmt(cond=st.cond, body=walk_block(st.body)))
+                continue
+            if isinstance(st, RepeatStmt):
+                out.append(RepeatStmt(body=walk_block(st.body)))
+                continue
+            if isinstance(st, IfStmt):
+                out.append(IfStmt(cond=st.cond, then_body=walk_block(st.then_body), else_body=walk_block(st.else_body)))
+                continue
+            if isinstance(st, FuncDef):
+                out.append(FuncDef(
+                    name=st.name,
+                    args=list(st.args),
+                    defaults=dict(st.defaults),
+                    body=walk_block(st.body),
+                    leading_comments=st.leading_comments,
+                ))
+                continue
+            out.append(st)
+        return out
+
+    return walk_block(stmts)
+
+
 def _stmt_tree_has_side_effect_ops(ss: list[object]) -> bool:
     """Conservative impurity test for R-subset function bodies."""
     bad_call_names = {"set.seed", "cat", "print"}
@@ -9667,6 +9743,7 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
         raise NotImplementedError("could not parse full source for R annotation")
     stmts = _lower_dim_assignments(stmts)
     stmts = attach_function_adjacent_comments(stmts)
+    stmts = rename_conflicting_loop_vars(stmts)
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     raw_name = _raw_r_name_map_from_source(src)
@@ -9757,6 +9834,7 @@ def transpile_r_to_fortran(
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
     stmts = attach_function_adjacent_comments(stmts)
+    stmts = rename_conflicting_loop_vars(stmts)
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
@@ -12479,6 +12557,34 @@ def _find_likely_r_source_lines(src: str, f_line: str, message: str = "") -> lis
     return out[:8]
 
 
+def _suggest_minimal_r_reproducer(f_line: str, message: str, matches: list[tuple[int, str, str]]) -> list[str]:
+    f = f_line.strip()
+    msg_l = message.lower()
+    var = ""
+    m_do = re.match(r"^do\s+([A-Za-z]\w*)\s*=", f, re.IGNORECASE)
+    if m_do is not None and "loop variable" in msg_l and "array" in msg_l:
+        var = m_do.group(1)
+    if not var:
+        m_alloc = re.match(r"^allocate\s*\(\s*([A-Za-z]\w*)\s*\(", f, re.IGNORECASE)
+        if m_alloc is not None and "allocate-object" in msg_l:
+            alloc_var = m_alloc.group(1)
+            if any(
+                any(re.search(rf"\bfor\s*\(\s*{re.escape(cand)}\s+in\b", r_line) for cand in _r_name_candidates(alloc_var))
+                for _ln, r_line, _reason in matches
+            ):
+                var = alloc_var
+    if not var:
+        return []
+    r_var = var.replace("_dot_", ".")
+    return [
+        "k <- 3",
+        f"{r_var} <- numeric(3)",
+        f"for ({r_var} in 1:k) {{",
+        f"  print({r_var})",
+        "}",
+    ]
+
+
 def _explain_compile_failure(cp: subprocess.CompletedProcess[str], out_path: Path, src: str) -> None:
     blob = "\n".join(x for x in [cp.stdout or "", cp.stderr or ""] if x)
     if not blob.strip() or not out_path.exists():
@@ -12523,6 +12629,11 @@ def _explain_compile_failure(cp: subprocess.CompletedProcess[str], out_path: Pat
             safe_print(f"  Compiler: {msg}")
         for r_line_no, r_line, reason in matches:
             safe_print(f"  R line {r_line_no}: {r_line.strip()}  [{reason}]")
+        repro = _suggest_minimal_r_reproducer(f_line, msg, matches)
+        if repro:
+            safe_print("  Suggested minimal R reproducer:")
+            for r in repro:
+                safe_print(f"    {r}")
 
 
 def _run_xr2r_prepass(in_path: Path) -> tuple[str | None, str | None]:
