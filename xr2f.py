@@ -32,6 +32,7 @@ _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
+_SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
@@ -745,10 +746,14 @@ def _parse_for_head(line: str) -> tuple[str, str, str] | None:
                 if depth == 0:
                     inside = s[i0 + 1 : j].strip()
                     tail = s[j + 1 :].strip()
-                    m_in = re.match(r"^([A-Za-z]\w*)\s+in\s+(.+)$", inside)
+                    m_in = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s+in\s+(.+)$", inside)
                     if not m_in:
                         return None
-                    return m_in.group(1), m_in.group(2).strip(), tail
+                    raw_var = m_in.group(1)
+                    var = _sanitize_r_var_name(raw_var)
+                    if raw_var != var:
+                        _DOTTED_VAR_RENAMES[raw_var] = var
+                    return var, m_in.group(2).strip(), tail
         j += 1
     return None
 
@@ -3715,6 +3720,64 @@ def _stmt_tree_has_side_effect_ops(ss: list[object]) -> bool:
     return walk(ss)
 
 
+def _stmt_tree_has_output_ops(ss: list[object]) -> bool:
+    output_call_names = {"cat", "print", "writelines", "write.table"}
+
+    def expr_is_output_call(expr: str) -> bool:
+        c = parse_call_text(expr.strip())
+        return c is not None and c[0].lower() in output_call_names
+
+    def walk(stmts: list[object]) -> bool:
+        for st in stmts:
+            if isinstance(st, PrintStmt):
+                return True
+            if isinstance(st, CallStmt) and st.name.lower() in output_call_names:
+                return True
+            if isinstance(st, ExprStmt) and expr_is_output_call(st.expr):
+                return True
+            if isinstance(st, ForStmt):
+                if walk(st.body):
+                    return True
+            elif isinstance(st, WhileStmt):
+                if walk(st.body):
+                    return True
+            elif isinstance(st, RepeatStmt):
+                if walk(st.body):
+                    return True
+            elif isinstance(st, IfStmt):
+                if walk(st.then_body) or walk(st.else_body):
+                    return True
+        return False
+
+    return walk(ss)
+
+
+def _function_has_void_return(fn: FuncDef) -> bool:
+    if not fn.body:
+        return True
+    last = fn.body[-1]
+    if isinstance(last, (CallStmt, PrintStmt)):
+        return True
+    if not isinstance(last, ExprStmt):
+        return True
+    expr = last.expr.strip()
+    ret_arg = _return_call_arg(expr)
+    target = ret_arg if ret_arg is not None else expr
+    if target is None:
+        return False
+    t = target.strip()
+    if not t:
+        return True
+    if t.upper() == "NULL":
+        return True
+    c = parse_call_text(t)
+    return c is not None and c[0].lower() == "invisible"
+
+
+def _function_should_emit_subroutine(fn: FuncDef) -> bool:
+    return _stmt_tree_has_output_ops(fn.body) and _function_has_void_return(fn)
+
+
 def _cond_identifiers(expr: str) -> set[str]:
     """Collect identifier-like tokens from an R condition expression."""
     out: set[str] = set()
@@ -5501,6 +5564,11 @@ def r_expr_to_fortran(expr: str) -> str:
                 vals.append(t)
         return "[" + ", ".join(vals) + "]"
     s = _replace_balanced_func_calls(s, "c", _repl_c)
+    s = _replace_balanced_func_calls(
+        s,
+        "matrix",
+        lambda inner: r_expr_to_fortran("matrix(" + inner.strip() + ")"),
+    )
     # decorate bare real literals
     s = re.sub(r"(?<![\w.])(\d+\.\d*([eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?![\w.])", r"\1_dp", s)
     # R list/S4 member access: a$b$c and a@b@c -> a%b%c
@@ -7439,6 +7507,10 @@ def emit_stmts(
                 continue
             if c_expr is not None:
                 nm_expr = c_expr[0].lower()
+                if nm_expr in _SUBROUTINE_FUNCTIONS:
+                    call_f = r_expr_to_fortran(st.expr.strip())
+                    _wstmt(f"call {call_f}", st.comment)
+                    continue
                 if nm_expr in _VOID_FUNCTION_LIKE:
                     call_f = r_expr_to_fortran(st.expr.strip())
                     o.w("block")
@@ -7576,6 +7648,9 @@ def emit_function(
         opening_comments.append(fn_body.pop(0).text)
     if not fn_body:
         raise NotImplementedError(f"empty function body not supported: {fn.name}")
+    emit_as_subroutine = _stmt_tree_has_output_ops(fn_body) and _function_has_void_return(
+        FuncDef(name=fn.name, args=fn.args, defaults=fn.defaults, body=fn_body)
+    )
     has_explicit_return = isinstance(fn_body[-1], ExprStmt)
     last = fn_body[-1] if has_explicit_return else ExprStmt(expr="0.0")
     list_spec = list_specs.get(fn.name)
@@ -7712,7 +7787,10 @@ def emit_function(
         c = cmt.strip()
         if c:
             o.w(f"! {c}")
-    o.w(f"{pref}function {fn.name}({', '.join(fn.args)}) result({rname})")
+    if emit_as_subroutine:
+        o.w(f"subroutine {fn.name}({', '.join(fn.args)})")
+    else:
+        o.w(f"{pref}function {fn.name}({', '.join(fn.args)}) result({rname})")
     for cmt in opening_comments:
         c = cmt.strip()
         if c:
@@ -7790,7 +7868,9 @@ def emit_function(
         else:
             o.w(f"real(kind=dp), intent({intent}){opt} :: {a}")
             arg_type[a] = "real"
-    if list_spec is None and ret_rank >= 1 and "allocatable" in rdecl:
+    if emit_as_subroutine:
+        pass
+    elif list_spec is None and ret_rank >= 1 and "allocatable" in rdecl:
         if "integer" in rdecl:
             o.w(f"integer, allocatable :: {rname}(" + ":," * (ret_rank - 1) + ":)")
         else:
@@ -8240,13 +8320,18 @@ def emit_function(
             x for x in real_arrays if local_ranks.get(x, _infer_local_array_rank(body_use, x)) < 2
         }
         helper_ctx_loc["local_ranks"] = dict(local_ranks)
-        helper_ctx_loc["return_var"] = rname
+        if not emit_as_subroutine:
+            helper_ctx_loc["return_var"] = rname
         if return_alias_map:
             helper_ctx_loc["return_alias_map"] = return_alias_map
         emit_stmts(o, hoisted_checks + body_rest, need_rnorm_local, set(params.keys()), helper_ctx=helper_ctx_loc)
     elif arg_local_init_lines:
         for ln in arg_local_init_lines:
             o.w(ln)
+
+    if emit_as_subroutine:
+        o.w(f"end subroutine {fn.name}")
+        return bool(need_rnorm_local["used"])
 
     if list_spec is None or ret_type_name is not None:
         rename_all = {}
@@ -9605,6 +9690,7 @@ def transpile_r_to_fortran(
     recycle_stop: bool = False,
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
+    global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS
@@ -9624,10 +9710,16 @@ def transpile_r_to_fortran(
     stmts = attach_function_adjacent_comments(stmts)
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
     _VOID_FUNCTION_LIKE = {
         f.name.lower()
         for f in funcs
-        if (not f.body or not isinstance(f.body[-1], ExprStmt) or _function_returns_invisible(f))
+        if (
+            f.name.lower() in _SUBROUTINE_FUNCTIONS
+            or not f.body
+            or not isinstance(f.body[-1], ExprStmt)
+            or _function_returns_invisible(f)
+        )
     }
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     main_stmts = expand_data_frame_assignments(main_stmts)
@@ -9735,6 +9827,8 @@ def transpile_r_to_fortran(
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ELEMENTAL = set()
     for f in funcs:
+        if f.name.lower() in _SUBROUTINE_FUNCTIONS:
+            continue
         kinds: list[str] = []
         idx: dict[str, int] = {}
         fn_ints = fn_int_names.get(f.name, set())
