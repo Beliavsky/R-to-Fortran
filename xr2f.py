@@ -8007,6 +8007,22 @@ def emit_function(
             local_rename_map[nm] = f"{nm}_"
     if local_rename_map:
         body_use = [_rename_stmt_obj(st, local_rename_map) for st in body_use]
+    result_alias_source = ""
+    if not emit_as_subroutine and list_spec is None and ret_type_name is None:
+        ret_expr_for_alias = _replace_idents(last.expr, arg_local_map) if arg_local_map else last.expr
+        if return_alias_map:
+            ret_expr_for_alias = _replace_idents(ret_expr_for_alias, return_alias_map)
+        if local_rename_map:
+            ret_expr_for_alias = _replace_idents(ret_expr_for_alias, local_rename_map)
+        ret_arg_for_alias = _return_call_arg(ret_expr_for_alias)
+        if ret_arg_for_alias is not None:
+            ret_expr_for_alias = ret_arg_for_alias if ret_arg_for_alias else ret_expr_for_alias
+        m_ret_alias = re.match(r"^[A-Za-z]\w*$", ret_expr_for_alias.strip())
+        if m_ret_alias is not None:
+            cand_alias = m_ret_alias.group(0)
+            if cand_alias != rname and cand_alias not in fn.args and cand_alias in infer_assigned_names(body_use):
+                body_use = [_rename_stmt_obj(st, {cand_alias: rname}) for st in body_use]
+                result_alias_source = cand_alias
     if body_no_ret:
         body_use = [
             st2
@@ -8027,6 +8043,9 @@ def emit_function(
         ints, real_scalars, int_arrays, real_arrays, params = classify_vars(
             body_use, infer_assigned_names(body_use), known_arrays=known_arrays
         )
+        for ret_local_set in (ints, real_scalars, int_arrays, real_arrays):
+            ret_local_set.discard(rname)
+        params.pop(rname, None)
         char_scalars_loc = set(fn_char_scalars) - set(fn.args)
         char_arrays_loc = set(fn_char_arrays) - set(fn.args)
         logical_arrays: set[str] = set()
@@ -8347,6 +8366,10 @@ def emit_function(
 
     if emit_as_subroutine:
         o.w(f"end subroutine {fn.name}")
+        return bool(need_rnorm_local["used"])
+
+    if result_alias_source:
+        o.w(f"end function {fn.name}")
         return bool(need_rnorm_local["used"])
 
     if list_spec is None or ret_type_name is not None:
