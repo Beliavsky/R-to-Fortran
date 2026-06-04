@@ -1064,7 +1064,7 @@ def _named_subscript_lhs_to_fortran(lhs_src: str) -> str | None:
             return f"{base}({idx[0]})"
         return f"{base}([" + ", ".join(str(i) for i in idx) + "])"
     label = _dequote_string_literal(inner)
-    if label is not None and base == "y":
+    if label is not None and (base == "y" or base.endswith("_result")):
         dynamic = {
             "order": "1",
             "intercept": "2",
@@ -1075,7 +1075,7 @@ def _named_subscript_lhs_to_fortran(lhs_src: str) -> str | None:
         if label in dynamic:
             return f"{base}({dynamic[label]})"
     c_inner = parse_call_text(inner)
-    if c_inner is not None and base == "y" and c_inner[0].lower() == "paste0" and len(c_inner[1]) >= 2:
+    if c_inner is not None and (base == "y" or base.endswith("_result")) and c_inner[0].lower() == "paste0" and len(c_inner[1]) >= 2:
         prefix = _dequote_string_literal(c_inner[1][0].strip())
         seq_call = parse_call_text(c_inner[1][1].strip())
         if prefix == "phi" and seq_call is not None and seq_call[0].lower() == "seq_len":
@@ -2523,6 +2523,18 @@ def classify_vars(
             ints.discard(nm)
             params.pop(nm, None)
 
+    def mark_loop_scalar(nm: str, *, integer: bool) -> None:
+        if integer:
+            ints.add(nm)
+            real_scalars.discard(nm)
+        else:
+            real_scalars.add(nm)
+            ints.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        known_arrays.discard(nm)
+        params.pop(nm, None)
+
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, ForStmt):
@@ -2535,19 +2547,14 @@ def classify_vars(
                     walk(st.body)
                     continue
                 if re.match(r"^seq_len\s*\(", it) or re.match(r"^.+:.+$", it):
-                    ints.add(st.var)
-                    real_scalars.discard(st.var)
-                    real_arrays.discard(st.var)
+                    mark_loop_scalar(st.var, integer=True)
                 elif re.match(r"^[A-Za-z]\w*$", it):
                     if it in int_arrays:
-                        ints.add(st.var)
-                        real_scalars.discard(st.var)
-                        real_arrays.discard(st.var)
+                        mark_loop_scalar(st.var, integer=True)
                     else:
-                        real_scalars.add(st.var)
-                        ints.discard(st.var)
+                        mark_loop_scalar(st.var, integer=False)
                 else:
-                    ints.add(st.var)
+                    mark_loop_scalar(st.var, integer=True)
                 walk(st.body)
             elif isinstance(st, WhileStmt):
                 mark_array_uses(st.cond)
@@ -2889,7 +2896,17 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         continue
-                    if base_idx in int_arrays and "," not in idx_rhs and ":" not in idx_rhs and _split_top_level_colon(idx_rhs) is None:
+                    idx_rhs_l = idx_rhs.lower()
+                    if (
+                        base_idx in int_arrays
+                        and "," not in idx_rhs
+                        and ":" not in idx_rhs
+                        and _split_top_level_colon(idx_rhs) is None
+                        and "seq_len(" not in idx_rhs_l
+                        and "r_seq_len(" not in idx_rhs_l
+                        and "r_seq_int(" not in idx_rhs_l
+                        and "c(" not in idx_rhs_l
+                    ):
                         ints.add(st.name)
                         params.pop(st.name, None)
                         known_arrays.discard(st.name)
@@ -2901,6 +2918,9 @@ def classify_vars(
                         (":" in idx_rhs)
                         or ("," in idx_rhs)
                         or ("c(" in idx_rhs.lower())
+                        or ("seq_len(" in idx_rhs.lower())
+                        or ("r_seq_len(" in idx_rhs.lower())
+                        or ("r_seq_int(" in idx_rhs.lower())
                         or ("is.finite(" in idx_rhs.lower())
                         or ("is.na(" in idx_rhs.lower())
                         or any(op in idx_rhs for op in ["==", "!=", ">=", "<=", ">", "<"])
@@ -3029,13 +3049,117 @@ def classify_vars(
                     real_arrays.discard(st.name)
 
     walk(stmts)
+    loop_vars: set[str] = set()
+
+    def collect_loop_vars(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, ForStmt):
+                loop_vars.add(st.var)
+                collect_loop_vars(st.body)
+            elif isinstance(st, IfStmt):
+                collect_loop_vars(st.then_body)
+                collect_loop_vars(st.else_body)
+            elif isinstance(st, WhileStmt):
+                collect_loop_vars(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect_loop_vars(st.body)
+
+    collect_loop_vars(stmts)
+    for lv in loop_vars:
+        int_arrays.discard(lv)
+        real_arrays.discard(lv)
+        known_arrays.discard(lv)
+        params.pop(lv, None)
+
+    def collect_int_vector_assignments(ss: list[object]) -> set[str]:
+        out: set[str] = set()
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs_txt = st.expr.strip()
+                if re.match(r"^[A-Za-z]\w*$", rhs_txt) and rhs_txt in int_arrays:
+                    out.add(st.name)
+                    continue
+                m_idx_rhs = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs_txt)
+                if m_idx_rhs is not None:
+                    base_idx = m_idx_rhs.group(1)
+                    idx_rhs_l = m_idx_rhs.group(2).strip().lower()
+                    if base_idx in int_arrays and (
+                        "seq_len(" in idx_rhs_l
+                        or "r_seq_len(" in idx_rhs_l
+                        or "r_seq_int(" in idx_rhs_l
+                        or "c(" in idx_rhs_l
+                        or "," in idx_rhs_l
+                        or ":" in idx_rhs_l
+                        or _split_top_level_colon(idx_rhs_l) is not None
+                    ):
+                        out.add(st.name)
+                        continue
+            elif isinstance(st, ForStmt):
+                out |= collect_int_vector_assignments(st.body)
+            elif isinstance(st, IfStmt):
+                out |= collect_int_vector_assignments(st.then_body)
+                out |= collect_int_vector_assignments(st.else_body)
+            elif isinstance(st, WhileStmt):
+                out |= collect_int_vector_assignments(st.body)
+            elif isinstance(st, RepeatStmt):
+                out |= collect_int_vector_assignments(st.body)
+        return out
+
+    for nm in collect_int_vector_assignments(stmts):
+        int_arrays.add(nm)
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        real_arrays.discard(nm)
+        known_arrays.add(nm)
+        params.pop(nm, None)
     assigned_names_ctx = set(assign_counts.keys())
-    for nm in infer_integer_context_names(stmts) & assigned_names_ctx:
+    integer_context_names = infer_integer_context_names(stmts) & assigned_names_ctx
+
+    def assigned_from_scalar_int_index(target: str, ss: list[object]) -> bool:
+        for st in ss:
+            if isinstance(st, Assign):
+                if st.name != target:
+                    continue
+                m_idx = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", st.expr.strip())
+                if m_idx is None:
+                    continue
+                base_idx = m_idx.group(1)
+                idx_rhs = m_idx.group(2).strip()
+                if base_idx in int_arrays and "," not in idx_rhs and ":" not in idx_rhs and _split_top_level_colon(idx_rhs) is None:
+                    return True
+            elif isinstance(st, ForStmt):
+                if assigned_from_scalar_int_index(target, st.body):
+                    return True
+            elif isinstance(st, IfStmt):
+                if assigned_from_scalar_int_index(target, st.then_body) or assigned_from_scalar_int_index(target, st.else_body):
+                    return True
+            elif isinstance(st, WhileStmt):
+                if assigned_from_scalar_int_index(target, st.body):
+                    return True
+            elif isinstance(st, RepeatStmt):
+                if assigned_from_scalar_int_index(target, st.body):
+                    return True
+        return False
+
+    for nm in list(integer_context_names):
+        if nm in int_arrays and assigned_from_scalar_int_index(nm, stmts):
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            known_arrays.discard(nm)
+            params.pop(nm, None)
+    for nm in integer_context_names:
         if nm in real_arrays or nm in int_arrays:
             continue
         ints.add(nm)
         real_scalars.discard(nm)
         known_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in collect_int_vector_assignments(stmts):
+        int_arrays.add(nm)
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        real_arrays.discard(nm)
+        known_arrays.add(nm)
         params.pop(nm, None)
     # move params out of scalar var declarations
     for p in params:
@@ -3273,7 +3397,14 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         spread_rhs = re.compile(rf"^\s*{v}\s*<-\s*.*\b(?:spread|r_matmul)\s*\(", re.IGNORECASE)
-        return any(_has_rank2_index_use(t, var) or mat_rhs.search(t) or mat_call_rhs.search(t) or spread_rhs.search(t) for t in texts)
+        return any(
+            _has_rank2_index_use(t, var)
+            or mat_rhs.search(t)
+            or mat_call_rhs.search(t)
+            or spread_rhs.search(t)
+            or (re.search(rf"^\s*{v}\s*<-.*%\*%", t) and "as.numeric" not in t.lower())
+            for t in texts
+        )
 
     for t in texts:
         if re.match(
@@ -3348,6 +3479,17 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             )
         ):
             return 2
+        m_arith_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
+        if m_arith_rhs is not None:
+            rhs_arith = fscan.strip_redundant_outer_parens_expr(m_arith_rhs.group(1).strip())
+            for op in ["+", "-", "*", "/"]:
+                mm = _split_top_level_token(rhs_arith, op, from_right=True)
+                if mm is None:
+                    continue
+                for side in (mm[0].strip(), mm[1].strip()):
+                    if re.match(r"^[A-Za-z]\w*$", side) and _has_rank2_evidence(side):
+                        return 2
+                break
         m_exp_rhs = re.match(rf"^\s*{nm}\s*<-\s*exp\s*\((.*)\)\s*$", t, re.IGNORECASE)
         if m_exp_rhs is not None:
             inner = fscan.strip_redundant_outer_parens_expr(m_exp_rhs.group(1).strip())
@@ -3700,12 +3842,13 @@ def rename_reserved_main_names(stmts: list[object]) -> list[object]:
 
 
 def _find_r_for_line(src: str, var: str) -> int | None:
+    found: int | None = None
     for i, raw in enumerate(src.splitlines(), start=1):
         code, _cmt = split_r_code_comment(raw)
         for cand in _r_name_candidates(var):
             if re.search(rf"\bfor\s*\(\s*{re.escape(cand)}\s+in\b", code):
-                return i
-    return None
+                found = i
+    return found
 
 
 def rename_conflicting_loop_vars(
@@ -4173,7 +4316,7 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"{obj}({idx})"
         if root == "a_list":
             return f"{obj}(:,:,:,{idx})"
-        if root in _KNOWN_RANK3_NAMES or root == "gamma" or "sigma" in root:
+        if root in _KNOWN_RANK3_NAMES or root == "gamma" or root.endswith("_result") or "sigma" in root:
             return f"{obj}(:,:,{idx})"
         return f"{obj}(:,{idx})"
     s = re.sub(r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)?)\s*\[\[\s*([^\]]+?)\s*\]\]", _list_index_repl, s)
@@ -5656,6 +5799,26 @@ def r_expr_to_fortran(expr: str) -> str:
                 vals.append(t)
         return "[" + ", ".join(vals) + "]"
     s = _replace_balanced_func_calls(s, "c", _repl_c)
+
+    def _integerize_shape_constructor(txt: str) -> str:
+        vals: list[str] = []
+        for p in split_top_level_commas(txt):
+            t = p.strip()
+            m_real_int_name = re.match(r"^real\(\s*([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*,\s*kind\s*=\s*dp\s*\)$", t, re.IGNORECASE)
+            if m_real_int_name is not None:
+                vals.append(m_real_int_name.group(1))
+                continue
+            m_real_int_lit = re.match(r"^([+-]?\d+)\.0_dp$", t)
+            if m_real_int_lit is not None:
+                vals.append(m_real_int_lit.group(1))
+                continue
+            vals.append(t)
+        return "[" + ", ".join(vals) + "]"
+
+    def _repl_shape_eq_vec(m: re.Match[str]) -> str:
+        return m.group(1) + _integerize_shape_constructor(m.group(2))
+
+    s = re.sub(r"(shape\([^)]*\)\s*==\s*)\[([^\[\]]+)\]", _repl_shape_eq_vec, s)
     s = _replace_balanced_func_calls(
         s,
         "matrix",
@@ -7707,9 +7870,20 @@ def emit_stmts(
                             _wstmt(f"where ({mask_f}) {base_lhs} = {rhs}", st.comment)
                             continue
                 lhs = _named_subscript_lhs_to_fortran(lhs_src) or r_expr_to_fortran(lhs_src)
-                m_row_assign = re.match(r"^([A-Za-z]\w*)\s*\[\s*[^,\]]+\s*,\s*\]\s*$", lhs_src)
+                m_row_assign = re.match(r"^([A-Za-z]\w*)\s*\[\s*([^,\]]+)\s*,\s*\]\s*$", lhs_src)
                 if m_row_assign is not None and re.match(r"^rmvnorm_chol\s*\(", rhs, re.IGNORECASE):
-                    rhs = f"reshape({rhs}, [size({m_row_assign.group(1)}, 2)])"
+                    row_idx_src = m_row_assign.group(2).strip()
+                    is_simple_row_scalar = (
+                        _is_int_literal(row_idx_src)
+                        or (
+                            re.match(r"^[A-Za-z]\w*$", row_idx_src)
+                            and row_idx_src not in vector_vars
+                            and row_idx_src.lower() not in _KNOWN_VECTOR_NAMES
+                            and row_idx_src.lower() not in _KNOWN_LOGICAL_VECTOR_NAMES
+                        )
+                    )
+                    if is_simple_row_scalar:
+                        rhs = f"reshape({rhs}, [size({m_row_assign.group(1)}, 2)])"
                 if re.match(r"^[A-Za-z]\w*$", lhs_src) and lhs_src in {"aic_order", "bic_order"}:
                     rhs = f"int({rhs})"
                 _wstmt(f"{lhs} = {rhs}", st.comment)
@@ -7951,7 +8125,11 @@ def emit_function(
             o.w(f"real(kind=dp), intent({intent}){opt} :: {a}{dims}")
             arg_type[a] = "real_array"
             continue
-        if a in {"n", "k", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or a in fn_int_args:
+        if (
+            a in {"n", "k", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
+            or (a == "name" and fn.name.lower().startswith("print_"))
+            or a in fn_int_args
+        ):
             o.w(f"integer, intent(in){opt} :: {a}")
             arg_type[a] = "integer"
             continue
@@ -9834,7 +10012,14 @@ def transpile_r_to_fortran(
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
     stmts = attach_function_adjacent_comments(stmts)
-    stmts = rename_conflicting_loop_vars(stmts)
+    loop_shadow_warnings: list[tuple[str, str, int | None]] = []
+    stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
+    for old, new, line_no in loop_shadow_warnings:
+        loc = f" at R line {line_no}" if line_no is not None else ""
+        print(
+            f"Warning: R loop variable `{old}`{loc} reuses an earlier assigned name; "
+            f"translating loop variable as `{new}`."
+        )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
