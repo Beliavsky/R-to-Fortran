@@ -12423,6 +12423,108 @@ def _print_captured(
             sys.stdout.flush()
 
 
+def _r_name_candidates(fortran_name: str) -> set[str]:
+    out = {fortran_name}
+    if "_dot_" in fortran_name:
+        out.add(fortran_name.replace("_dot_", "."))
+    if "_at_" in fortran_name:
+        out.add(fortran_name.replace("_at_", "@"))
+    return out
+
+
+def _find_likely_r_source_lines(src: str, f_line: str, message: str = "") -> list[tuple[int, str, str]]:
+    f = f_line.strip()
+    out: list[tuple[int, str, str]] = []
+    seen: set[int] = set()
+    raw_lines = src.splitlines()
+
+    def add(i: int, reason: str) -> None:
+        if i in seen or i < 1 or i > len(raw_lines):
+            return
+        seen.add(i)
+        out.append((i, raw_lines[i - 1].rstrip(), reason))
+
+    m_do = re.match(r"^do\s+([A-Za-z]\w*)\s*=", f, re.IGNORECASE)
+    if m_do is not None:
+        var = m_do.group(1)
+        for i, raw in enumerate(raw_lines, start=1):
+            code, _cmt = split_r_code_comment(raw)
+            for cand in _r_name_candidates(var):
+                if re.search(rf"\bfor\s*\(\s*{re.escape(cand)}\s+in\b", code):
+                    add(i, f"Fortran loop variable `{var}`")
+                    break
+
+    if "cannot be an array" in message.lower():
+        m_var = re.search(r"\bdo\s+([A-Za-z]\w*)\b", f, re.IGNORECASE)
+        if m_var is not None:
+            var = m_var.group(1)
+            for i, raw in enumerate(raw_lines, start=1):
+                code, _cmt = split_r_code_comment(raw)
+                for cand in _r_name_candidates(var):
+                    if re.search(rf"\b{re.escape(cand)}\s*(?:<-|=)\s*(?:c|numeric|double|integer|matrix|array)\s*\(", code):
+                        add(i, f"`{cand}` appears to be assigned an array")
+                        break
+
+    if not out:
+        ids = [
+            t for t in re.findall(r"\b[A-Za-z]\w*\b", f)
+            if t.lower() not in {"do", "if", "then", "call", "real", "int", "kind", "dp", "size"}
+        ]
+        for i, raw in enumerate(raw_lines, start=1):
+            code, _cmt = split_r_code_comment(raw)
+            if any(any(cand in code for cand in _r_name_candidates(tok)) for tok in ids[:4]):
+                add(i, "shares identifiers with failing Fortran line")
+                if len(out) >= 5:
+                    break
+    return out[:8]
+
+
+def _explain_compile_failure(cp: subprocess.CompletedProcess[str], out_path: Path, src: str) -> None:
+    blob = "\n".join(x for x in [cp.stdout or "", cp.stderr or ""] if x)
+    if not blob.strip() or not out_path.exists():
+        return
+    diags: list[tuple[int, str]] = []
+    for m in re.finditer(r"(?m)^(.*?):(\d+):(\d+):\s*$", blob):
+        try:
+            line_no = int(m.group(2))
+        except ValueError:
+            continue
+        tail = blob[m.end():]
+        msg_m = re.search(r"(?m)^(?:Fatal )?Error:\s*(.+)$", tail)
+        msg = msg_m.group(1).strip() if msg_m is not None else ""
+        if line_no not in [d[0] for d in diags]:
+            diags.append((line_no, msg))
+    if not diags:
+        return
+    try:
+        f_lines = out_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    printed = False
+    for line_no, msg in diags[:3]:
+        if line_no < 1 or line_no > len(f_lines):
+            continue
+        f_line = f_lines[line_no - 1].rstrip()
+        matches = _find_likely_r_source_lines(src, f_line, msg)
+        if not matches:
+            continue
+        def safe_print(txt: str) -> None:
+            try:
+                print(txt)
+            except UnicodeEncodeError:
+                sys.stdout.buffer.write((txt + "\n").encode("utf-8", errors="replace"))
+                sys.stdout.flush()
+
+        if not printed:
+            safe_print("Likely R source for compile error:")
+            printed = True
+        safe_print(f"  Fortran {out_path.name}:{line_no}: {f_line.strip()}")
+        if msg:
+            safe_print(f"  Compiler: {msg}")
+        for r_line_no, r_line, reason in matches:
+            safe_print(f"  R line {r_line_no}: {r_line.strip()}  [{reason}]")
+
+
 def _run_xr2r_prepass(in_path: Path) -> tuple[str | None, str | None]:
     """Return (core_r_text, error_message)."""
     xr2r_path = Path(__file__).with_name("xr2r.py")
@@ -13183,6 +13285,7 @@ def main() -> int:
         if cp.returncode != 0:
             print(f"Build: FAIL (exit {cp.returncode})")
             _print_captured(cp)
+            _explain_compile_failure(cp, out_path, src)
             return cp.returncode
         print("Build: PASS")
 
