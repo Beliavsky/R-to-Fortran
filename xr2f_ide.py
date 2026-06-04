@@ -384,11 +384,11 @@ def run_fortran_source(fortran: str, *, mode: str, run_dir: Path, timeout: float
         return RunResult(rp.returncode == 0, rp.stdout or "", diagnostics, elapsed, run_cmd, compile_elapsed, run_elapsed)
 
 
-def make_scrolled_text(parent: tk.Widget, *, wrap: str = tk.NONE) -> tk.Text:
+def make_scrolled_text(parent: tk.Widget, *, wrap: str = tk.NONE, height: int = 10) -> tk.Text:
     frame = ttk.Frame(parent)
     frame.grid_rowconfigure(0, weight=1)
     frame.grid_columnconfigure(0, weight=1)
-    text = tk.Text(frame, wrap=wrap, undo=True, maxundo=200)
+    text = tk.Text(frame, wrap=wrap, undo=True, maxundo=200, height=height)
     yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
     xscroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=text.xview)
     text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
@@ -441,7 +441,6 @@ class Xr2fIde:
         self.source_to_fortran_lines: dict[int, set[int]] = {}
         self.update_job: str | None = None
         self.highlight_job: str | None = None
-        self.output_equalize_job: str | None = None
         self.raw_r_output = ""
         self.raw_fortran_output = ""
 
@@ -489,16 +488,19 @@ class Xr2fIde:
         ttk.Checkbutton(toolbar, text="R output", variable=self.show_r_output, command=self.update_output_layout).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Help", command=self.show_help).pack(side=tk.RIGHT)
 
-        main_pane = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
-        main_pane.grid(row=1, column=0, sticky="nsew")
+        main_frame = ttk.Frame(self.root)
+        main_frame.grid(row=1, column=0, sticky="nsew")
+        main_frame.grid_rowconfigure(0, weight=72, uniform="code_output")
+        main_frame.grid_rowconfigure(1, weight=28, uniform="code_output")
+        main_frame.grid_columnconfigure(0, weight=1)
 
-        editor_pane = ttk.PanedWindow(main_pane, orient=tk.HORIZONTAL)
-        main_pane.add(editor_pane, weight=4)
+        editor_pane = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        editor_pane.grid(row=0, column=0, sticky="nsew")
 
         r_frame = ttk.LabelFrame(editor_pane, text="R source")
         r_frame.grid_rowconfigure(0, weight=1)
         r_frame.grid_columnconfigure(0, weight=1)
-        self.r_text = make_scrolled_text(r_frame)
+        self.r_text = make_scrolled_text(r_frame, height=28)
         self.r_text.container.grid(row=0, column=0, sticky="nsew")  # type: ignore[attr-defined]
         configure_text_tags(self.r_text)
         self.r_text.bind("<<Modified>>", self.on_source_modified)
@@ -509,28 +511,30 @@ class Xr2fIde:
         f_frame = ttk.LabelFrame(editor_pane, text="Generated Fortran")
         f_frame.grid_rowconfigure(0, weight=1)
         f_frame.grid_columnconfigure(0, weight=1)
-        self.fortran_text = make_scrolled_text(f_frame)
+        self.fortran_text = make_scrolled_text(f_frame, height=28)
         self.fortran_text.is_fortran = True  # type: ignore[attr-defined]
         self.fortran_text.container.grid(row=0, column=0, sticky="nsew")  # type: ignore[attr-defined]
         self.fortran_text.configure(state=tk.DISABLED)
         configure_text_tags(self.fortran_text)
         editor_pane.add(f_frame, weight=1)
 
-        self.output_pane = ttk.PanedWindow(main_pane, orient=tk.HORIZONTAL)
-        main_pane.add(self.output_pane, weight=1)
+        self.output_frame = ttk.Frame(main_frame)
+        self.output_frame.grid(row=1, column=0, sticky="nsew")
+        self.output_frame.grid_rowconfigure(0, weight=1)
+        self.output_frame.grid_columnconfigure(0, weight=1)
+        self.output_frame.grid_columnconfigure(1, weight=1)
 
-        self.r_output_frame = ttk.LabelFrame(self.output_pane, text="R output")
+        self.r_output_frame = ttk.LabelFrame(self.output_frame, text="R output")
         self.r_output_frame.grid_rowconfigure(0, weight=1)
         self.r_output_frame.grid_columnconfigure(0, weight=1)
-        self.r_output = make_scrolled_text(self.r_output_frame, wrap=tk.WORD)
+        self.r_output = make_scrolled_text(self.r_output_frame, wrap=tk.WORD, height=7)
         self.r_output.container.grid(row=0, column=0, sticky="nsew")  # type: ignore[attr-defined]
 
-        self.fortran_output_frame = ttk.LabelFrame(self.output_pane, text="Fortran output")
+        self.fortran_output_frame = ttk.LabelFrame(self.output_frame, text="Fortran output")
         self.fortran_output_frame.grid_rowconfigure(0, weight=1)
         self.fortran_output_frame.grid_columnconfigure(0, weight=1)
-        self.fortran_output = make_scrolled_text(self.fortran_output_frame, wrap=tk.WORD)
+        self.fortran_output = make_scrolled_text(self.fortran_output_frame, wrap=tk.WORD, height=7)
         self.fortran_output.container.grid(row=0, column=0, sticky="nsew")  # type: ignore[attr-defined]
-        self.output_pane.bind("<Configure>", self.schedule_equalize_output_panes)
         self.update_output_layout()
 
         status = ttk.Frame(self.root, padding=(6, 2))
@@ -652,7 +656,6 @@ class Xr2fIde:
         self.show_r_output.set(True)
         self.update_output_layout()
         self.root.update_idletasks()
-        self.equalize_output_panes()
 
     def ensure_fortran(self) -> bool:
         if self.current_fortran.strip():
@@ -742,37 +745,16 @@ class Xr2fIde:
         self.elapsed_f_run_var.set("")
 
     def update_output_layout(self) -> None:
-        panes = set(self.output_pane.panes())
-        r_name = str(self.r_output_frame)
-        f_name = str(self.fortran_output_frame)
-        if r_name in panes:
-            self.output_pane.forget(self.r_output_frame)
-        if f_name in panes:
-            self.output_pane.forget(self.fortran_output_frame)
         if self.show_r_output.get():
-            self.output_pane.add(self.r_output_frame, weight=1)
-        self.output_pane.add(self.fortran_output_frame, weight=1)
-        self.schedule_equalize_output_panes()
-
-    def schedule_equalize_output_panes(self, _event: tk.Event | None = None) -> None:
-        if self.output_equalize_job is not None:
-            self.root.after_cancel(self.output_equalize_job)
-        self.output_equalize_job = self.root.after_idle(self.equalize_output_panes)
-
-    def equalize_output_panes(self) -> None:
-        self.output_equalize_job = None
-        if not self.show_r_output.get():
-            return
-        if len(self.output_pane.panes()) < 2:
-            return
-        width = self.output_pane.winfo_width()
-        height = self.output_pane.winfo_height()
-        if width <= 2 or height <= 2:
-            return
-        try:
-            self.output_pane.sashpos(0, width // 2)
-        except tk.TclError:
-            return
+            self.output_frame.grid_columnconfigure(0, weight=1)
+            self.output_frame.grid_columnconfigure(1, weight=1)
+            self.r_output_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+            self.fortran_output_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
+        else:
+            self.r_output_frame.grid_remove()
+            self.output_frame.grid_columnconfigure(0, weight=0)
+            self.output_frame.grid_columnconfigure(1, weight=1)
+            self.fortran_output_frame.grid(row=0, column=1, sticky="nsew", padx=0)
 
     def open_source(self) -> None:
         path = filedialog.askopenfilename(title="Open R source", filetypes=R_FILETYPES)
