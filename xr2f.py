@@ -14,6 +14,7 @@ import argparse
 import difflib
 import glob
 import hashlib
+import os
 import re
 import shlex
 import subprocess
@@ -841,6 +842,19 @@ def _replace_dotted_var_refs(expr: str) -> str:
     return out
 
 
+def _looks_vector_actual_for_matrix_arg(src: str, lowered: str) -> bool:
+    """Heuristic for wrapping a vector actual when a helper expects a matrix."""
+    t = lowered.strip()
+    if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(:,\s*[^,()]+\)$", t):
+        return True
+    if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\([^,()]+:\s*[^,()]+\)$", t):
+        return True
+    s = src.strip()
+    if re.match(r"^[A-Za-z]\w*(?:\$[A-Za-z]\w*)?\s*\[\[\s*.+\s*\]\]$", s):
+        return True
+    return False
+
+
 def _fortran_str_literal(raw: str) -> str:
     txt = raw.replace('"', '""')
     return f'"{txt}"'
@@ -916,7 +930,7 @@ def _numeric_list_array_expr(expr: str) -> tuple[str, int] | None:
             flat = ", ".join(x for v in vals2 for x in v)
             return f"reshape([{flat}], [{n}, {len(vals2)}])", 2
 
-    mats: list[tuple[list[str], int, int, bool]] = []
+    mats: list[tuple[list[str], int, int, str, str, bool]] = []
     for p in items:
         cm = parse_call_text(p)
         if cm is None or cm[0].lower() != "matrix":
@@ -933,24 +947,39 @@ def _numeric_list_array_expr(expr: str) -> tuple[str, int] | None:
         if vals is None:
             mats = []
             break
-        nr = int(_int_bound_expr(r_expr_to_fortran(nr_src)))
-        nc = int(_int_bound_expr(r_expr_to_fortran(nc_src))) if nc_src is not None else len(vals) // nr
+        nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
+        try:
+            nr = int(nr_f)
+        except ValueError:
+            nr = int(round(len(vals) ** 0.5)) if nc_src is None and int(round(len(vals) ** 0.5)) ** 2 == len(vals) else 0
+        if nc_src is not None:
+            nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
+            try:
+                nc = int(nc_f)
+            except ValueError:
+                nc = len(vals) // nr if nr > 0 and len(vals) % nr == 0 else 0
+        else:
+            nc = len(vals) // nr if nr > 0 and len(vals) % nr == 0 else 0
+            nc_f = str(nc) if nr_f.isdigit() else f"({len(vals)} / ({nr_f}))"
+        if nr <= 0 or nc <= 0:
+            mats = []
+            break
         byrow_src = kw.get("byrow") or (pos[3] if len(pos) >= 4 else "")
         byrow = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"}
         if len(vals) != nr * nc:
             mats = []
             break
-        mats.append((vals, nr, nc, byrow))
+        mats.append((vals, nr, nc, nr_f, nc_f, byrow))
     if mats:
-        nr0, nc0 = mats[0][1], mats[0][2]
-        if all(nr == nr0 and nc == nc0 for _vals, nr, nc, _byrow in mats):
+        nr0, nc0, nr0_f, nc0_f = mats[0][1], mats[0][2], mats[0][3], mats[0][4]
+        if all(nr == nr0 and nc == nc0 and nr_f == nr0_f and nc_f == nc0_f for _vals, nr, nc, nr_f, nc_f, _byrow in mats):
             flat_parts: list[str] = []
-            for vals, nr, nc, byrow in mats:
+            for vals, nr, nc, _nr_f, _nc_f, byrow in mats:
                 if byrow:
                     flat_parts.extend(vals[r * nc + c] for c in range(nc) for r in range(nr))
                 else:
                     flat_parts.extend(vals)
-            return f"reshape([{', '.join(flat_parts)}], [{nr0}, {nc0}, {len(mats)}])", 3
+            return f"reshape([{', '.join(flat_parts)}], [{nr0_f}, {nc0_f}, {len(mats)}])", 3
     return None
 
 
@@ -2741,6 +2770,13 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^sample\s*\(\s*(?:seq_len|seq\.int)\s*\(", rhs, re.IGNORECASE) or re.match(r"^sample\.int\s*\(", rhs, re.IGNORECASE):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.search(r"\bfindInterval\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -4486,6 +4522,8 @@ def r_expr_to_fortran(expr: str) -> str:
             pos_out: list[str] = []
             for i, a in enumerate(pos_u):
                 af = r_expr_to_fortran(a)
+                if key_u == "print_matrix" and i == 1 and _looks_vector_actual_for_matrix_arg(a, af):
+                    af = f"reshape({af}, [size({af}), 1])"
                 if i < len(kinds) and kinds[i] == "real":
                     if _is_int_literal(af.strip()):
                         af = f"{int(af.strip())}.0_dp"
@@ -4496,6 +4534,8 @@ def r_expr_to_fortran(expr: str) -> str:
             for k, v in kw_u.items():
                 vf = r_expr_to_fortran(v)
                 idx_k = idx_map.get(k.lower(), -1)
+                if key_u == "print_matrix" and k.lower() == "x" and _looks_vector_actual_for_matrix_arg(v, vf):
+                    vf = f"reshape({vf}, [size({vf}), 1])"
                 if idx_k >= 0 and idx_k < len(kinds) and kinds[idx_k] == "real":
                     if _is_int_literal(vf.strip()):
                         vf = f"{int(vf.strip())}.0_dp"
@@ -5580,6 +5620,12 @@ def r_expr_to_fortran(expr: str) -> str:
     def _mean_to_fortran(inner: str) -> str:
         x_src, na_rm = _split_reduction_args(inner)
         inner_f = r_expr_to_fortran(x_src)
+        root_l = inner_f.strip().split("%")[-1].lower()
+        if root_l in {x.lower() for x in _KNOWN_LOGICAL_VECTOR_NAMES} or any(
+            _split_top_level_token(x_src, op, from_right=True) is not None
+            for op in ["==", "!=", ">=", "<=", ">", "<"]
+        ):
+            return f"(real(count({inner_f}), kind=dp)/real(size({inner_f}), kind=dp))"
         if na_rm:
             packed = _non_na_pack_expr(inner_f)
             return f"(sum({packed})/real(size({packed}), kind=dp))"
@@ -5594,7 +5640,10 @@ def r_expr_to_fortran(expr: str) -> str:
         "sum",
         lambda inner: (
             f"count({r_expr_to_fortran(inner)})"
-            if re.match(r"^\s*is_na\s*\(.+\)\s*$", inner.strip(), re.IGNORECASE)
+            if (
+                re.match(r"^\s*is_na\s*\(.+\)\s*$", inner.strip(), re.IGNORECASE)
+                or r_expr_to_fortran(inner).strip().split("%")[-1].lower() in {x.lower() for x in _KNOWN_LOGICAL_VECTOR_NAMES}
+            )
             else (
                 f"sum({_non_na_pack_expr(r_expr_to_fortran(_split_reduction_args(inner)[0]))})"
                 if _split_reduction_args(inner)[1]
@@ -5784,6 +5833,8 @@ def r_expr_to_fortran(expr: str) -> str:
     # c(...) -> [...] (also for nested occurrences).
     def _repl_c(inner: str) -> str:
         parts = split_top_level_commas(inner.strip())
+        if not any(p.strip() for p in parts):
+            return "numeric(0)"
         vals = []
         for p in parts:
             t = _strip_named_actual_value(p)
@@ -5884,6 +5935,10 @@ def r_expr_to_fortran(expr: str) -> str:
             if len(name_idx) == 1:
                 return f"{base}({name_idx[0]})"
             return f"{base}([" + ", ".join(str(i) for i in name_idx) + "])"
+        if "," not in inner and base.lower().endswith("%mu"):
+            return f"{base}(:, {_index_inner_to_fortran(inner, base=base)})"
+        if "," not in inner and base.lower().endswith("%sigma"):
+            return f"{base}(:, :, {_index_inner_to_fortran(inner, base=base)})"
         # Logical masking for 1D vectors: x[mask] -> pack(x, mask)
         if "," not in inner:
             il = inner.lower()
@@ -6464,6 +6519,9 @@ def emit_stmts(
                 len_f = _int_bound_expr(r_expr_to_fortran(len_src))
                 if st.name in object_list_vars:
                     _wstmt(f"allocate({st.name}({len_f}))", st.comment)
+                    continue
+                if st.name == "stats_list":
+                    _wstmt(f"allocate({st.name}(7, {len_f}))", st.comment)
                     continue
                 rank_hint = local_ranks_ctx.get(st.name, 0)
                 if rank_hint >= 3 or _list_name_holds_matrices_in_texts(_stmt_texts_for_rank_scan(stmts), st.name) or "sigma" in st.name.lower():
@@ -8036,6 +8094,10 @@ def emit_function(
     arg_rank = {a: infer_arg_rank(fn, a) for a in fn.args}
     if s3_receiver_type is not None and fn.args:
         arg_rank[fn.args[0]] = 0
+    if fn.name.lower() == "print_matrix" and "x" in arg_rank:
+        arg_rank["x"] = 2
+    if fn.name.lower() == "print_stats" and "stats" in arg_rank:
+        arg_rank["stats"] = 1
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
         for a in fn.args:
@@ -8112,6 +8174,10 @@ def emit_function(
             arg_type[a] = "char_array"
             continue
         if a in fn_char_scalars:
+            o.w(f"character(len=*), intent({intent}){opt} :: {a}")
+            arg_type[a] = "char"
+            continue
+        if a == "name" and fn.name.lower() == "print_matrix":
             o.w(f"character(len=*), intent({intent}){opt} :: {a}")
             arg_type[a] = "char"
             continue
@@ -8517,6 +8583,13 @@ def emit_function(
                     out_rk.extend(_walk_assigns(st_rk.body))
             return out_rk
         assign_nodes = _walk_assigns(body_use)
+        for st_seq_rank in assign_nodes:
+            if st_seq_rank.name in local_ranks and re.match(
+                r"^(?:seq|seq\.int|seq_len|seq_along|quantile)\s*\(",
+                st_seq_rank.expr.strip(),
+                re.IGNORECASE,
+            ):
+                local_ranks[st_seq_rank.name] = 1
         changed = True
         while changed:
             changed = False
@@ -9040,7 +9113,10 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
                     names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
-                    is_logical_vec = bool(names & array_names)
+                    rhs_f = r_expr_to_fortran(rhs)
+                    is_logical_vec = bool(names & array_names) or bool(
+                        re.search(r"\b(?:runif_vec|rnorm_vec|numeric|r_rep_real|r_rep_int)\s*\(", rhs_f)
+                    )
                 if is_logical_vec:
                     out.add(st.name)
             elif isinstance(st, IfStmt):
@@ -10139,8 +10215,6 @@ def transpile_r_to_fortran(
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ELEMENTAL = set()
     for f in funcs:
-        if f.name.lower() in _SUBROUTINE_FUNCTIONS:
-            continue
         kinds: list[str] = []
         idx: dict[str, int] = {}
         fn_ints = fn_int_names.get(f.name, set())
@@ -10148,6 +10222,8 @@ def transpile_r_to_fortran(
         arg_rank_f = {a: infer_arg_rank(f, a) for a in f.args}
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
         if (
+            f.name.lower() not in _SUBROUTINE_FUNCTIONS
+            and
             f.name.lower() not in fn_return_array_kind
             and (not _stmt_tree_has_side_effect_ops(f_body_eff))
             and all(arg_rank_f.get(a, 0) == 0 for a in f.args)
@@ -10155,7 +10231,16 @@ def transpile_r_to_fortran(
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
             idx[a.lower()] = i
-            kinds.append("integer" if (a in fn_ints or a in fn_int_arrs or a in {"asset_names", "price_names"}) else "real")
+            kinds.append(
+                "integer"
+                if (
+                    a in fn_ints
+                    or a in fn_int_arrs
+                    or a in {"asset_names", "price_names"}
+                    or (a == "name" and f.name.lower().startswith("print_") and f.name.lower() != "print_matrix")
+                )
+                else "real"
+            )
         _USER_FUNC_ARG_KIND[f.name.lower()] = kinds
         _USER_FUNC_ARG_INDEX[f.name.lower()] = idx
     helper_modules = set(m.lower() for m in (helper_modules or set()))
@@ -10570,6 +10655,8 @@ def transpile_r_to_fortran(
         int_arrays.discard(nm)
         real_arrays.discard(nm)
         params.pop(nm, None)
+    if "stats_list" in real_arrays:
+        real_matrices.add("stats_list")
     for nm in real_matrices:
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -11040,11 +11127,11 @@ def transpile_r_to_fortran(
         any("r_command_args(" in ln for ln in pbody.lines)
         or any("r_command_args(" in ln for ln in mprocs.lines)
     )
-    emit_local_order = (
+    emit_local_order = (not has_r_mod_emit) and (
         any("order_real(" in ln for ln in pbody.lines)
         or any("order_real(" in ln for ln in mprocs.lines)
     )
-    emit_local_rank = (
+    emit_local_rank = (not has_r_mod_emit) and (
         any("rank_average(" in ln or "rank_first(" in ln for ln in pbody.lines)
         or any("rank_average(" in ln or "rank_first(" in ln for ln in mprocs.lines)
     )
@@ -11899,6 +11986,9 @@ def transpile_r_to_fortran(
         mod_needed.discard("print_matrix")
     if "print_matrix_rstyle" in main_needed:
         main_needed.discard("print_matrix")
+    user_func_names_l = {f.name.lower() for f in funcs}
+    mod_needed = {nm for nm in mod_needed if nm.lower() not in user_func_names_l}
+    main_needed = {nm for nm in main_needed if nm.lower() not in user_func_names_l}
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("lm_fit_t")
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", main_text_now, re.IGNORECASE):
@@ -12074,7 +12164,11 @@ def transpile_r_to_fortran(
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_real_mats:
                         _emit_real_field_decl(k, 2)
                     elif any(re.search(rf"\b{re.escape(nm)}\s*\[", txt) for nm in (fn_real_arrays | fn_int_arrays)):
-                        o.w(f"real(kind=dp), allocatable :: {k}(:)")
+                        m_field_ix = re.search(r"\b[A-Za-z]\w*\s*\[([^\[\]]+)\]", txt)
+                        if m_field_ix is not None and len(_split_index_dims(m_field_ix.group(1))) >= 2:
+                            o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
+                        else:
+                            o.w(f"real(kind=dp), allocatable :: {k}(:)")
                     elif txt.startswith("cbind(") or txt.startswith("cbind2(") or "%*%" in txt:
                         o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif parse_call_text(txt) is not None:
@@ -12633,24 +12727,51 @@ def _cached_runtime_object(
     """Return cached object/include dir for r.f90, compiling it on cache miss."""
     helper = helper.resolve()
     src_hash = _sha256_file(helper)
-    key_src = "\0".join(["xr2f-rmod-v1", str(helper), src_hash, *cparts])
+    key_src = "\0".join(["xr2f-rmod-v3", str(helper), src_hash, *cparts])
     key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
     cache_dir = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key
     obj = cache_dir / "r.o"
     mod = cache_dir / "r_mod.mod"
     if obj.exists() and mod.exists():
         return obj, cache_dir, None
+    lock_dir = cache_dir.with_name(cache_dir.name + ".lock")
+    have_lock = False
+    start = time.monotonic()
+    while not have_lock:
+        try:
+            lock_dir.mkdir(parents=True)
+            have_lock = True
+        except FileExistsError:
+            if obj.exists() and mod.exists():
+                return obj, cache_dir, None
+            if time.monotonic() - start > 120:
+                return obj, cache_dir, subprocess.CompletedProcess(
+                    cparts, 1, "", f"timed out waiting for runtime cache lock: {lock_dir}\n"
+                )
+            time.sleep(0.1)
+    if obj.exists() and mod.exists():
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+        return obj, cache_dir, None
     cache_dir.mkdir(parents=True, exist_ok=True)
     cmd = cparts + ["-J", str(cache_dir), "-c", str(helper), "-o", str(obj)]
-    cp = _run_capture(cmd, cwd=cache_dir)
-    if cp.returncode != 0:
+    try:
+        cp = _run_capture(cmd, cwd=cache_dir)
+        if cp.returncode != 0:
+            return obj, cache_dir, cp
+        if not mod.exists():
+            # Case-preserving filesystems can produce uppercase module names.
+            mods = list(cache_dir.glob("*.mod"))
+            if not any(p.name.lower() == "r_mod.mod" for p in mods):
+                return obj, cache_dir, subprocess.CompletedProcess(cmd, 1, "", "r_mod.mod was not produced\n")
         return obj, cache_dir, cp
-    if not mod.exists():
-        # Case-preserving filesystems can produce uppercase module names.
-        mods = list(cache_dir.glob("*.mod"))
-        if not any(p.name.lower() == "r_mod.mod" for p in mods):
-            return obj, cache_dir, subprocess.CompletedProcess(cmd, 1, "", "r_mod.mod was not produced\n")
-    return obj, cache_dir, cp
+    finally:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
 
 
 def _print_captured(
@@ -13555,10 +13676,12 @@ def main() -> int:
         t0 = time.perf_counter()
         build_helpers: list[str] = []
         include_dirs: list[str] = []
+        using_cached_runtime = False
         if not args.self_contained:
             use_runtime_cache = bool(cparts) and "gfortran" in Path(cparts[0]).name.lower()
             for hp in helper_paths:
                 if use_runtime_cache and hp.name.lower() == "r.f90":
+                    using_cached_runtime = True
                     obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts)
                     if helper_cp is not None and helper_cp.returncode != 0:
                         print("Build helper:", " ".join(cparts + ["-c", str(hp.resolve()), "-o", str(obj)]))
@@ -13566,10 +13689,16 @@ def main() -> int:
                         print(f"Build: FAIL (exit {helper_cp.returncode})")
                         _print_captured(helper_cp)
                         return helper_cp.returncode
-                    include_dirs.extend(["-I", str(inc_dir)])
+                    include_dirs.extend(["-J", str(inc_dir), "-I", str(inc_dir)])
                     build_helpers.append(str(obj))
                 else:
                     build_helpers.append(str(hp.resolve()))
+        if using_cached_runtime:
+            for stale_mod in (artifact_dir / "r_mod.mod", artifact_dir / "R_MOD.mod"):
+                try:
+                    stale_mod.unlink()
+                except FileNotFoundError:
+                    pass
         cmd = cparts + include_dirs + build_helpers + [str(out_path)]
         if args.run:
             cmd += ["-o", str(exe)]
