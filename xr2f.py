@@ -6249,6 +6249,12 @@ def r_expr_to_fortran(expr: str) -> str:
         parts = split_top_level_commas(inner.strip())
         if not any(p.strip() for p in parts):
             return "numeric(0)"
+        string_vals = [_dequote_string_literal(_strip_named_actual_value(p)) for p in parts if p.strip()]
+        if len(string_vals) == len([p for p in parts if p.strip()]) and all(v is not None for v in string_vals):
+            vals_s = [str(v) for v in string_vals]
+            width = max(1, max(len(v) for v in vals_s))
+            quoted = ", ".join('"' + v.replace('"', '""') + '"' for v in vals_s)
+            return f"[character(len={width}) :: {quoted}]"
         vals = []
         for p in parts:
             t = _strip_named_actual_value(p)
@@ -10717,17 +10723,25 @@ def collect_model_data_frame_uses(stmts: list[object]) -> set[str]:
 
 def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
     labels: dict[str, list[str]] = {}
+    string_vectors: dict[str, list[str]] = {}
 
     def walk(ss: list[object]) -> None:
         for st in ss:
-            if isinstance(st, ExprStmt):
+            if isinstance(st, Assign):
+                labs = _parse_string_c_vector(st.expr.strip())
+                if labs is not None:
+                    string_vectors[st.name.lower()] = labs
+            elif isinstance(st, ExprStmt):
                 m = re.match(
                     r"^\s*colnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
                     st.expr.strip(),
                     re.IGNORECASE,
                 )
                 if m is not None:
-                    labs = _parse_string_c_vector(m.group(2).strip())
+                    rhs = m.group(2).strip()
+                    labs = _parse_string_c_vector(rhs)
+                    if labs is None and re.fullmatch(r"[A-Za-z]\w*", rhs):
+                        labs = string_vectors.get(rhs.lower())
                     if labs is not None:
                         labels[m.group(1).lower()] = labs
             elif isinstance(st, FuncDef):
