@@ -2379,6 +2379,31 @@ def _int_vector_literal_from_c(expr: str) -> str | None:
     return "[" + ", ".join(out) + "]"
 
 
+def _strict_int_vector_literal_from_c(expr: str) -> str | None:
+    c = parse_call_text(expr.strip())
+    if c is None or c[0].lower() != "c":
+        return None
+    vals = list(c[1]) + list(c[2].values())
+    if not vals:
+        return "[]"
+    out: list[str] = []
+    for v in vals:
+        t = v.strip()
+        if not _is_int_literal(t):
+            return None
+        out.append(_normalize_r_int_literal(t))
+    return "[" + ", ".join(out) + "]"
+
+
+def _matrix_has_integer_literal_data(expr: str) -> bool:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "matrix":
+        return False
+    pos, kw = cinfo[1], cinfo[2]
+    data_src = pos[0] if pos else kw.get("data", "")
+    return _strict_int_vector_literal_from_c(data_src.strip()) is not None
+
+
 def _expr_uses_int64(txt: str) -> bool:
     return re.search(r"\bint64\b|_int64\b", txt, re.IGNORECASE) is not None
 
@@ -4865,6 +4890,11 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_ct = [r_expr_to_fortran(a) for a in pos_ct]
         kw_out_ct = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ct.items()]
         return f"cor_test({', '.join(pos_out_ct + kw_out_ct)})"
+    if c_usr is not None and c_usr[0].lower() in {"fisher.test", "fisher_test"}:
+        _nm_ft, pos_ft, kw_ft = c_usr
+        pos_out_ft = [r_expr_to_fortran(a) for a in pos_ft]
+        kw_out_ft = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ft.items()]
+        return f"fisher_test({', '.join(pos_out_ft + kw_out_ft)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
         args_q = [r_expr_to_fortran(a) for a in pos_q]
@@ -5295,7 +5325,7 @@ def r_expr_to_fortran(expr: str) -> str:
             byrow_src = pos_m[3]
         if nr_src is None and nc_src is None:
             raise NotImplementedError("matrix(...) requires nrow or ncol in this subset")
-        data_f = r_expr_to_fortran(data_src)
+        data_f = _strict_int_vector_literal_from_c(data_src.strip()) or r_expr_to_fortran(data_src)
         nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
         if nc_src is None:
             nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
@@ -7270,7 +7300,7 @@ def emit_stmts(
                         need_rnorm["used"] = True
                         continue
                     # Generic fallback for matrix(data, nrow=, ncol=)
-                    data_f = r_expr_to_fortran(data_src)
+                    data_f = _strict_int_vector_literal_from_c(data_src.strip()) or r_expr_to_fortran(data_src)
                     if nrow_src is None:
                         nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
                         nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
@@ -7760,6 +7790,10 @@ def emit_stmts(
                         _wstmt(f"call print_cor_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_cor_test", "cor_test", "cor_test_result_t"})
                         continue
+                    if re.match(r"^fisher_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_fisher_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_fisher_test", "fisher_test", "fisher_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -7775,6 +7809,10 @@ def emit_stmts(
                     if c_one is not None and c_one[0].lower() in {"cor.test", "cor_test"}:
                         _wstmt(f"call print_cor_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"cor_test", "print_cor_test", "cor_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"fisher.test", "fisher_test"}:
+                        _wstmt(f"call print_fisher_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"fisher_test", "print_fisher_test", "fisher_test_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
@@ -10426,9 +10464,10 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
     return out
 
 
-def infer_main_real_matrices(stmts: list[object]) -> set[str]:
+def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] | None = None) -> set[str]:
     """Find variables that should be declared as rank-2 real allocatables."""
     out: set[str] = set()
+    known_int_matrices = set(known_int_matrices or set())
 
     def _scan_text(txt: str) -> None:
         for m in re.finditer(r"\b(?:nrow|ncol)\s*\(\s*([A-Za-z]\w*)\s*\)", txt):
@@ -10452,7 +10491,7 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
             low = rhs.lower()
             if _split_top_level_token(rhs, "%*%", from_right=True) is not None:
                 out.add(st.name)
-            if low.startswith("matrix("):
+            if low.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs):
                 out.add(st.name)
             if low.startswith("read.csv("):
                 out.add(st.name)
@@ -10487,6 +10526,8 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
             c_exp = parse_call_text(rhs)
             if c_exp is not None and c_exp[0].lower() == "exp" and len(c_exp[1]) == 1:
                 inner = fscan.strip_redundant_outer_parens_expr(c_exp[1][0].strip())
+                if any(re.search(rf"\b{re.escape(nm)}\b", inner) for nm in known_int_matrices):
+                    out.add(st.name)
                 for op in ["+", "-", "*", "/"]:
                     mm = _split_top_level_token(inner, op, from_right=True)
                     if mm is None:
@@ -10518,7 +10559,7 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
                     if isinstance(b, Assign):
                         rhs_b = b.expr.strip()
                         low_b = rhs_b.lower()
-                        if low_b.startswith("matrix(") or low_b.startswith("array("):
+                        if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or low_b.startswith("array("):
                             out.add(b.name)
                     _scan_text(b.expr if isinstance(b, ExprStmt) else (b.name + "(" + ", ".join(b.args) + ")" if isinstance(b, CallStmt) else b.expr))
                 elif isinstance(b, PrintStmt):
@@ -10529,7 +10570,7 @@ def infer_main_real_matrices(stmts: list[object]) -> set[str]:
                 if isinstance(b, Assign):
                     rhs_b = b.expr.strip()
                     low_b = rhs_b.lower()
-                    if low_b.startswith("matrix(") or low_b.startswith("array("):
+                    if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or low_b.startswith("array("):
                         out.add(b.name)
                     _scan_text(rhs_b)
                 elif isinstance(b, (CallStmt, ExprStmt)):
@@ -10562,6 +10603,9 @@ def infer_main_integer_matrices(stmts: list[object]) -> set[str]:
             ):
                 out.add(st.name)
                 continue
+        if cinfo_o is not None and cinfo_o[0].lower() == "matrix" and _matrix_has_integer_literal_data(rhs):
+            out.add(st.name)
+            continue
         if cinfo_o is None or cinfo_o[0].lower() != "outer":
             continue
         fun_src = cinfo_o[2].get("FUN", "").strip()
@@ -11769,11 +11813,11 @@ def transpile_r_to_fortran(
         real_arrays.discard(nm)
         params.pop(nm, None)
     logical_scalars = infer_main_logical_scalars(main_stmts)
-    real_matrices = infer_main_real_matrices(main_stmts)
+    int_matrices = infer_main_integer_matrices(main_stmts)
+    real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
     real_rank3_arrays = infer_main_real_rank3_arrays(main_stmts)
     real_rank4_arrays = infer_main_real_rank4_arrays(main_stmts)
     _KNOWN_RANK3_NAMES.update(nm.lower() for nm in real_rank3_arrays)
-    int_matrices = infer_main_integer_matrices(main_stmts)
     logical_arrays = infer_main_logical_arrays(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
@@ -13527,6 +13571,9 @@ def transpile_r_to_fortran(
         "cor_test_result_t",
         "cor_test",
         "print_cor_test",
+        "fisher_test_result_t",
+        "fisher_test",
+        "print_fisher_test",
         "max_col",
         "tabulate",
         "table2",
@@ -14144,6 +14191,88 @@ def simplify_write_g0_outer_parens(lines: list[str]) -> list[str]:
         expr = fscan.strip_redundant_outer_parens_expr(m.group(2).strip())
         suffix = f" {comment.strip()}" if comment.strip() else ""
         out.append(f"{m.group(1)}{expr}{suffix}")
+    return out
+
+
+def hoist_repeated_numeric_array_literals(lines: list[str]) -> list[str]:
+    """Hoist repeated numeric array constructors in each procedure/program scope."""
+
+    unit_start_re = re.compile(
+        r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*\s*(?:program|function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
+    implicit_re = re.compile(r"^\s*implicit\s+none\b", re.IGNORECASE)
+    ctor_re = re.compile(r"\[((?:\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_[A-Za-z]\w*)?\s*,){1,}\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_[A-Za-z]\w*)?\s*)\]")
+
+    def classify_ctor(txt: str) -> tuple[str, int] | None:
+        if "character(" in txt.lower():
+            return None
+        inner = txt[1:-1]
+        vals = [v.strip() for v in split_top_level_commas(inner)]
+        if len(vals) < 2:
+            return None
+        all_int = all(_is_int_literal(v) for v in vals)
+        all_num = all(_is_int_literal(v) or _is_real_literal(v) for v in vals)
+        if not all_num:
+            return None
+        return ("integer" if all_int else "real", len(vals))
+
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i]):
+            i += 1
+            continue
+        start = i
+        end = i + 1
+        while end < len(out) and not unit_end_re.match(out[end]):
+            end += 1
+        if end >= len(out):
+            end = len(out) - 1
+        kinds: dict[str, tuple[str, int]] = {}
+        repeated_set: set[str] = set()
+        stmt = ""
+        for ln in out[start : end + 1]:
+            code = ln.split("!", 1)[0]
+            stmt = (stmt + " " + code.lstrip("&").strip()) if stmt else code.strip()
+            if code.rstrip().endswith("&"):
+                continue
+            counts: dict[str, int] = {}
+            for m in ctor_re.finditer(stmt):
+                ctor = m.group(0)
+                info = classify_ctor(ctor)
+                if info is None:
+                    continue
+                counts[ctor] = counts.get(ctor, 0) + 1
+                kinds[ctor] = info
+            repeated_set.update(ctor for ctor, n in counts.items() if n >= 2)
+            stmt = ""
+        repeated = list(repeated_set)
+        if not repeated:
+            i = end + 1
+            continue
+        name_by_ctor = {ctor: f"arr_lit_{j}" for j, ctor in enumerate(repeated, start=1)}
+        for idx in range(start, end + 1):
+            for ctor, nm in name_by_ctor.items():
+                out[idx] = out[idx].replace(ctor, nm)
+        decls: list[str] = []
+        for ctor in repeated:
+            nm = name_by_ctor[ctor]
+            kind, n = kinds[ctor]
+            if kind == "integer":
+                decls.append(f"integer, parameter :: {nm}({n}) = {ctor}")
+            else:
+                decls.append(f"real(kind=dp), parameter :: {nm}({n}) = {ctor}")
+        insert_at = None
+        for idx in range(start + 1, end + 1):
+            if implicit_re.match(out[idx]):
+                insert_at = idx + 1
+                break
+        if insert_at is None:
+            insert_at = start + 1
+        out[insert_at:insert_at] = decls
+        i = end + 1 + len(decls)
     return out
 
 
@@ -15391,6 +15520,7 @@ def main() -> int:
     f90_lines = fpost.simplify_do_while_true(f90_lines)
     f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
+    f90_lines = hoist_repeated_numeric_array_literals(f90_lines)
     # NOTE: keep named-argument rewriting disabled here; the generic pass
     # can mis-handle array constructors in helper calls (e.g., r_rep_*).
     # Keep helper argument forms as emitted; avoid line-based rewrites that can
