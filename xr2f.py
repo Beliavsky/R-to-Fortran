@@ -3787,6 +3787,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
             if not _is_inline_temp_rhs(st.expr):
                 i += 1
                 continue
+            if re.search(rf"\b{re.escape(name)}\b", st.expr):
+                i += 1
+                continue
             total_uses = sum(_stmt_uses_name(sj, name) for sj in out[i + 1 :])
             if total_uses != 1:
                 i += 1
@@ -4237,7 +4240,7 @@ def _fortran_error_msg(text: str) -> str:
 
 
 def _is_simple_value_for_merge(expr_f: str) -> bool:
-    """True when expression is a simple value (literal or variable reference)."""
+    """True when expression is a scalar-looking literal or variable reference."""
     t = expr_f.strip()
     if not t:
         return False
@@ -4245,8 +4248,11 @@ def _is_simple_value_for_merge(expr_f: str) -> bool:
         return True
     if re.match(r"^\.(true|false)\.$", t, re.IGNORECASE):
         return True
-    # Simple variable or component, optionally with one index list: a, a%b, a(i), a%b(i,j)
-    if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)*(?:\([^()]*\))?$", t):
+    # Keep MERGE away from array sections, constructors, and helper calls such
+    # as numeric(0). Fortran MERGE requires conforming array operands, so using
+    # it for R branches like par[i:j] vs numeric(0) can silently erase the
+    # non-empty branch.
+    if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)*$", t):
         return True
     return False
 
@@ -8080,8 +8086,10 @@ def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = 
     control_src = kw.get("control", "")
     maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
     reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
+    ndeps_src = _control_value_from_list(control_src, "ndeps") if control_src else None
     maxit_f = _int_bound_expr(r_expr_to_fortran(maxit_src or "100"))
     gtol_f = r_expr_to_fortran(reltol_src or "1.0e-8")
+    ndeps_f = r_expr_to_fortran(ndeps_src or "1.0e-3")
     prefix = re.sub(r"[^A-Za-z0-9_]", "_", target)
     if not prefix or prefix[0].isdigit():
         prefix = "opt_" + prefix
@@ -8108,6 +8116,7 @@ def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = 
     fplus = f"{prefix}_f_plus"
     fminus = f"{prefix}_f_minus"
     eps = f"{prefix}_eps"
+    ndeps = f"{prefix}_ndeps"
     gtol = f"{prefix}_gtol"
     alpha = f"{prefix}_alpha"
     slope = f"{prefix}_slope"
@@ -8123,7 +8132,7 @@ def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = 
     def emit_gradient(point: str, grad: str) -> None:
         o.w(f"do {i} = 1, {np}")
         o.push()
-        o.w(f"{eps} = sqrt(epsilon(1.0_dp)) * (abs({point}({i})) + 1.0_dp)")
+        o.w(f"{eps} = {ndeps} * (abs({point}({i})) + 1.0_dp)")
         o.w(f"{ptmp} = {point}")
         o.w(f"{ptmp}({i}) = {ptmp}({i}) + {eps}")
         o.w(f"{fplus} = {obj_call(ptmp)}")
@@ -8143,7 +8152,7 @@ def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = 
     o.w(f"integer :: {np}, {max_iter}, {n_iter}, {i}, {j}, {iter_nm}")
     o.w(f"logical :: {converged}")
     o.w(
-        f"real(kind=dp) :: {fval}, {fnew}, {fplus}, {fminus}, {eps}, {gtol}, "
+        f"real(kind=dp) :: {fval}, {fnew}, {fplus}, {fminus}, {eps}, {ndeps}, {gtol}, "
         f"{alpha}, {slope}, {sy}, {rho}, {shift}"
     )
     o.w(f"real(kind=dp), allocatable :: {p}(:), {pnew}(:), {ptmp}(:), {g}(:), {gnew}(:)")
@@ -8151,6 +8160,7 @@ def _emit_optim_bfgs_assignment(o: FEmit, target: str, rhs: str, comment: str = 
     o.w(f"{p} = {par_f}")
     o.w(f"{np} = size({p})")
     o.w(f"{max_iter} = {maxit_f}")
+    o.w(f"{ndeps} = {ndeps_f}")
     o.w(f"{gtol} = max({gtol_f}, sqrt(epsilon(1.0_dp)))")
     o.w(f"allocate({pnew}({np}), {ptmp}({np}), {g}({np}), {gnew}({np}), {h}({np},{np}), {d}({np}), {svec}({np}), {yvec}({np}), {amat}({np},{np}), {tmp}({np},{np}))")
     o.w(f"{h} = 0.0_dp")
