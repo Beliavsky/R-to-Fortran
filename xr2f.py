@@ -3028,7 +3028,7 @@ def classify_vars(
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
-                elif st.name == "max_dot_assets" and re.match(r"^min\s*\(", rhs, re.IGNORECASE):
+                elif st.name in {"max_dot_assets", "max_dot_returns"} and re.match(r"^min\s*\(", rhs, re.IGNORECASE):
                     ints.add(st.name)
                     params.pop(st.name, None)
                     known_arrays.discard(st.name)
@@ -3051,7 +3051,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                    elif re.search(r"\b(sum|mean|max|min|maxval|minval|logsumexp|sd|r_sd|tail)\s*\(", rhs, re.IGNORECASE) or re.search(r"\[[^:,\]]+\]", rhs):
+                    elif re.search(r"\b(sum|mean|max|min|maxval|minval|logsumexp|sd|r_sd|tail|det|logdet_spd)\s*\(", rhs, re.IGNORECASE) or re.search(r"\[[^:,\]]+\]", rhs):
                         real_scalars.add(st.name)
                         params.pop(st.name, None)
                         ints.discard(st.name)
@@ -3093,7 +3093,7 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
-                elif st.name in {"i", "j", "k", "it", "iter", "row1", "row2", "col1", "col2", "nfit", "max_order", "max_dot_assets", "aic_dot_comp", "bic_dot_comp", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
+                elif st.name in {"i", "j", "k", "it", "iter", "i0", "i1", "i2", "row1", "row2", "col1", "col2", "nfit", "max_order", "max_dot_assets", "max_dot_returns", "aic_dot_comp", "bic_dot_comp", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
                     ints.add(st.name)
                     params.pop(st.name, None)
                     known_arrays.discard(st.name)
@@ -3101,7 +3101,7 @@ def classify_vars(
                     real_scalars.discard(st.name)
                     real_arrays.discard(st.name)
                 elif re.match(
-                    r"^[A-Za-z]\w*\$(?:n|k|nobs|nseries|convergence|n_iter|order|trial)\s*$",
+                    r"^[A-Za-z]\w*\$(?:n|k|p|q|aic_p|aic_q|bic_p|bic_q|aic_row|bic_row|nobs|nseries|convergence|n_iter|order|trial)\s*$",
                     rhs,
                     re.IGNORECASE,
                 ):
@@ -3111,6 +3111,13 @@ def classify_vars(
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                     real_arrays.discard(st.name)
+                elif re.match(r"^[A-Za-z]\w*\$(?:par|coef|fitted|resid|mu|pi|weights|nk)\s*$", rhs, re.IGNORECASE):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 else:
                     real_scalars.add(st.name)
                     params.pop(st.name, None)
@@ -3244,6 +3251,12 @@ def classify_vars(
         real_scalars.discard("asset")
         params.pop("asset", None)
         ints.add("asset")
+    for bound_nm in {"i0", "i1", "i2", "row0", "row1", "row2", "col0", "col1", "col2", "start", "start_row"} & set(assign_counts):
+        int_arrays.discard(bound_nm)
+        real_arrays.discard(bound_nm)
+        real_scalars.discard(bound_nm)
+        params.pop(bound_nm, None)
+        ints.add(bound_nm)
     return ints, real_scalars, int_arrays, real_arrays, params
 
 
@@ -3256,8 +3269,9 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bn(?:row|col)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bdim\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bapply\s*\(\s*{re.escape(arg)}\b"),
-        re.compile(rf"\b(?:chol|sweep)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\b(?:chol|sweep|det)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b(?:fit_var|fit_var_orders|make_var_design)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\b{re.escape(arg)}\s*\[\s*,"),
         re.compile(rf"\b{re.escape(arg)}\s*\[[^,\[\]\(\)]+,\s*[^,\[\]\(\)]+\]"),
         re.compile(rf"\b{re.escape(arg)}\s*%\*%"),
     ]
@@ -3504,6 +3518,13 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         )
 
     for t in texts:
+        m_comp_rhs = re.match(rf"^\s*{nm}\s*<-\s*[A-Za-z]\w*\$(\w+)\s*$", t, re.IGNORECASE)
+        if m_comp_rhs is not None:
+            fld_rhs = m_comp_rhs.group(1).lower()
+            if fld_rhs in {"ar", "ma", "sigma", "table", "design", "y"}:
+                return 2
+            if fld_rhs in {"par", "coef", "fitted", "resid", "mu", "pi", "weights", "nk"}:
+                return 1
         m_user_call_rhs = re.match(rf"^\s*{nm}\s*<-\s*([A-Za-z]\w*)\s*\(", t, re.IGNORECASE)
         if m_user_call_rhs is not None:
             rr = _USER_FUNC_RETURN_RANK.get(m_user_call_rhs.group(1).lower())
@@ -9101,6 +9122,51 @@ def emit_function(
         _walk_int64_assigns(body_use)
         int64_locals &= ints
         assigned_locals = set(infer_assigned_names(body_use).keys())
+        def _force_local_vector_component_aliases(ss_alias: list[object]) -> None:
+            int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
+            real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
+            vector_fields = {"par", "coef", "fitted", "resid", "mu", "pi", "weights", "nk"}
+            matrix_fields = {"ar", "ma", "sigma", "table", "design", "y"}
+            for st_alias in ss_alias:
+                if isinstance(st_alias, Assign):
+                    rhs_alias = st_alias.expr.strip()
+                    m_scalar_alias = re.match(r"^[A-Za-z]\w*\$([A-Za-z]\w*)\s*$", rhs_alias, re.IGNORECASE)
+                    if m_scalar_alias is not None and m_scalar_alias.group(1).lower() in int_fields:
+                        ints.add(st_alias.name)
+                        int_arrays.discard(st_alias.name)
+                        real_arrays.discard(st_alias.name)
+                        real_scalars.discard(st_alias.name)
+                        params.pop(st_alias.name, None)
+                    elif m_scalar_alias is not None and m_scalar_alias.group(1).lower() in real_fields:
+                        real_scalars.add(st_alias.name)
+                        ints.discard(st_alias.name)
+                        int_arrays.discard(st_alias.name)
+                        real_arrays.discard(st_alias.name)
+                        params.pop(st_alias.name, None)
+                    elif re.match(rf"^[A-Za-z]\w*\$(?:{'|'.join(sorted(vector_fields))})\s*$", rhs_alias, re.IGNORECASE):
+                        real_arrays.add(st_alias.name)
+                        ints.discard(st_alias.name)
+                        int_arrays.discard(st_alias.name)
+                        real_scalars.discard(st_alias.name)
+                        params.pop(st_alias.name, None)
+                    elif re.match(rf"^[A-Za-z]\w*\$(?:{'|'.join(sorted(matrix_fields))})\s*$", rhs_alias, re.IGNORECASE):
+                        real_arrays.add(st_alias.name)
+                        known_arrays.add(st_alias.name)
+                        ints.discard(st_alias.name)
+                        int_arrays.discard(st_alias.name)
+                        real_scalars.discard(st_alias.name)
+                        params.pop(st_alias.name, None)
+                elif isinstance(st_alias, IfStmt):
+                    _force_local_vector_component_aliases(st_alias.then_body)
+                    _force_local_vector_component_aliases(st_alias.else_body)
+                elif isinstance(st_alias, ForStmt):
+                    _force_local_vector_component_aliases(st_alias.body)
+                elif isinstance(st_alias, WhileStmt):
+                    _force_local_vector_component_aliases(st_alias.body)
+                elif isinstance(st_alias, RepeatStmt):
+                    _force_local_vector_component_aliases(st_alias.body)
+
+        _force_local_vector_component_aliases(body_use)
         for metric_scalar in {"loglik", "aic", "bic", "npar", "ridge", "sigma2"} & assigned_locals:
             ints.discard(metric_scalar)
             int_arrays.discard(metric_scalar)
@@ -11365,8 +11431,9 @@ def transpile_r_to_fortran(
         real_matrices.discard(nm)
 
     def _force_main_list_component_alias_types(ss_alias: list[object]) -> None:
-        int_fields = {"n", "k", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
+        int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
         real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
+        matrix_fields = {"ar", "ma", "sigma", "table", "design", "y"}
         for st_alias in ss_alias:
             if isinstance(st_alias, Assign):
                 rhs_alias = st_alias.expr.strip()
@@ -11388,6 +11455,13 @@ def transpile_r_to_fortran(
                 elif fld in real_fields:
                     real_scalars.add(st_alias.name)
                     ints.discard(st_alias.name)
+                elif fld in matrix_fields:
+                    real_matrices.add(st_alias.name)
+                    ints.discard(st_alias.name)
+                    int_arrays.discard(st_alias.name)
+                    real_arrays.discard(st_alias.name)
+                    real_scalars.discard(st_alias.name)
+                    params.pop(st_alias.name, None)
             elif isinstance(st_alias, IfStmt):
                 _force_main_list_component_alias_types(st_alias.then_body)
                 _force_main_list_component_alias_types(st_alias.else_body)
@@ -12867,7 +12941,7 @@ def transpile_r_to_fortran(
                     fn_real_arrays = fn_real_array_names.get(fn_name, set())
                     fn_real_mats = fn_real_matrix_names.get(fn_name, set())
                     fn_lms = fn_lm_names.get(fn_name, set())
-                    if k in {"n", "k", "trial", "n_iter", "convergence", "nobs", "nseries"}:
+                    if k in {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "trial", "n_iter", "convergence", "nobs", "nseries"}:
                         o.w(f"integer :: {k}")
                     elif k == "ok":
                         o.w(f"logical :: {k}")
@@ -14322,6 +14396,8 @@ def main() -> int:
             return r_run.returncode
         print("Run (r): PASS")
         _print_captured(r_run, round_digits=args.round_both)
+        if args.run_both:
+            print()
 
     t0 = time.perf_counter()
     src = in_path.read_text(encoding="utf-8")
