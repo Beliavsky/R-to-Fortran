@@ -6424,6 +6424,23 @@ def emit_stmts(
                 return r_expr_to_fortran(src.strip())
         return None
 
+    def _int_col_mask_literal(labels: list[str]) -> str | None:
+        int_names = {
+            "nobs",
+            "n",
+            "order",
+            "ar.order",
+            "ma.order",
+            "convergence",
+            "ok",
+            "class",
+            "cluster",
+        }
+        mask = [lab.strip().lower() in int_names for lab in labels]
+        if not any(mask):
+            return None
+        return "[" + ", ".join(".true." if x else ".false." for x in mask) + "]"
+
     def _char_array_literal(labels: list[str]) -> str:
         if not labels:
             return "[character(len=1) :: ]"
@@ -7378,12 +7395,28 @@ def emit_stmts(
                         if has_r_mod:
                             labels = _matrix_col_labels_for_print(one)
                             if labels is not None:
-                                _wstmt(f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)})", st.comment)
+                                int_cols = _int_col_mask_literal(labels)
+                                if int_cols is not None:
+                                    _wstmt(
+                                        f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)}, "
+                                        f"int_cols={int_cols})",
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)})", st.comment)
                                 need_r_mod.add("print_matrix_rstyle_named")
                             else:
                                 label_expr = _matrix_col_label_expr_for_print(one)
                                 if label_expr is not None:
-                                    _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
+                                    if re.fullmatch(r"arma_mat", one_f.strip(), re.IGNORECASE):
+                                        _wstmt(
+                                            f"call print_matrix_rstyle_named({one_f}, {label_expr}, "
+                                            f"int_cols=[.true., .true., spread(.false., dim=1, "
+                                            f"ncopies=max(0, size({label_expr}) - 4)), .true., .true.])",
+                                            st.comment,
+                                        )
+                                    else:
+                                        _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
                                     need_r_mod.add("print_matrix_rstyle_named")
                                 else:
                                     _wstmt(f"call print_matrix({one_f})", st.comment)
@@ -10884,10 +10917,10 @@ def transpile_r_to_fortran(
         real_arrays.discard("arma_mat")
         real_scalars.discard("arma_mat")
         for nm_order in ("aic_order", "bic_order"):
-            real_arrays.add(nm_order)
+            int_arrays.add(nm_order)
+            real_arrays.discard(nm_order)
             real_scalars.discard(nm_order)
             ints.discard(nm_order)
-            int_arrays.discard(nm_order)
             params.pop(nm_order, None)
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices))}
