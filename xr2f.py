@@ -42,6 +42,8 @@ _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _NULL_ARRAY_SENTINELS: dict[str, str] = {}
 _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
+_CATEGORICAL_LABELS: dict[str, list[str]] = {}
+_TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
@@ -2640,6 +2642,23 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif rhs.lower().startswith("sample(") and st.name.lower() in _CATEGORICAL_LABELS:
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif rhs.lower().startswith("table("):
+                    c_table_rhs = parse_call_text(rhs)
+                    vals_table_rhs = (list(c_table_rhs[1]) + list(c_table_rhs[2].values())) if c_table_rhs is not None else []
+                    if len(vals_table_rhs) <= 1:
+                        int_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        real_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
                 elif rhs.lower().startswith("sample(") and st.name in int_arrays:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -3805,6 +3824,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
         return False
+    if re.search(r"\b(?:sample|sample\.int|runif|rnorm|rexp|rbinom|rpois)\s*\(", t, re.IGNORECASE):
+        return False
     if _split_top_level_colon(fscan.strip_redundant_outer_parens_expr(t)) is not None:
         return False
     return True
@@ -4637,10 +4658,34 @@ def r_expr_to_fortran(expr: str) -> str:
                 return ".false."
         if nm_pre == "table":
             vals = list(pos_pre) + list(c_pre[2].values())
+            if len(vals) >= 2:
+                x_f = r_expr_to_fortran(vals[0])
+                y_f = r_expr_to_fortran(vals[1])
+                nlab_x = len(_CATEGORICAL_LABELS.get(vals[0].strip().lower(), []))
+                nlab_y = len(_CATEGORICAL_LABELS.get(vals[1].strip().lower(), []))
+                x_tab = x_f if nlab_x else f"({x_f} - minval({x_f}) + 1)"
+                y_tab = y_f if nlab_y else f"({y_f} - minval({y_f}) + 1)"
+                nx = str(nlab_x) if nlab_x else f"maxval({x_f}) - minval({x_f}) + 1"
+                ny = str(nlab_y) if nlab_y else f"maxval({y_f}) - minval({y_f}) + 1"
+                return f"table2({x_tab}, {y_tab}, {nx}, {ny})"
             if vals:
                 vtab = r_expr_to_fortran(vals[0])
-                return f"tabulate({vtab}, maxval({vtab}))"
+                nlab = len(_CATEGORICAL_LABELS.get(vals[0].strip().lower(), []))
+                vtab_shifted = vtab if nlab else f"({vtab} - minval({vtab}) + 1)"
+                nbins = str(nlab) if nlab else f"maxval({vtab}) - minval({vtab}) + 1"
+                return f"tabulate({vtab_shifted}, {nbins})"
             return "[0]"
+        if nm_pre in {"prop.table", "prop_table"}:
+            vals = list(pos_pre) + [v for k, v in c_pre[2].items() if k.lower() not in {"margin"}]
+            margin_src = c_pre[2].get("margin")
+            if margin_src is None and len(pos_pre) >= 2:
+                vals = [pos_pre[0]]
+                margin_src = pos_pre[1]
+            if vals:
+                x_f = r_expr_to_fortran(vals[0])
+                if margin_src is not None:
+                    return f"prop_table({x_f}, margin={_int_bound_expr(r_expr_to_fortran(margin_src))})"
+                return f"prop_table({x_f})"
     if c_pre is not None and c_pre[0].lower() == "sub":
         _nm_sub, pos_sub, _kw_sub = c_pre
         if len(pos_sub) >= 3:
@@ -4735,6 +4780,11 @@ def r_expr_to_fortran(expr: str) -> str:
                 vf_tt = f"{int(vf_tt.strip())}.0_dp"
             kw_out_tt.append(f"{_sanitize_fortran_kwarg_name(k)}={vf_tt}")
         return f"t_test({', '.join(pos_out_tt + kw_out_tt)})"
+    if c_usr is not None and c_usr[0].lower() in {"chisq.test", "chisq_test"}:
+        _nm_ch, pos_ch, kw_ch = c_usr
+        pos_out_ch = [r_expr_to_fortran(a) for a in pos_ch]
+        kw_out_ch = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ch.items()]
+        return f"chisq_test({', '.join(pos_out_ch + kw_out_ch)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
         args_q = [r_expr_to_fortran(a) for a in pos_q]
@@ -4820,11 +4870,16 @@ def r_expr_to_fortran(expr: str) -> str:
         prob_src = kw_s.get("prob")
         x_t = x_src.strip()
         identity_base = False
+        labels_x = _parse_string_c_vector(x_t)
+        if labels_x is not None:
+            n_f = str(len(labels_x))
+            base_f = f"r_seq_int(1, {n_f})"
+            identity_base = True
         if _is_int_literal(x_t):
             n_f = _int_bound_expr(r_expr_to_fortran(x_t))
             base_f = f"r_seq_int(1, {n_f})"
             identity_base = True
-        else:
+        elif labels_x is None:
             c_x = parse_call_text(x_t)
             if c_x is not None and c_x[0].lower() in {"seq_len", "seq.int"} and len(c_x[1]) == 1 and not c_x[2]:
                 n_f = _int_bound_expr(r_expr_to_fortran(c_x[1][0]))
@@ -6502,6 +6557,16 @@ def emit_stmts(
                 return _expr_rank_for_print(c[1][0])
             if nm_c == "c":
                 return 1
+            if nm_c in {"table", "table2"}:
+                vals_c = list(c[1]) + list(c[2].values())
+                return 2 if len(vals_c) >= 2 or nm_c == "table2" else 1
+            if nm_c in {"prop.table", "prop_table"}:
+                vals_c = list(c[1]) + [v for k, v in c[2].items() if k.lower() != "margin"]
+                if vals_c:
+                    rr = _expr_rank_for_print(vals_c[0])
+                    if rr is not None:
+                        return rr
+                return 1
             if nm_c in {"dim", "rev", "rep.int"}:
                 return 1
             if nm_c in {
@@ -6530,6 +6595,7 @@ def emit_stmts(
                 "rank_average",
                 "rank_first",
                 "solve_real",
+                "prop_table",
             }:
                 return 1
             if nm_c == "r_matmul":
@@ -6694,6 +6760,23 @@ def emit_stmts(
         width = max(1, max(len(x) for x in labels))
         vals = ", ".join('"' + x.replace('"', '""') + '"' for x in labels)
         return f"[character(len={width}) :: {vals}]"
+
+    def _table_labels_for_expr(expr_txt: str) -> tuple[list[str] | None, list[str] | None] | None:
+        t_tbl = expr_txt.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", t_tbl):
+            return _TABLE_LABELS.get(t_tbl.lower())
+        c_tbl = parse_call_text(t_tbl)
+        if c_tbl is None or c_tbl[0].lower() != "table":
+            return None
+        vals_tbl = list(c_tbl[1]) + list(c_tbl[2].values())
+        if len(vals_tbl) == 1:
+            return (_CATEGORICAL_LABELS.get(vals_tbl[0].strip().lower()), None)
+        if len(vals_tbl) >= 2:
+            return (
+                _CATEGORICAL_LABELS.get(vals_tbl[0].strip().lower()) or [],
+                _CATEGORICAL_LABELS.get(vals_tbl[1].strip().lower()) or [],
+            )
+        return None
 
     def _print_only_loop_body_with_value(ss: list[object], var: str, value_expr: str) -> list[object] | None:
         if not ss:
@@ -7573,9 +7656,17 @@ def emit_stmts(
                         _wstmt(f"call print_t_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
                         continue
+                    if re.match(r"^chisq_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_chisq_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_chisq_test", "chisq_test", "chisq_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"chisq.test", "chisq_test"}:
+                        _wstmt(f"call print_chisq_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"chisq_test", "print_chisq_test", "chisq_test_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
@@ -7664,6 +7755,46 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({names_arg})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    table_labels = _table_labels_for_expr(one)
+                    if has_r_mod and table_labels is not None:
+                        row_labs, col_labs = table_labels
+                        one_f_tbl = r_expr_to_fortran(one)
+                        if col_labs is None:
+                            if row_labs:
+                                _wstmt(f"call print_table1({one_f_tbl}, {_char_array_literal(row_labs)})", st.comment)
+                                need_r_mod.add("print_table1")
+                            else:
+                                _wstmt(f"call print_real_vector(real({one_f_tbl}, kind=dp))", st.comment)
+                                need_r_mod.add("print_real_vector")
+                            continue
+                        if row_labs and col_labs:
+                            _wstmt(
+                                f"call print_table2({one_f_tbl}, {_char_array_literal(row_labs)}, {_char_array_literal(col_labs)})",
+                                st.comment,
+                            )
+                            need_r_mod.add("print_table2")
+                            continue
+                    if has_r_mod and c_one is not None and c_one[0].lower() in {"prop.table", "prop_table"}:
+                        vals_prop = list(c_one[1]) + [v for k, v in c_one[2].items() if k.lower() != "margin"]
+                        x_prop = vals_prop[0].strip() if vals_prop else ""
+                        prop_labs = _table_labels_for_expr(x_prop)
+                        if prop_labs is not None:
+                            row_labs, col_labs = prop_labs
+                            one_f_prop = r_expr_to_fortran(one)
+                            if col_labs is None and row_labs:
+                                _wstmt(
+                                    f"call print_named_real_vector({one_f_prop}, {_char_array_literal(row_labs)})",
+                                    st.comment,
+                                )
+                                need_r_mod.add("print_named_real_vector")
+                                continue
+                            if row_labs and col_labs:
+                                _wstmt(
+                                    f"call print_table2({one_f_prop}, {_char_array_literal(row_labs)}, {_char_array_literal(col_labs)})",
+                                    st.comment,
+                                )
+                                need_r_mod.add("print_table2")
+                                continue
                     named_parts = _named_vector_print_parts(one)
                     if has_r_mod and named_parts is not None:
                         val_expr, name_expr, scalar_val = named_parts
@@ -9998,6 +10129,64 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
     return out
 
 
+def collect_categorical_sample_labels(stmts: list[object]) -> dict[str, list[str]]:
+    """Find vars assigned from sample(c("A", ...)) and keep their level labels."""
+    out: dict[str, list[str]] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                cinfo = parse_call_text(st.expr.strip())
+                if cinfo is not None and cinfo[0].lower() == "sample":
+                    x_src = cinfo[1][0] if cinfo[1] else cinfo[2].get("x")
+                    labels = _parse_string_c_vector(x_src.strip()) if x_src is not None else None
+                    if labels is not None:
+                        out[st.name.lower()] = labels
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return out
+
+
+def collect_table_labels(stmts: list[object], categorical_labels: dict[str, list[str]]) -> dict[str, tuple[list[str] | None, list[str] | None]]:
+    """Track labels for simple table(...) results assigned to variables."""
+    out: dict[str, tuple[list[str] | None, list[str] | None]] = {}
+
+    def _labels_for(src: str) -> list[str] | None:
+        return categorical_labels.get(src.strip().lower())
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                cinfo = parse_call_text(st.expr.strip())
+                if cinfo is not None and cinfo[0].lower() == "table":
+                    vals = list(cinfo[1]) + list(cinfo[2].values())
+                    if len(vals) == 1:
+                        out[st.name.lower()] = (_labels_for(vals[0]), None)
+                    elif len(vals) >= 2:
+                        out[st.name.lower()] = (_labels_for(vals[0]) or [], _labels_for(vals[1]) or [])
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return out
+
+
 def infer_function_character_scalars(fn: FuncDef) -> set[str]:
     """Infer character scalar locals from string comparisons and string helpers."""
     out: set[str] = set()
@@ -10248,6 +10437,11 @@ def infer_main_integer_matrices(stmts: list[object]) -> set[str]:
             continue
         rhs = st.expr.strip()
         cinfo_o = parse_call_text(rhs)
+        if cinfo_o is not None and cinfo_o[0].lower() == "table":
+            vals = list(cinfo_o[1]) + list(cinfo_o[2].values())
+            if len(vals) >= 2:
+                out.add(st.name)
+                continue
         if cinfo_o is not None and cinfo_o[0].lower() == "array":
             data_src = cinfo_o[1][0] if cinfo_o[1] else cinfo_o[2].get("data", "")
             data_txt = data_src.strip()
@@ -11108,12 +11302,14 @@ def transpile_r_to_fortran(
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
-    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
+    _CATEGORICAL_LABELS = {}
+    _TABLE_LABELS = {}
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -11135,6 +11331,8 @@ def transpile_r_to_fortran(
         )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    _CATEGORICAL_LABELS = collect_categorical_sample_labels(stmts)
+    _TABLE_LABELS = collect_table_labels(stmts, _CATEGORICAL_LABELS)
     _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
     _VOID_FUNCTION_LIKE = {
         f.name.lower()
@@ -13153,8 +13351,15 @@ def transpile_r_to_fortran(
         "t_test",
         "t_test_p_value",
         "print_t_test",
+        "chisq_test_result_t",
+        "chisq_test",
+        "print_chisq_test",
         "max_col",
         "tabulate",
+        "table2",
+        "prop_table",
+        "print_table1",
+        "print_table2",
         "nested_matrix_list_len",
     }
     mod_needed: set[str] = set()
