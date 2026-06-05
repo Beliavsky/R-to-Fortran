@@ -5,18 +5,26 @@ use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, &
    & ieee_is_finite
 implicit none
 private
-public :: runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, random_choice2_prob, &
+public :: runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
-   & pmax, sd, r_sd, var, r_format_vec, colMeans, count_ws_tokens, read_real_vector, read_table_real_matrix, read_csv_real_matrix, &
-   & write_table_real_matrix, lm_fit_t, lm_fit_general, lm_predict_general, &
+   & pmax, sd, r_sd, var, r_format_vec, colMeans, count_ws_tokens, &
+   & read_real_vector, read_table_real_matrix, read_csv_real_matrix, &
+   & write_table_real_matrix, lm_fit_t, optim_result_t, lm_fit_general, lm_predict_general, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, cov, cor, r_seq_int, r_seq_len, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
    & r_rep_real, r_rep_int, r_array_real, r_array_int, r_array_char, matrix, &
-   & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, print_real_vector, print_char_vector, &
-   & print_named_real_vector, print_summary, set_print_int_like, &
+   & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
+   & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
+   & print_real_vector, print_char_vector, &
+   & print_named_real_vector, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
-   & kmeans_result_t, kmeans, max_col, tabulate, match, findInterval, cumsum, cumprod, diff, diag, toeplitz, chol, backsolve, sort, &
-   & nchar, is_na, r_typeof, r_character, order_real, rank_average, rank_first, det_real, solve_real, nested_matrix_list_len
+   & kmeans_result_t, kmeans, max_col, tabulate, table2, prop_table, match, findInterval, &
+   & cumsum, cumprod, diff, diag, toeplitz, chol, backsolve, sort, polyroot, &
+   & nchar, is_na, r_typeof, r_character, order_real, rank_average, &
+   & rank_first, det_real, eigen_sym_values, solve_real, &
+   & nested_matrix_list_len, t_test_result_t, t_test, t_test_p_value, print_t_test, &
+   & chisq_test_result_t, chisq_test, print_chisq_test, prop_test_result_t, &
+   & prop_test, print_prop_test
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -32,6 +40,42 @@ type :: kmeans_result_t
    integer, allocatable :: cluster(:)
 end type kmeans_result_t
 
+type :: optim_result_t
+   real(kind=dp), allocatable :: par(:)
+   real(kind=dp) :: value
+   integer :: convergence
+end type optim_result_t
+
+type :: t_test_result_t
+   real(kind=dp) :: statistic = 0.0_dp
+   real(kind=dp) :: parameter = 0.0_dp
+   real(kind=dp) :: p_value = 1.0_dp
+   real(kind=dp) :: estimate = 0.0_dp
+   real(kind=dp) :: estimate2 = 0.0_dp
+   real(kind=dp) :: null_value = 0.0_dp
+   real(kind=dp) :: conf_low = 0.0_dp
+   real(kind=dp) :: conf_high = 0.0_dp
+   real(kind=dp) :: stderr = 0.0_dp
+   integer :: method = 1
+end type t_test_result_t
+
+type :: chisq_test_result_t
+   real(kind=dp) :: statistic = 0.0_dp
+   integer :: parameter = 0
+   real(kind=dp) :: p_value = 1.0_dp
+   integer :: method = 1
+end type chisq_test_result_t
+
+type :: prop_test_result_t
+   real(kind=dp) :: statistic = 0.0_dp
+   integer :: parameter = 0
+   real(kind=dp) :: p_value = 1.0_dp
+   real(kind=dp) :: estimate = 0.0_dp
+   real(kind=dp) :: estimate2 = 0.0_dp
+   real(kind=dp) :: null_value = 0.0_dp
+   integer :: method = 1
+end type prop_test_result_t
+
 interface cov
    module procedure cov_vec
    module procedure cov_mat
@@ -45,7 +89,37 @@ end interface var
 interface cor
    module procedure cor_vec
    module procedure cor_mat
+   module procedure cor_mat_pair
 end interface cor
+
+interface kmeans
+   module procedure kmeans_vec
+   module procedure kmeans_mat
+end interface kmeans
+
+interface t_test
+   module procedure t_test_one
+   module procedure t_test_two
+end interface t_test
+
+interface t_test_p_value
+   module procedure t_test_p_value_one
+   module procedure t_test_p_value_two
+end interface t_test_p_value
+
+interface chisq_test
+   module procedure chisq_test_int_vec
+   module procedure chisq_test_real_vec
+   module procedure chisq_test_int_mat
+   module procedure chisq_test_real_mat
+end interface chisq_test
+
+interface prop_test
+   module procedure prop_test_int_scalar
+   module procedure prop_test_real_scalar
+   module procedure prop_test_int_vec
+   module procedure prop_test_real_vec
+end interface prop_test
 
 interface matrix
    module procedure matrix_real
@@ -116,6 +190,20 @@ interface tabulate
    module procedure tabulate_real
 end interface tabulate
 
+interface table2
+   module procedure table2_int
+end interface table2
+
+interface prop_table
+   module procedure prop_table_int_vec
+   module procedure prop_table_int_mat
+end interface prop_table
+
+interface print_table2
+   module procedure print_table2_int
+   module procedure print_table2_real
+end interface print_table2
+
 interface match
    module procedure match_int
    module procedure match_real
@@ -153,6 +241,7 @@ interface diag
    module procedure diag_mat_int
    module procedure diag_vec_int
    module procedure diag_scalar_int
+   module procedure diag_scalar_real_n
 end interface diag
 
 interface sort
@@ -237,7 +326,7 @@ call random_seed(put=put)
 deallocate(put)
 end subroutine set_seed_int
 
-function kmeans(x, centers, nstart) result(out)
+function kmeans_vec(x, centers, nstart) result(out)
 ! Minimal 1D k-means helper: returns centers and 1-based cluster ids.
 real(kind=dp), intent(in) :: x(:)
 integer, intent(in) :: centers
@@ -297,7 +386,71 @@ do it = 1, 50 * nstart_loc
 end do
 out%centers = c
 out%cluster = cl
-end function kmeans
+end function kmeans_vec
+
+function kmeans_mat(x, centers, nstart) result(out)
+! Minimal row-wise k-means helper for matrix observations.
+real(kind=dp), intent(in) :: x(:,:)
+integer, intent(in) :: centers
+integer, intent(in), optional :: nstart
+type(kmeans_result_t) :: out
+real(kind=dp), allocatable :: c(:,:), c_new(:,:), sums(:,:), dist(:)
+integer, allocatable :: cnt(:), cl(:)
+integer :: i, j, k, n, p, it, jbest, nstart_loc
+real(kind=dp) :: d, dbest, shift
+n = size(x, 1)
+p = size(x, 2)
+k = max(1, centers)
+nstart_loc = 1
+if (present(nstart)) nstart_loc = max(1, nstart)
+allocate(c(k, p), c_new(k, p), sums(k, p), cnt(k), cl(n), dist(n))
+if (n <= 0 .or. p <= 0) then
+   out%centers = reshape(c, [k * max(1, p)])
+   out%cluster = cl
+   return
+end if
+do i = 1, n
+   dist(i) = sum((x(i, :) - sum(x, dim=1) / real(n, kind=dp))**2)
+end do
+do j = 1, k
+   c(j, :) = x(1 + mod(j - 1, n), :)
+end do
+if (k > 1) then
+   do j = 1, k
+      c(j, :) = x(1 + int(real(j - 1, kind=dp) * real(max(1, n - 1), kind=dp) / real(k - 1, kind=dp)), :)
+   end do
+end if
+do it = 1, 50 * nstart_loc
+   do i = 1, n
+      jbest = 1
+      dbest = sum((x(i, :) - c(1, :))**2)
+      do j = 2, k
+         d = sum((x(i, :) - c(j, :))**2)
+         if (d < dbest) then
+            dbest = d
+            jbest = j
+         end if
+      end do
+      cl(i) = jbest
+   end do
+   sums = 0.0_dp
+   cnt = 0
+   do i = 1, n
+      j = cl(i)
+      sums(j, :) = sums(j, :) + x(i, :)
+      cnt(j) = cnt(j) + 1
+   end do
+   c_new = c
+   do j = 1, k
+      if (cnt(j) > 0) c_new(j, :) = sums(j, :) / real(cnt(j), kind=dp)
+   end do
+   shift = maxval(abs(c_new - c))
+   if (shift <= 1.0e-12_dp * max(1.0_dp, maxval(abs(c)))) exit
+   c = c_new
+end do
+out%centers = reshape(transpose(c), [k * p])
+out%cluster = cl
+end function kmeans_mat
 
 pure function max_col(x, ties_method) result(idx)
 ! Return 1-based column index of row-wise maxima (ties -> first).
@@ -356,6 +509,77 @@ do i = 1, size(x)
    if (b >= 1 .and. b <= size(out)) out(b) = out(b) + 1
 end do
 end function tabulate_real
+
+function table2_int(x, y, nx, ny) result(out)
+! Count paired integer labels into an nx-by-ny contingency table.
+integer, intent(in) :: x(:), y(:)
+integer, intent(in) :: nx, ny
+integer, allocatable :: out(:,:)
+integer :: i, a, b, n
+allocate(out(max(0, nx), max(0, ny)))
+if (size(out) > 0) out = 0
+n = min(size(x), size(y))
+do i = 1, n
+   a = x(i)
+   b = y(i)
+   if (a >= 1 .and. a <= size(out, 1) .and. b >= 1 .and. b <= size(out, 2)) then
+      out(a, b) = out(a, b) + 1
+   end if
+end do
+end function table2_int
+
+function prop_table_int_vec(x, margin) result(out)
+! Convert integer counts to proportions.
+integer, intent(in) :: x(:)
+integer, intent(in), optional :: margin
+real(kind=dp), allocatable :: out(:)
+integer :: s
+allocate(out(size(x)))
+s = sum(x)
+if (s > 0) then
+   out = real(x, kind=dp) / real(s, kind=dp)
+else
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+end if
+end function prop_table_int_vec
+
+function prop_table_int_mat(x, margin) result(out)
+! Convert integer contingency tables to overall, row, or column proportions.
+integer, intent(in) :: x(:,:)
+integer, intent(in), optional :: margin
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j, s
+allocate(out(size(x, 1), size(x, 2)))
+if (present(margin)) then
+   if (margin == 1) then
+      do i = 1, size(x, 1)
+         s = sum(x(i, :))
+         if (s > 0) then
+            out(i, :) = real(x(i, :), kind=dp) / real(s, kind=dp)
+         else
+            out(i, :) = ieee_value(0.0_dp, ieee_quiet_nan)
+         end if
+      end do
+      return
+   else if (margin == 2) then
+      do j = 1, size(x, 2)
+         s = sum(x(:, j))
+         if (s > 0) then
+            out(:, j) = real(x(:, j), kind=dp) / real(s, kind=dp)
+         else
+            out(:, j) = ieee_value(0.0_dp, ieee_quiet_nan)
+         end if
+      end do
+      return
+   end if
+end if
+s = sum(x)
+if (s > 0) then
+   out = real(x, kind=dp) / real(s, kind=dp)
+else
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+end if
+end function prop_table_int_mat
 
 pure function nested_matrix_list_len(x) result(n)
 ! Count non-padding matrix slices in a ragged nested list lowered to rank 3.
@@ -529,6 +753,72 @@ character(len=*), intent(in) :: names(:)
 call print_char_vector(names)
 call print_real_vector(x)
 end subroutine print_named_real_vector
+
+subroutine print_table1(x, names)
+integer, intent(in) :: x(:)
+character(len=*), intent(in) :: names(:)
+integer :: i
+do i = 1, min(size(x), size(names))
+   write(*,'(a,1x)', advance='no') trim(names(i))
+end do
+write(*,*)
+do i = 1, size(x)
+   write(*,'(i0,1x)', advance='no') x(i)
+end do
+write(*,*)
+end subroutine print_table1
+
+subroutine print_table2_int(x, row_names, col_names)
+integer, intent(in) :: x(:,:)
+character(len=*), intent(in) :: row_names(:), col_names(:)
+integer :: i, j
+write(*,'(12x)', advance='no')
+do j = 1, size(x, 2)
+   if (j <= size(col_names)) then
+      write(*,'(a12,1x)', advance='no') trim(col_names(j))
+   else
+      write(*,'(i12,1x)', advance='no') j
+   end if
+end do
+write(*,*)
+do i = 1, size(x, 1)
+   if (i <= size(row_names)) then
+      write(*,'(a12,1x)', advance='no') trim(row_names(i))
+   else
+      write(*,'(i12,1x)', advance='no') i
+   end if
+   do j = 1, size(x, 2)
+      write(*,'(i12,1x)', advance='no') x(i, j)
+   end do
+   write(*,*)
+end do
+end subroutine print_table2_int
+
+subroutine print_table2_real(x, row_names, col_names)
+real(kind=dp), intent(in) :: x(:,:)
+character(len=*), intent(in) :: row_names(:), col_names(:)
+integer :: i, j
+write(*,'(12x)', advance='no')
+do j = 1, size(x, 2)
+   if (j <= size(col_names)) then
+      write(*,'(a12,1x)', advance='no') trim(col_names(j))
+   else
+      write(*,'(i12,1x)', advance='no') j
+   end if
+end do
+write(*,*)
+do i = 1, size(x, 1)
+   if (i <= size(row_names)) then
+      write(*,'(a12,1x)', advance='no') trim(row_names(i))
+   else
+      write(*,'(i12,1x)', advance='no') i
+   end if
+   do j = 1, size(x, 2)
+      write(*,'(f12.4,1x)', advance='no') x(i, j)
+   end do
+   write(*,*)
+end do
+end subroutine print_table2_real
 
 subroutine print_summary_vec(x)
 ! Print an R-like summary for a numeric vector.
@@ -883,6 +1173,25 @@ v = rnorm_vec(nrow * ncol)
 x = reshape(v, [nrow, ncol])
 end function rnorm_mat
 
+function rbinom(n, size_, prob) result(x)
+! Return n binomial(size, prob) variates.
+integer, intent(in) :: n, size_
+real(kind=dp), intent(in) :: prob
+integer, allocatable :: x(:)
+integer :: i, j, s
+real(kind=dp) :: u, p
+allocate(x(max(0, n)))
+p = max(0.0_dp, min(1.0_dp, prob))
+do i = 1, size(x)
+   s = 0
+   do j = 1, max(0, size_)
+      call random_number(u)
+      if (u < p) s = s + 1
+   end do
+   x(i) = s
+end do
+end function rbinom
+
 function random_choice2_prob(n, p1) result(z)
 ! Sample n labels in {1,2} with P(label=1)=p1.
 integer, intent(in) :: n
@@ -1186,6 +1495,61 @@ do k = 1, n
 end do
 end function det_real
 
+pure function eigen_sym_values(x) result(vals)
+! Return eigenvalues of a real symmetric matrix using Jacobi rotations.
+real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), allocatable :: vals(:)
+real(kind=dp), allocatable :: a(:,:)
+integer :: i, j, p, q, iter, n, max_iter
+real(kind=dp) :: app, aqq, apq, c, off, phi, s, tau, t, tmp
+n = size(x, 1)
+allocate(vals(n))
+vals = 0.0_dp
+if (n <= 0 .or. n /= size(x, 2)) return
+a = x
+max_iter = max(1, 100 * n * n)
+do iter = 1, max_iter
+   off = 0.0_dp
+   p = 1
+   q = min(2, n)
+   do i = 1, n - 1
+      do j = i + 1, n
+         if (abs(a(i, j)) > off) then
+            off = abs(a(i, j))
+            p = i
+            q = j
+         end if
+      end do
+   end do
+   if (off <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(a)))) exit
+   app = a(p, p)
+   aqq = a(q, q)
+   apq = a(p, q)
+   if (abs(apq) <= tiny(1.0_dp)) cycle
+   tau = (aqq - app) / (2.0_dp * apq)
+   t = sign(1.0_dp, tau) / (abs(tau) + sqrt(1.0_dp + tau * tau))
+   c = 1.0_dp / sqrt(1.0_dp + t * t)
+   s = t * c
+   do j = 1, n
+      if (j /= p .and. j /= q) then
+         tmp = a(j, p)
+         a(j, p) = c * tmp - s * a(j, q)
+         a(p, j) = a(j, p)
+         a(j, q) = s * tmp + c * a(j, q)
+         a(q, j) = a(j, q)
+      end if
+   end do
+   phi = t * apq
+   a(p, p) = app - phi
+   a(q, q) = aqq + phi
+   a(p, q) = 0.0_dp
+   a(q, p) = 0.0_dp
+end do
+do i = 1, n
+   vals(i) = a(i, i)
+end do
+end function eigen_sym_values
+
 pure function solve_real_vec(a, b) result(x)
 ! Return the solution of a square linear system a %*% x = b.
 real(kind=dp), intent(in) :: a(:,:), b(:)
@@ -1405,6 +1769,19 @@ do i = 1, n
    out(i, i) = 1
 end do
 end function diag_scalar_int
+
+pure function diag_scalar_real_n(x, n) result(out)
+! Create an n by n real diagonal matrix with scalar value x.
+real(kind=dp), intent(in) :: x
+integer, intent(in) :: n
+real(kind=dp), allocatable :: out(:,:)
+integer :: i
+allocate(out(n, n))
+out = 0.0_dp
+do i = 1, n
+   out(i, i) = x
+end do
+end function diag_scalar_real_n
 
 pure function toeplitz(x) result(out)
 ! Symmetric Toeplitz matrix from first column/row vector x.
@@ -2319,6 +2696,26 @@ do i = 1, p
 end do
 end function cor_mat
 
+pure function cor_mat_pair(x, y) result(out)
+! Sample column-pair correlation matrix between x and y.
+real(kind=dp), intent(in) :: x(:,:), y(:,:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j, n, px, py
+n = min(size(x, 1), size(y, 1))
+px = size(x, 2)
+py = size(y, 2)
+allocate(out(px, py))
+if (n <= 1) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
+do i = 1, px
+   do j = 1, py
+      out(i, j) = cor_vec(x(1:n, i), y(1:n, j))
+   end do
+end do
+end function cor_mat_pair
+
 pure integer function count_ws_tokens(line) result(n_tok)
 ! Count whitespace-separated tokens in one text line.
 character(len=*), intent(in) :: line
@@ -2530,11 +2927,13 @@ do i = 1, size(x, 1)
 end do
 end subroutine print_matrix_rstyle_real
 
-subroutine print_matrix_rstyle_named(x, names)
+subroutine print_matrix_rstyle_named(x, names, int_cols)
 ! Print a real matrix with R-like row labels and provided column names.
 real(kind=dp), intent(in) :: x(:,:)
 character(len=*), intent(in) :: names(:)
-integer :: i
+logical, intent(in), optional :: int_cols(:)
+integer :: i, j
+logical :: as_int_col
 write(*,'(7x)', advance='no')
 do i = 1, size(x, 2)
    if (i <= size(names)) then
@@ -2546,7 +2945,18 @@ end do
 write(*,*)
 do i = 1, size(x, 1)
    write(*,'("[",i0,",]",1x)', advance='no') i
-   write(*,'(*(f12.4,1x))') x(i, :)
+   do j = 1, size(x, 2)
+      as_int_col = .false.
+      if (present(int_cols)) then
+         if (j <= size(int_cols)) as_int_col = int_cols(j)
+      end if
+      if (as_int_col .and. ieee_is_finite(x(i, j))) then
+         write(*,'(i12,1x)', advance='no') nint(x(i, j))
+      else
+         write(*,'(f12.4,1x)', advance='no') x(i, j)
+      end if
+   end do
+   write(*,*)
 end do
 end subroutine print_matrix_rstyle_named
 
@@ -2698,6 +3108,48 @@ fit = lm_fit_general(y, xpred)
 coef = fit%coef
 end function lm_coef
 
+pure function polyroot(coef) result(root_mod)
+! Return moduli of roots for coefficients in R polyroot order.
+real(kind=dp), intent(in) :: coef(:)
+real(kind=dp), allocatable :: root_mod(:)
+integer :: n, i, j, iter
+complex(kind=dp), allocatable :: z(:), znew(:)
+complex(kind=dp) :: pz, denom
+real(kind=dp) :: theta, max_delta
+real(kind=dp), parameter :: twopi = 6.2831853071795864769252867665590058_dp
+n = size(coef) - 1
+allocate(root_mod(max(0, n)))
+if (n <= 0) return
+if (abs(coef(n + 1)) <= tiny(1.0_dp)) then
+   root_mod = huge(1.0_dp)
+   return
+end if
+allocate(z(n), znew(n))
+do i = 1, n
+   theta = twopi * real(i - 1, kind=dp) / real(n, kind=dp)
+   z(i) = cmplx(cos(theta), sin(theta), kind=dp)
+end do
+do iter = 1, 200
+   max_delta = 0.0_dp
+   znew = z
+   do i = 1, n
+      pz = cmplx(coef(n + 1), 0.0_dp, kind=dp)
+      do j = n, 1, -1
+         pz = pz * z(i) + cmplx(coef(j), 0.0_dp, kind=dp)
+      end do
+      denom = cmplx(1.0_dp, 0.0_dp, kind=dp)
+      do j = 1, n
+         if (j /= i) denom = denom * (z(i) - z(j))
+      end do
+      if (abs(denom) > tiny(1.0_dp)) znew(i) = z(i) - (pz / cmplx(coef(n + 1), 0.0_dp, kind=dp)) / denom
+      max_delta = max(max_delta, abs(znew(i) - z(i)))
+   end do
+   z = znew
+   if (max_delta <= 100.0_dp * epsilon(1.0_dp)) exit
+end do
+root_mod = abs(z)
+end function polyroot
+
 subroutine print_lm_summary(fit)
 ! Print a compact summary of fitted linear model diagnostics.
 type(lm_fit_t), intent(in) :: fit
@@ -2731,5 +3183,327 @@ else
    write(*,*)
 end if
 end subroutine print_lm_coef_rstyle
+
+pure function normal_cdf(x) result(p)
+real(kind=dp), intent(in) :: x
+real(kind=dp) :: p
+p = 0.5_dp * (1.0_dp + erf(x / sqrt(2.0_dp)))
+end function normal_cdf
+
+pure function chisq_upper_tail_approx(x, df) result(p)
+real(kind=dp), intent(in) :: x, df
+real(kind=dp) :: p, z
+if (df <= 0.0_dp) then
+   p = 1.0_dp
+   return
+end if
+if (x <= 0.0_dp) then
+   p = 1.0_dp
+   return
+end if
+if (abs(df - 1.0_dp) <= epsilon(1.0_dp)) then
+   p = erfc(sqrt(0.5_dp * x))
+   return
+end if
+z = ((x / df)**(1.0_dp / 3.0_dp) - (1.0_dp - 2.0_dp / (9.0_dp * df))) / &
+   & sqrt(2.0_dp / (9.0_dp * df))
+p = max(0.0_dp, min(1.0_dp, 1.0_dp - normal_cdf(z)))
+end function chisq_upper_tail_approx
+
+pure function chisq_test_real_vec(x, p) result(out)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: p(:)
+type(chisq_test_result_t) :: out
+real(kind=dp), allocatable :: expected(:), prob(:)
+real(kind=dp) :: total, psum
+integer :: n
+n = size(x)
+if (n <= 1) return
+total = sum(x)
+if (total <= 0.0_dp) return
+if (present(p)) then
+   if (size(p) /= n) return
+   psum = sum(p)
+   if (psum <= 0.0_dp) return
+   prob = p / psum
+else
+   allocate(prob(n))
+   prob = 1.0_dp / real(n, kind=dp)
+end if
+expected = total * prob
+if (any(expected <= 0.0_dp)) return
+out%statistic = sum((x - expected)**2 / expected)
+out%parameter = n - 1
+out%p_value = chisq_upper_tail_approx(out%statistic, real(out%parameter, kind=dp))
+out%method = 1
+end function chisq_test_real_vec
+
+pure function chisq_test_int_vec(x, p) result(out)
+integer, intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: p(:)
+type(chisq_test_result_t) :: out
+if (present(p)) then
+   out = chisq_test_real_vec(real(x, kind=dp), p)
+else
+   out = chisq_test_real_vec(real(x, kind=dp))
+end if
+end function chisq_test_int_vec
+
+pure function chisq_test_int_mat(x) result(out)
+integer, intent(in) :: x(:,:)
+type(chisq_test_result_t) :: out
+out = chisq_test_real_mat(real(x, kind=dp))
+end function chisq_test_int_mat
+
+pure function chisq_test_real_mat(x) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+type(chisq_test_result_t) :: out
+real(kind=dp), allocatable :: xr(:,:), row_tot(:), col_tot(:), expected(:,:)
+real(kind=dp) :: total
+integer :: nr, nc, i, j
+nr = size(x, 1)
+nc = size(x, 2)
+if (nr <= 1 .or. nc <= 1) return
+xr = x
+total = sum(xr)
+if (total <= 0.0_dp) return
+allocate(row_tot(nr), col_tot(nc), expected(nr, nc))
+do i = 1, nr
+   row_tot(i) = sum(xr(i, :))
+end do
+do j = 1, nc
+   col_tot(j) = sum(xr(:, j))
+end do
+do i = 1, nr
+   do j = 1, nc
+      expected(i, j) = row_tot(i) * col_tot(j) / total
+   end do
+end do
+if (any(expected <= 0.0_dp)) return
+out%statistic = sum((xr - expected)**2 / expected)
+out%parameter = (nr - 1) * (nc - 1)
+out%p_value = chisq_upper_tail_approx(out%statistic, real(out%parameter, kind=dp))
+out%method = 2
+end function chisq_test_real_mat
+
+pure function prop_test_int_scalar(x, n, p, correct) result(out)
+integer, intent(in) :: x, n
+real(kind=dp), intent(in), optional :: p
+logical, intent(in), optional :: correct
+type(prop_test_result_t) :: out
+out = prop_test_real_scalar(real(x, kind=dp), real(n, kind=dp), p, correct)
+end function prop_test_int_scalar
+
+pure function prop_test_real_scalar(x, n, p, correct) result(out)
+real(kind=dp), intent(in) :: x, n
+real(kind=dp), intent(in), optional :: p
+logical, intent(in), optional :: correct
+type(prop_test_result_t) :: out
+real(kind=dp) :: p0, diff, denom
+logical :: use_correct
+p0 = 0.5_dp
+if (present(p)) p0 = p
+if (n <= 0.0_dp .or. p0 <= 0.0_dp .or. p0 >= 1.0_dp) return
+use_correct = .false.
+if (present(correct)) use_correct = correct
+out%estimate = x / n
+out%null_value = p0
+out%parameter = 1
+diff = abs(x - n * p0)
+if (use_correct) diff = max(0.0_dp, diff - 0.5_dp)
+denom = n * p0 * (1.0_dp - p0)
+if (denom > 0.0_dp) out%statistic = diff * diff / denom
+out%p_value = chisq_upper_tail_approx(out%statistic, real(out%parameter, kind=dp))
+out%method = 1
+end function prop_test_real_scalar
+
+pure function prop_test_int_vec(x, n, p, correct) result(out)
+integer, intent(in) :: x(:), n(:)
+real(kind=dp), intent(in), optional :: p
+logical, intent(in), optional :: correct
+type(prop_test_result_t) :: out
+out = prop_test_real_vec(real(x, kind=dp), real(n, kind=dp), p, correct)
+end function prop_test_int_vec
+
+pure function prop_test_real_vec(x, n, p, correct) result(out)
+real(kind=dp), intent(in) :: x(:), n(:)
+real(kind=dp), intent(in), optional :: p
+logical, intent(in), optional :: correct
+type(prop_test_result_t) :: out
+real(kind=dp) :: p0, pooled, denom, diff
+integer :: k, i
+logical :: use_correct
+k = size(x)
+if (k /= size(n) .or. k < 1) return
+if (any(n <= 0.0_dp)) return
+use_correct = .false.
+if (present(correct)) use_correct = correct
+if (k == 1) then
+   if (present(p)) then
+      out = prop_test_real_scalar(x(1), n(1), p, correct)
+   else
+      out = prop_test_real_scalar(x(1), n(1), correct=correct)
+   end if
+   return
+end if
+out%parameter = k - 1
+out%estimate = x(1) / n(1)
+if (k >= 2) out%estimate2 = x(2) / n(2)
+pooled = sum(x) / sum(n)
+out%null_value = pooled
+if (pooled <= 0.0_dp .or. pooled >= 1.0_dp) return
+do i = 1, k
+   p0 = x(i) / n(i)
+   diff = abs(p0 - pooled)
+   if (use_correct .and. k == 2) diff = max(0.0_dp, diff - 0.5_dp / n(i))
+   denom = pooled * (1.0_dp - pooled) / n(i)
+   if (denom > 0.0_dp) out%statistic = out%statistic + diff * diff / denom
+end do
+out%p_value = chisq_upper_tail_approx(out%statistic, real(out%parameter, kind=dp))
+out%method = 2
+end function prop_test_real_vec
+
+pure function t_test_one(x, mu) result(out)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: mu
+type(t_test_result_t) :: out
+real(kind=dp) :: xbar, s, mu0
+integer :: n
+n = size(x)
+mu0 = 0.0_dp
+if (present(mu)) mu0 = mu
+if (n <= 1) return
+xbar = sum(x) / real(n, kind=dp)
+s = sd(x)
+out%stderr = s / sqrt(real(n, kind=dp))
+out%estimate = xbar
+out%null_value = mu0
+out%parameter = real(n - 1, kind=dp)
+if (out%stderr > 0.0_dp) out%statistic = (xbar - mu0) / out%stderr
+out%p_value = 2.0_dp * max(0.0_dp, min(1.0_dp, 1.0_dp - normal_cdf(abs(out%statistic))))
+out%conf_low = xbar - 1.96_dp * out%stderr
+out%conf_high = xbar + 1.96_dp * out%stderr
+out%method = 1
+end function t_test_one
+
+pure function t_test_two(x, y, paired, var_equal) result(out)
+real(kind=dp), intent(in) :: x(:), y(:)
+logical, intent(in), optional :: paired, var_equal
+type(t_test_result_t) :: out
+logical :: is_paired, is_equal
+real(kind=dp) :: nx, ny, mx, my, vx, vy, sp2, denom
+real(kind=dp), allocatable :: d(:)
+is_paired = .false.
+if (present(paired)) is_paired = paired
+is_equal = .false.
+if (present(var_equal)) is_equal = var_equal
+if (is_paired) then
+   if (size(x) /= size(y)) return
+   d = x - y
+   out = t_test_one(d, 0.0_dp)
+   out%method = 4
+   return
+end if
+if (size(x) <= 1 .or. size(y) <= 1) return
+nx = real(size(x), kind=dp)
+ny = real(size(y), kind=dp)
+mx = sum(x) / nx
+my = sum(y) / ny
+vx = var(x)
+vy = var(y)
+out%estimate = mx
+out%estimate2 = my
+out%null_value = 0.0_dp
+if (is_equal) then
+   sp2 = ((nx - 1.0_dp) * vx + (ny - 1.0_dp) * vy) / (nx + ny - 2.0_dp)
+   out%stderr = sqrt(sp2 * (1.0_dp / nx + 1.0_dp / ny))
+   out%parameter = nx + ny - 2.0_dp
+   out%method = 3
+else
+   out%stderr = sqrt(vx / nx + vy / ny)
+   denom = (vx / nx)**2 / max(1.0_dp, nx - 1.0_dp) + (vy / ny)**2 / max(1.0_dp, ny - 1.0_dp)
+   if (denom > 0.0_dp) out%parameter = (vx / nx + vy / ny)**2 / denom
+   out%method = 2
+end if
+if (out%stderr > 0.0_dp) out%statistic = ((mx - my) - out%null_value) / out%stderr
+out%p_value = 2.0_dp * max(0.0_dp, min(1.0_dp, 1.0_dp - normal_cdf(abs(out%statistic))))
+out%conf_low = (mx - my) - 1.96_dp * out%stderr
+out%conf_high = (mx - my) + 1.96_dp * out%stderr
+end function t_test_two
+
+pure function t_test_p_value_one(x, mu) result(p)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: mu
+real(kind=dp) :: p
+type(t_test_result_t) :: fit
+fit = t_test_one(x, mu)
+p = fit%p_value
+end function t_test_p_value_one
+
+pure function t_test_p_value_two(x, y, paired, var_equal) result(p)
+real(kind=dp), intent(in) :: x(:), y(:)
+logical, intent(in), optional :: paired, var_equal
+real(kind=dp) :: p
+type(t_test_result_t) :: fit
+fit = t_test_two(x, y, paired, var_equal)
+p = fit%p_value
+end function t_test_p_value_two
+
+subroutine print_t_test(fit)
+type(t_test_result_t), intent(in) :: fit
+select case (fit%method)
+case (1)
+   write(*,'(a)') "One Sample t-test"
+case (2)
+   write(*,'(a)') "Welch Two Sample t-test"
+case (3)
+   write(*,'(a)') "Two Sample t-test"
+case (4)
+   write(*,'(a)') "Paired t-test"
+case default
+   write(*,'(a)') "t-test"
+end select
+write(*,'(a,g0,a,g0,a,g0)') "t = ", fit%statistic, ", df = ", fit%parameter, ", p-value = ", fit%p_value
+write(*,'(a,g0,a,g0)') "95 percent confidence interval: ", fit%conf_low, " ", fit%conf_high
+if (fit%method == 2 .or. fit%method == 3) then
+   write(*,'(a,g0,a,g0)') "sample estimates: ", fit%estimate, " ", fit%estimate2
+else
+   write(*,'(a,g0)') "sample estimate: ", fit%estimate
+end if
+end subroutine print_t_test
+
+subroutine print_chisq_test(fit)
+type(chisq_test_result_t), intent(in) :: fit
+select case (fit%method)
+case (1)
+   write(*,'(a)') "Chi-squared goodness-of-fit test"
+case (2)
+   write(*,'(a)') "Pearson's Chi-squared test"
+case default
+   write(*,'(a)') "Chi-squared test"
+end select
+write(*,'(a,g0,a,i0,a,g0)') "X-squared = ", fit%statistic, ", df = ", fit%parameter, &
+   & ", p-value = ", fit%p_value
+end subroutine print_chisq_test
+
+subroutine print_prop_test(fit)
+type(prop_test_result_t), intent(in) :: fit
+select case (fit%method)
+case (1)
+   write(*,'(a)') "1-sample proportions test"
+case (2)
+   write(*,'(a)') "2-sample test for equality of proportions"
+case default
+   write(*,'(a)') "proportions test"
+end select
+write(*,'(a,g0,a,i0,a,g0)') "X-squared = ", fit%statistic, ", df = ", fit%parameter, &
+   & ", p-value = ", fit%p_value
+if (fit%method == 2) then
+   write(*,'(a,g0,a,g0)') "sample estimates: ", fit%estimate, " ", fit%estimate2
+else
+   write(*,'(a,g0)') "sample estimate: ", fit%estimate
+   write(*,'(a,g0)') "null value: ", fit%null_value
+end if
+end subroutine print_prop_test
 
 end module r_mod
