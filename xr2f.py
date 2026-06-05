@@ -45,6 +45,7 @@ _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
+_EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -2622,6 +2623,8 @@ def classify_vars(
                 rhs = st.expr.strip()
                 rhs_l = rhs.lower()
                 rhs_f = r_expr_to_fortran(rhs)
+                rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
+                cinfo = parse_call_text(rhs_call_src)
                 mark_array_uses(rhs)
                 if _ifelse_integer_coded(rhs):
                     int_arrays.add(st.name)
@@ -2674,7 +2677,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply)\s*\(", rhs_l):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply|rexp)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -2717,6 +2720,13 @@ def classify_vars(
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif rhs_l.startswith("as.integer("):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif rhs_l.startswith("as.numeric(") or rhs_l.startswith("as.double("):
                     c_asn = parse_call_text(rhs)
@@ -2780,14 +2790,14 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colSums|rowSums|rev|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colSums|rowSums|rev|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3536,6 +3546,8 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         ):
             return 1
+        if re.match(rf"^\s*{nm}\s*<-\s*(?:numeric|double|r_rep_real|r_rep_int|seq|seq_len|seq_along)\s*\(", t, re.IGNORECASE):
+            return 1
         m_scalar_formula_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
         if m_scalar_formula_rhs is not None:
             rhs_scalar = m_scalar_formula_rhs.group(1).strip()
@@ -3607,6 +3619,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             or pat_mat_call_rhs.search(t)
             or pat_spread_rhs.search(t)
             or pat_matrix_slice_rhs.search(t)
+            or re.search(rf"^\s*{nm}\s*<-\s*diag\s*\(.*\)\s*[-+]", t, re.IGNORECASE)
             or (
                 re.search(rf"^\s*{nm}\s*<-.*%\*%", t)
                 and "as.numeric" not in t.lower()
@@ -4025,7 +4038,7 @@ def rename_conflicting_loop_vars(
             if isinstance(st, ForStmt):
                 body = walk_block(st.body)
                 var = st.var
-                if var in seen_assigns:
+                if var.lower() in {nm.lower() for nm in seen_assigns}:
                     new_var = fresh(var)
                     if warnings is not None:
                         warnings.append((var, new_var, _find_r_for_line(src, var) if src else None))
@@ -4445,6 +4458,83 @@ def r_expr_to_fortran(expr: str) -> str:
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
     s = _replace_dotted_var_refs(s)
+    s = re.sub(r"\bt\.test\s*\(", "t_test(", s, flags=re.IGNORECASE)
+
+    def _rewrite_t_test_field_access(txt: str) -> str:
+        out: list[str] = []
+        i = 0
+        needle = "t_test"
+        low = txt.lower()
+        while i < len(txt):
+            j = low.find(needle, i)
+            if j < 0:
+                out.append(txt[i:])
+                break
+            if j > 0 and (txt[j - 1].isalnum() or txt[j - 1] == "_"):
+                out.append(txt[i:j + len(needle)])
+                i = j + len(needle)
+                continue
+            k = j + len(needle)
+            while k < len(txt) and txt[k].isspace():
+                k += 1
+            if k >= len(txt) or txt[k] != "(":
+                out.append(txt[i:j + len(needle)])
+                i = j + len(needle)
+                continue
+            depth = 0
+            q: str | None = None
+            esc = False
+            end = -1
+            for p in range(k, len(txt)):
+                ch = txt[p]
+                if q is not None:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == q:
+                        q = None
+                    continue
+                if ch in {"'", '"'}:
+                    q = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = p
+                        break
+            if end < 0:
+                out.append(txt[i:])
+                break
+            rest = txt[end + 1 :]
+            m_field = re.match(r"\s*\$\s*(p\.value|statistic|parameter|estimate|stderr)\b", rest, re.IGNORECASE)
+            if m_field is None:
+                out.append(txt[i:end + 1])
+                i = end + 1
+                continue
+            fld = m_field.group(1).lower().replace(".", "_")
+            call_src = txt[j:end + 1]
+            out.append(txt[i:j])
+            if fld == "p_value":
+                c_tt_field = parse_call_text(call_src)
+                if c_tt_field is not None:
+                    _nm_tt_f, pos_tt_f, kw_tt_f = c_tt_field
+                    pos_f = [r_expr_to_fortran(p.strip()) for p in pos_tt_f]
+                    kw_f = [
+                        f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v.strip())}"
+                        for k, v in kw_tt_f.items()
+                    ]
+                    out.append(f"t_test_p_value({', '.join(pos_f + kw_f)})")
+                else:
+                    out.append(f"({r_expr_to_fortran(call_src)})%{fld}")
+            else:
+                out.append(f"({r_expr_to_fortran(call_src)})%{fld}")
+            i = end + 1 + m_field.end()
+        return "".join(out)
+
+    if "$" in s and re.search(r"\bt_test\s*\(", s, re.IGNORECASE):
+        s = _rewrite_t_test_field_access(s)
     def _nested_list_index_repl(m: re.Match[str]) -> str:
         obj = m.group(1)
         idx1 = _int_bound_expr(r_expr_to_fortran(m.group(2).strip()))
@@ -4601,6 +4691,21 @@ def r_expr_to_fortran(expr: str) -> str:
         vals_cor = list(c_cor0[1])
         if vals_cor:
             return f"{c_cor0[0].lower()}({', '.join(r_expr_to_fortran(v) for v in vals_cor[:2])})"
+    c_rbinom0 = parse_call_text(s)
+    if c_rbinom0 is not None and c_rbinom0[0].lower() == "rbinom":
+        _nm_rb0, pos_rb0, kw_rb0 = c_rbinom0
+        n_src = pos_rb0[0] if pos_rb0 else kw_rb0.get("n", "1")
+        size_src = kw_rb0.get("size")
+        if size_src is None and len(pos_rb0) >= 2:
+            size_src = pos_rb0[1]
+        prob_src = kw_rb0.get("prob")
+        if prob_src is None and len(pos_rb0) >= 3:
+            prob_src = pos_rb0[2]
+        return (
+            f"rbinom({_int_bound_expr(r_expr_to_fortran(n_src))}, "
+            f"{_int_bound_expr(r_expr_to_fortran(size_src or '1'))}, "
+            f"{r_expr_to_fortran(prob_src or '0.5')})"
+        )
     # Preserve operator precedence: parse top-level scalar +/- before scalar division.
     # Example: m4 / sd**4 - 3.0 must map to (m4 / sd**4) - 3.0, not m4 / (sd**4 - 3.0).
     addsub = _find_top_level_addsub(s)
@@ -4620,6 +4725,22 @@ def r_expr_to_fortran(expr: str) -> str:
         rhs = r_expr_to_fortran(mm_div[1])
         return f"(real({lhs}, kind=dp)) / (real({rhs}, kind=dp))"
     c_usr = parse_call_text(s)
+    if c_usr is not None and c_usr[0].lower() == "t_test":
+        _nm_tt, pos_tt, kw_tt = c_usr
+        pos_out_tt = [r_expr_to_fortran(a) for a in pos_tt]
+        kw_out_tt: list[str] = []
+        for k, v in kw_tt.items():
+            vf_tt = r_expr_to_fortran(v)
+            if _sanitize_fortran_kwarg_name(k).lower() == "mu" and _is_int_literal(vf_tt.strip()):
+                vf_tt = f"{int(vf_tt.strip())}.0_dp"
+            kw_out_tt.append(f"{_sanitize_fortran_kwarg_name(k)}={vf_tt}")
+        return f"t_test({', '.join(pos_out_tt + kw_out_tt)})"
+    if c_usr is not None and c_usr[0].lower() == "quantile":
+        _nm_q, pos_q, kw_q = c_usr
+        args_q = [r_expr_to_fortran(a) for a in pos_q]
+        for k, v in kw_q.items():
+            args_q.append(f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}")
+        return f"quantile({', '.join(args_q)})"
     if c_usr is not None:
         nm_u, pos_u, kw_u = c_usr
         key_u = nm_u.lower()
@@ -5162,7 +5283,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if _is_int_literal(expr_src.strip()):
             return f"r_rep_int([{_int_bound_expr(val_f)}], times={n_f})"
         return f"r_rep_real([{val_f}], times={n_f})"
-    if c_rng is not None and c_rng[0].lower() in {"runif", "rnorm"}:
+    if c_rng is not None and c_rng[0].lower() in {"runif", "rnorm", "rexp"}:
         fn = c_rng[0].lower()
         _nm_g, pos_g, kw_g = c_rng
         n_src = pos_g[0] if pos_g else kw_g.get("n", "1")
@@ -5177,12 +5298,17 @@ def r_expr_to_fortran(expr: str) -> str:
             if a_f == "0.0_dp" and b_f == "1.0_dp":
                 return f"runif_vec({n_f})"
             return f"({a_f}) + (({b_f}) - ({a_f})) * runif_vec({n_f})"
-        # rnorm
-        mean_f = r_expr_to_fortran(kw_g.get("mean", "0.0"))
-        sd_f = r_expr_to_fortran(kw_g.get("sd", "1.0"))
-        if mean_f == "0.0_dp" and sd_f == "1.0_dp":
-            return f"rnorm_vec({n_f})"
-        return f"({mean_f}) + ({sd_f}) * rnorm_vec({n_f})"
+        if fn == "rnorm":
+            mean_f = r_expr_to_fortran(kw_g.get("mean", "0.0"))
+            sd_f = r_expr_to_fortran(kw_g.get("sd", "1.0"))
+            if mean_f == "0.0_dp" and sd_f == "1.0_dp":
+                return f"rnorm_vec({n_f})"
+            return f"({mean_f}) + ({sd_f}) * rnorm_vec({n_f})"
+        rate_src = kw_g.get("rate")
+        if rate_src is None and len(pos_g) >= 2:
+            rate_src = pos_g[1]
+        rate_f = r_expr_to_fortran(rate_src or "1.0")
+        return f"(-log(max(tiny(1.0_dp), 1.0_dp - runif_vec({n_f}))) / ({rate_f}))"
     # array(data, dim) / array(data, dim=c(...))
     c_arr = parse_call_text(s)
     if c_arr is not None and c_arr[0].lower() == "array":
@@ -5638,7 +5764,13 @@ def r_expr_to_fortran(expr: str) -> str:
         x_f = r_expr_to_fortran(inner.strip())
         return f"reshape({x_f}, [size({x_f})])"
     s = _replace_balanced_func_calls(s, "as.vector", _as_vector_to_fortran)
-    s = _replace_balanced_func_calls(s, "as.integer", lambda inner: f"int({r_expr_to_fortran(inner)})")
+    def _as_integer_to_fortran(inner: str) -> str:
+        src_i = inner.strip()
+        pred_i = r_expr_to_fortran(src_i)
+        if any(_split_top_level_token(src_i, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
+            return f"merge(1, 0, {pred_i})"
+        return f"int({pred_i})"
+    s = _replace_balanced_func_calls(s, "as.integer", _as_integer_to_fortran)
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "as.double", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "as.character", lambda inner: inner.strip())
@@ -5730,7 +5862,7 @@ def r_expr_to_fortran(expr: str) -> str:
             _split_top_level_token(x_src, op, from_right=True) is not None
             for op in ["==", "!=", ">=", "<=", ">", "<"]
         ):
-            return f"(real(count({inner_f}), kind=dp)/real(size({inner_f}), kind=dp))"
+            return f"(real(sum(merge(1, 0, {inner_f})), kind=dp)/real(size({inner_f}), kind=dp))"
         if na_rm:
             packed = _non_na_pack_expr(inner_f)
             return f"(sum({packed})/real(size({packed}), kind=dp))"
@@ -5740,21 +5872,33 @@ def r_expr_to_fortran(expr: str) -> str:
         "mean",
         _mean_to_fortran,
     )
+
+    def _is_logical_reduction_arg(x_src: str, x_f: str) -> bool:
+        root_l = x_f.strip().split("%")[-1].lower()
+        return (
+            re.match(r"^\s*is_na\s*\(.+\)\s*$", x_src.strip(), re.IGNORECASE) is not None
+            or root_l in {x.lower() for x in _KNOWN_LOGICAL_VECTOR_NAMES}
+            or any(
+                _split_top_level_token(x_src, op, from_right=True) is not None
+                for op in ["==", "!=", ">=", "<=", ">", "<", "&", "|"]
+            )
+            or _split_top_level_token(x_f, ".and.", from_right=True) is not None
+            or _split_top_level_token(x_f, ".or.", from_right=True) is not None
+        )
+
+    def _sum_to_fortran(inner: str) -> str:
+        x_src, na_rm = _split_reduction_args(inner)
+        inner_f = r_expr_to_fortran(x_src)
+        if _is_logical_reduction_arg(x_src, inner_f):
+            return f"sum(merge(1, 0, {inner_f}))"
+        if na_rm:
+            return f"sum({_non_na_pack_expr(inner_f)})"
+        return f"sum({inner_f})"
+
     s = _replace_balanced_func_calls(
         s,
         "sum",
-        lambda inner: (
-            f"count({r_expr_to_fortran(inner)})"
-            if (
-                re.match(r"^\s*is_na\s*\(.+\)\s*$", inner.strip(), re.IGNORECASE)
-                or r_expr_to_fortran(inner).strip().split("%")[-1].lower() in {x.lower() for x in _KNOWN_LOGICAL_VECTOR_NAMES}
-            )
-            else (
-                f"sum({_non_na_pack_expr(r_expr_to_fortran(_split_reduction_args(inner)[0]))})"
-                if _split_reduction_args(inner)[1]
-                else f"sum({inner})"
-            )
-        ),
+        _sum_to_fortran,
     )
     s = _replace_balanced_func_calls(
         s,
@@ -5986,6 +6130,18 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?<![\w.])(\d+\.\d*([eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?![\w.])", r"\1_dp", s)
     # R list/S4 member access: a$b$c and a@b@c -> a%b%c
     s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*Date\b", r"\1(:,1)", s)
+    if _EXPANDED_DATA_FRAME_FIELDS:
+        def _repl_expanded_df_field(m: re.Match[str]) -> str:
+            obj = m.group(1)
+            field = m.group(2)
+            fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj)
+            if fields is None:
+                fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj.lower())
+            if fields is not None and field.lower() in {f.lower() for f in fields}:
+                return f"{obj}_{_sanitize_fortran_kwarg_name(field)}"
+            return m.group(0)
+
+        s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)\b", _repl_expanded_df_field, s)
     s = s.replace("$", "%")
     s = s.replace("@", "%")
     s = re.sub(
@@ -6156,6 +6312,7 @@ def emit_stmts(
     char_scalar_vars: set[str] = set()
     return_array_fns: set[str] = set()
     object_list_vars: dict[str, str] = {}
+    t_test_vars_ctx: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -6196,6 +6353,9 @@ def emit_stmts(
         olv = helper_ctx.get("object_list_vars")
         if isinstance(olv, dict):
             object_list_vars = {str(k): str(v) for k, v in olv.items()}
+        ttv = helper_ctx.get("t_test_vars")
+        if isinstance(ttv, set):
+            t_test_vars_ctx = {str(x) for x in ttv}
     if not matrix_vars:
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
@@ -6472,6 +6632,9 @@ def emit_stmts(
         return _NAMED_VECTOR_NAMES.get(src.lower())
 
     def _matrix_col_labels_for_print(expr_txt: str) -> list[str] | None:
+        matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
+        if not isinstance(matrix_labels_map, dict):
+            matrix_labels_map = {}
         labels_map = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
         if not isinstance(labels_map, dict):
             labels_map = _NAMED_VECTOR_LABELS
@@ -6480,6 +6643,10 @@ def emit_stmts(
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        for cand in reversed(candidates):
+            labs = matrix_labels_map.get(cand)
+            if isinstance(labs, list) and labs:
+                return [str(x) for x in labs]
         for cand in reversed(candidates):
             labs = labels_map.get(cand)
             if isinstance(labs, list) and labs:
@@ -6505,6 +6672,9 @@ def emit_stmts(
         int_names = {
             "nobs",
             "n",
+            "p",
+            "q",
+            "npar",
             "order",
             "ar.order",
             "ma.order",
@@ -6644,6 +6814,7 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
             if _emit_optim_bfgs_assignment(o, st.name, rhs, st.comment):
                 continue
             c_read_csv = parse_call_text(rhs)
@@ -7200,7 +7371,7 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
-            cinfo = parse_call_text(rhs)
+            cinfo = parse_call_text(rhs_call_src)
             if cinfo is not None and cinfo[0].lower() == "apply" and len(cinfo[1]) >= 3:
                 mat_f = r_expr_to_fortran(cinfo[1][0])
                 dim_f = _int_bound_expr(r_expr_to_fortran(cinfo[1][1]))
@@ -7239,6 +7410,10 @@ def emit_stmts(
                 elif "sample_int(" in rhs_f:
                     need_r_mod.add("sample_int")
                 continue
+            if cinfo is not None and cinfo[0].lower() == "rbinom":
+                _wstmt(f"{st.name} = {rhs_f}", st.comment)
+                need_r_mod.add("rbinom")
+                continue
             if cinfo is not None and cinfo[0].lower() == "sample.int":
                 if not has_r_mod:
                     raise NotImplementedError("sample.int requires helper module r_mod")
@@ -7265,6 +7440,10 @@ def emit_stmts(
                 else:
                     o.w(f"{st.name} = sample_int({n_f}, size_={size_f}, replace={rep_f})")
                 need_r_mod.add("sample_int")
+                continue
+            if cinfo is not None and cinfo[0].lower() in {"t.test", "t_test"}:
+                _wstmt(f"{st.name} = {rhs_f}", st.comment)
+                need_r_mod.update({"t_test", "t_test_result_t"})
                 continue
             if rhs.startswith("runif(") and rhs.endswith(")"):
                 c_ru = parse_call_text(rhs)
@@ -7387,7 +7566,38 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
-                    c_one = parse_call_text(one)
+                    one_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", one, flags=re.IGNORECASE)
+                    c_one = parse_call_text(one_call_src)
+                    one_f_early = r_expr_to_fortran(_rewrite_predict_expr(one))
+                    if re.match(r"^t_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_t_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
+                        _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
+                        _wstmt(f"call print_t_test({one})", st.comment)
+                        need_r_mod.update({"print_t_test", "t_test_result_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in _EXPANDED_DATA_FRAME_FIELDS:
+                        fields_df = _EXPANDED_DATA_FRAME_FIELDS.get(one, [])
+                        if fields_df:
+                            col_vars = [f"{one}_{_sanitize_fortran_kwarg_name(f)}" for f in fields_df]
+                            header = ", ".join(f'"{f}"' for f in fields_df)
+                            _wstmt(f'write(*,"(*(a,1x))") {header}', st.comment)
+                            o.w("block")
+                            o.push()
+                            o.w("integer :: i_df")
+                            o.w(f"do i_df = 1, size({col_vars[0]})")
+                            o.push()
+                            o.w(f'write(*,"(*(g0,1x))") ' + ", ".join(f"{v}(i_df)" for v in col_vars))
+                            o.pop()
+                            o.w("end do")
+                            o.pop()
+                            o.w("end block")
+                            continue
                     if c_one is not None and c_one[0].lower() == "data.frame" and c_one[2]:
                         cols_df = [(k, v) for k, v in c_one[2].items()]
                         if len(cols_df) >= 2:
@@ -7532,6 +7742,10 @@ def emit_stmts(
                                 for lab_df, val_df in zip(labels_df, vals_df):
                                     _wstmt(f'write(*,"(a,1x,g0)") {lab_df.strip()}, {val_df.strip()}', "")
                                 continue
+                        if re.match(r"^t_test\s*\(", one_f.strip(), re.IGNORECASE):
+                            _wstmt(f"call print_t_test({one_f})", st.comment)
+                            need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
+                            continue
                         if re.match(r"^[A-Za-z]\w*\s*\(.*\)$", one_f.strip()):
                             _wstmt(f"call print_real_scalar({one_f})", st.comment)
                         elif _looks_integer_fortran_expr(one_f):
@@ -8081,6 +8295,8 @@ def emit_stmts(
             asn = split_top_level_assignment(st.expr.strip())
             if asn is not None:
                 rhs = r_expr_to_fortran(asn[1].strip())
+                if "t_test_p_value(" in rhs:
+                    need_r_mod.update({"t_test_p_value", "t_test", "t_test_result_t"})
                 lhs_src = asn[0].strip()
                 m_obj_list_lhs = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+)\s*\]\]$", lhs_src)
                 if m_obj_list_lhs is not None and m_obj_list_lhs.group(1) in object_list_vars:
@@ -9327,6 +9543,13 @@ def emit_function(
                 re.IGNORECASE,
             ):
                 local_ranks[st_seq_rank.name] = 1
+            if re.match(r"^diag\s*\(.*\)\s*[-+]", st_seq_rank.expr.strip(), re.IGNORECASE):
+                local_ranks[st_seq_rank.name] = 2
+                real_arrays.add(st_seq_rank.name)
+                ints.discard(st_seq_rank.name)
+                int_arrays.discard(st_seq_rank.name)
+                real_scalars.discard(st_seq_rank.name)
+                params.pop(st_seq_rank.name, None)
         changed = True
         while changed:
             changed = False
@@ -9877,7 +10100,9 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                 rhs = st.expr.strip()
                 rhs_l = rhs.lower()
                 is_logical_vec = False
-                if re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
+                if re.match(r"^logical\s*\(", rhs_l):
+                    is_logical_vec = True
+                elif re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
                     names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
@@ -10057,6 +10282,7 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
 
     Emits assignments to `a_x1`, `a_x2`, ... so later calls can reference fields.
     """
+    global _EXPANDED_DATA_FRAME_FIELDS
     out: list[object] = []
     for st in stmts:
         if not isinstance(st, Assign):
@@ -10072,8 +10298,18 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
             # Keep fallback if shape is not understood.
             out.append(st)
             continue
+        fields_for_df = list(kw.keys())
+        for df_key in (st.name, st.name.lower()):
+            prior = _EXPANDED_DATA_FRAME_FIELDS.setdefault(df_key, [])
+            for field in fields_for_df:
+                if field.lower() not in {p.lower() for p in prior}:
+                    prior.append(field)
+        first_col_src = next((v.strip() for v in kw.values() if v.strip()), "")
         for k, v in kw.items():
-            out.append(Assign(name=f"{st.name}_{k}", expr=v, comment=st.comment))
+            v_out = v
+            if first_col_src and re.fullmatch(r"NA(?:_real_)?", v.strip(), re.IGNORECASE):
+                v_out = f"numeric(length({first_col_src}))"
+            out.append(Assign(name=f"{st.name}_{_sanitize_fortran_kwarg_name(k)}", expr=v_out, comment=st.comment))
     return out
 
 
@@ -10873,9 +11109,11 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS
+    global _EXPANDED_DATA_FRAME_FIELDS
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
+    _EXPANDED_DATA_FRAME_FIELDS = {}
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -10945,6 +11183,7 @@ def transpile_r_to_fortran(
     _NAMED_VECTOR_LABELS = {nm.lower(): labels for nm, (labels, _vals) in named_vectors.items()}
     _NAMED_VECTOR_LABELS.update(collect_colname_labels(stmts))
     list_specs = _list_return_specs(funcs)
+    fn_matrix_col_labels = {f.name: collect_colname_labels(f.body) for f in funcs}
     fn_alias_return_type: dict[str, str] = {}
     for f_alias in funcs:
         if f_alias.name in list_specs:
@@ -11102,6 +11341,7 @@ def transpile_r_to_fortran(
         "named_vector_names": dict(_NAMED_VECTOR_NAMES),
         "return_array_fns": set(fn_return_array_kind.keys()),
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
+        "matrix_col_labels": collect_colname_labels(main_stmts),
         "matrix_colname_exprs": collect_colname_sources(stmts),
     }
 
@@ -11309,6 +11549,7 @@ def transpile_r_to_fortran(
     main_list_specs: dict[str, ListReturnSpec] = {}
     main_list_var_fields: dict[str, dict[str, object]] = {}
     lm_vars: set[str] = set()
+    t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
     call_pat = re.compile(r"^([A-Za-z]\w*)\s*\(")
@@ -11350,6 +11591,8 @@ def transpile_r_to_fortran(
             ):
                 lm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
+            if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
+                t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
             if not m:
                 m_cp = re.match(r"^\s*([A-Za-z]\w*)\s*$", st.expr.strip())
@@ -11465,6 +11708,50 @@ def transpile_r_to_fortran(
                 main_list_var_fields[base] = main_list_specs[base].root_fields
 
     _walk_collect_extra_list_fields(main_stmts)
+    matrix_col_labels_main = helper_ctx_main.get("matrix_col_labels")
+    if not isinstance(matrix_col_labels_main, dict):
+        matrix_col_labels_main = {}
+        helper_ctx_main["matrix_col_labels"] = matrix_col_labels_main
+
+    def _list_spec_from_type_name(type_name: str) -> ListReturnSpec | None:
+        for fn_ls, spec_ls in list_specs.items():
+            if _type_name_for_path(fn_ls, ()) == type_name:
+                return spec_ls
+        return None
+
+    def _matrix_labels_from_list_field(expr_txt: str) -> list[str] | None:
+        m_lf = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)$", expr_txt.strip())
+        if m_lf is None:
+            return None
+        base_lf, field_lf = m_lf.group(1), m_lf.group(2)
+        spec_lf = _list_spec_from_type_name(list_vars.get(base_lf, ""))
+        if spec_lf is None:
+            return None
+        field_expr_lf = spec_lf.root_fields.get(field_lf)
+        fn_labs_lf = fn_matrix_col_labels.get(spec_lf.fn_name, {})
+        if isinstance(field_expr_lf, str):
+            labs_lf = fn_labs_lf.get(field_expr_lf.strip().lower())
+            if isinstance(labs_lf, list) and labs_lf:
+                return [str(x) for x in labs_lf]
+        labs_lf = fn_labs_lf.get(field_lf.lower())
+        if isinstance(labs_lf, list) and labs_lf:
+            return [str(x) for x in labs_lf]
+        return None
+
+    for st_mcl in main_stmts:
+        if not isinstance(st_mcl, Assign):
+            continue
+        rhs_mcl = st_mcl.expr.strip()
+        labs_mcl = _matrix_labels_from_list_field(rhs_mcl)
+        if labs_mcl is None:
+            m_alias_mcl = re.match(r"^([A-Za-z]\w*)$", rhs_mcl)
+            if m_alias_mcl is not None:
+                prev_labs_mcl = matrix_col_labels_main.get(m_alias_mcl.group(1).lower())
+                if isinstance(prev_labs_mcl, list) and prev_labs_mcl:
+                    labs_mcl = [str(x) for x in prev_labs_mcl]
+        if labs_mcl is not None:
+            matrix_col_labels_main[st_mcl.name.lower()] = labs_mcl
+
     for nm in list_vars:
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -11477,6 +11764,12 @@ def transpile_r_to_fortran(
         real_arrays.discard(nm)
         params.pop(nm, None)
     for nm in lm_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in t_test_vars:
         ints.discard(nm)
         real_scalars.discard(nm)
         int_arrays.discard(nm)
@@ -11586,6 +11879,12 @@ def transpile_r_to_fortran(
 
     _force_main_list_component_alias_types(main_stmts)
 
+    helper_ctx_main["int_matrix_vars"] = set(int_matrices)
+    helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays)
+    helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
+    helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
+    helper_ctx_main["char_scalar_vars"] = set(char_scalars)
+
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
     if int_arrays:
@@ -11602,6 +11901,8 @@ def transpile_r_to_fortran(
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:,:)" for x in sorted(real_rank3_arrays)))
     if real_rank4_arrays:
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:,:,:)" for x in sorted(real_rank4_arrays)))
+    if t_test_vars:
+        pbody.w("type(t_test_result_t) :: " + ", ".join(sorted(t_test_vars)))
     if char_scalars:
         pbody.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars)))
     if char_arrays:
@@ -11624,6 +11925,8 @@ def transpile_r_to_fortran(
     if main_object_list_vars:
         helper_ctx_main["object_list_vars"] = dict(main_object_list_vars)
         _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in main_object_list_vars)
+    if t_test_vars:
+        helper_ctx_main["t_test_vars"] = set(t_test_vars)
     pbody.w("")
     if ("r_mod" in helper_modules) and (not int_like_print):
         pbody.w("call set_print_int_like(.false.)")
@@ -12769,6 +13072,7 @@ def transpile_r_to_fortran(
         "rnorm1",
         "rnorm_vec",
         "rnorm_mat",
+        "rbinom",
         "random_choice2_prob",
         "sample_int",
         "sample_int1",
@@ -12845,6 +13149,10 @@ def transpile_r_to_fortran(
         "print_lm_coef_rstyle",
         "lm_fit_t",
         "optim_result_t",
+        "t_test_result_t",
+        "t_test",
+        "t_test_p_value",
+        "print_t_test",
         "max_col",
         "tabulate",
         "nested_matrix_list_len",
