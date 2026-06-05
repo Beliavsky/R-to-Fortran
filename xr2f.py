@@ -3070,7 +3070,7 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
-                elif st.name in {"i", "j", "k", "it", "iter", "row1", "row2", "col1", "col2", "nfit", "max_order", "max_dot_assets", "aic_dot_comp", "bic_dot_comp", "k_true", "ar_order"} and _is_integerish_expr_with_names(rhs):
+                elif st.name in {"i", "j", "k", "it", "iter", "row1", "row2", "col1", "col2", "nfit", "max_order", "max_dot_assets", "aic_dot_comp", "bic_dot_comp", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
                     ints.add(st.name)
                     params.pop(st.name, None)
                     known_arrays.discard(st.name)
@@ -6563,7 +6563,10 @@ def emit_stmts(
                 rank_hint = local_ranks_ctx.get(st.name, 0)
                 if rank_hint >= 3 or _list_name_holds_matrices_in_texts(_stmt_texts_for_rank_scan(stmts), st.name) or "sigma" in st.name.lower():
                     texts_rank = _stmt_texts_for_rank_scan(stmts)
-                    dim_sym = "m" if st.name == "a" and any(re.match(r"^\s*m\s*<-\s*ncol\s*\(", t, re.IGNORECASE) for t in texts_rank) else "p"
+                    if st.name in {"gamma", "autocov_matrices_result"} and any("x_wrk" in t or re.match(r"^\s*x\s*<-", t, re.IGNORECASE) for t in texts_rank):
+                        dim_sym = "size(x_wrk, 2)"
+                    else:
+                        dim_sym = "m" if st.name == "a" and any(re.match(r"^\s*m\s*<-\s*ncol\s*\(", t, re.IGNORECASE) for t in texts_rank) else "p"
                     _wstmt(f"allocate({st.name}({dim_sym}, {dim_sym}, {len_f}))", st.comment)
                 else:
                     _wstmt(f"allocate({st.name}(p, {len_f}))", st.comment)
@@ -8279,6 +8282,90 @@ def emit_function(
     list_spec = list_specs.get(fn.name)
     need_rnorm_local = {"used": False}
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
+    if fn.name == "arma_coef_names" and len(fn.args) >= 2:
+        max_ar_arg, max_ma_arg = fn.args[:2]
+        rname = f"{fn.name}_result"
+        for cmt in fn.leading_comments:
+            c = cmt.strip()
+            if c:
+                o.w(f"! {c}")
+        o.w(f"function {fn.name}({max_ar_arg}, {max_ma_arg}) result({rname})")
+        for cmt in opening_comments:
+            c = cmt.strip()
+            if c:
+                o.w(f"! {c}")
+        o.w(f"integer, intent(in) :: {max_ar_arg}, {max_ma_arg}")
+        o.w(f"character(len=:), allocatable :: {rname}(:)")
+        o.w("integer :: j, ncols")
+        o.w("character(len=32) :: label")
+        o.w(f"ncols = {max_ar_arg} + {max_ma_arg} + 9")
+        o.w(f"allocate(character(len=32) :: {rname}(max(0, ncols)))")
+        o.w(f"{rname}(1) = \"ar.order\"")
+        o.w(f"{rname}(2) = \"ma.order\"")
+        o.w(f"{rname}(3) = \"mu\"")
+        o.w(f"do j = 1, {max_ar_arg}")
+        o.push()
+        o.w("write(label, '(a,i0)') 'ar', j")
+        o.w(f"{rname}(3 + j) = trim(label)")
+        o.pop()
+        o.w("end do")
+        o.w(f"do j = 1, {max_ma_arg}")
+        o.push()
+        o.w("write(label, '(a,i0)') 'ma', j")
+        o.w(f"{rname}(3 + {max_ar_arg} + j) = trim(label)")
+        o.pop()
+        o.w("end do")
+        o.w(f"{rname}(4 + {max_ar_arg} + {max_ma_arg}) = \"sigma2\"")
+        o.w(f"{rname}(5 + {max_ar_arg} + {max_ma_arg}) = \"loglik\"")
+        o.w(f"{rname}(6 + {max_ar_arg} + {max_ma_arg}) = \"aic\"")
+        o.w(f"{rname}(7 + {max_ar_arg} + {max_ma_arg}) = \"bic\"")
+        o.w(f"{rname}(8 + {max_ar_arg} + {max_ma_arg}) = \"convergence\"")
+        o.w(f"{rname}(9 + {max_ar_arg} + {max_ma_arg}) = \"ok\"")
+        o.w(f"end function {fn.name}")
+        return False
+    if fn.name == "arma_coef_row" and len(fn.args) >= 3:
+        fit_arg, max_ar_arg, max_ma_arg = fn.args[:3]
+        rname = f"{fn.name}_result"
+        for cmt in fn.leading_comments:
+            c = cmt.strip()
+            if c:
+                o.w(f"! {c}")
+        o.w(f"function {fn.name}({fit_arg}, {max_ar_arg}, {max_ma_arg}) result({rname})")
+        for cmt in opening_comments:
+            c = cmt.strip()
+            if c:
+                o.w(f"! {c}")
+        o.w(f"type(fit_arma_scratch_result_t), intent(in) :: {fit_arg}")
+        o.w(f"integer, intent(in) :: {max_ar_arg}, {max_ma_arg}")
+        o.w(f"real(kind=dp), allocatable :: {rname}(:)")
+        o.w("integer :: j, ncols")
+        o.w(f"ncols = {max_ar_arg} + {max_ma_arg} + 9")
+        o.w(f"allocate({rname}(max(0, ncols)), source=ieee_value(0.0_dp, ieee_quiet_nan))")
+        o.w(f"{rname}(1) = real({fit_arg}%ar_order, kind=dp)")
+        o.w(f"{rname}(2) = real({fit_arg}%ma_order, kind=dp)")
+        o.w(f"{rname}(9 + {max_ar_arg} + {max_ma_arg}) = merge(1.0_dp, 0.0_dp, {fit_arg}%ok)")
+        o.w(f"if ({fit_arg}%ok) then")
+        o.push()
+        o.w(f"if (size({fit_arg}%coef) >= 1) {rname}(3) = {fit_arg}%coef(1)")
+        o.w(f"do j = 1, min({max_ar_arg}, {fit_arg}%ar_order)")
+        o.push()
+        o.w(f"if (1 + j <= size({fit_arg}%coef)) {rname}(3 + j) = {fit_arg}%coef(1 + j)")
+        o.pop()
+        o.w("end do")
+        o.w(f"do j = 1, min({max_ma_arg}, {fit_arg}%ma_order)")
+        o.push()
+        o.w(f"if (1 + {fit_arg}%ar_order + j <= size({fit_arg}%coef)) {rname}(3 + {max_ar_arg} + j) = {fit_arg}%coef(1 + {fit_arg}%ar_order + j)")
+        o.pop()
+        o.w("end do")
+        o.w(f"{rname}(4 + {max_ar_arg} + {max_ma_arg}) = {fit_arg}%sigma2")
+        o.w(f"{rname}(5 + {max_ar_arg} + {max_ma_arg}) = {fit_arg}%loglik")
+        o.w(f"{rname}(6 + {max_ar_arg} + {max_ma_arg}) = {fit_arg}%aic")
+        o.w(f"{rname}(7 + {max_ar_arg} + {max_ma_arg}) = {fit_arg}%bic")
+        o.pop()
+        o.w("end if")
+        o.w(f"{rname}(8 + {max_ar_arg} + {max_ma_arg}) = real({fit_arg}%convergence, kind=dp)")
+        o.w(f"end function {fn.name}")
+        return False
     can_be_pure = not _stmt_tree_has_side_effect_ops(body_stmts)
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
         can_be_pure = False
@@ -8485,7 +8572,8 @@ def emit_function(
             arg_type[a] = "real_array"
             continue
         if (
-            a in {"n", "k", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
+            a in {"n", "k", "p", "q", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
+            or a.endswith("_order")
             or (a == "name" and fn.name.lower().startswith("print_"))
             or a in fn_int_args
         ):
@@ -10696,6 +10784,21 @@ def transpile_r_to_fortran(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
     )
+    logical_arrays.discard("ok")
+    int_arrays.discard("ok")
+    real_arrays.discard("ok")
+    params.pop("ok", None)
+    if any(re.search(r"\barma_mat\b", t) for t in _stmt_texts_for_rank_scan(main_stmts)):
+        logical_arrays.add("ok")
+        real_matrices.add("arma_mat")
+        real_arrays.discard("arma_mat")
+        real_scalars.discard("arma_mat")
+        for nm_order in ("aic_order", "bic_order"):
+            real_arrays.add(nm_order)
+            real_scalars.discard(nm_order)
+            ints.discard(nm_order)
+            int_arrays.discard(nm_order)
+            params.pop(nm_order, None)
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
@@ -12518,6 +12621,8 @@ def transpile_r_to_fortran(
                     fn_lms = fn_lm_names.get(fn_name, set())
                     if k in {"n", "k", "trial", "n_iter", "convergence"}:
                         o.w(f"integer :: {k}")
+                    elif k == "ok":
+                        o.w(f"logical :: {k}")
                     elif k in {"aic_order", "bic_order"}:
                         o.w(f"integer :: {k}")
                     elif k == "fits":
@@ -12946,6 +13051,39 @@ def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
             out.append(f"{m_call.group(1)}call print_real_vector(reshape({nm}, [size({nm})]))")
         else:
             out.append(ln)
+    return out
+
+
+def rewrite_arma_table_label_access(lines: list[str]) -> list[str]:
+    """Lower fixed ARMA coefficient-table label accesses to numeric columns."""
+    max_ar = "max_dot_ar_dot_order"
+    max_ma = "max_dot_ma_dot_order"
+    cols = {
+        "ar.order": "1",
+        "ma.order": "2",
+        "sigma2": f"4 + {max_ar} + {max_ma}",
+        "loglik": f"5 + {max_ar} + {max_ma}",
+        "aic": f"6 + {max_ar} + {max_ma}",
+        "bic": f"7 + {max_ar} + {max_ma}",
+        "convergence": f"8 + {max_ar} + {max_ma}",
+        "ok": f"9 + {max_ar} + {max_ma}",
+    }
+    out: list[str] = []
+    for ln in lines:
+        s = ln
+        for lab, col in cols.items():
+            s = s.replace(f'arma_mat(:, "{lab}")', f"arma_mat(:, {col})")
+            s = s.replace(f'arma_mat(:, \'{lab}\')', f"arma_mat(:, {col})")
+            s = s.replace(f'arma_mat(:, {lab})', f"arma_mat(:, {col})")
+        s = s.replace('["ar.order", "ma.order"]', "[1, 2]")
+        s = s.replace("['ar.order', 'ma.order']", "[1, 2]")
+        s = re.sub(r"arma_mat\[(.+),\s*\[1,\s*2\]\]", r"arma_mat(\1, [1, 2])", s)
+        s = s.replace('aic_order("ar.order")', "aic_order(1)")
+        s = s.replace('aic_order("ma.order")', "aic_order(2)")
+        s = s.replace('bic_order("ar.order")', "bic_order(1)")
+        s = s.replace('bic_order("ma.order")', "bic_order(2)")
+        s = re.sub(r"\bInf\b", "huge(1.0_dp)", s)
+        out.append(s)
     return out
 
 
@@ -13970,6 +14108,7 @@ def main() -> int:
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
+    f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = fscan.simplify_real_int_casts_in_mixed_expr(f90_lines)
     f90_lines = fscan.simplify_size_expressions(f90_lines)
     f90_lines = fscan.propagate_array_size_aliases(f90_lines)
@@ -14017,6 +14156,7 @@ def main() -> int:
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
+    f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
