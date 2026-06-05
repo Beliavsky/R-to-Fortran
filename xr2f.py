@@ -5521,8 +5521,6 @@ def r_expr_to_fortran(expr: str) -> str:
     # basic helpers
     def _length_repl(inner: str) -> str:
         txt = inner.strip()
-        if txt == "coef_names":
-            return "nacf + 5"
         ft = r_expr_to_fortran(txt)
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(:,:,:,", ft):
             return f"nested_matrix_list_len({ft})"
@@ -6411,6 +6409,21 @@ def emit_stmts(
                 return [str(x) for x in labs]
         return None
 
+    def _matrix_col_label_expr_for_print(expr_txt: str) -> str | None:
+        expr_map = helper_ctx.get("matrix_colname_exprs") if helper_ctx is not None else None
+        if not isinstance(expr_map, dict):
+            return None
+        t = expr_txt.strip()
+        c_round = parse_call_text(t)
+        if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
+            t = c_round[1][0].strip()
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        for cand in reversed(candidates):
+            src = expr_map.get(cand)
+            if isinstance(src, str) and src.strip():
+                return r_expr_to_fortran(src.strip())
+        return None
+
     def _char_array_literal(labels: list[str]) -> str:
         if not labels:
             return "[character(len=1) :: ]"
@@ -6489,8 +6502,6 @@ def emit_stmts(
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
-            if st.name == "coef_names":
-                continue
             c_df = parse_call_text(st.expr.strip())
             if c_df is not None and c_df[0].lower() == "data.frame":
                 _df_nm, pos_df, kw_df = c_df
@@ -7370,8 +7381,13 @@ def emit_stmts(
                                 _wstmt(f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)})", st.comment)
                                 need_r_mod.add("print_matrix_rstyle_named")
                             else:
-                                _wstmt(f"call print_matrix({one_f})", st.comment)
-                                need_r_mod.add("print_matrix_rstyle")
+                                label_expr = _matrix_col_label_expr_for_print(one)
+                                if label_expr is not None:
+                                    _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
+                                    need_r_mod.add("print_matrix_rstyle_named")
+                                else:
+                                    _wstmt(f"call print_matrix({one_f})", st.comment)
+                                    need_r_mod.add("print_matrix_rstyle")
                         else:
                             o.w("block")
                             o.push()
@@ -9405,48 +9421,74 @@ def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) 
 def infer_main_character_scalars(stmts: list[object]) -> set[str]:
     """Find scalar vars assigned from quoted string literals in main statements."""
     out: set[str] = set()
-    for st in stmts:
-        if not isinstance(st, Assign):
-            continue
-        rhs = st.expr.strip()
-        if _dequote_string_literal(rhs) is not None:
-            out.add(st.name)
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                if _dequote_string_literal(rhs) is not None:
+                    out.add(st.name)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
     return out
 
 
 def infer_main_character_arrays(stmts: list[object]) -> set[str]:
     """Find vector vars assigned from c("...")-style character constructors."""
     out: set[str] = set()
-    for st in stmts:
-        if not isinstance(st, Assign):
-            continue
-        rhs = st.expr.strip()
-        low = rhs.lower()
-        if low.startswith("commandargs("):
-            out.add(st.name)
-            continue
-        if low.startswith("character("):
-            out.add(st.name)
-            continue
-        if not low.startswith("c("):
-            continue
-        cinfo = parse_call_text(rhs)
-        if cinfo is None:
-            continue
-        _nm, pos, _kw = cinfo
-        if not pos:
-            continue
-        all_chr = True
-        for a in pos:
-            aa = a.strip()
-            if _dequote_string_literal(aa) is not None:
-                continue
-            if aa.upper() == "NA_CHARACTER_":
-                continue
-            all_chr = False
-            break
-        if all_chr:
-            out.add(st.name)
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                low = rhs.lower()
+                if low.startswith("commandargs("):
+                    out.add(st.name)
+                    continue
+                if low.startswith("character("):
+                    out.add(st.name)
+                    continue
+                c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
+                    out.add(st.name)
+                    continue
+                if not low.startswith("c("):
+                    continue
+                cinfo = c_rhs
+                if cinfo is None:
+                    continue
+                _nm, pos, _kw = cinfo
+                if not pos:
+                    continue
+                all_chr = True
+                for a in pos:
+                    aa = a.strip()
+                    if _dequote_string_literal(aa) is not None:
+                        continue
+                    if aa.upper() == "NA_CHARACTER_":
+                        continue
+                    all_chr = False
+                    break
+                if all_chr:
+                    out.add(st.name)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
     return out
 
 
@@ -9781,6 +9823,37 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
 
     walk(stmts)
     return labels
+
+
+def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
+    sources: dict[str, str] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, ExprStmt):
+                m = re.match(
+                    r"^\s*colnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m is not None:
+                    src = m.group(2).strip()
+                    if _parse_string_c_vector(src) is None:
+                        sources[m.group(1).lower()] = src
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return sources
 
 
 def infer_main_real_rank3_arrays(stmts: list[object]) -> set[str]:
@@ -10730,6 +10803,7 @@ def transpile_r_to_fortran(
         "named_vector_names": dict(_NAMED_VECTOR_NAMES),
         "return_array_fns": set(fn_return_array_kind.keys()),
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
+        "matrix_colname_exprs": collect_colname_sources(stmts),
     }
 
     assign_counts = infer_assigned_names(main_stmts)
@@ -10784,6 +10858,12 @@ def transpile_r_to_fortran(
     array_params = infer_main_array_params(main_stmts, assign_counts)
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
+    for nm in set(char_scalars) | set(char_arrays):
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        params.pop(nm, None)
     logical_scalars = infer_main_logical_scalars(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts)
     real_rank3_arrays = infer_main_real_rank3_arrays(main_stmts)
