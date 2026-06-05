@@ -6226,7 +6226,7 @@ def emit_stmts(
         if t.startswith("[") and t.endswith("]"):
             return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
-        if m_field_print is not None and m_field_print.group(1).lower() in {"a", "ar", "ma", "sigma", "resid", "fitted"}:
+        if m_field_print is not None and m_field_print.group(1).lower() in {"ar", "ma", "sigma", "resid", "fitted"}:
             return 2
         if re.match(r"^[A-Za-z]\w*\s*\$\s*a\s*\[\[", t):
             return 2
