@@ -4895,6 +4895,11 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_ft = [r_expr_to_fortran(a) for a in pos_ft]
         kw_out_ft = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ft.items()]
         return f"fisher_test({', '.join(pos_out_ft + kw_out_ft)})"
+    if c_usr is not None and c_usr[0].lower() == "confint":
+        _nm_ci, pos_ci, kw_ci = c_usr
+        pos_out_ci = [r_expr_to_fortran(a) for a in pos_ci]
+        kw_out_ci = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ci.items()]
+        return f"lm_confint({', '.join(pos_out_ci + kw_out_ci)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
         args_q = [r_expr_to_fortran(a) for a in pos_q]
@@ -6582,6 +6587,22 @@ def emit_stmts(
         p = len(terms)
         return f"lm_predict_general({fit_nm}, reshape([{cols}], [size({first}), {p}]))"
 
+    def _predict_design_expr(expr: str) -> tuple[str, str, dict[str, str]] | None:
+        c = parse_call_text(expr.strip())
+        if c is None or c[0].lower() != "predict":
+            return None
+        _np, posp, kwp = c
+        fit_nm = posp[0].strip() if posp else kwp.get("object", "").strip()
+        newd = kwp.get("newdata", "").strip()
+        if not fit_nm or not newd:
+            return None
+        terms = lm_terms_by_fit.get(fit_nm)
+        if not terms:
+            return None
+        cols = ", ".join(r_expr_to_fortran(f"{newd}_{t}") for t in terms)
+        first = r_expr_to_fortran(f"{newd}_{terms[0]}")
+        return fit_nm, f"reshape([{cols}], [size({first}), {len(terms)}])", kwp
+
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -6645,6 +6666,10 @@ def emit_stmts(
         c = parse_call_text(t)
         if c is not None:
             nm_c = c[0].lower()
+            if nm_c in {"confint", "lm_confint"}:
+                return 2
+            if nm_c in {"predict", "lm_predict_general"}:
+                return 1
             if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz"}:
                 return 2
             if nm_c in return_array_fns:
@@ -7965,6 +7990,33 @@ def emit_stmts(
                             )
                         need_r_mod.add("print_named_real_vector")
                         continue
+                    m_confint = re.match(r"^confint\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
+                    if has_r_mod and m_confint is not None:
+                        fit_nm = m_confint.group(1)
+                        terms = lm_terms_by_fit.get(fit_nm, [])
+                        if terms:
+                            max_len = max(1, max(len(t) for t in terms))
+                            terms_lit = ", ".join(f'"{t}"' for t in terms)
+                            _wstmt(
+                                f'call print_lm_confint({fit_nm}, [character(len={max_len}) :: {terms_lit}])',
+                                st.comment,
+                            )
+                        else:
+                            _wstmt(f"call print_lm_confint({fit_nm})", st.comment)
+                        need_r_mod.add("print_lm_confint")
+                        if helper_ctx is not None:
+                            helper_ctx["need_lm"] = True
+                        continue
+                    pred_design = _predict_design_expr(one)
+                    if has_r_mod and pred_design is not None:
+                        fit_nm, xpred_f, kw_pred = pred_design
+                        interval_src = kw_pred.get("interval", "").strip().strip("\"'").lower()
+                        if interval_src == "prediction":
+                            _wstmt(f"call print_lm_prediction_interval({fit_nm}, {xpred_f})", st.comment)
+                            need_r_mod.add("print_lm_prediction_interval")
+                            if helper_ctx is not None:
+                                helper_ctx["need_lm"] = True
+                            continue
                     rank_one = _expr_rank_for_print(one)
                     if rank_one == 2:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
@@ -8185,7 +8237,16 @@ def emit_stmts(
                             (re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in lm_terms_by_fit)
                             or re.search(r"(?:\$|%)\s*lm_fit\s*$", sum_arg, re.IGNORECASE)
                         ):
-                            _wstmt(f"call print_lm_summary({sum_arg_f})", st.comment)
+                            terms = lm_terms_by_fit.get(sum_arg, [])
+                            if terms:
+                                max_len = max(1, max(len(t) for t in terms))
+                                terms_lit = ", ".join(f'"{t}"' for t in terms)
+                                _wstmt(
+                                    f'call print_lm_summary({sum_arg_f}, [character(len={max_len}) :: {terms_lit}])',
+                                    st.comment,
+                                )
+                            else:
+                                _wstmt(f"call print_lm_summary({sum_arg_f})", st.comment)
                             if helper_ctx is not None:
                                 helper_ctx["need_lm"] = True
                             if has_r_mod:
@@ -8269,6 +8330,12 @@ def emit_stmts(
                             continue
                         lit = _dequote_string_literal(at)
                         if lit is not None:
+                            while lit.startswith("\\n"):
+                                if out_items:
+                                    _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
+                                    out_items = []
+                                _wstmt("write(*,*)", "")
+                                lit = lit[2:]
                             lit2 = lit.replace("\\n", "").replace("\\t", " ")
                             if lit2.endswith("="):
                                 lit2 = lit2 + " "
@@ -12007,11 +12074,7 @@ def transpile_r_to_fortran(
                 )
                 main_list_var_fields[st.name] = fields_main
                 continue
-            if re.match(
-                r"^lm\s*\(\s*([A-Za-z]\w*)\s*~\s*([A-Za-z]\w*)\s*\+\s*([A-Za-z]\w*)(?:\s*,\s*.*)?\)\s*$",
-                st.expr.strip(),
-                re.IGNORECASE,
-            ):
+            if parse_call_text(st.expr.strip()) is not None and parse_call_text(st.expr.strip())[0].lower() == "lm":
                 lm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
@@ -12084,6 +12147,17 @@ def transpile_r_to_fortran(
                 _collect_main_object_list_assigns(st_obj.body)
 
     _collect_main_object_list_assigns(main_stmts)
+    for nm in lm_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        params.pop(nm, None)
+        array_params.pop(nm, None)
 
     def _add_field_path(fields: dict[str, object], path: list[str], rhs_expr: str) -> None:
         cur = fields
@@ -12573,6 +12647,74 @@ def transpile_r_to_fortran(
         mprocs.w("yhat = fit%coef(1) + matmul(xpred, fit%coef(2:p+1))")
         mprocs.w("end function lm_predict_general")
         mprocs.w("")
+        mprocs.w("pure function lm_confint(fit, level) result(out)")
+        mprocs.w("type(lm_fit_t), intent(in) :: fit")
+        mprocs.w("real(kind=dp), intent(in), optional :: level")
+        mprocs.w("real(kind=dp), allocatable :: out(:,:)")
+        mprocs.w("real(kind=dp) :: crit, se")
+        mprocs.w("integer :: j, p")
+        mprocs.w("p = size(fit%coef)")
+        mprocs.w("allocate(out(p, 2))")
+        mprocs.w("if (p <= 0) return")
+        mprocs.w("crit = t_crit_975(fit%df)")
+        mprocs.w("do j = 1, p")
+        mprocs.push()
+        mprocs.w("se = fit%sigma")
+        mprocs.w("if (allocated(fit%cov_unscaled) .and. size(fit%cov_unscaled, 1) >= j .and. size(fit%cov_unscaled, 2) >= j) then")
+        mprocs.push()
+        mprocs.w("se = fit%sigma * sqrt(max(0.0_dp, fit%cov_unscaled(j, j)))")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("out(j, 1) = fit%coef(j) - crit * se")
+        mprocs.w("out(j, 2) = fit%coef(j) + crit * se")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function lm_confint")
+        mprocs.w("")
+        mprocs.w("pure function t_crit_975(df) result(out)")
+        mprocs.w("integer, intent(in) :: df")
+        mprocs.w("real(kind=dp) :: out")
+        mprocs.w("select case (df)")
+        for df_i, val_i in [
+            (1, "12.7062047364321"), (2, "4.30265272974946"), (3, "3.18244630528426"),
+            (4, "2.77644510519779"), (5, "2.57058183563631"), (6, "2.44691184879168"),
+            (7, "2.36462425159278"), (8, "2.30600413503337"), (9, "2.26215716274099"),
+            (10, "2.22813885196494"), (11, "2.20098516008295"), (12, "2.17881282966342"),
+            (13, "2.16036865646101"), (14, "2.14478668791693"), (15, "2.13144954555978"),
+            (16, "2.11990529922125"), (17, "2.10981557783318"), (18, "2.10092204024096"),
+            (19, "2.09302405440831"), (20, "2.08596344726586"), (21, "2.07961384472766"),
+            (22, "2.07387306790401"), (23, "2.06865761041904"), (24, "2.06389856162802"),
+            (25, "2.05953855275329"), (26, "2.05552943864287"), (27, "2.05183051648028"),
+            (28, "2.04840714179524"), (29, "2.04522964213270"), (30, "2.04227245630124"),
+        ]:
+            mprocs.w(f"case ({df_i}); out = {val_i}_dp")
+        mprocs.w("case default")
+        mprocs.push()
+        mprocs.w("if (df <= 0) then")
+        mprocs.push()
+        mprocs.w("out = 1.959963984540054_dp")
+        mprocs.pop()
+        mprocs.w("else if (df <= 40) then")
+        mprocs.push()
+        mprocs.w("out = 2.02107539030627_dp")
+        mprocs.pop()
+        mprocs.w("else if (df <= 60) then")
+        mprocs.push()
+        mprocs.w("out = 2.00029782105826_dp")
+        mprocs.pop()
+        mprocs.w("else if (df <= 120) then")
+        mprocs.push()
+        mprocs.w("out = 1.97993040505278_dp")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("out = 1.959963984540054_dp")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end select")
+        mprocs.w("end function t_crit_975")
+        mprocs.w("")
         mprocs.w("subroutine solve_linear(a, b, x, ok)")
         mprocs.w("real(kind=dp), intent(inout) :: a(:,:)")
         mprocs.w("real(kind=dp), intent(inout) :: b(:)")
@@ -12654,7 +12796,7 @@ def transpile_r_to_fortran(
         mprocs.w("real(kind=dp), intent(in) :: xpred(:,:)")
         mprocs.w("type(lm_fit_t) :: fit")
         mprocs.w("integer :: i, j, n, p, k, dof")
-        mprocs.w("real(kind=dp), allocatable :: a(:,:), b(:), beta(:)")
+        mprocs.w("real(kind=dp), allocatable :: a(:,:), a_xtx(:,:), a_work(:,:), b(:), b_work(:), beta(:), sol(:)")
         mprocs.w("real(kind=dp) :: ybar, sse, sst")
         mprocs.w("logical :: ok")
         mprocs.w("if (size(y) /= size(xpred,1)) then")
@@ -12688,8 +12830,20 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.pop()
         mprocs.w("end do")
+        mprocs.w("a_xtx = a")
         mprocs.w("call solve_linear(a, b, beta, ok)")
         mprocs.w("if (.not. ok) error stop \"error: singular normal equations\"")
+        mprocs.w("allocate(fit%cov_unscaled(k, k), a_work(k, k), b_work(k), sol(k))")
+        mprocs.w("do j = 1, k")
+        mprocs.push()
+        mprocs.w("a_work = a_xtx")
+        mprocs.w("b_work = 0.0_dp")
+        mprocs.w("b_work(j) = 1.0_dp")
+        mprocs.w("call solve_linear(a_work, b_work, sol, ok)")
+        mprocs.w("if (.not. ok) error stop \"error: singular normal equations\"")
+        mprocs.w("fit%cov_unscaled(:, j) = sol")
+        mprocs.pop()
+        mprocs.w("end do")
         mprocs.w("fit%coef = beta")
         mprocs.w("fit%fitted = beta(1) + matmul(xpred, beta(2:k))")
         mprocs.w("fit%resid = y - fit%fitted")
@@ -12706,6 +12860,7 @@ def transpile_r_to_fortran(
         mprocs.pop()
         mprocs.w("end if")
         mprocs.w("dof = max(1, n - k)")
+        mprocs.w("fit%df = n - k")
         mprocs.w("fit%sigma = sqrt(sse / dof)")
         mprocs.w("fit%adj_r_squared = 1.0_dp - (1.0_dp - fit%r_squared) * (n - 1) / dof")
         mprocs.w("end function lm_fit_general")
@@ -13568,8 +13723,12 @@ def transpile_r_to_fortran(
         "write_table_real_matrix",
         "lm_fit_general",
         "lm_predict_general",
+        "lm_predict_interval",
+        "print_lm_prediction_interval",
+        "lm_confint",
         "print_lm_summary",
         "print_lm_coef_rstyle",
+        "print_lm_confint",
         "lm_fit_t",
         "optim_result_t",
         "t_test_result_t",
@@ -13732,8 +13891,9 @@ def transpile_r_to_fortran(
         o.w("")
         o.w("type :: lm_fit_t")
         o.push()
-        o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:)")
+        o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:), cov_unscaled(:,:)")
         o.w("real(kind=dp) :: sigma, r_squared, adj_r_squared")
+        o.w("integer :: df = 0")
         o.pop()
         o.w("end type lm_fit_t")
         o.w("")
