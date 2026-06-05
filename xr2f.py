@@ -2787,7 +2787,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|raw|dim|order|max_col|which|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3536,6 +3536,17 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         ):
             return 1
+        m_scalar_formula_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
+        if m_scalar_formula_rhs is not None:
+            rhs_scalar = m_scalar_formula_rhs.group(1).strip()
+            if (
+                not rhs_scalar.lstrip().startswith(("c(", "["))
+                and
+                re.search(r"\b(?:nrow|ncol|length|sum|mean|min|max|det|logdet_spd|sd|r_sd|log)\s*\(", rhs_scalar, re.IGNORECASE)
+                and "%*%" not in rhs_scalar
+                and not re.match(r"\s*(?:matrix|array|cbind|cbind2|rbind|crossprod|tcrossprod|sweep|t)\s*\(", rhs_scalar, re.IGNORECASE)
+            ):
+                return 0
         if re.match(rf"^\s*{nm}\s*<-\s*apply\s*\(", t, re.IGNORECASE):
             return 1
         if re.match(rf"^\s*{nm}\s*<-\s*autocov_matrices\s*\(", t, re.IGNORECASE):
@@ -8568,10 +8579,10 @@ def emit_function(
             rdecl = "logical"
         elif ret_ident in b_int_arrays0:
             ret_rank = _infer_local_array_rank(body_stmts, ret_ident)
-            rdecl = f"integer, allocatable :: {''}".strip()
+            rdecl = "integer, allocatable"
         elif ret_ident in b_real_arrays0:
             ret_rank = _infer_local_array_rank(body_stmts, ret_ident)
-            rdecl = f"real(kind=dp), allocatable :: {''}".strip()
+            rdecl = "real(kind=dp), allocatable"
         elif ret_ident in b_ints0:
             rdecl = "integer"
         elif ret_ident in b_real_scalars0:
@@ -9122,6 +9133,101 @@ def emit_function(
         _walk_int64_assigns(body_use)
         int64_locals &= ints
         assigned_locals = set(infer_assigned_names(body_use).keys())
+
+        list_type_fields: dict[str, dict[str, object]] = {}
+        for spec_ltf in list_specs.values():
+            for path_ltf, fields_ltf in spec_ltf.nested_types.items():
+                list_type_fields[_type_name_for_path(spec_ltf.fn_name, path_ltf)] = fields_ltf
+        list_type_fields["optim_result_t"] = {
+            "par": "numeric(0)",
+            "value": "0.0",
+            "convergence": "0",
+        }
+
+        def _local_field_expr(base: str, fld: str) -> object | None:
+            fields = local_list_fields.get(base)
+            if fields is None:
+                typ = local_list_types.get(base)
+                fields = list_type_fields.get(typ or "")
+            if fields is None:
+                return None
+            return fields.get(fld)
+
+        def _apply_local_alias_from_expr(target: str, expr_obj: object | None) -> bool:
+            if expr_obj is None or isinstance(expr_obj, dict):
+                return False
+            expr_txt = str(expr_obj).strip()
+            if _is_int_literal(expr_txt) or re.match(
+                r"^(?:nrow|ncol|length|which\.min|which\.max)\s*\(",
+                expr_txt,
+                re.IGNORECASE,
+            ):
+                ints.add(target)
+                int_arrays.discard(target)
+                real_arrays.discard(target)
+                real_scalars.discard(target)
+                params.pop(target, None)
+                return True
+            if re.match(r"^[A-Za-z]\w*$", expr_txt):
+                if expr_txt == target:
+                    return False
+                if expr_txt in ints or expr_txt in infer_function_integer_names(fn):
+                    ints.add(target)
+                    int_arrays.discard(target)
+                    real_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
+                if expr_txt in int_arrays:
+                    int_arrays.add(target)
+                    ints.discard(target)
+                    real_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
+                if expr_txt in real_arrays:
+                    real_arrays.add(target)
+                    known_arrays.add(target)
+                    ints.discard(target)
+                    int_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
+                if expr_txt in real_scalars:
+                    real_scalars.add(target)
+                    ints.discard(target)
+                    int_arrays.discard(target)
+                    real_arrays.discard(target)
+                    params.pop(target, None)
+                    return True
+            c_expr = parse_call_text(expr_txt)
+            if c_expr is not None:
+                cn_expr = c_expr[0].lower()
+                if cn_expr in {"matrix", "array", "cbind", "cbind2", "rbind", "crossprod", "tcrossprod", "t"}:
+                    real_arrays.add(target)
+                    known_arrays.add(target)
+                    ints.discard(target)
+                    int_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
+                if cn_expr in {"c", "numeric", "as.numeric", "coef", "fitted", "residuals", "colmeans", "rowsums", "colsums"}:
+                    real_arrays.add(target)
+                    known_arrays.add(target)
+                    ints.discard(target)
+                    int_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
+            if re.search(r"\b(?:sum|mean|min|max|det|logdet_spd|log|sd|r_sd)\s*\(", expr_txt, re.IGNORECASE):
+                real_scalars.add(target)
+                ints.discard(target)
+                int_arrays.discard(target)
+                real_arrays.discard(target)
+                params.pop(target, None)
+                return True
+            return False
+
         def _force_local_vector_component_aliases(ss_alias: list[object]) -> None:
             int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
             real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
@@ -9130,6 +9236,12 @@ def emit_function(
             for st_alias in ss_alias:
                 if isinstance(st_alias, Assign):
                     rhs_alias = st_alias.expr.strip()
+                    m_full_alias = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*$", rhs_alias, re.IGNORECASE)
+                    if m_full_alias is not None and _apply_local_alias_from_expr(
+                        st_alias.name,
+                        _local_field_expr(m_full_alias.group(1), m_full_alias.group(2)),
+                    ):
+                        continue
                     m_scalar_alias = re.match(r"^[A-Za-z]\w*\$([A-Za-z]\w*)\s*$", rhs_alias, re.IGNORECASE)
                     if m_scalar_alias is not None and m_scalar_alias.group(1).lower() in int_fields:
                         ints.add(st_alias.name)
@@ -12919,6 +13031,82 @@ def transpile_r_to_fortran(
         else:
             o.w(f"real(kind=dp) :: {k}")
 
+    def _field_decl_from_expr(fn_name: str, k: str, txt: str) -> str | None:
+        fn_ints = fn_int_names.get(fn_name, set())
+        fn_int_arrays = fn_int_array_names.get(fn_name, set())
+        fn_real_arrays = fn_real_array_names.get(fn_name, set())
+        fn_real_mats = fn_real_matrix_names.get(fn_name, set())
+        fn_lms = fn_lm_names.get(fn_name, set())
+        txt_l = txt.lower()
+        if txt in {"TRUE", "FALSE"}:
+            return f"logical :: {k}"
+        if _dequote_string_literal(txt) is not None or re.match(r"^(sub|substr)\s*\(", txt, re.IGNORECASE):
+            return f"character(len=:), allocatable :: {k}"
+        if _is_int_literal(txt) or _selects_named_order_column(txt) or re.match(
+            r"^(?:nrow|ncol|length|which\.min|which\.max|minloc|maxloc)\s*\(",
+            txt,
+            re.IGNORECASE,
+        ):
+            return f"integer :: {k}"
+        if re.match(r"^[A-Za-z]\w*$", txt):
+            if txt in fn_lms:
+                return f"type(lm_fit_t) :: {k}"
+            if txt in fn_ints:
+                return f"integer :: {k}"
+            if txt in fn_int_arrays:
+                return f"integer, allocatable :: {k}(:)"
+            if txt in fn_real_arrays or txt in fn_real_mats:
+                rk_field = _local_rank_for_type_field(fn_name, txt)
+                if rk_field >= 3:
+                    return f"real(kind=dp), allocatable :: {k}(:,:,:)"
+                if rk_field == 2:
+                    return f"real(kind=dp), allocatable :: {k}(:,:)"
+                if txt in fn_real_mats:
+                    return f"real(kind=dp), allocatable :: {k}(:,:)"
+                if rk_field <= 0:
+                    return f"real(kind=dp) :: {k}"
+                return f"real(kind=dp), allocatable :: {k}(:)"
+            if fn_name in funcs_by_name and txt in funcs_by_name[fn_name].args:
+                rk_field = _local_rank_for_type_field(fn_name, txt)
+                if rk_field == 0 and txt in fn_ints:
+                    return f"integer :: {k}"
+                if rk_field >= 1:
+                    if rk_field >= 3:
+                        return f"real(kind=dp), allocatable :: {k}(:,:,:)"
+                    if rk_field == 2:
+                        return f"real(kind=dp), allocatable :: {k}(:,:)"
+                    return f"real(kind=dp), allocatable :: {k}(:)"
+        if re.search(r"\b(?:nrow|ncol|length|which\.min|which\.max|minloc|maxloc)\s*\(", txt, re.IGNORECASE):
+            return f"integer :: {k}"
+        c_txt = parse_call_text(txt)
+        if c_txt is not None:
+            cn, pos_cn, kw_cn = c_txt
+            cn_l = cn.lower()
+            if cn_l == "c":
+                return f"real(kind=dp), allocatable :: {k}(:)"
+            if cn_l in {"r_matmul", "crossprod", "tcrossprod", "t", "matrix", "array", "cbind", "cbind2"}:
+                return f"real(kind=dp), allocatable :: {k}(:,:)"
+            if cn_l in {"coef", "fitted", "residuals", "colmeans", "rowsums", "colsums", "numeric", "r_rep_real"}:
+                return f"real(kind=dp), allocatable :: {k}(:)"
+            if cn_l == "as.numeric":
+                return f"real(kind=dp), allocatable :: {k}(:)"
+            if cn_l == "tail":
+                n_cn = pos_cn[1] if len(pos_cn) >= 2 else kw_cn.get("n", "")
+                if str(n_cn).strip().upper() in {"1", "1L"}:
+                    return f"real(kind=dp) :: {k}"
+            arg_names = [a.strip() for a in (list(pos_cn) + list(kw_cn.values()))]
+            if any(re.match(r"^[A-Za-z]\w*$", a) and a in fn_real_mats for a in arg_names):
+                return f"real(kind=dp), allocatable :: {k}(:,:)"
+            if any(re.match(r"^[A-Za-z]\w*$", a) and a in fn_real_arrays for a in arg_names):
+                return f"real(kind=dp), allocatable :: {k}(:)"
+            if any(re.match(r"^[A-Za-z]\w*$", a) and a in fn_int_arrays for a in arg_names):
+                return f"integer, allocatable :: {k}(:)"
+        if "%*%" in txt or re.match(r"^(?:cbind|cbind2|matrix|array)\s*\(", txt, re.IGNORECASE):
+            return f"real(kind=dp), allocatable :: {k}(:,:)"
+        if txt.startswith("c(") or txt.startswith("[") or txt_l.startswith(("runif(", "rnorm(")):
+            return f"real(kind=dp), allocatable :: {k}(:)"
+        return None
+
     for fn_name, spec in all_list_specs.items():
         paths = sorted(spec.nested_types.keys(), key=lambda p: len(p), reverse=True)
         for path in paths:
@@ -12936,6 +13124,10 @@ def transpile_r_to_fortran(
                     o.w(f"type({nt}) :: {k}")
                 else:
                     txt = str(v).strip()
+                    structural_decl = _field_decl_from_expr(fn_name, k, txt)
+                    if structural_decl is not None:
+                        o.w(structural_decl)
+                        continue
                     fn_ints = fn_int_names.get(fn_name, set())
                     fn_int_arrays = fn_int_array_names.get(fn_name, set())
                     fn_real_arrays = fn_real_array_names.get(fn_name, set())
