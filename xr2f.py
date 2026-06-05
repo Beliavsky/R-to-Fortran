@@ -4785,6 +4785,11 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_ch = [r_expr_to_fortran(a) for a in pos_ch]
         kw_out_ch = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ch.items()]
         return f"chisq_test({', '.join(pos_out_ch + kw_out_ch)})"
+    if c_usr is not None and c_usr[0].lower() in {"prop.test", "prop_test"}:
+        _nm_pr, pos_pr, kw_pr = c_usr
+        pos_out_pr = [r_expr_to_fortran(a) for a in pos_pr]
+        kw_out_pr = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_pr.items()]
+        return f"prop_test({', '.join(pos_out_pr + kw_out_pr)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
         args_q = [r_expr_to_fortran(a) for a in pos_q]
@@ -7660,6 +7665,10 @@ def emit_stmts(
                         _wstmt(f"call print_chisq_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_chisq_test", "chisq_test", "chisq_test_result_t"})
                         continue
+                    if re.match(r"^prop_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_prop_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_prop_test", "prop_test", "prop_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -7667,6 +7676,10 @@ def emit_stmts(
                     if c_one is not None and c_one[0].lower() in {"chisq.test", "chisq_test"}:
                         _wstmt(f"call print_chisq_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"chisq_test", "print_chisq_test", "chisq_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"prop.test", "prop_test"}:
+                        _wstmt(f"call print_prop_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"prop_test", "print_prop_test", "prop_test_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
@@ -13354,6 +13367,9 @@ def transpile_r_to_fortran(
         "chisq_test_result_t",
         "chisq_test",
         "print_chisq_test",
+        "prop_test_result_t",
+        "prop_test",
+        "print_prop_test",
         "max_col",
         "tabulate",
         "table2",
