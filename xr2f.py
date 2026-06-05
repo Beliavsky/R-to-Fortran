@@ -48,6 +48,8 @@ _KNOWN_RANK3_NAMES: set[str] = set()
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
+_EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
+_DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -56,6 +58,24 @@ DEBUG_COMPILER = "gfortran -g -O0 -Wall -Wextra -Wimplicit-interface -fcheck=all
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
+
+
+def _expanded_data_frame_col_expr(obj: str, field: str) -> str | None:
+    fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj)
+    aliases = _EXPANDED_DATA_FRAME_ALIASES.get(obj)
+    if fields is None:
+        fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj.lower())
+        aliases = _EXPANDED_DATA_FRAME_ALIASES.get(obj.lower())
+    if fields is None:
+        return None
+    field_l = field.lower()
+    if field_l not in {f.lower() for f in fields}:
+        return None
+    if aliases is not None:
+        for k, v in aliases.items():
+            if k.lower() == field_l:
+                return v
+    return f"{obj}_{_sanitize_fortran_kwarg_name(field)}"
 
 
 @dataclass
@@ -3844,6 +3864,18 @@ def _stmt_uses_name_as_reducer_arg(st: object, name: str) -> bool:
     return False
 
 
+def _stmt_uses_name_in_model_formula(st: object, name: str) -> bool:
+    if not isinstance(st, Assign):
+        return False
+    cinfo = parse_call_text(st.expr.strip())
+    if cinfo is None or cinfo[0].lower() not in {"lm", "glm", "aov"}:
+        return False
+    pos = cinfo[1]
+    kw = cinfo[2]
+    form = pos[0].strip() if pos else kw.get("formula", "").strip()
+    return bool(re.search(rf"\b{re.escape(name)}\b", form))
+
+
 def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
     """Inline simple single-use temporaries (`t = expr`) into their sole later use."""
     out = list(stmts)
@@ -3915,6 +3947,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
                 i += 1
                 continue
             if parse_call_text(st.expr.strip()) is not None and _stmt_uses_name_as_reducer_arg(out[use_j], name):
+                i += 1
+                continue
+            if _stmt_uses_name_in_model_formula(out[use_j], name):
                 i += 1
                 continue
             out[use_j] = _replace_name_in_stmt(out[use_j], name, st.expr)
@@ -4271,6 +4306,15 @@ def _int_bound_expr(expr: str) -> str:
     if _looks_integer_fortran_expr(t):
         return t
     return f"int({t})"
+
+
+def _mul_factor_expr(expr: str) -> str:
+    t = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    if _split_top_level_token(t, "+", from_right=True) is not None:
+        return f"({t})"
+    if _split_top_level_token(t, "-", from_right=True) is not None:
+        return f"({t})"
+    return t
 
 
 def _negate_simple_relational_expr(expr_f: str) -> str | None:
@@ -4734,6 +4778,19 @@ def r_expr_to_fortran(expr: str) -> str:
     c_cor0 = parse_call_text(s)
     if c_cor0 is not None and c_cor0[0].lower() in {"cor", "cov"}:
         vals_cor = list(c_cor0[1])
+        if c_cor0[0].lower() == "cor" and len(vals_cor) == 1 and not c_cor0[2]:
+            df_src = vals_cor[0].strip()
+            if re.fullmatch(r"[A-Za-z]\w*", df_src):
+                fields_cor_df = _EXPANDED_DATA_FRAME_FIELDS.get(df_src) or _EXPANDED_DATA_FRAME_FIELDS.get(df_src.lower())
+                if fields_cor_df:
+                    cols_cor_df = [
+                        _expanded_data_frame_col_expr(df_src, f) or f"{df_src}_{_sanitize_fortran_kwarg_name(f)}"
+                        for f in fields_cor_df
+                    ]
+                    if len(cols_cor_df) == 2:
+                        return f"cor(cbind2({cols_cor_df[0]}, {cols_cor_df[1]}))"
+                    if len(cols_cor_df) == 3:
+                        return f"cor(cbind({cols_cor_df[0]}, {cols_cor_df[1]}, {cols_cor_df[2]}))"
         if vals_cor:
             return f"{c_cor0[0].lower()}({', '.join(r_expr_to_fortran(v) for v in vals_cor[:2])})"
     c_rbinom0 = parse_call_text(s)
@@ -4770,6 +4827,19 @@ def r_expr_to_fortran(expr: str) -> str:
         rhs = r_expr_to_fortran(mm_div[1])
         return f"(real({lhs}, kind=dp)) / (real({rhs}, kind=dp))"
     c_usr = parse_call_text(s)
+    if c_usr is not None and c_usr[0].lower() == "cor" and len(c_usr[1]) == 1 and not c_usr[2]:
+        df_src = c_usr[1][0].strip()
+        if re.fullmatch(r"[A-Za-z]\w*", df_src):
+                fields_cor_df = _EXPANDED_DATA_FRAME_FIELDS.get(df_src) or _EXPANDED_DATA_FRAME_FIELDS.get(df_src.lower())
+                if fields_cor_df:
+                    cols_cor_df = [
+                        _expanded_data_frame_col_expr(df_src, f) or f"{df_src}_{_sanitize_fortran_kwarg_name(f)}"
+                        for f in fields_cor_df
+                    ]
+                    if len(cols_cor_df) == 2:
+                        return f"cor(cbind2({cols_cor_df[0]}, {cols_cor_df[1]}))"
+                if len(cols_cor_df) == 3:
+                    return f"cor(cbind({cols_cor_df[0]}, {cols_cor_df[1]}, {cols_cor_df[2]}))"
     if c_usr is not None and c_usr[0].lower() == "t_test":
         _nm_tt, pos_tt, kw_tt = c_usr
         pos_out_tt = [r_expr_to_fortran(a) for a in pos_tt]
@@ -4790,6 +4860,11 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_pr = [r_expr_to_fortran(a) for a in pos_pr]
         kw_out_pr = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_pr.items()]
         return f"prop_test({', '.join(pos_out_pr + kw_out_pr)})"
+    if c_usr is not None and c_usr[0].lower() in {"cor.test", "cor_test"}:
+        _nm_ct, pos_ct, kw_ct = c_usr
+        pos_out_ct = [r_expr_to_fortran(a) for a in pos_ct]
+        kw_out_ct = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ct.items()]
+        return f"cor_test({', '.join(pos_out_ct + kw_out_ct)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
         args_q = [r_expr_to_fortran(a) for a in pos_q]
@@ -6194,11 +6269,9 @@ def r_expr_to_fortran(expr: str) -> str:
         def _repl_expanded_df_field(m: re.Match[str]) -> str:
             obj = m.group(1)
             field = m.group(2)
-            fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj)
-            if fields is None:
-                fields = _EXPANDED_DATA_FRAME_FIELDS.get(obj.lower())
-            if fields is not None and field.lower() in {f.lower() for f in fields}:
-                return f"{obj}_{_sanitize_fortran_kwarg_name(field)}"
+            col_expr = _expanded_data_frame_col_expr(obj, field)
+            if col_expr is not None:
+                return col_expr
             return m.group(0)
 
         s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)\b", _repl_expanded_df_field, s)
@@ -7290,9 +7363,23 @@ def emit_stmts(
                     if rhs.strip() == rn_call and has_r_mod:
                         if mean_f == "0.0_dp" and sd_f == "1.0_dp":
                             o.w(f"{st.name} = rnorm_vec({n_f})")
+                        elif mean_f == "0.0_dp":
+                            o.w(f"{st.name} = {_mul_factor_expr(sd_f)} * rnorm_vec({n_f})")
                         else:
                             o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * rnorm_vec({n_f})")
                         need_r_mod.add("rnorm_vec")
+                        continue
+                    if has_r_mod and len(re.findall(r"\brnorm\s*\(", rhs, re.IGNORECASE)) == 1:
+                        if mean_f == "0.0_dp" and sd_f == "1.0_dp":
+                            rn_expr = f"rnorm_vec({n_f})"
+                        elif mean_f == "0.0_dp":
+                            rn_expr = f"{_mul_factor_expr(sd_f)} * rnorm_vec({n_f})"
+                        else:
+                            rn_expr = f"(({mean_f}) + ({sd_f}) * rnorm_vec({n_f}))"
+                        rhs_i = rhs.replace(rn_call, rn_expr)
+                        _wstmt(f"{st.name} = {r_expr_to_fortran(rhs_i)}", st.comment)
+                        need_r_mod.add("rnorm_vec")
+                        need_rnorm["used"] = True
                         continue
                     o.w("block")
                     o.push()
@@ -7669,6 +7756,10 @@ def emit_stmts(
                         _wstmt(f"call print_prop_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_prop_test", "prop_test", "prop_test_result_t"})
                         continue
+                    if re.match(r"^cor_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_cor_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_cor_test", "cor_test", "cor_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -7681,6 +7772,10 @@ def emit_stmts(
                         _wstmt(f"call print_prop_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"prop_test", "print_prop_test", "prop_test_result_t"})
                         continue
+                    if c_one is not None and c_one[0].lower() in {"cor.test", "cor_test"}:
+                        _wstmt(f"call print_cor_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"cor_test", "print_cor_test", "cor_test_result_t"})
+                        continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
                         need_r_mod.update({"print_t_test", "t_test_result_t"})
@@ -7688,7 +7783,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in _EXPANDED_DATA_FRAME_FIELDS:
                         fields_df = _EXPANDED_DATA_FRAME_FIELDS.get(one, [])
                         if fields_df:
-                            col_vars = [f"{one}_{_sanitize_fortran_kwarg_name(f)}" for f in fields_df]
+                            col_vars = [
+                                _expanded_data_frame_col_expr(one, f) or f"{one}_{_sanitize_fortran_kwarg_name(f)}"
+                                for f in fields_df
+                            ]
                             header = ", ".join(f'"{f}"' for f in fields_df)
                             _wstmt(f'write(*,"(*(a,1x))") {header}', st.comment)
                             o.w("block")
@@ -10489,7 +10587,7 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
 
     Emits assignments to `a_x1`, `a_x2`, ... so later calls can reference fields.
     """
-    global _EXPANDED_DATA_FRAME_FIELDS
+    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _DATA_FRAME_FORCE_MATERIALIZE
     out: list[object] = []
     for st in stmts:
         if not isinstance(st, Assign):
@@ -10506,17 +10604,70 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
             out.append(st)
             continue
         fields_for_df = list(kw.keys())
+        aliases_for_df: dict[str, str] = {}
+        for k, v in kw.items():
+            v_txt = v.strip()
+            if re.fullmatch(r"[A-Za-z]\w*", v_txt):
+                aliases_for_df[k] = v_txt
         for df_key in (st.name, st.name.lower()):
             prior = _EXPANDED_DATA_FRAME_FIELDS.setdefault(df_key, [])
             for field in fields_for_df:
                 if field.lower() not in {p.lower() for p in prior}:
                     prior.append(field)
+            if aliases_for_df:
+                prior_aliases = _EXPANDED_DATA_FRAME_ALIASES.setdefault(df_key, {})
+                for field, alias in aliases_for_df.items():
+                    prior_aliases[field] = alias
         first_col_src = next((v.strip() for v in kw.values() if v.strip()), "")
         for k, v in kw.items():
             v_out = v
             if first_col_src and re.fullmatch(r"NA(?:_real_)?", v.strip(), re.IGNORECASE):
                 v_out = f"numeric(length({first_col_src}))"
+            if st.name not in _DATA_FRAME_FORCE_MATERIALIZE and k in aliases_for_df and v_out == v:
+                continue
             out.append(Assign(name=f"{st.name}_{_sanitize_fortran_kwarg_name(k)}", expr=v_out, comment=st.comment))
+    return out
+
+
+def collect_model_data_frame_uses(stmts: list[object]) -> set[str]:
+    out: set[str] = set()
+
+    def add_name(src: str | None) -> None:
+        if src is None:
+            return
+        t = src.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", t):
+            out.add(t)
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            exprs: list[str] = []
+            if isinstance(st, Assign):
+                exprs.append(st.expr)
+            elif isinstance(st, ExprStmt):
+                exprs.append(st.expr)
+            elif isinstance(st, PrintStmt):
+                exprs.extend(st.args)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+            for expr in exprs:
+                cinfo = parse_call_text(expr.strip())
+                if cinfo is None:
+                    continue
+                nm, _pos, kw = cinfo
+                if nm.lower() in {"lm", "glm", "aov"}:
+                    add_name(kw.get("data"))
+                elif nm.lower() == "predict":
+                    add_name(kw.get("newdata"))
+
+    walk(stmts)
     return out
 
 
@@ -11316,11 +11467,13 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS
-    global _EXPANDED_DATA_FRAME_FIELDS
+    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
+    _EXPANDED_DATA_FRAME_ALIASES = {}
+    _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
     _TABLE_LABELS = {}
     unit_name = _fortran_ident(stem)
@@ -11358,6 +11511,7 @@ def transpile_r_to_fortran(
         )
     }
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+    _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts)
     sd_name_collision = "sd" in {n.lower() for n in infer_assigned_names(main_stmts)}
@@ -13370,6 +13524,9 @@ def transpile_r_to_fortran(
         "prop_test_result_t",
         "prop_test",
         "print_prop_test",
+        "cor_test_result_t",
+        "cor_test",
+        "print_cor_test",
         "max_col",
         "tabulate",
         "table2",
