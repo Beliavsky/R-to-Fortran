@@ -2244,6 +2244,18 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
                 if _is_exponent_sign(i):
                     i += 1
                     continue
+                if token == "*" and (
+                    (i > 0 and text[i - 1] in {"%", "*"})
+                    or (i + 1 < n and text[i + 1] in {"%", "*"})
+                ):
+                    i += 1
+                    continue
+                if token == "/" and (
+                    (i > 0 and text[i - 1] == "%")
+                    or (i + 1 < n and text[i + 1] == "%")
+                ):
+                    i += 1
+                    continue
                 hits.append(i)
                 i += len(token)
                 continue
@@ -4432,6 +4444,13 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         if mm is not None:
             r1 = _infer_assignment_rank_hint(mm[0], inferred_ranks)
             r2 = _infer_assignment_rank_hint(mm[1], inferred_ranks)
+            if op == "%*%":
+                if r1 >= 2 and r2 >= 2:
+                    return 2
+                if r1 >= 1 and r2 >= 1:
+                    return 1
+                if r1 >= 2 or r2 >= 2:
+                    return 1
             return max(r1, r2)
 
     # Sequence expression.
@@ -4447,6 +4466,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         c_call = parse_call_text(expr)
         if c_call is not None:
             fn_name = c_call[0].lower()
+            if fn_name == "diag":
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return 1 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) > 0 else 2
+            if fn_name == "t":
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
             if fn_name in {
                 "c",
                 "vector",
@@ -4456,13 +4481,11 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "cbind2",
                 "rbind",
                 "outer",
-                "diag",
                 "chol",
                 "backsolve",
                 "sweep",
                 "crossprod",
                 "tcrossprod",
-                "t",
                 "r_matmul",
                 "toeplitz",
                 "chol2inv",
@@ -4498,6 +4521,14 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "trigamma",
             }:
                 return 1
+            if fn_name == "solve":
+                b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
+                if b_src is None:
+                    return 2
+                return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks)
+            if fn_name in {"qr.solve", "qr_solve", "qr.coef", "qr_coef"}:
+                b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
+                return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks) if b_src is not None else 1
             if fn_name in {"as.integer", "as.numeric", "as.double"}:
                 return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
             if fn_name in {
@@ -4533,6 +4564,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 fixed += 1
         if base_rank > 0:
             return max(0, base_rank - fixed)
+        base_rank = inferred_ranks.get(base.lower(), 0)
+        if base_rank > 0:
+            return max(0, base_rank - fixed)
         return 2 if len(parts) > 1 else 1
 
     if expr_l.startswith("r_seq_"):
@@ -4540,12 +4574,52 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 
     m_var = re.match(r"^([A-Za-z]\w*)$", expr_l)
     if m_var is not None:
-        return inferred_ranks.get(m_var.group(1), 0)
+        return inferred_ranks.get(m_var.group(1), inferred_ranks.get(m_var.group(1).lower(), 0))
 
     if (":" in expr_l) and re.match(r"^[^\[]*:[^\]]*$", expr_l):
         return 1
 
     return 0
+
+
+def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
+    """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
+    expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    if not expr:
+        return "unknown"
+    expr_l = expr.lower()
+    if expr_l.startswith(("+", "-")) and len(expr_l) > 1 and expr_l[1].isalnum():
+        return _infer_assignment_kind_hint(expr[1:].strip(), inferred_kinds)
+    if _contains_r_complex_literal(expr):
+        return "complex"
+    c_call = parse_call_text(expr)
+    if c_call is not None:
+        nm = c_call[0].lower()
+        if nm in {"re", "im", "mod", "arg", "abs"}:
+            return "real"
+        vals = list(c_call[1]) + list(c_call[2].values())
+        if nm in {"complex", "as.complex"}:
+            return "complex"
+        if nm in {"solve", "qr.solve", "qr_solve"}:
+            if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals[:2]):
+                return "complex"
+            return "real"
+        if nm in {"matrix", "array", "c", "as.vector", "as.numeric", "as.double", "t"} and vals:
+            if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals):
+                return "complex"
+            return "real"
+    for op in ["%*%", "%/%", "%%", "^", "**", "*", "/", "+", "-"]:
+        mm = _split_top_level_token(expr, op, from_right=True)
+        if mm is not None:
+            k1 = _infer_assignment_kind_hint(mm[0], inferred_kinds)
+            k2 = _infer_assignment_kind_hint(mm[1], inferred_kinds)
+            return "complex" if "complex" in {k1, k2} else ("real" if "real" in {k1, k2} else "unknown")
+    m_var = re.match(r"^([A-Za-z]\w*)$", expr)
+    if m_var is not None:
+        return inferred_kinds.get(m_var.group(1), "unknown")
+    if re.search(r"\d", expr):
+        return "real"
+    return "unknown"
 
 
 def rename_conflicting_reused_vars(
@@ -4571,12 +4645,14 @@ def rename_conflicting_reused_vars(
     def walk_block(
         ss: list[object],
         var_ranks: dict[str, int],
+        var_kinds: dict[str, str],
         rename_map: dict[str, str],
         used_names: set[str],
         local_only: bool = False,
-    ) -> tuple[list[object], dict[str, int], dict[str, str]]:
+    ) -> tuple[list[object], dict[str, int], dict[str, str], dict[str, str]]:
         out: list[object] = []
         var_ranks = dict(var_ranks)
+        var_kinds = dict(var_kinds)
         rename_map = dict(rename_map)
         for st in ss:
             if local_only:
@@ -4584,24 +4660,36 @@ def rename_conflicting_reused_vars(
             st = _rename_stmt_obj(st, rename_map)
             if isinstance(st, Assign):
                 rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
+                rhs_kind = _infer_assignment_kind_hint(st.expr, var_kinds)
                 name = st.name
-                if name in var_ranks and var_ranks[name] != rhs_rank:
+                old_kind = var_kinds.get(name, "unknown")
+                kind_conflict = old_kind != "unknown" and rhs_kind != "unknown" and old_kind != rhs_kind
+                if name in var_ranks and (var_ranks[name] != rhs_rank or kind_conflict):
+                    old_name = name
                     new_name = fresh(name, used_names)
                     if warnings is not None:
                         line_no = _find_r_assign_line(src, name) if src else None
                         warnings.append((name, new_name, line_no))
-                    var_ranks[name] = rhs_rank
+                    var_ranks[new_name] = rhs_rank
+                    if rhs_kind != "unknown":
+                        var_kinds[new_name] = rhs_kind
                     used_names.add(new_name)
-                    rename_map[name] = new_name
+                    for old_key, old_val in list(rename_map.items()):
+                        if old_val == old_name:
+                            rename_map[old_key] = new_name
+                    rename_map[old_name] = new_name
                     name = new_name
                 else:
                     var_ranks[name] = rhs_rank
+                    if rhs_kind != "unknown":
+                        var_kinds[name] = rhs_kind
                 st = Assign(name=name, expr=st.expr, comment=st.comment)
                 out.append(st)
             elif isinstance(st, FuncDef):
-                body, child_ranks, child_map = walk_block(
+                body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
@@ -4610,9 +4698,10 @@ def rename_conflicting_reused_vars(
                 # keep function-local renames only
                 used_names = used_names | set(child_map.values())
             elif isinstance(st, ForStmt):
-                body, child_ranks, child_map = walk_block(
+                body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
@@ -4623,19 +4712,22 @@ def rename_conflicting_reused_vars(
                     body=body,
                 )
                 var_ranks = child_ranks
+                var_kinds = child_kinds
                 rename_map = child_map
                 out.append(st_ren)
             elif isinstance(st, IfStmt):
-                then_body, then_ranks, _ = walk_block(
+                then_body, then_ranks, _, then_kinds = walk_block(
                     st.then_body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
                 )
-                else_body, else_ranks, _ = walk_block(
+                else_body, else_ranks, _, else_kinds = walk_block(
                     st.else_body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
@@ -4652,6 +4744,10 @@ def rename_conflicting_reused_vars(
                     else:
                         merged[nm] = r
                 var_ranks = merged
+                merged_kinds = var_kinds.copy()
+                merged_kinds.update({k: v for k, v in then_kinds.items() if v != "unknown"})
+                merged_kinds.update({k: v for k, v in else_kinds.items() if v != "unknown"})
+                var_kinds = merged_kinds
                 out.append(
                     IfStmt(
                         cond=_replace_idents(st.cond, rename_map),
@@ -4660,25 +4756,29 @@ def rename_conflicting_reused_vars(
                     )
                 )
             elif isinstance(st, WhileStmt):
-                body, child_ranks, child_map = walk_block(
+                body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
                 )
                 var_ranks = child_ranks
+                var_kinds = child_kinds
                 rename_map = child_map
                 out.append(WhileStmt(cond=_replace_idents(st.cond, rename_map), body=body))
             elif isinstance(st, RepeatStmt):
-                body, child_ranks, child_map = walk_block(
+                body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
                     {k: v for k, v in var_ranks.items()},
+                    {k: v for k, v in var_kinds.items()},
                     rename_map,
                     used_names.copy(),
                     local_only=False,
                 )
                 var_ranks = child_ranks
+                var_kinds = child_kinds
                 rename_map = child_map
                 out.append(RepeatStmt(body=body))
             elif isinstance(st, PrintStmt):
@@ -4689,10 +4789,10 @@ def rename_conflicting_reused_vars(
                 out.append(ExprStmt(expr=_replace_idents(st.expr, rename_map), comment=st.comment))
             else:
                 out.append(st)
-        return out, var_ranks, rename_map
+        return out, var_ranks, rename_map, var_kinds
 
     used = {nm.lower() for nm in _assigned_names_in_stmts(stmts)} | {nm.lower() for nm in _r_name_candidates("x")}
-    out, _, _ = walk_block(stmts, {}, {}, used, local_only=False)
+    out, _, _, _ = walk_block(stmts, {}, {}, {}, used, local_only=False)
     return out
 
 
@@ -5328,6 +5428,16 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
     s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
     s = re.sub(r"(?i)\bqr\.coef\s*\(", "qr_coef(", s)
+    m_lmfit_coef_early = re.match(r"^(lm\.fit\s*\(.*\))\s*\$\s*coefficients\s*$", s, re.IGNORECASE)
+    if m_lmfit_coef_early is not None:
+        c_lmfit_e = parse_call_text(m_lmfit_coef_early.group(1))
+        if c_lmfit_e is not None and c_lmfit_e[0].lower() == "lm.fit":
+            _nm_lm_e, pos_lm_e, kw_lm_e = c_lmfit_e
+            x_src_e = pos_lm_e[0] if pos_lm_e else kw_lm_e.get("x")
+            y_src_e = pos_lm_e[1] if len(pos_lm_e) >= 2 else kw_lm_e.get("y")
+            if x_src_e is None or y_src_e is None:
+                raise NotImplementedError("lm.fit(... )$coefficients requires x and y")
+            return f"qr_coef(qr(real({r_expr_to_fortran(x_src_e)}, kind=dp)), {r_expr_to_fortran(y_src_e)})"
     m_coef_named_early = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
     if m_coef_named_early is not None:
         fit_nm = m_coef_named_early.group(1)
@@ -6349,14 +6459,32 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("det requires an argument")
         return f"det_real({r_expr_to_fortran(x_src)})"
+    c_kappa = parse_call_text(s)
+    if c_kappa is not None and c_kappa[0].lower() == "kappa":
+        _nk, pos_k, kw_k = c_kappa
+        x_src = pos_k[0] if pos_k else kw_k.get("x")
+        if x_src is None:
+            raise NotImplementedError("kappa requires an argument")
+        return f"kappa_real(real({r_expr_to_fortran(x_src)}, kind=dp))"
+    c_qr_solve = parse_call_text(s)
+    if c_qr_solve is not None and c_qr_solve[0].lower() in {"qr.solve", "qr_solve"}:
+        _nqs, pos_qs, kw_qs = c_qr_solve
+        a_src = pos_qs[0] if pos_qs else kw_qs.get("a")
+        b_src = pos_qs[1] if len(pos_qs) >= 2 else kw_qs.get("b")
+        if a_src is None or b_src is None:
+            raise NotImplementedError("qr.solve requires matrix a and right-hand side b")
+        return f"qr_coef(qr(real({r_expr_to_fortran(a_src)}, kind=dp)), {r_expr_to_fortran(b_src)})"
     c_solve = parse_call_text(s)
     if c_solve is not None and c_solve[0].lower() == "solve":
         _ns, pos_s, kw_s = c_solve
         a_src = pos_s[0] if pos_s else kw_s.get("a")
         b_src = pos_s[1] if len(pos_s) >= 2 else kw_s.get("b")
-        if a_src is None or b_src is None:
-            raise NotImplementedError("solve(a, b) requires both arguments in this subset")
-        return f"solve_real({r_expr_to_fortran(a_src)}, {r_expr_to_fortran(b_src)})"
+        if a_src is None:
+            raise NotImplementedError("solve requires matrix argument a")
+        a_f = r_expr_to_fortran(a_src)
+        if b_src is None:
+            return f"solve_real({a_f}, diag(size({a_f}, 1)))"
+        return f"solve_real({a_f}, {r_expr_to_fortran(b_src)})"
     c_tail = parse_call_text(s)
     if c_tail is not None and c_tail[0].lower() == "tail":
         _nt, pos_tl, kw_tl = c_tail
@@ -12680,6 +12808,13 @@ def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None
         cinfo = parse_call_text(rhs_t)
         if cinfo is not None:
             nm = cinfo[0].lower()
+            if nm == "matrix":
+                vals = list(cinfo[1]) + list(cinfo[2].values())
+                return any(_is_complex_expr_source(v.strip()) for v in vals)
+            if nm == "solve":
+                vals = list(cinfo[1]) + list(cinfo[2].values())
+                if any(_infer_assignment_rank_hint(v.strip(), {n: 2 for n in matrices}) >= 2 for v in vals[1:2]):
+                    return any(_infer_assignment_kind_hint(v.strip(), {n: "complex" for n in matrices | arrays | scalars}) == "complex" for v in vals[:2])
             if nm in {"complex", "as.complex"}:
                 arg = ""
                 if cinfo[1]:
@@ -12733,6 +12868,12 @@ def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None
             if nm == "c":
                 vals = cinfo[1] + list(cinfo[2].values())
                 return any(_is_complex_expr_source(v.strip()) for v in vals)
+            if nm in {"solve", "r_matmul"}:
+                vals = list(cinfo[1]) + list(cinfo[2].values())
+                return any(
+                    _infer_assignment_kind_hint(v.strip(), {n: "complex" for n in matrices | arrays | scalars}) == "complex"
+                    for v in vals[:2]
+                )
             if nm in {"conj"}:
                 arg = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("z", "").strip()
                 return arg.lower() in arrays or arg.lower() in scalars
@@ -12790,7 +12931,10 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
         if isinstance(st, Assign):
             rhs = st.expr.strip()
             low = rhs.lower()
-            if _split_top_level_token(rhs, "%*%", from_right=True) is not None:
+            if (
+                _split_top_level_token(rhs, "%*%", from_right=True) is not None
+                and _infer_assignment_rank_hint(rhs, {n.lower(): 2 for n in (out | known_int_matrices)}) >= 2
+            ):
                 out.add(st.name)
             if low.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs):
                 out.add(st.name)
@@ -12803,10 +12947,19 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 out.add(st.name)
             if low.startswith("cbind(") or low.startswith("cbind2(") or low.startswith("rbind("):
                 out.add(st.name)
-            if low.startswith("t("):
+            c_t_mat = parse_call_text(rhs)
+            if c_t_mat is not None and c_t_mat[0].lower() == "t":
                 out.add(st.name)
             if low.startswith("chol("):
                 out.add(st.name)
+            if low.startswith("diag(") and _infer_assignment_rank_hint(rhs, {n.lower(): 2 for n in out}) >= 2:
+                out.add(st.name)
+            if low.startswith("solve("):
+                c_solve_m = parse_call_text(rhs)
+                if c_solve_m is not None and c_solve_m[0].lower() == "solve":
+                    b_src_m = c_solve_m[1][1] if len(c_solve_m[1]) >= 2 else c_solve_m[2].get("b")
+                    if b_src_m is None or _infer_assignment_rank_hint(b_src_m.strip(), {n: 2 for n in out}) >= 2:
+                        out.add(st.name)
             if low.startswith("qr.q(") or low.startswith("qr.r(") or low.startswith("qr_q(") or low.startswith("qr_r("):
                 out.add(st.name)
             if low.startswith("outer("):
@@ -14255,6 +14408,19 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    for st_solve_mat in main_stmts:
+        if not isinstance(st_solve_mat, Assign):
+            continue
+        c_solve_mat = parse_call_text(st_solve_mat.expr.strip())
+        if c_solve_mat is None or c_solve_mat[0].lower() != "solve":
+            continue
+        b_src_solve = c_solve_mat[1][1] if len(c_solve_mat[1]) >= 2 else c_solve_mat[2].get("b")
+        if b_src_solve is None or _infer_assignment_rank_hint(
+            b_src_solve.strip(),
+            {n.lower(): 2 for n in set(int_matrices) | set(real_matrices)},
+        ) >= 2:
+            real_matrices.add(st_solve_mat.name)
+            int_matrices.discard(st_solve_mat.name)
     int_rank3_arrays = infer_main_integer_rank3_arrays(main_stmts)
     real_rank3_arrays = infer_main_real_rank3_arrays(main_stmts)
     real_rank4_arrays = infer_main_real_rank4_arrays(main_stmts)
@@ -16317,6 +16483,7 @@ def transpile_r_to_fortran(
         "rank_average",
         "rank_first",
         "det_real",
+        "kappa_real",
         "eigen_sym_values",
         "solve_real",
         "chol",
