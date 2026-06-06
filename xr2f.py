@@ -5253,6 +5253,25 @@ def r_expr_to_fortran(expr: str) -> str:
         rows = [r_expr_to_fortran(a) for a in c_rb[1]]
         if len(rows) < 1:
             raise NotImplementedError("rbind requires at least one row")
+        if _HAS_R_MOD and len(rows) > 1:
+            def _row_is_matrix_expr(raw_row: str) -> bool:
+                rs = raw_row.strip()
+                if rs.startswith("(") and rs.endswith(")"):
+                    rs = rs[1:-1].strip()
+                c_row = parse_call_text(rs)
+                if c_row is not None:
+                    nm_row = c_row[0].lower()
+                    if nm_row in {"matrix", "array", "cbind", "cbind2", "rbind", "crossprod", "tcrossprod"}:
+                        return True
+                    if rs.startswith("r_matmul") or rs.startswith("reshape(") or rs.startswith("transpose("):
+                        return True
+                return False
+
+            if any(_row_is_matrix_expr(a) for a in c_rb[1]):
+                out = rows[0]
+                for row in rows[1:]:
+                    out = f"rbind({out}, {row})"
+                return out
         nrow = len(rows)
         first = rows[0]
         ncol = len(split_top_level_commas(first[1:-1])) if first.strip().startswith("[") and first.strip().endswith("]") else f"size({first})"
@@ -7006,7 +7025,7 @@ def emit_stmts(
         if t.startswith("[") and t.endswith("]"):
             return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
-        if m_field_print is not None and m_field_print.group(1).lower() in {"ar", "ma", "sigma", "resid", "fitted"}:
+        if m_field_print is not None and m_field_print.group(1).lower() in {"ar", "ma", "sigma", "resid", "fitted", "centers"}:
             return 2
         if re.match(r"^[A-Za-z]\w*\s*\$\s*a\s*\[\[", t):
             return 2
@@ -7155,7 +7174,7 @@ def emit_stmts(
                 return 1
         if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
             fld = re.split(r"[$%]", t)[-1].lower()
-            if fld in {"table", "design", "sigma", "y"}:
+            if fld in {"centers", "table", "design", "sigma", "y"}:
                 return 2
             if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
                 return 1
@@ -7166,7 +7185,7 @@ def emit_stmts(
             dims = _split_index_dims(m_comp_ix.group(1).strip())
             if fld == "a" and len(dims) >= 2:
                 return 2
-            if fld in {"table", "design", "sigma", "y"} and len(dims) >= 2:
+            if fld in {"centers", "table", "design", "sigma", "y"} and len(dims) >= 2:
                 scalar_dims = [d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None for d in dims]
                 return 0 if all(scalar_dims) else 2
             if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
@@ -7924,6 +7943,7 @@ def emit_stmts(
                     n_f = _int_bound_expr(r_expr_to_fortran(n_src))
                     mean_f = r_expr_to_fortran(kw_i.get("mean", "0.0"))
                     sd_f = r_expr_to_fortran(kw_i.get("sd", "1.0"))
+                    rn_count = len(re.findall(r"\brnorm\s*\(", rhs, re.IGNORECASE))
                     if rhs.strip() == rn_call and has_r_mod:
                         if mean_f == "0.0_dp" and sd_f == "1.0_dp":
                             o.w(f"{st.name} = rnorm_vec({n_f})")
@@ -7933,7 +7953,7 @@ def emit_stmts(
                             o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * rnorm_vec({n_f})")
                         need_r_mod.add("rnorm_vec")
                         continue
-                    if has_r_mod and len(re.findall(r"\brnorm\s*\(", rhs, re.IGNORECASE)) == 1:
+                    if has_r_mod and rn_count == 1:
                         if mean_f == "0.0_dp" and sd_f == "1.0_dp":
                             rn_expr = f"rnorm_vec({n_f})"
                         elif mean_f == "0.0_dp":
@@ -7945,23 +7965,29 @@ def emit_stmts(
                         need_r_mod.add("rnorm_vec")
                         need_rnorm["used"] = True
                         continue
-                    o.w("block")
-                    o.push()
-                    o.w("real(kind=dp), allocatable :: rn_tmp(:)")
                     if has_r_mod:
-                        o.w(f"rn_tmp = rnorm_vec({n_f})")
-                        need_r_mod.add("rnorm_vec")
+                        # Avoid reusing a single temporary across multiple rnorm calls;
+                        # fall through for correct semantics.
+                        pass
                     else:
-                        o.w(f"call rnorm_vec({n_f}, rn_tmp)")
-                    if mean_f != "0.0_dp" or sd_f != "1.0_dp":
-                        o.w(f"rn_tmp = ({mean_f}) + ({sd_f}) * rn_tmp")
-                    rhs_i = rhs.replace(rn_call, "rn_tmp")
-                    rhs_f_i = r_expr_to_fortran(rhs_i)
-                    _wstmt(f"{st.name} = {rhs_f_i}", st.comment)
-                    o.pop()
-                    o.w("end block")
-                    need_rnorm["used"] = True
-                    continue
+                        # Existing compatibility path when rnorm helper is unavailable.
+                        o.w("block")
+                        o.push()
+                        o.w("real(kind=dp), allocatable :: rn_tmp(:)")
+                        if has_r_mod:
+                            o.w(f"rn_tmp = rnorm_vec({n_f})")
+                            need_r_mod.add("rnorm_vec")
+                        else:
+                            o.w(f"call rnorm_vec({n_f}, rn_tmp)")
+                        if mean_f != "0.0_dp" or sd_f != "1.0_dp":
+                            o.w(f"rn_tmp = ({mean_f}) + ({sd_f}) * rn_tmp")
+                        rhs_i = rhs.replace(rn_call, "rn_tmp")
+                        rhs_f_i = r_expr_to_fortran(rhs_i)
+                        _wstmt(f"{st.name} = {rhs_f_i}", st.comment)
+                        o.pop()
+                        o.w("end block")
+                        need_rnorm["used"] = True
+                        continue
             c_numeric_assign = parse_call_text(rhs)
             if c_numeric_assign is not None and c_numeric_assign[0].lower() in {"numeric", "double"}:
                 _nnm, pos_num, kw_num = c_numeric_assign
@@ -10343,6 +10369,12 @@ def emit_function(
         for spec_ltf in list_specs.values():
             for path_ltf, fields_ltf in spec_ltf.nested_types.items():
                 list_type_fields[_type_name_for_path(spec_ltf.fn_name, path_ltf)] = fields_ltf
+        list_type_fields["kmeans_result_t"] = {
+            "cluster": "integer(0)",
+            "size": "integer(0)",
+            "centers": "numeric(0)",
+            "withinss": "numeric(0)",
+        }
         list_type_fields["optim_result_t"] = {
             "par": "numeric(0)",
             "value": "0.0",
@@ -10434,10 +10466,10 @@ def emit_function(
             return False
 
         def _force_local_vector_component_aliases(ss_alias: list[object]) -> None:
-            int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
+            int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial", "size", "cluster"}
             real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
-            vector_fields = {"par", "coef", "fitted", "resid", "mu", "pi", "weights", "nk"}
-            matrix_fields = {"ar", "ma", "sigma", "table", "design", "y"}
+            vector_fields = {"par", "coef", "fitted", "resid", "mu", "pi", "weights", "nk", "withinss"}
+            matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers"}
             for st_alias in ss_alias:
                 if isinstance(st_alias, Assign):
                     rhs_alias = st_alias.expr.strip()
@@ -12760,6 +12792,10 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() in {"lm", "aov"}:
                 lm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
+            if c_fit_main is not None and c_fit_main[0].lower() == "kmeans":
+                list_vars[st.name] = "kmeans_result_t"
+                helper_ctx_main["need_r_mod"].add("kmeans")
+                helper_ctx_main["need_r_mod"].add("kmeans_result_t")
             if c_fit_main is not None and c_fit_main[0].lower() == "glm":
                 glm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
@@ -13021,9 +13057,9 @@ def transpile_r_to_fortran(
         real_matrices.discard(nm)
 
     def _force_main_list_component_alias_types(ss_alias: list[object]) -> None:
-        int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial"}
+        int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial", "size", "cluster"}
         real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
-        matrix_fields = {"ar", "ma", "sigma", "table", "design", "y"}
+        matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers"}
         for st_alias in ss_alias:
             if isinstance(st_alias, Assign):
                 rhs_alias = st_alias.expr.strip()
@@ -14413,9 +14449,10 @@ def transpile_r_to_fortran(
         "summary",
         "dnorm",
         "tail",
-        "cbind2",
-        "cbind",
-        "numeric",
+    "cbind2",
+    "cbind",
+    "rbind",
+    "numeric",
         "pmax",
         "sd",
         "r_sd",
