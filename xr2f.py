@@ -1170,6 +1170,10 @@ def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
             break
         s0 = i + m.start()
         e0 = i + m.end()
+        if s0 > 0 and expr[s0 - 1] == ".":
+            out.append(expr[i:e0])
+            i = e0
+            continue
         out.append(expr[i:s0])
         j = e0
         while j < n and expr[j].isspace():
@@ -4785,6 +4789,8 @@ def r_expr_to_fortran(expr: str) -> str:
     c_cast0 = parse_call_text(s)
     if c_cast0 is not None and c_cast0[0].lower() in {"as.numeric", "as.double"} and c_cast0[1]:
         return r_expr_to_fortran(c_cast0[1][0].strip())
+    if c_cast0 is not None and c_cast0[0].lower() == "factor" and c_cast0[1]:
+        return r_expr_to_fortran(c_cast0[1][0].strip())
     for op, fn in [("+", "r_add"), ("-", "r_sub"), ("*", "r_mul"), ("/", "r_div")]:
         mm_op = _split_top_level_token(s, op, from_right=True)
         if mm_op is not None:
@@ -4940,8 +4946,24 @@ def r_expr_to_fortran(expr: str) -> str:
     for op_r, op_f in [("==", "=="), ("!=", "/="), (">=", ">="), ("<=", "<="), (">", ">"), ("<", "<")]:
         mm_cmp = _split_top_level_token(s, op_r, from_right=True)
         if mm_cmp is not None:
-            lhs = r_expr_to_fortran(mm_cmp[0])
-            rhs = r_expr_to_fortran(mm_cmp[1])
+            lhs_src = mm_cmp[0].strip()
+            rhs_src = mm_cmp[1].strip()
+            lhs_label = _dequote_string_literal(lhs_src)
+            rhs_label = _dequote_string_literal(rhs_src)
+            if rhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", lhs_src) and lhs_src in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[lhs_src]
+                if rhs_label in labels:
+                    lhs = r_expr_to_fortran(lhs_src)
+                    rhs = str(labels.index(rhs_label) + 1)
+                    return f"{lhs} {op_f} {rhs}"
+            if lhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", rhs_src) and rhs_src in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[rhs_src]
+                if lhs_label in labels:
+                    lhs = str(labels.index(lhs_label) + 1)
+                    rhs = r_expr_to_fortran(rhs_src)
+                    return f"{lhs} {op_f} {rhs}"
+            lhs = r_expr_to_fortran(lhs_src)
+            rhs = r_expr_to_fortran(rhs_src)
             return f"{lhs} {op_f} {rhs}"
     mm_mod = _split_top_level_token(s, "%%", from_right=True)
     if mm_mod is not None:
@@ -5886,8 +5908,19 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?<!\|)\|(?!\|)", ".or.", s)
     s = re.sub(r"!\s*(?!=)", ".not. ", s)
     s = s.replace("^", "**")
-    # ifelse(a,b,c) -> merge(b,c,a)
-    s = re.sub(r"\bifelse\s*\((.+?),(.+?),(.+?)\)", r"merge(\2,\3,\1)", s)
+    # ifelse(a,b,c) -> merge(b,c,a), recursively lowering the condition so
+    # categorical comparisons such as x == "B" become integer-code tests.
+    def _ifelse_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) != 3:
+            return "ifelse(" + inner + ")"
+        return (
+            f"merge({r_expr_to_fortran(parts[1].strip())}, "
+            f"{r_expr_to_fortran(parts[2].strip())}, "
+            f"{r_expr_to_fortran(parts[0].strip())})"
+        )
+
+    s = _replace_balanced_func_calls(s, "ifelse", _ifelse_to_fortran)
     # basic helpers
     def _length_repl(inner: str) -> str:
         txt = inner.strip()
@@ -6475,6 +6508,8 @@ def emit_stmts(
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
     need_r_mod: set[str] = set()
     lm_terms_by_fit: dict[str, list[str]] = {}
+    lm_design_exprs_by_fit: dict[str, list[str]] = {}
+    lm_design_first_by_fit: dict[str, str] = {}
     data_frame_vars: dict[str, tuple[str | None, list[str]]] = {}
     int_matrix_vars: set[str] = set()
     real_matrix_vars: set[str] = set()
@@ -6494,6 +6529,12 @@ def emit_stmts(
         lmd = helper_ctx.get("lm_terms_by_fit")
         if isinstance(lmd, dict):
             lm_terms_by_fit = lmd
+        lme = helper_ctx.get("lm_design_exprs_by_fit")
+        if isinstance(lme, dict):
+            lm_design_exprs_by_fit = lme
+        lmf = helper_ctx.get("lm_design_first_by_fit")
+        if isinstance(lmf, dict):
+            lm_design_first_by_fit = lmf
         dfv = helper_ctx.get("data_frame_vars")
         if isinstance(dfv, dict):
             data_frame_vars = dfv
@@ -6602,6 +6643,59 @@ def emit_stmts(
         cols = ", ".join(r_expr_to_fortran(f"{newd}_{t}") for t in terms)
         first = r_expr_to_fortran(f"{newd}_{terms[0]}")
         return fit_nm, f"reshape([{cols}], [size({first}), {len(terms)}])", kwp
+
+    def _source_name_from_factor_expr(expr: str) -> str:
+        t = expr.strip()
+        c = parse_call_text(t)
+        if c is not None and c[0].lower() == "factor" and c[1]:
+            return c[1][0].strip()
+        return t
+
+    def _lm_design_columns(raw_terms: list[str], data_name: str = "") -> tuple[list[str], list[str], str]:
+        labels: list[str] = []
+        exprs: list[str] = []
+        first_src = ""
+        df_predictors: list[str] = []
+        if data_name in data_frame_vars:
+            _df_y, df_predictors = data_frame_vars[data_name]
+        df_by_source: dict[str, str] = {}
+        for p_src in df_predictors:
+            src_nm = _source_name_from_factor_expr(p_src)
+            if re.fullmatch(r"[A-Za-z]\w*", src_nm):
+                df_by_source[src_nm] = p_src
+        for term in raw_terms:
+            tnm = term.strip()
+            src_nm = _source_name_from_factor_expr(df_by_source.get(tnm, tnm))
+            if not first_src:
+                first_src = src_nm
+            if re.fullmatch(r"[A-Za-z]\w*", src_nm) and src_nm in _CATEGORICAL_LABELS:
+                cat_labels = _CATEGORICAL_LABELS[src_nm]
+                for level_idx, level in enumerate(cat_labels[1:], start=2):
+                    labels.append(f"{src_nm}{level}")
+                    exprs.append(f"merge(1.0_dp, 0.0_dp, {r_expr_to_fortran(src_nm)} == {level_idx})")
+                continue
+            labels.append(tnm)
+            exprs.append(r_expr_to_fortran(tnm))
+        return labels, exprs, first_src or (raw_terms[0].strip() if raw_terms else "")
+
+    def _model_matrix_print(expr: str) -> tuple[str, str, list[str]] | None:
+        m = re.match(
+            r"^head\s*\(\s*model\.matrix\s*\(\s*([A-Za-z]\w*)\s*\)\s*\)\s*$",
+            expr.strip(),
+            re.IGNORECASE,
+        )
+        if m is None:
+            return None
+        fit_nm = m.group(1)
+        exprs = lm_design_exprs_by_fit.get(fit_nm)
+        labels = lm_terms_by_fit.get(fit_nm)
+        first = lm_design_first_by_fit.get(fit_nm)
+        if not exprs or not labels or not first:
+            return None
+        cols = ", ".join(["spread(1.0_dp, dim=1, ncopies=size(" + first + "))"] + exprs)
+        all_labels = ["(Intercept)"] + labels
+        mm_expr = f"reshape([{cols}], [size({first}), {len(all_labels)}])"
+        return fit_nm, mm_expr, all_labels
 
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
@@ -7182,8 +7276,10 @@ def emit_stmts(
                     x_terms = df_x
                     if not x_terms:
                         raise NotImplementedError("lm(y ~ ., data=df) requires predictor columns in data.frame")
-                    lm_terms_by_fit[st.name] = x_terms
                     if len(x_terms) == 1 and x_terms[0] in matrix_vars:
+                        lm_terms_by_fit[st.name] = x_terms
+                        lm_design_exprs_by_fit[st.name] = [r_expr_to_fortran(x_terms[0])]
+                        lm_design_first_by_fit[st.name] = x_terms[0]
                         xpred_f = r_expr_to_fortran(x_terms[0])
                         o.w("block")
                         o.push()
@@ -7198,8 +7294,11 @@ def emit_stmts(
                     terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
                 if not terms:
                     raise NotImplementedError("lm formula requires at least one predictor")
-                lm_terms_by_fit[st.name] = terms
-                p = len(terms)
+                term_labels, term_exprs, first_src = _lm_design_columns(terms, data_name)
+                lm_terms_by_fit[st.name] = term_labels
+                lm_design_exprs_by_fit[st.name] = term_exprs
+                lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src)
+                p = len(term_exprs)
                 o.w("block")
                 o.push()
                 o.w("integer :: n_lm, p_lm")
@@ -7207,8 +7306,7 @@ def emit_stmts(
                 o.w(f"n_lm = size({yv})")
                 o.w(f"p_lm = {p}")
                 o.w("allocate(x_lm(n_lm, p_lm))")
-                for j, tnm in enumerate(terms, start=1):
-                    tv = r_expr_to_fortran(tnm)
+                for j, tv in enumerate(term_exprs, start=1):
                     o.w(f"x_lm(:, {j}) = {tv}")
                 o.w(f"{st.name} = lm_fit_general({yv}, x_lm)")
                 o.pop()
@@ -7375,7 +7473,11 @@ def emit_stmts(
                 else:
                     raise NotImplementedError("read.table requires file argument in this subset")
                 path_f = r_expr_to_fortran(path_src)
-                o.w(f"call read_table_real_matrix({path_f}, {st.name})")
+                header_f = r_expr_to_fortran(kwrt.get("header", "FALSE"))
+                if header_f == ".true.":
+                    o.w(f"call read_table_real_matrix({path_f}, {st.name}, header=.true.)")
+                else:
+                    o.w(f"call read_table_real_matrix({path_f}, {st.name})")
                 if helper_ctx is not None:
                     helper_ctx["need_table_reader"] = True
                 continue
@@ -7392,7 +7494,11 @@ def emit_stmts(
                 else:
                     raise NotImplementedError("read.table requires file argument in this subset")
                 path_f = r_expr_to_fortran(path_src)
-                o.w(f"call read_table_real_matrix({path_f}, {st.name})")
+                header_f = r_expr_to_fortran(kwrt.get("header", "FALSE"))
+                if header_f == ".true.":
+                    o.w(f"call read_table_real_matrix({path_f}, {st.name}, header=.true.)")
+                else:
+                    o.w(f"call read_table_real_matrix({path_f}, {st.name})")
                 if helper_ctx is not None:
                     helper_ctx["need_table_reader"] = True
                 continue
@@ -8017,6 +8123,41 @@ def emit_stmts(
                             if helper_ctx is not None:
                                 helper_ctx["need_lm"] = True
                             continue
+                    m_anova = re.match(r"^anova\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
+                    if has_r_mod and m_anova is not None:
+                        fit_nm = m_anova.group(1)
+                        terms = lm_terms_by_fit.get(fit_nm, [])
+                        if terms:
+                            max_len = max(1, max(len(t) for t in terms))
+                            terms_lit = ", ".join(f'"{t}"' for t in terms)
+                            _wstmt(
+                                f'call print_lm_anova({fit_nm}, [character(len={max_len}) :: {terms_lit}])',
+                                st.comment,
+                            )
+                        else:
+                            _wstmt(f"call print_lm_anova({fit_nm})", st.comment)
+                        need_r_mod.add("print_lm_anova")
+                        if helper_ctx is not None:
+                            helper_ctx["need_lm"] = True
+                        continue
+                    mm_print = _model_matrix_print(one)
+                    if has_r_mod and mm_print is not None:
+                        _fit_nm, mm_expr, mm_labels = mm_print
+                        max_len = max(1, max(len(t) for t in mm_labels))
+                        labels_lit = ", ".join(f'"{t}"' for t in mm_labels)
+                        o.w("block")
+                        o.push()
+                        o.w("real(kind=dp), allocatable :: mm_pr(:,:)")
+                        o.w(f"mm_pr = {mm_expr}")
+                        _wstmt(
+                            f"call print_matrix_rstyle_named(mm_pr(1:min(6, size(mm_pr, 1)), :), "
+                            f"[character(len={max_len}) :: {labels_lit}])",
+                            st.comment,
+                        )
+                        o.pop()
+                        o.w("end block")
+                        need_r_mod.add("print_matrix_rstyle_named")
+                        continue
                     rank_one = _expr_rank_for_print(one)
                     if rank_one == 2:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
@@ -8419,7 +8560,15 @@ def emit_stmts(
                 data_arg = data_f
                 if data_rank == 1 or re.search(r"%\s*(?:x|z|loglik|pi|mu|sigma)\b", data_f):
                     data_arg = f"reshape({data_f}, [size({data_f}), 1])"
-                o.w(f"call write_table_real_matrix({file_f}, {data_arg})")
+                matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
+                labels = None
+                if isinstance(matrix_labels_map, dict) and re.fullmatch(r"[A-Za-z]\w*", data_src.strip()):
+                    labels = matrix_labels_map.get(data_src.strip().lower())
+                col_names_f = r_expr_to_fortran(kw.get("col.names", "TRUE"))
+                if labels and col_names_f != ".false.":
+                    o.w(f"call write_table_real_matrix({file_f}, {data_arg}, {_char_array_literal([str(x) for x in labels])})")
+                else:
+                    o.w(f"call write_table_real_matrix({file_f}, {data_arg})")
                 if helper_ctx is not None:
                     helper_ctx["need_table_writer"] = True
                 continue
@@ -10798,6 +10947,23 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
                 labs = _parse_string_c_vector(st.expr.strip())
                 if labs is not None:
                     string_vectors[st.name.lower()] = labs
+                cinfo = parse_call_text(st.expr.strip())
+                if cinfo is not None and cinfo[0].lower() in {"cbind", "cbind2"}:
+                    cbind_labs: list[str] = []
+                    ok = True
+                    for idx, arg in enumerate(cinfo[1], start=1):
+                        asn = split_top_level_assignment(arg.strip())
+                        if asn is not None:
+                            cbind_labs.append(asn[0].strip())
+                            continue
+                        nm = re.match(r"^([A-Za-z]\w*)$", arg.strip())
+                        if nm is not None:
+                            cbind_labs.append(nm.group(1))
+                            continue
+                        cbind_labs.append(f"V{idx}")
+                        ok = False
+                    if cbind_labs and ok:
+                        labels[st.name.lower()] = cbind_labs
             elif isinstance(st, ExprStmt):
                 m = re.match(
                     r"^\s*colnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
@@ -12548,21 +12714,32 @@ def transpile_r_to_fortran(
         mprocs.w("end function count_ws_tokens")
         mprocs.w("")
     if emit_local_table_reader:
-        mprocs.w("subroutine read_table_real_matrix(file_path, x)")
+        mprocs.w("subroutine read_table_real_matrix(file_path, x, header)")
         mprocs.w("character(len=*), intent(in) :: file_path")
         mprocs.w("real(kind=dp), allocatable, intent(out) :: x(:,:)")
+        mprocs.w("logical, intent(in), optional :: header")
         mprocs.w("integer :: fp, ios, nrow, ncol, i")
         mprocs.w("character(len=4096) :: line")
+        mprocs.w("logical :: has_header, skipped_header")
         mprocs.w("nrow = 0")
         mprocs.w("ncol = 0")
+        mprocs.w("has_header = .false.")
+        mprocs.w("if (present(header)) has_header = header")
+        mprocs.w("skipped_header = .false.")
         mprocs.w('open(newunit=fp, file=file_path, status="old", action="read")')
         mprocs.w("do")
         mprocs.push()
         mprocs.w("read(fp, '(A)', iostat=ios) line")
         mprocs.w("if (ios /= 0) exit")
         mprocs.w("if (len_trim(line) == 0) cycle")
-        mprocs.w("nrow = nrow + 1")
         mprocs.w("if (ncol == 0) ncol = count_ws_tokens(line)")
+        mprocs.w("if (has_header .and. .not. skipped_header) then")
+        mprocs.push()
+        mprocs.w("skipped_header = .true.")
+        mprocs.w("cycle")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("nrow = nrow + 1")
         mprocs.pop()
         mprocs.w("end do")
         mprocs.w("if (nrow <= 0 .or. ncol <= 0) then")
@@ -12575,11 +12752,18 @@ def transpile_r_to_fortran(
         mprocs.w("allocate(x(nrow, ncol))")
         mprocs.w("rewind(fp)")
         mprocs.w("i = 0")
+        mprocs.w("skipped_header = .false.")
         mprocs.w("do")
         mprocs.push()
         mprocs.w("read(fp, '(A)', iostat=ios) line")
         mprocs.w("if (ios /= 0) exit")
         mprocs.w("if (len_trim(line) == 0) cycle")
+        mprocs.w("if (has_header .and. .not. skipped_header) then")
+        mprocs.push()
+        mprocs.w("skipped_header = .true.")
+        mprocs.w("cycle")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("i = i + 1")
         mprocs.w("read(line, *) x(i, 1:ncol)")
         mprocs.pop()
@@ -12588,11 +12772,31 @@ def transpile_r_to_fortran(
         mprocs.w("end subroutine read_table_real_matrix")
         mprocs.w("")
     if emit_local_table_writer:
-        mprocs.w("subroutine write_table_real_matrix(file_path, x)")
+        mprocs.w("subroutine write_table_real_matrix(file_path, x, names)")
         mprocs.w("character(len=*), intent(in) :: file_path")
         mprocs.w("real(kind=dp), intent(in) :: x(:,:)")
-        mprocs.w("integer :: fp, i")
+        mprocs.w("character(len=*), intent(in), optional :: names(:)")
+        mprocs.w("integer :: fp, i, j")
         mprocs.w('open(newunit=fp, file=file_path, status="replace", action="write")')
+        mprocs.w("if (present(names)) then")
+        mprocs.push()
+        mprocs.w("do j = 1, size(x, 2)")
+        mprocs.push()
+        mprocs.w("if (j > 1) write(fp, '(1x)', advance='no')")
+        mprocs.w("if (j <= size(names)) then")
+        mprocs.push()
+        mprocs.w("write(fp, '(a)', advance='no') trim(names(j))")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w('write(fp, \'("V",i0)\', advance=\'no\') j')
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("write(fp,*)")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("do i = 1, size(x, 1)")
         mprocs.push()
         mprocs.w("write(fp, *) x(i, 1:size(x, 2))")
@@ -12845,6 +13049,8 @@ def transpile_r_to_fortran(
         mprocs.pop()
         mprocs.w("end do")
         mprocs.w("fit%coef = beta")
+        mprocs.w("fit%y = y")
+        mprocs.w("fit%xpred = xpred")
         mprocs.w("fit%fitted = beta(1) + matmul(xpred, beta(2:k))")
         mprocs.w("fit%resid = y - fit%fitted")
         mprocs.w("sse = sum(fit%resid**2)")
@@ -13729,6 +13935,7 @@ def transpile_r_to_fortran(
         "print_lm_summary",
         "print_lm_coef_rstyle",
         "print_lm_confint",
+        "print_lm_anova",
         "lm_fit_t",
         "optim_result_t",
         "t_test_result_t",
@@ -13891,7 +14098,7 @@ def transpile_r_to_fortran(
         o.w("")
         o.w("type :: lm_fit_t")
         o.push()
-        o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:), cov_unscaled(:,:)")
+        o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:), cov_unscaled(:,:), y(:), xpred(:,:)")
         o.w("real(kind=dp) :: sigma, r_squared, adj_r_squared")
         o.w("integer :: df = 0")
         o.pop()
