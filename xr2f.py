@@ -44,6 +44,7 @@ _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
 _CATEGORICAL_LABELS: dict[str, list[str]] = {}
 _TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
+_FIT_TERM_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
@@ -2893,7 +2894,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|rpois|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -4591,6 +4592,22 @@ def r_expr_to_fortran(expr: str) -> str:
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
     s = _replace_dotted_var_refs(s)
+    m_coef_named_early = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
+    if m_coef_named_early is not None:
+        fit_nm = m_coef_named_early.group(1)
+        coef_nm = m_coef_named_early.group(2)
+        terms = _FIT_TERM_LABELS.get(fit_nm.lower(), [])
+        idx = terms.index(coef_nm) + 2 if coef_nm in terms else 1
+        return f"{r_expr_to_fortran(fit_nm)}%coef({idx})"
+    c_resid_early = parse_call_text(s)
+    if c_resid_early is not None and c_resid_early[0].lower() == "resid":
+        _nm_res_e, pos_res_e, kw_res_e = c_resid_early
+        fit_src_e = pos_res_e[0] if pos_res_e else kw_res_e.get("object", "")
+        typ_e = (_dequote_string_literal(kw_res_e.get("type", "").strip()) or "").lower()
+        if fit_src_e and typ_e == "pearson":
+            return f"glm_pearson_resid({r_expr_to_fortran(fit_src_e)})"
+        if fit_src_e:
+            return f"{r_expr_to_fortran(fit_src_e)}%resid"
     s = re.sub(r"\bt\.test\s*\(", "t_test(", s, flags=re.IGNORECASE)
     s = re.sub(r"\bcooks\.distance\s*\(", "lm_cooks_distance(", s, flags=re.IGNORECASE)
 
@@ -4690,6 +4707,16 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?i)\.machine\s*\$\s*double\.eps", "epsilon(1.0_dp)", s)
     s = re.sub(r"(?i)\.machine\s*\$\s*double\.xmin", "tiny(1.0_dp)", s)
     s = re.sub(r"(?i)\.machine\s*\$\s*double\.xmax", "huge(1.0_dp)", s)
+    m_df_resid = re.match(r"^([A-Za-z]\w*)\s*\$\s*df\.residual\s*$", s, re.IGNORECASE)
+    if m_df_resid is not None:
+        return f"{r_expr_to_fortran(m_df_resid.group(1))}%df"
+    m_coef_named = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
+    if m_coef_named is not None:
+        fit_nm = m_coef_named.group(1)
+        coef_nm = m_coef_named.group(2)
+        terms = _FIT_TERM_LABELS.get(fit_nm.lower(), [])
+        idx = terms.index(coef_nm) + 2 if coef_nm in terms else 1
+        return f"{r_expr_to_fortran(fit_nm)}%coef({idx})"
     s = re.sub(r"(?i)\bmax\.col\s*\(", "max_col(", s)
     s = re.sub(r"(?i)\bties\.method\s*=", "ties_method=", s)
     s = _replace_balanced_func_calls(s, "t", lambda inner: f"transpose({r_expr_to_fortran(inner.strip())})")
@@ -4883,6 +4910,14 @@ def r_expr_to_fortran(expr: str) -> str:
             f"{_int_bound_expr(r_expr_to_fortran(size_src or '1'))}, "
             f"{r_expr_to_fortran(prob_src or '0.5')})"
         )
+    c_rpois0 = parse_call_text(s)
+    if c_rpois0 is not None and c_rpois0[0].lower() == "rpois":
+        _nm_rp0, pos_rp0, kw_rp0 = c_rpois0
+        n_src = pos_rp0[0] if pos_rp0 else kw_rp0.get("n", "1")
+        lam_src = kw_rp0.get("lambda")
+        if lam_src is None and len(pos_rp0) >= 2:
+            lam_src = pos_rp0[1]
+        return f"rpois({_int_bound_expr(r_expr_to_fortran(n_src))}, {r_expr_to_fortran(lam_src or '1.0')})"
     # Preserve operator precedence: parse top-level scalar +/- before scalar division.
     # Example: m4 / sd**4 - 3.0 must map to (m4 / sd**4) - 3.0, not m4 / (sd**4 - 3.0).
     addsub = _find_top_level_addsub(s)
@@ -4951,6 +4986,14 @@ def r_expr_to_fortran(expr: str) -> str:
         if not fit_src:
             raise NotImplementedError("cooks.distance requires a fitted model")
         return f"lm_cooks_distance({r_expr_to_fortran(fit_src)})"
+    if c_usr is not None and c_usr[0].lower() == "resid":
+        _nm_res, pos_res, kw_res = c_usr
+        fit_src = pos_res[0] if pos_res else kw_res.get("object", "")
+        typ = (_dequote_string_literal(kw_res.get("type", "").strip()) or "").lower()
+        if fit_src and typ == "pearson":
+            return f"glm_pearson_resid({r_expr_to_fortran(fit_src)})"
+        if fit_src:
+            return f"{r_expr_to_fortran(fit_src)}%resid"
     if c_usr is not None and c_usr[0].lower() == "pchisq":
         _nm_pc, pos_pc, kw_pc = c_usr
         x_src = pos_pc[0] if pos_pc else kw_pc.get("q", "0.0")
@@ -6609,6 +6652,20 @@ def r_expr_to_fortran(expr: str) -> str:
     while prev != s:
         prev = s
         s = idx_pat.sub(_repl_idx, s)
+    def _coef_named_percent_repl(m: re.Match[str]) -> str:
+        fit_nm = m.group(1)
+        coef_nm = m.group(2)
+        terms = _FIT_TERM_LABELS.get(fit_nm.lower(), [])
+        idx = terms.index(coef_nm) + 2 if coef_nm in terms else 1
+        return f"{fit_nm}%coef({idx})"
+
+    s = re.sub(r"\b([A-Za-z]\w*)%coef\(\s*['\"]([^'\"]+)['\"]\s*\)", _coef_named_percent_repl, s)
+    s = re.sub(
+        r"\bresid\s*\(\s*([A-Za-z]\w*)\s*,\s*type\s*=\s*['\"]pearson['\"]\s*\)",
+        r"glm_pearson_resid(\1)",
+        s,
+        flags=re.IGNORECASE,
+    )
     # R empty subscript positions: a[,j] -> a(:,j), a[i,] -> a(i,:)
     s = re.sub(r"\(\s*,", "(:,", s)
     s = re.sub(r",\s*\)", ",:)", s)
@@ -7508,8 +7565,12 @@ def emit_stmts(
                     raise NotImplementedError("lm/aov/glm requires formula like y ~ x1 + x2 + ... in this subset")
                 if is_glm:
                     fam_src = kw_lm.get("family", "")
-                    if fam_src and not re.match(r"^binomial\s*\(", fam_src.strip(), re.IGNORECASE):
-                        raise NotImplementedError("glm currently supports family = binomial() only")
+                    fam_txt = fam_src.strip().lower()
+                    if fam_txt and not re.match(r"^(binomial|poisson)\s*\(", fam_txt, re.IGNORECASE):
+                        raise NotImplementedError("glm currently supports family = binomial() or poisson() only")
+                    glm_family = "poisson" if re.match(r"^poisson\s*\(", fam_txt, re.IGNORECASE) else "binomial"
+                else:
+                    glm_family = ""
                 yv = r_expr_to_fortran(m_form.group(1).strip())
                 rhs_terms = m_form.group(2).strip()
                 data_name = kw_lm.get("data", "").strip()
@@ -7538,8 +7599,18 @@ def emit_stmts(
                     terms = x_terms
                 else:
                     terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
+                offset_terms: list[str] = []
+                if is_glm:
+                    kept_terms: list[str] = []
+                    for term in terms:
+                        c_offset = parse_call_text(term.strip())
+                        if c_offset is not None and c_offset[0].lower() == "offset" and c_offset[1]:
+                            offset_terms.append(c_offset[1][0].strip())
+                        else:
+                            kept_terms.append(term)
+                    terms = kept_terms
                 if not terms:
-                    raise NotImplementedError("lm formula requires at least one predictor")
+                    raise NotImplementedError("lm/glm formula requires at least one predictor")
                 term_labels, term_exprs, first_src = _lm_design_columns(terms, data_name)
                 anova_labels, anova_dfs = _lm_anova_groups(terms, data_name)
                 lm_terms_by_fit[st.name] = term_labels
@@ -7550,6 +7621,7 @@ def emit_stmts(
                 if is_glm:
                     glm_fits.add(st.name)
                     glm_terms_by_fit[st.name] = term_labels
+                    _FIT_TERM_LABELS[st.name.lower()] = term_labels
                 lm_design_exprs_by_fit[st.name] = term_exprs
                 lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src)
                 p = len(term_exprs)
@@ -7563,7 +7635,15 @@ def emit_stmts(
                 for j, tv in enumerate(term_exprs, start=1):
                     o.w(f"x_lm(:, {j}) = {tv}")
                 if is_glm:
-                    o.w(f"{st.name} = glm_binomial_fit({yv}, x_lm)")
+                    if glm_family == "poisson":
+                        offset_f = "spread(0.0_dp, dim=1, ncopies=n_lm)"
+                        if offset_terms:
+                            offset_f = r_expr_to_fortran(offset_terms[0])
+                            for off_term in offset_terms[1:]:
+                                offset_f = f"{offset_f} + {r_expr_to_fortran(off_term)}"
+                        o.w(f"{st.name} = glm_poisson_fit({yv}, x_lm, offset={offset_f})")
+                    else:
+                        o.w(f"{st.name} = glm_binomial_fit({yv}, x_lm)")
                 else:
                     o.w(f"{st.name} = lm_fit_general({yv}, x_lm)")
                 o.pop()
@@ -8009,9 +8089,9 @@ def emit_stmts(
                 elif "sample_int(" in rhs_f:
                     need_r_mod.add("sample_int")
                 continue
-            if cinfo is not None and cinfo[0].lower() == "rbinom":
+            if cinfo is not None and cinfo[0].lower() in {"rbinom", "rpois"}:
                 _wstmt(f"{st.name} = {rhs_f}", st.comment)
-                need_r_mod.add("rbinom")
+                need_r_mod.add(cinfo[0].lower())
                 continue
             if cinfo is not None and cinfo[0].lower() == "sample.int":
                 if not has_r_mod:
@@ -12062,7 +12142,7 @@ def transpile_r_to_fortran(
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES
-    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
     global _NO_RECYCLE
     global _R_SD_CALL_NAME
@@ -12072,6 +12152,7 @@ def transpile_r_to_fortran(
     _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
     _TABLE_LABELS = {}
+    _FIT_TERM_LABELS = {}
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -14200,6 +14281,7 @@ def transpile_r_to_fortran(
         "rnorm_vec",
         "rnorm_mat",
         "rbinom",
+        "rpois",
         "random_choice2_prob",
         "sample_int",
         "sample_int1",
@@ -14275,7 +14357,9 @@ def transpile_r_to_fortran(
         "lm_r_squared_general",
         "lm_predict_general",
         "glm_binomial_fit",
+        "glm_poisson_fit",
         "glm_predict_response",
+        "glm_pearson_resid",
         "print_glm_summary",
         "lm_predict_interval",
         "lm_cooks_distance",
