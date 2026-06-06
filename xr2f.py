@@ -3042,6 +3042,10 @@ def classify_vars(
                         or re.match(r"^(?:solve|solve_real)\s*\(", arg0, re.IGNORECASE)
                         or "[" in arg0
                         or "%*%" in arg0
+                        or (
+                            any(re.search(rf"\b{re.escape(nm)}\b", arg0) for nm in known_arrays | int_arrays | real_arrays)
+                            and any(op in arg0 for op in ["+", "-", "*", "/"])
+                        )
                     ):
                         real_arrays.add(st.name)
                         known_arrays.add(st.name)
@@ -3366,6 +3370,24 @@ def classify_vars(
                     params.pop(st.name, None)
                     known_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                elif re.match(r"^(?:pmax|pmin)\s*\(", rhs, re.IGNORECASE):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif re.match(r"^[A-Za-z]\w*\s*\[[^:,\]]+\]\s*$", rhs):
+                    if any(re.match(rf"^{re.escape(a)}\s*\[", rhs) for a in int_arrays):
+                        ints.add(st.name)
+                        real_scalars.discard(st.name)
+                    else:
+                        real_scalars.add(st.name)
+                        ints.discard(st.name)
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                 elif re.match(r"^[A-Za-z]\w*$", rhs) and rhs in int_arrays:
@@ -4479,6 +4501,16 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "t":
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
+            if fn_name == "apply":
+                margin_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("MARGIN", c_call[2].get("margin", "")).strip()
+                fun_src = c_call[1][2] if len(c_call[1]) >= 3 else c_call[2].get("FUN", c_call[2].get("fun", "")).strip()
+                if margin_src.strip() in {"2", "2L"} and fun_src.strip().lower() == "cumsum":
+                    return 2
+                return 1
+            if fn_name == "apply_col_cumsum":
+                return 2
+            if fn_name == "apply_col_sd":
+                return 1
             if fn_name in {
                 "c",
                 "vector",
@@ -5927,6 +5959,21 @@ def r_expr_to_fortran(expr: str) -> str:
         x_src = pos_pc[0] if pos_pc else kw_pc.get("q", "0.0")
         df_src = kw_pc.get("df", pos_pc[1] if len(pos_pc) >= 2 else "1")
         return f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), real({r_expr_to_fortran(df_src)}, kind=dp))"
+    if c_usr is not None and c_usr[0].lower() == "pnorm":
+        _nm_pn, pos_pn, kw_pn = c_usr
+        x_src = pos_pn[0] if pos_pn else kw_pn.get("q", "0.0")
+        return f"normal_cdf(real({r_expr_to_fortran(x_src)}, kind=dp))"
+    if c_usr is not None and c_usr[0].lower() == "apply":
+        _nm_app, pos_app, kw_app = c_usr
+        x_src = pos_app[0] if pos_app else kw_app.get("X", kw_app.get("x", ""))
+        margin_src = pos_app[1] if len(pos_app) >= 2 else kw_app.get("MARGIN", kw_app.get("margin", ""))
+        fun_src = pos_app[2] if len(pos_app) >= 3 else kw_app.get("FUN", kw_app.get("fun", ""))
+        fun_name = fun_src.strip().lower()
+        margin_txt = margin_src.strip()
+        if margin_txt in {"2", "2L"} and fun_name == "cumsum":
+            return f"apply_col_cumsum({r_expr_to_fortran(x_src)})"
+        if margin_txt in {"2", "2L"} and fun_name in {"sd", "r_sd"}:
+            return f"apply_col_sd({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "sort":
         _nm_sort, pos_sort, kw_sort = c_usr
         x_src = pos_sort[0] if pos_sort else kw_sort.get("x", "")
@@ -7343,6 +7390,19 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "as.double", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(s, "as.character", lambda inner: inner.strip())
+    def _apply_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 3:
+            x_src = parts[0].strip()
+            margin_src = parts[1].strip()
+            fun_src = parts[2].strip().lower()
+            if margin_src in {"2", "2L"} and fun_src == "cumsum":
+                return f"apply_col_cumsum({r_expr_to_fortran(x_src)})"
+            if margin_src in {"2", "2L"} and fun_src in {"sd", "r_sd"}:
+                return f"apply_col_sd({r_expr_to_fortran(x_src)})"
+        return f"apply({inner})"
+    s = _replace_balanced_func_calls(s, "apply", _apply_to_fortran)
+    s = _replace_balanced_func_calls(s, "rep", lambda inner: r_expr_to_fortran("rep(" + inner + ")"))
     s = _replace_balanced_func_calls(
         s,
         "as.Date",
@@ -7406,6 +7466,10 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bNA_real_\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     s = re.sub(r"\bNA\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     def _split_reduction_args(inner: str) -> tuple[str, bool]:
+        x_parts, na_rm = _split_reduction_arg_list(inner)
+        return (x_parts[0] if x_parts else ""), na_rm
+
+    def _split_reduction_arg_list(inner: str) -> tuple[list[str], bool]:
         parts = split_top_level_commas(inner)
         x_parts: list[str] = []
         na_rm = False
@@ -7418,7 +7482,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 continue
             if t:
                 x_parts.append(t)
-        return (x_parts[0] if x_parts else ""), na_rm
+        return x_parts, na_rm
 
     def _non_na_pack_expr(x_f: str) -> str:
         return f"pack({x_f}, .not. is_na({x_f}))"
@@ -7498,24 +7562,22 @@ def r_expr_to_fortran(expr: str) -> str:
 
     s = _replace_balanced_func_calls(s, "rowSums", _rowsums_to_fortran)
     s = _replace_balanced_func_calls(s, "colSums", _colsums_to_fortran)
-    s = _replace_balanced_func_calls(
-        s,
-        "max",
-        lambda inner: (
-            f"maxval({_normalize_numeric_args(inner)})"
-            if len(split_top_level_commas(inner)) == 1
-            else f"max({_normalize_numeric_args(inner)})"
-        ),
-    )
-    s = _replace_balanced_func_calls(
-        s,
-        "min",
-        lambda inner: (
-            f"minval({_normalize_numeric_args(inner)})"
-            if len(split_top_level_commas(inner)) == 1
-            else f"min({_normalize_numeric_args(inner)})"
-        ),
-    )
+    def _max_to_fortran(inner: str) -> str:
+        parts, na_rm = _split_reduction_arg_list(inner)
+        if len(parts) <= 1:
+            x_f = r_expr_to_fortran(parts[0] if parts else "")
+            return f"maxval({_non_na_pack_expr(x_f)})" if na_rm else f"maxval({x_f})"
+        return f"max({_normalize_numeric_args(', '.join(parts))})"
+
+    def _min_to_fortran(inner: str) -> str:
+        parts, na_rm = _split_reduction_arg_list(inner)
+        if len(parts) <= 1:
+            x_f = r_expr_to_fortran(parts[0] if parts else "")
+            return f"minval({_non_na_pack_expr(x_f)})" if na_rm else f"minval({x_f})"
+        return f"min({_normalize_numeric_args(', '.join(parts))})"
+
+    s = _replace_balanced_func_calls(s, "max", _max_to_fortran)
+    s = _replace_balanced_func_calls(s, "min", _min_to_fortran)
     s = _replace_balanced_func_calls(
         s,
         "pmax",
@@ -11144,11 +11206,112 @@ def emit_function(
     emit_as_subroutine = _stmt_tree_has_output_ops(fn_body) and _function_has_void_return(
         FuncDef(name=fn.name, args=fn.args, defaults=fn.defaults, body=fn_body)
     )
+    def _lower_local_scalar_closures(
+        body_in: list[object],
+        last_in: ExprStmt,
+    ) -> tuple[list[object], ExprStmt]:
+        closures: dict[str, tuple[str, str]] = {}
+        body_no_closure: list[object] = []
+        for st_lc in body_in:
+            if isinstance(st_lc, FuncDef) and len(st_lc.args) == 1:
+                body_lc = [b for b in st_lc.body if not isinstance(b, CommentStmt)]
+                if len(body_lc) == 1 and isinstance(body_lc[0], ExprStmt):
+                    expr_lc = body_lc[0].expr.strip()
+                    ret_lc = _return_call_arg(expr_lc)
+                    closures[st_lc.name] = (st_lc.args[0], (ret_lc.strip() if ret_lc is not None else expr_lc))
+                    continue
+            body_no_closure.append(st_lc)
+
+        if not closures:
+            return body_in, last_in
+
+        def _inline_expr(expr_src: str) -> str:
+            out_expr = expr_src
+            for fn_lc, (arg_lc, expr_lc) in closures.items():
+                def repl(inner: str, arg_nm: str = arg_lc, body_expr: str = expr_lc) -> str:
+                    actual = inner.strip()
+                    return "(" + _replace_idents(body_expr, {arg_nm: f"({actual})"}) + ")"
+
+                out_expr = _replace_balanced_func_calls(out_expr, fn_lc, repl)
+            return out_expr
+
+        def _rewrite_stmt(st_lc: object) -> object:
+            if isinstance(st_lc, Assign):
+                return Assign(st_lc.name, _inline_expr(st_lc.expr), st_lc.comment)
+            if isinstance(st_lc, ExprStmt):
+                return ExprStmt(_inline_expr(st_lc.expr), st_lc.comment)
+            if isinstance(st_lc, IfStmt):
+                return IfStmt(
+                    _inline_expr(st_lc.cond),
+                    [_rewrite_stmt(s) for s in st_lc.then_body],
+                    [_rewrite_stmt(s) for s in st_lc.else_body],
+                )
+            if isinstance(st_lc, ForStmt):
+                return ForStmt(st_lc.var, _inline_expr(st_lc.iter_expr), [_rewrite_stmt(s) for s in st_lc.body])
+            if isinstance(st_lc, WhileStmt):
+                return WhileStmt(_inline_expr(st_lc.cond), [_rewrite_stmt(s) for s in st_lc.body])
+            if isinstance(st_lc, RepeatStmt):
+                return RepeatStmt([_rewrite_stmt(s) for s in st_lc.body])
+            return st_lc
+
+        body_out = [_rewrite_stmt(st_lc) for st_lc in body_no_closure]
+        last_expr = _inline_expr(last_in.expr)
+
+        m_uniroot = re.match(
+            r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$",
+            last_expr.strip(),
+            re.IGNORECASE,
+        )
+        if m_uniroot is not None:
+            c_ur = parse_call_text("uniroot(" + m_uniroot.group(1).strip() + ")")
+            if c_ur is not None:
+                _nm_ur, pos_ur, kw_ur = c_ur
+                f_src = pos_ur[0].strip() if pos_ur else kw_ur.get("f", "").strip()
+                if f_src in closures:
+                    arg_ur, expr_ur = closures[f_src]
+                    lower_ur = kw_ur.get("lower", pos_ur[1] if len(pos_ur) >= 2 else "0.0")
+                    upper_ur = kw_ur.get("upper", pos_ur[2] if len(pos_ur) >= 3 else "1.0")
+                    tol_ur = kw_ur.get("tol", "1.0e-8")
+
+                    def f_at(x_src: str) -> str:
+                        return _replace_idents(expr_ur, {arg_ur: f"({x_src})"})
+
+                    a_nm = "uniroot_lower"
+                    b_nm = "uniroot_upper"
+                    mid_nm = "uniroot_root"
+                    fmid_nm = "uniroot_f_mid"
+                    flower_nm = "uniroot_f_lower"
+                    body_out.extend(
+                        [
+                            Assign(a_nm, lower_ur, ""),
+                            Assign(b_nm, upper_ur, ""),
+                            Assign(flower_nm, f_at(a_nm), ""),
+                            Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
+                            ForStmt(
+                                "uniroot_iter",
+                                "1:100",
+                                [
+                                    Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
+                                    Assign(fmid_nm, f_at(mid_nm), ""),
+                                    IfStmt(
+                                        f"{flower_nm} * {fmid_nm} <= 0",
+                                        [Assign(b_nm, mid_nm, "")],
+                                        [Assign(a_nm, mid_nm, ""), Assign(flower_nm, fmid_nm, "")],
+                                    ),
+                                ],
+                            ),
+                        ]
+                    )
+                    last_expr = mid_nm
+
+        return body_out, ExprStmt(last_expr, last_in.comment)
+
     has_explicit_return = isinstance(fn_body[-1], ExprStmt)
     last = fn_body[-1] if has_explicit_return else ExprStmt(expr="0.0")
     list_spec = list_specs.get(fn.name)
     need_rnorm_local = {"used": False}
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
+    body_stmts, last = _lower_local_scalar_closures(body_stmts, last)
     if fn.name == "arma_coef_names" and len(fn.args) >= 2:
         max_ar_arg, max_ma_arg = fn.args[:2]
         rname = f"{fn.name}_result"
@@ -11439,7 +11602,7 @@ def emit_function(
             arg_type[a] = "real_array"
             continue
         if (
-            a in {"n", "k", "p", "q", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
+            a in {"n", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
             or a.endswith("_order")
             or (a == "name" and fn.name.lower().startswith("print_"))
             or a in fn_int_args
@@ -12120,6 +12283,22 @@ def emit_function(
                 int_arrays.discard(st_seq_rank.name)
                 real_scalars.discard(st_seq_rank.name)
                 params.pop(st_seq_rank.name, None)
+            if st_seq_rank.name in real_scalars and re.match(
+                r"^(?:pmax|pmin|max|min)\s*\(",
+                st_seq_rank.expr.strip(),
+                re.IGNORECASE,
+            ):
+                rhs_rank_hint = _infer_assignment_rank_hint(
+                    st_seq_rank.expr.strip(),
+                    {n.lower(): r for n, r in local_ranks.items()},
+                )
+                if rhs_rank_hint >= 1:
+                    local_ranks[st_seq_rank.name] = rhs_rank_hint
+                    real_arrays.add(st_seq_rank.name)
+                    real_scalars.discard(st_seq_rank.name)
+                    ints.discard(st_seq_rank.name)
+                    int_arrays.discard(st_seq_rank.name)
+                    params.pop(st_seq_rank.name, None)
         changed = True
         while changed:
             changed = False
@@ -12321,7 +12500,7 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
     ints: set[str] = set()
     for a in fn.args:
         dflt = fn.defaults.get(a, "").strip()
-        if a in {"n", "k", "p", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
+        if a in {"n", "p", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
             ints.add(a)
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     if body_no_ret:
@@ -15104,6 +15283,47 @@ def transpile_r_to_fortran(
             real_rank4_arrays.discard(nm)
             params.pop(nm, None)
 
+    scalar_element_assigns: dict[str, list[str]] = {}
+
+    def _collect_main_scalar_element_assigns(ss_se: list[object]) -> None:
+        for st_se in ss_se:
+            if isinstance(st_se, Assign):
+                rhs_se = st_se.expr.strip()
+                if re.match(r"^[A-Za-z]\w*\s*\[[^:,\]]+\]\s*$", rhs_se):
+                    scalar_element_assigns.setdefault(st_se.name, []).append(rhs_se)
+            elif isinstance(st_se, IfStmt):
+                _collect_main_scalar_element_assigns(st_se.then_body)
+                _collect_main_scalar_element_assigns(st_se.else_body)
+            elif isinstance(st_se, ForStmt):
+                _collect_main_scalar_element_assigns(st_se.body)
+            elif isinstance(st_se, WhileStmt):
+                _collect_main_scalar_element_assigns(st_se.body)
+            elif isinstance(st_se, RepeatStmt):
+                _collect_main_scalar_element_assigns(st_se.body)
+
+    _collect_main_scalar_element_assigns(main_stmts)
+    for nm, rhs_items in scalar_element_assigns.items():
+        if assign_counts.get(nm, 0) != len(rhs_items):
+            continue
+        base_names = [
+            re.match(r"^([A-Za-z]\w*)\s*\[", rhs_item).group(1)  # type: ignore[union-attr]
+            for rhs_item in rhs_items
+        ]
+        params.pop(nm, None)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        if any(base in int_arrays or (base in array_params and array_params[base][0] == "integer") for base in base_names):
+            ints.add(nm)
+            real_scalars.discard(nm)
+        else:
+            real_scalars.add(nm)
+            ints.discard(nm)
+
     helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
@@ -16473,6 +16693,8 @@ def transpile_r_to_fortran(
         "var",
         "r_format_vec",
         "colMeans",
+        "apply_col_cumsum",
+        "apply_col_sd",
         "cov",
         "cor",
         "r_seq_int",
@@ -16525,6 +16747,7 @@ def transpile_r_to_fortran(
         "print_real_vector",
         "print_summary",
         "lm_coef",
+        "normal_cdf",
         "set_print_int_like",
         "set_recycle_warn",
         "set_recycle_stop",
