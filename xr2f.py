@@ -2745,7 +2745,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply|rexp)\s*\(", rhs_l):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -2988,6 +2988,17 @@ def classify_vars(
                         ints.add(st.name)
                         real_scalars.discard(st.name)
                     params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                elif (
+                    re.search(r"\bsummary\s*\(.+\)\s*\$\s*r\.squared\b", rhs, re.IGNORECASE)
+                    or re.search(r"\blm_r_squared_general\s*\(", rhs_f, re.IGNORECASE)
+                    or re.search(r"\bpchisq\s*\(", rhs_f, re.IGNORECASE)
+                ):
+                    real_scalars.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
@@ -3304,7 +3315,7 @@ def classify_vars(
             known_arrays.discard(nm)
             params.pop(nm, None)
     for nm in integer_context_names:
-        if nm in real_arrays or nm in int_arrays:
+        if nm in real_scalars or nm in real_arrays or nm in int_arrays:
             continue
         ints.add(nm)
         real_scalars.discard(nm)
@@ -4553,6 +4564,7 @@ def r_expr_to_fortran(expr: str) -> str:
     s = fscan.strip_redundant_outer_parens_expr(s)
     s = _replace_dotted_var_refs(s)
     s = re.sub(r"\bt\.test\s*\(", "t_test(", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bcooks\.distance\s*\(", "lm_cooks_distance(", s, flags=re.IGNORECASE)
 
     def _rewrite_t_test_field_access(txt: str) -> str:
         out: list[str] = []
@@ -4901,6 +4913,35 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_ft = [r_expr_to_fortran(a) for a in pos_ft]
         kw_out_ft = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ft.items()]
         return f"fisher_test({', '.join(pos_out_ft + kw_out_ft)})"
+    if c_usr is not None and c_usr[0].lower() == "lm_cooks_distance":
+        _nm_cd, pos_cd, kw_cd = c_usr
+        fit_src = pos_cd[0] if pos_cd else kw_cd.get("object", "")
+        if not fit_src:
+            raise NotImplementedError("cooks.distance requires a fitted model")
+        return f"lm_cooks_distance({r_expr_to_fortran(fit_src)})"
+    if c_usr is not None and c_usr[0].lower() == "pchisq":
+        _nm_pc, pos_pc, kw_pc = c_usr
+        x_src = pos_pc[0] if pos_pc else kw_pc.get("q", "0.0")
+        df_src = kw_pc.get("df", pos_pc[1] if len(pos_pc) >= 2 else "1")
+        return f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), real({r_expr_to_fortran(df_src)}, kind=dp))"
+    if c_usr is not None and c_usr[0].lower() == "sort":
+        _nm_sort, pos_sort, kw_sort = c_usr
+        x_src = pos_sort[0] if pos_sort else kw_sort.get("x", "")
+        if not x_src:
+            raise NotImplementedError("sort requires x argument")
+        dec_src = kw_sort.get("decreasing")
+        if dec_src is not None:
+            return f"sort({r_expr_to_fortran(x_src)}, decreasing={r_expr_to_fortran(dec_src)})"
+        return f"sort({r_expr_to_fortran(x_src)})"
+    if c_usr is not None and c_usr[0].lower() == "head":
+        _nm_head, pos_head, kw_head = c_usr
+        x_src = pos_head[0] if pos_head else kw_head.get("x", "")
+        n_src = kw_head.get("n", pos_head[1] if len(pos_head) >= 2 else "6")
+        if not x_src:
+            raise NotImplementedError("head requires x argument")
+        x_f = r_expr_to_fortran(x_src)
+        n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        return f"r_head({x_f}, {n_f})"
     if c_usr is not None and c_usr[0].lower() == "confint":
         _nm_ci, pos_ci, kw_ci = c_usr
         pos_out_ci = [r_expr_to_fortran(a) for a in pos_ci]
@@ -5884,6 +5925,84 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bcoef\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%coef", s)
     s = re.sub(r"\bfitted\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%fitted", s)
     s = re.sub(r"\bresiduals\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%resid", s)
+    s = re.sub(r"\bresid\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%resid", s)
+
+    def _inline_lm_r_squared_call(inner: str) -> str | None:
+        c_lm_inline = parse_call_text(inner.strip())
+        if c_lm_inline is None or c_lm_inline[0].lower() != "lm":
+            return None
+        _nm_lm_i, pos_lm_i, kw_lm_i = c_lm_inline
+        form_i = pos_lm_i[0].strip() if pos_lm_i else kw_lm_i.get("formula", "").strip()
+        m_form_i = re.match(r"^(.+?)\s*~\s*(.+)$", form_i)
+        if m_form_i is None:
+            return None
+        y_src_i = m_form_i.group(1).strip()
+        rhs_i = m_form_i.group(2).strip()
+        terms_i = [t.strip() for t in split_top_level_commas(rhs_i.replace("+", ",")) if t.strip()]
+        if not terms_i:
+            return None
+        term_exprs_i = [r_expr_to_fortran(t) for t in terms_i]
+        first_i = term_exprs_i[0]
+        return (
+            f"lm_r_squared_general({r_expr_to_fortran(y_src_i)}, "
+            f"reshape([{', '.join(term_exprs_i)}], [size({first_i}), {len(term_exprs_i)}]))"
+        )
+
+    def _rewrite_inline_lm_summary_rsq(txt: str) -> str:
+        out: list[str] = []
+        i = 0
+        low = txt.lower()
+        while i < len(txt):
+            j = low.find("summary", i)
+            if j < 0:
+                out.append(txt[i:])
+                break
+            if j > 0 and (txt[j - 1].isalnum() or txt[j - 1] == "_"):
+                out.append(txt[i:j + 7])
+                i = j + 7
+                continue
+            k = j + 7
+            while k < len(txt) and txt[k].isspace():
+                k += 1
+            if k >= len(txt) or txt[k] != "(":
+                out.append(txt[i:j + 7])
+                i = j + 7
+                continue
+            depth = 0
+            q: str | None = None
+            end = -1
+            for p in range(k, len(txt)):
+                ch = txt[p]
+                if q is not None:
+                    if ch == q:
+                        q = None
+                    continue
+                if ch in {"'", '"'}:
+                    q = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = p
+                        break
+            if end < 0:
+                out.append(txt[i:])
+                break
+            rest = txt[end + 1 :]
+            m_field = re.match(r"\s*(?:\$|%)\s*r(?:\.|_)squared\b", rest, re.IGNORECASE)
+            repl = _inline_lm_r_squared_call(txt[k + 1 : end].strip()) if m_field is not None else None
+            if repl is None:
+                out.append(txt[i:end + 1])
+                i = end + 1
+                continue
+            out.append(txt[i:j])
+            out.append(repl)
+            i = end + 1 + m_field.end()
+        return "".join(out)
+
+    if re.search(r"\bsummary\s*\(\s*lm\s*\(", s, re.IGNORECASE):
+        s = _rewrite_inline_lm_summary_rsq(s)
 
     def _normalize_numeric_args(inner: str) -> str:
         parts = split_top_level_commas(inner)
@@ -6510,6 +6629,7 @@ def emit_stmts(
     lm_terms_by_fit: dict[str, list[str]] = {}
     lm_design_exprs_by_fit: dict[str, list[str]] = {}
     lm_design_first_by_fit: dict[str, str] = {}
+    cooks_fit_by_var: dict[str, str] = {}
     data_frame_vars: dict[str, tuple[str | None, list[str]]] = {}
     int_matrix_vars: set[str] = set()
     real_matrix_vars: set[str] = set()
@@ -6535,6 +6655,9 @@ def emit_stmts(
         lmf = helper_ctx.get("lm_design_first_by_fit")
         if isinstance(lmf, dict):
             lm_design_first_by_fit = lmf
+        ckv = helper_ctx.get("cooks_fit_by_var")
+        if isinstance(ckv, dict):
+            cooks_fit_by_var = ckv
         dfv = helper_ctx.get("data_frame_vars")
         if isinstance(dfv, dict):
             data_frame_vars = dfv
@@ -6697,6 +6820,28 @@ def emit_stmts(
         mm_expr = f"reshape([{cols}], [size({first}), {len(all_labels)}])"
         return fit_nm, mm_expr, all_labels
 
+    def _cooks_top_print(expr: str) -> tuple[str, str] | None:
+        c_head = parse_call_text(fscan.strip_redundant_outer_parens_expr(expr.strip()))
+        if c_head is None or c_head[0].lower() != "head":
+            return None
+        x_head = fscan.strip_redundant_outer_parens_expr(c_head[1][0].strip() if c_head[1] else c_head[2].get("x", "").strip())
+        n_head = c_head[2].get("n", c_head[1][1] if len(c_head[1]) >= 2 else "6")
+        c_sort = parse_call_text(x_head)
+        if c_sort is None or c_sort[0].lower() != "sort":
+            return None
+        x_sort = fscan.strip_redundant_outer_parens_expr(c_sort[1][0].strip() if c_sort[1] else c_sort[2].get("x", "").strip())
+        dec_sort = c_sort[2].get("decreasing", "FALSE").strip().upper()
+        if dec_sort not in {"TRUE", ".TRUE.", "T", "1"}:
+            return None
+        fit_nm = cooks_fit_by_var.get(x_sort)
+        if fit_nm is None:
+            c_cd = parse_call_text(x_sort)
+            if c_cd is not None and c_cd[0].lower() in {"cooks.distance", "lm_cooks_distance"}:
+                fit_nm = c_cd[1][0].strip() if c_cd[1] else c_cd[2].get("object", "").strip()
+        if not fit_nm:
+            return None
+        return fit_nm, _int_bound_expr(r_expr_to_fortran(n_head))
+
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -6801,6 +6946,8 @@ def emit_stmts(
                         return rr
                 return 1
             if nm_c in {"dim", "rev", "rep.int"}:
+                return 1
+            if nm_c in {"head", "sort", "lm_cooks_distance", "cooks.distance"}:
                 return 1
             if nm_c in {
                 "r_seq_int",
@@ -7130,6 +7277,11 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            c_cooks_assign = parse_call_text(rhs)
+            if c_cooks_assign is not None and c_cooks_assign[0].lower() in {"cooks.distance", "lm_cooks_distance"}:
+                fit_src_cook = c_cooks_assign[1][0].strip() if c_cooks_assign[1] else c_cooks_assign[2].get("object", "").strip()
+                if fit_src_cook:
+                    cooks_fit_by_var[st.name] = fit_src_cook
             rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
             if _emit_optim_bfgs_assignment(o, st.name, rhs, st.comment):
                 continue
@@ -8123,6 +8275,14 @@ def emit_stmts(
                             if helper_ctx is not None:
                                 helper_ctx["need_lm"] = True
                             continue
+                    cooks_top = _cooks_top_print(one)
+                    if has_r_mod and cooks_top is not None:
+                        fit_nm, n_top = cooks_top
+                        _wstmt(f"call print_lm_cooks_top({r_expr_to_fortran(fit_nm)}, {n_top})", st.comment)
+                        need_r_mod.add("print_lm_cooks_top")
+                        if helper_ctx is not None:
+                            helper_ctx["need_lm"] = True
+                        continue
                     m_anova = re.match(r"^anova\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
                     if has_r_mod and m_anova is not None:
                         fit_nm = m_anova.group(1)
@@ -12045,6 +12205,16 @@ def transpile_r_to_fortran(
                 real_scalars.discard(st_arr.name)
                 params.pop(st_arr.name, None)
                 changed_main_arrays = True
+    for st_real_expr in main_stmts:
+        if not isinstance(st_real_expr, Assign):
+            continue
+        rhs_real_f = r_expr_to_fortran(st_real_expr.expr.strip())
+        if re.search(r"\b(?:lm_r_squared_general|pchisq)\s*\(", rhs_real_f, re.IGNORECASE):
+            real_scalars.add(st_real_expr.name)
+            ints.discard(st_real_expr.name)
+            int_arrays.discard(st_real_expr.name)
+            real_arrays.discard(st_real_expr.name)
+            params.pop(st_real_expr.name, None)
     for comp_nm in {"aic_dot_comp", "bic_dot_comp"}:
         if comp_nm in real_scalars:
             real_scalars.discard(comp_nm)
@@ -13884,6 +14054,7 @@ def transpile_r_to_fortran(
         "r_seq_real_length",
         "r_rep_real",
         "r_rep_int",
+        "r_head",
         "r_array_real",
         "r_array_int",
         "r_array_char",
@@ -13928,10 +14099,14 @@ def transpile_r_to_fortran(
         "read_csv_real_matrix",
         "write_table_real_matrix",
         "lm_fit_general",
+        "lm_r_squared_general",
         "lm_predict_general",
         "lm_predict_interval",
+        "lm_cooks_distance",
+        "print_lm_cooks_top",
         "print_lm_prediction_interval",
         "lm_confint",
+        "pchisq",
         "print_lm_summary",
         "print_lm_coef_rstyle",
         "print_lm_confint",
