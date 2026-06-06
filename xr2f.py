@@ -4221,13 +4221,28 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     if not expr:
         return 0
 
+    expr = fscan.strip_redundant_outer_parens_expr(expr)
     expr_l = expr.lower()
     expr_f = r_expr_to_fortran(expr)
 
-    m_seq = _split_top_level_colon(expr)
+    # Unary +/- (strip simple unary sign).
+    if expr_l.startswith(("+", "-")) and len(expr_l) > 1 and expr_l[1].isalnum():
+        return _infer_assignment_rank_hint(expr_l[1:].strip(), inferred_ranks)
+
+    # Arithmetic operators generally preserve array rank.
+    for op in ["%*%", "%/%", "%%", "^", "**", "*", "/", "+", "-"]:
+        mm = _split_top_level_token(expr_l, op, from_right=True)
+        if mm is not None:
+            r1 = _infer_assignment_rank_hint(mm[0], inferred_ranks)
+            r2 = _infer_assignment_rank_hint(mm[1], inferred_ranks)
+            return max(r1, r2)
+
+    # Sequence expression.
+    m_seq = _split_top_level_colon(expr_l)
     if m_seq is not None and ("[" not in expr) and ("]" not in expr):
         return 1
 
+    # Constructor vectors/matrices.
     if expr_l.startswith("c(") or expr_f.startswith("c("):
         return 1
 
@@ -4303,6 +4318,26 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             }:
                 return 0
 
+    # R indexing: infer rank from number of fixed dimensions.
+    m_idx = re.match(r"^([A-Za-z]\w*)\s*\[\[(.+)\]\]$", expr_l)
+    if m_idx is None:
+        m_idx = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr_l)
+    if m_idx is not None:
+        base = m_idx.group(1)
+        inside = fscan.strip_redundant_outer_parens_expr(m_idx.group(2).strip())
+        base_rank = inferred_ranks.get(base, 0)
+        parts = _split_index_dims(inside)
+        fixed = 0
+        for p in parts:
+            p0 = p.strip()
+            if not p0:
+                continue
+            if _split_top_level_colon(p0) is None:
+                fixed += 1
+        if base_rank > 0:
+            return max(0, base_rank - fixed)
+        return 2 if len(parts) > 1 else 1
+
     if expr_l.startswith("r_seq_"):
         return 1
 
@@ -4310,14 +4345,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     if m_var is not None:
         return inferred_ranks.get(m_var.group(1), 0)
 
-    if expr_l.startswith("[" ) and "]" in expr_l:
-        m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^]]+\]$", expr_l)
-        if m_idx is None:
-            return 0
-        base = m_idx.group(1)
-        return inferred_ranks.get(base, 0)
-
-    if (":" in expr_l) and re.match(r"^[^\\[]*:[^\\]]*$", expr_l):
+    if (":" in expr_l) and re.match(r"^[^\[]*:[^\]]*$", expr_l):
         return 1
 
     return 0
@@ -10406,6 +10434,13 @@ def emit_function(
         ret_alias_src = ret_alias_arg.strip() if ret_alias_arg is not None else last.expr.strip()
         if re.match(r"^[A-Za-z]\w*$", ret_alias_src):
             list_alias = f"{ret_alias_src}_list"
+            m_ret_alias_conflict = re.match(r"^([A-Za-z]\w*)_(\d+)$", ret_alias_src)
+            if m_ret_alias_conflict is not None:
+                base_alias = m_ret_alias_conflict.group(1)
+                base_alias_list = f"{base_alias}_list"
+                assigned_now = {nm.lower() for nm in infer_assigned_names(body_use)}
+                if base_alias_list.lower() not in assigned_now and base_alias.lower() in assigned_now:
+                    list_alias = base_alias_list
 
             def _rename_return_list_alias(ss_alias: list[object]) -> list[object]:
                 out_alias: list[object] = []
