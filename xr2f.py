@@ -1664,6 +1664,26 @@ def _r_statement_continues(txt: str) -> bool:
     return re.search(r"(?:<-|=|,|%\*%|%%|%/%|[+\-*/^]|&&|\|\||&|\|)\s*$", t) is not None
 
 
+def _find_unquoted_brace(txt: str) -> int:
+    in_single = False
+    in_double = False
+    esc = False
+    for i, ch in enumerate(txt):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and (in_single or in_double):
+            esc = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double and ch in "{}":
+            return i
+    return -1
+
+
 def preprocess_r_lines(src: str) -> list[str]:
     lines0: list[str] = []
     seen_code = False
@@ -1732,11 +1752,9 @@ def preprocess_r_lines(src: str) -> list[str]:
         for ln_part in semis:
             cur = ln_part
             # make braces standalone tokens to simplify parsing
-            while "{" in cur or "}" in cur:
-                i_open = cur.find("{") if "{" in cur else 10**9
-                i_close = cur.find("}") if "}" in cur else 10**9
-                i = min(i_open, i_close)
-                if i == 10**9:
+            while True:
+                i = _find_unquoted_brace(cur)
+                if i < 0:
                     break
                 left = cur[:i].strip()
                 br = cur[i]
@@ -2234,6 +2252,78 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
         return None
     k = hits[-1] if from_right else hits[0]
     return text[:k].strip(), text[k + len(token) :].strip()
+
+
+def _split_top_level_muldiv_chain(text: str) -> tuple[list[str], list[str]] | None:
+    """Split a top-level chain of * and / operators, preserving left-to-right order."""
+    in_single = False
+    in_double = False
+    esc = False
+    pdepth = 0
+    bdepth = 0
+    cdepth = 0
+    parts: list[str] = []
+    ops: list[str] = []
+    start = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if ch == "\\":
+            esc = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                pdepth += 1
+            elif ch == ")" and pdepth > 0:
+                pdepth -= 1
+            elif ch == "[":
+                bdepth += 1
+            elif ch == "]" and bdepth > 0:
+                bdepth -= 1
+            elif ch == "{":
+                cdepth += 1
+            elif ch == "}" and cdepth > 0:
+                cdepth -= 1
+            elif pdepth == 0 and bdepth == 0 and cdepth == 0 and ch in {"*", "/"}:
+                if ch == "*" and i + 1 < len(text) and text[i + 1] == "*":
+                    i += 2
+                    continue
+                if ch == "*" and i > 0 and text[i - 1] == "*":
+                    i += 1
+                    continue
+                if ch == "*" and ((i > 0 and text[i - 1] == "%") or (i + 1 < len(text) and text[i + 1] == "%")):
+                    i += 1
+                    continue
+                if ch == "/" and ((i > 0 and text[i - 1] == "%") or (i + 1 < len(text) and text[i + 1] == "%")):
+                    i += 1
+                    continue
+                part = text[start:i].strip()
+                if not part:
+                    return None
+                parts.append(part)
+                ops.append(ch)
+                start = i + 1
+        i += 1
+    if not ops:
+        return None
+    tail = text[start:].strip()
+    if not tail:
+        return None
+    parts.append(tail)
+    return parts, ops
 
 
 def _find_top_level_addsub(s: str) -> tuple[int, str] | None:
@@ -5428,6 +5518,20 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_pre is not None:
         nm_pre = c_pre[0].lower()
         pos_pre = c_pre[1]
+        if nm_pre in {"besselj", "bessely", "besseli", "besselk"}:
+            if len(pos_pre) < 2:
+                raise NotImplementedError(f"{c_pre[0]} requires x and nu arguments")
+            x_src = pos_pre[0].strip()
+            nu_src = pos_pre[1].strip()
+            x_f = r_expr_to_fortran(x_src)
+            if _is_int_literal(x_src):
+                x_f = f"real({_int_bound_expr(x_f)}, kind=dp)"
+            nu_f = r_expr_to_fortran(nu_src)
+            args_b = [x_f, nu_f]
+            exp_src = c_pre[2].get("expon.scaled", c_pre[2].get("expon_scaled"))
+            if exp_src is not None:
+                args_b.append(f"expon_scaled={r_expr_to_fortran(exp_src)}")
+            return f"{c_pre[0]}({', '.join(args_b)})"
         if nm_pre in {"cbind", "cbind2"} and c_pre[2]:
             arg_srcs = [a.strip() for a in (pos_pre + list(c_pre[2].values()))]
             ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
@@ -5442,7 +5546,12 @@ def r_expr_to_fortran(expr: str) -> str:
                 else:
                     args.append(af)
             if args:
+                if nm_pre == "cbind" and len(args) > 3:
+                    return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
                 return f"{c_pre[0]}({', '.join(args)})"
+        if nm_pre == "cbind" and len(pos_pre) > 3 and not c_pre[2]:
+            args = [r_expr_to_fortran(a.strip()) for a in pos_pre]
+            return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
         if nm_pre == "names" and len(pos_pre) == 1:
             src_nm = pos_pre[0].strip()
             if src_nm.lower() in _NAMED_VECTOR_NAMES:
@@ -5594,6 +5703,24 @@ def r_expr_to_fortran(expr: str) -> str:
         lhs_as = r_expr_to_fortran(s[:i_as].strip())
         rhs_as = r_expr_to_fortran(s[i_as + 1 :].strip())
         return f"{lhs_as} {op_as} {rhs_as}"
+    muldiv_chain = _split_top_level_muldiv_chain(s)
+    if muldiv_chain is not None:
+        parts_md, ops_md = muldiv_chain
+        out_md = r_expr_to_fortran(parts_md[0])
+        for op_md, part_md in zip(ops_md, parts_md[1:]):
+            rhs_md = r_expr_to_fortran(part_md)
+            if op_md == "/":
+                if _is_complex_expr_source(part_md) or _expr_mentions_known_complex(out_md) or _expr_mentions_known_complex(rhs_md):
+                    out_md = f"({out_md}) / ({rhs_md})"
+                else:
+                    out_md = f"(real({out_md}, kind=dp)) / (real({rhs_md}, kind=dp))"
+            else:
+                lhs_need = _find_top_level_addsub(out_md) is not None
+                rhs_need = _find_top_level_addsub(rhs_md) is not None
+                lhs_mul = f"({out_md})" if lhs_need else out_md
+                rhs_mul = f"({rhs_md})" if rhs_need else rhs_md
+                out_md = f"{lhs_mul} * {rhs_mul}"
+        return out_md
     mm_idiv = _split_top_level_token(s, "%/%", from_right=True)
     if mm_idiv is not None:
         lhs = r_expr_to_fortran(mm_idiv[0])
@@ -8044,6 +8171,10 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
+            if nm_c in {"besselj", "bessely", "besseli", "besselk"}:
+                x_arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+                rr_b = _expr_rank_for_print(x_arg) if x_arg else None
+                return rr_b if rr_b is not None else 0
             if nm_c == "aperm":
                 src_ap = c[1][0].strip() if c[1] else c[2].get("a", c[2].get("x", "")).strip()
                 if src_ap.lower() in _KNOWN_RANK3_NAMES:
@@ -8598,6 +8729,12 @@ def emit_stmts(
                 x_src = pos_o[0].strip()
                 y_src = pos_o[1].strip()
                 fun_src = kw_o.get("FUN", pos_o[2] if len(pos_o) >= 3 else "")
+                c_vec_fun = parse_call_text(fun_src.strip())
+                if c_vec_fun is not None and c_vec_fun[0].lower() == "vectorize":
+                    if c_vec_fun[1]:
+                        fun_src = c_vec_fun[1][0].strip()
+                    elif "FUN" in c_vec_fun[2]:
+                        fun_src = c_vec_fun[2]["FUN"].strip()
                 m_fun = re.match(
                     r"^function\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
                     fun_src.strip(),
@@ -12956,6 +13093,9 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
                 if m is not None:
                     src = m.group(2).strip()
                     if _parse_string_c_vector(src) is None:
+                        c_src = parse_call_text(src)
+                        if c_src is not None and c_src[0].lower() in {"paste", "paste0"}:
+                            continue
                         sources[m.group(1).lower()] = src
             elif isinstance(st, FuncDef):
                 walk(st.body)
@@ -16266,6 +16406,10 @@ def transpile_r_to_fortran(
         "r_trigamma",
         "r_factorial",
         "r_lfactorial",
+        "besselJ",
+        "besselY",
+        "besselI",
+        "besselK",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
