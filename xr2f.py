@@ -2605,6 +2605,27 @@ def _function_returns_invisible(fn: FuncDef) -> bool:
     return c is not None and c[0].lower() == "invisible"
 
 
+def _factor_rep_string_info(expr: str) -> tuple[list[str], str] | None:
+    """Recognize factor(rep(c("A", ...), each = n)) as integer-coded levels."""
+    c_factor = parse_call_text(expr.strip())
+    if c_factor is None or c_factor[0].lower() != "factor" or not c_factor[1]:
+        return None
+    inner = c_factor[1][0].strip()
+    c_rep = parse_call_text(inner)
+    if c_rep is None or c_rep[0].lower() != "rep" or not c_rep[1]:
+        return None
+    labels = _parse_string_c_vector(c_rep[1][0].strip())
+    if labels is None:
+        return None
+    each_src = c_rep[2].get("each")
+    if each_src is None and len(c_rep[1]) >= 3:
+        # rep(x, times, each) positional form.
+        each_src = c_rep[1][2]
+    if each_src is None:
+        return None
+    return labels, each_src.strip()
+
+
 def classify_vars(
     stmts: list[object], assign_counts: dict[str, int], known_arrays: set[str] | None = None
 ) -> tuple[set[str], set[str], set[str], set[str], dict[str, str]]:
@@ -2678,6 +2699,13 @@ def classify_vars(
                 cinfo = parse_call_text(rhs_call_src)
                 mark_array_uses(rhs)
                 if _ifelse_integer_coded(rhs):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif _factor_rep_string_info(rhs) is not None:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -4798,6 +4826,10 @@ def r_expr_to_fortran(expr: str) -> str:
         return nested_list_arr[0]
     if list_arr is not None:
         return list_arr[0]
+    factor_rep = _factor_rep_string_info(s)
+    if factor_rep is not None:
+        labels, each_src = factor_rep
+        return f"r_rep_int(r_seq_int(1, {len(labels)}), each={_int_bound_expr(r_expr_to_fortran(each_src))})"
     c_cast0 = parse_call_text(s)
     if c_cast0 is not None and c_cast0[0].lower() in {"as.numeric", "as.double"} and c_cast0[1]:
         return r_expr_to_fortran(c_cast0[1][0].strip())
@@ -5312,6 +5344,15 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"maxval({x_f}, dim=1)"
                 if f_t == "min":
                     return f"minval({x_f}, dim=1)"
+    c_predict0 = parse_call_text(s)
+    if c_predict0 is not None and c_predict0[0].lower() == "predict":
+        _npr0, pos_pr0, kw_pr0 = c_predict0
+        fit_src = pos_pr0[0].strip() if pos_pr0 else kw_pr0.get("object", "").strip()
+        typ = (_dequote_string_literal(kw_pr0.get("type", "").strip()) or "").lower()
+        newdata_src = kw_pr0.get("newdata", "").strip()
+        if fit_src and typ == "response" and not newdata_src:
+            fit_f = r_expr_to_fortran(fit_src)
+            return f"glm_predict_response({fit_f}, {fit_f}%xpred)"
     c_coef = parse_call_text(s)
     if c_coef is not None and c_coef[0].lower() == "coef":
         _ncf, pos_cf, kw_cf = c_coef
@@ -6627,8 +6668,13 @@ def emit_stmts(
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
     need_r_mod: set[str] = set()
     lm_terms_by_fit: dict[str, list[str]] = {}
+    glm_terms_by_fit: dict[str, list[str]] = {}
+    glm_fits: set[str] = set()
     lm_design_exprs_by_fit: dict[str, list[str]] = {}
     lm_design_first_by_fit: dict[str, str] = {}
+    lm_anova_terms_by_fit: dict[str, list[str]] = {}
+    lm_anova_dfs_by_fit: dict[str, list[int]] = {}
+    aov_fits: set[str] = set()
     cooks_fit_by_var: dict[str, str] = {}
     data_frame_vars: dict[str, tuple[str | None, list[str]]] = {}
     int_matrix_vars: set[str] = set()
@@ -6649,12 +6695,27 @@ def emit_stmts(
         lmd = helper_ctx.get("lm_terms_by_fit")
         if isinstance(lmd, dict):
             lm_terms_by_fit = lmd
+        gtd = helper_ctx.get("glm_terms_by_fit")
+        if isinstance(gtd, dict):
+            glm_terms_by_fit = gtd
+        gfs = helper_ctx.get("glm_fits")
+        if isinstance(gfs, set):
+            glm_fits = gfs
         lme = helper_ctx.get("lm_design_exprs_by_fit")
         if isinstance(lme, dict):
             lm_design_exprs_by_fit = lme
         lmf = helper_ctx.get("lm_design_first_by_fit")
         if isinstance(lmf, dict):
             lm_design_first_by_fit = lmf
+        lat = helper_ctx.get("lm_anova_terms_by_fit")
+        if isinstance(lat, dict):
+            lm_anova_terms_by_fit = lat
+        lad = helper_ctx.get("lm_anova_dfs_by_fit")
+        if isinstance(lad, dict):
+            lm_anova_dfs_by_fit = lad
+        afv = helper_ctx.get("aov_fits")
+        if isinstance(afv, set):
+            aov_fits = afv
         ckv = helper_ctx.get("cooks_fit_by_var")
         if isinstance(ckv, dict):
             cooks_fit_by_var = ckv
@@ -6800,6 +6861,29 @@ def emit_stmts(
             labels.append(tnm)
             exprs.append(r_expr_to_fortran(tnm))
         return labels, exprs, first_src or (raw_terms[0].strip() if raw_terms else "")
+
+    def _lm_anova_groups(raw_terms: list[str], data_name: str = "") -> tuple[list[str], list[int]]:
+        labels: list[str] = []
+        dfs: list[int] = []
+        df_predictors: list[str] = []
+        if data_name in data_frame_vars:
+            _df_y, df_predictors = data_frame_vars[data_name]
+        df_by_source: dict[str, str] = {}
+        for p_src in df_predictors:
+            src_nm = _source_name_from_factor_expr(p_src)
+            if re.fullmatch(r"[A-Za-z]\w*", src_nm):
+                df_by_source[src_nm] = p_src
+        for term in raw_terms:
+            tnm = term.strip()
+            src_nm = _source_name_from_factor_expr(df_by_source.get(tnm, tnm))
+            if re.fullmatch(r"[A-Za-z]\w*", src_nm) and src_nm in _CATEGORICAL_LABELS:
+                ndf = max(1, len(_CATEGORICAL_LABELS[src_nm]) - 1)
+                labels.append(src_nm)
+                dfs.append(ndf)
+            else:
+                labels.append(tnm)
+                dfs.append(1)
+        return labels, dfs
 
     def _model_matrix_print(expr: str) -> tuple[str, str, list[str]] | None:
         m = re.match(
@@ -7414,12 +7498,18 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
-            if c_lm is not None and c_lm[0].lower() == "lm":
+            if c_lm is not None and c_lm[0].lower() in {"lm", "aov", "glm"}:
                 _nm_lm, pos_lm, kw_lm = c_lm
+                is_aov = _nm_lm.lower() == "aov"
+                is_glm = _nm_lm.lower() == "glm"
                 form = pos_lm[0].strip() if pos_lm else kw_lm.get("formula", "").strip()
                 m_form = re.match(r"^([A-Za-z]\w*)\s*~\s*(.+)$", form)
                 if not m_form:
-                    raise NotImplementedError("lm requires formula like y ~ x1 + x2 + ... in this subset")
+                    raise NotImplementedError("lm/aov/glm requires formula like y ~ x1 + x2 + ... in this subset")
+                if is_glm:
+                    fam_src = kw_lm.get("family", "")
+                    if fam_src and not re.match(r"^binomial\s*\(", fam_src.strip(), re.IGNORECASE):
+                        raise NotImplementedError("glm currently supports family = binomial() only")
                 yv = r_expr_to_fortran(m_form.group(1).strip())
                 rhs_terms = m_form.group(2).strip()
                 data_name = kw_lm.get("data", "").strip()
@@ -7430,6 +7520,10 @@ def emit_stmts(
                         raise NotImplementedError("lm(y ~ ., data=df) requires predictor columns in data.frame")
                     if len(x_terms) == 1 and x_terms[0] in matrix_vars:
                         lm_terms_by_fit[st.name] = x_terms
+                        lm_anova_terms_by_fit[st.name] = x_terms
+                        lm_anova_dfs_by_fit[st.name] = [1 for _ in x_terms]
+                        if is_aov:
+                            aov_fits.add(st.name)
                         lm_design_exprs_by_fit[st.name] = [r_expr_to_fortran(x_terms[0])]
                         lm_design_first_by_fit[st.name] = x_terms[0]
                         xpred_f = r_expr_to_fortran(x_terms[0])
@@ -7447,7 +7541,15 @@ def emit_stmts(
                 if not terms:
                     raise NotImplementedError("lm formula requires at least one predictor")
                 term_labels, term_exprs, first_src = _lm_design_columns(terms, data_name)
+                anova_labels, anova_dfs = _lm_anova_groups(terms, data_name)
                 lm_terms_by_fit[st.name] = term_labels
+                lm_anova_terms_by_fit[st.name] = anova_labels
+                lm_anova_dfs_by_fit[st.name] = anova_dfs
+                if is_aov:
+                    aov_fits.add(st.name)
+                if is_glm:
+                    glm_fits.add(st.name)
+                    glm_terms_by_fit[st.name] = term_labels
                 lm_design_exprs_by_fit[st.name] = term_exprs
                 lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src)
                 p = len(term_exprs)
@@ -7460,7 +7562,10 @@ def emit_stmts(
                 o.w("allocate(x_lm(n_lm, p_lm))")
                 for j, tv in enumerate(term_exprs, start=1):
                     o.w(f"x_lm(:, {j}) = {tv}")
-                o.w(f"{st.name} = lm_fit_general({yv}, x_lm)")
+                if is_glm:
+                    o.w(f"{st.name} = glm_binomial_fit({yv}, x_lm)")
+                else:
+                    o.w(f"{st.name} = lm_fit_general({yv}, x_lm)")
                 o.pop()
                 o.w("end block")
                 if helper_ctx is not None:
@@ -8283,15 +8388,21 @@ def emit_stmts(
                         if helper_ctx is not None:
                             helper_ctx["need_lm"] = True
                         continue
+                    c_tukey = parse_call_text(one)
+                    if c_tukey is not None and c_tukey[0].lower() == "tukeyhsd":
+                        _wstmt('write(*,*) "TukeyHSD not translated"', st.comment)
+                        continue
                     m_anova = re.match(r"^anova\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
                     if has_r_mod and m_anova is not None:
                         fit_nm = m_anova.group(1)
-                        terms = lm_terms_by_fit.get(fit_nm, [])
+                        terms = lm_anova_terms_by_fit.get(fit_nm, lm_terms_by_fit.get(fit_nm, []))
+                        dfs = lm_anova_dfs_by_fit.get(fit_nm, [1 for _ in terms])
                         if terms:
                             max_len = max(1, max(len(t) for t in terms))
                             terms_lit = ", ".join(f'"{t}"' for t in terms)
+                            dfs_lit = ", ".join(str(int(d)) for d in dfs)
                             _wstmt(
-                                f'call print_lm_anova({fit_nm}, [character(len={max_len}) :: {terms_lit}])',
+                                f'call print_lm_anova({fit_nm}, [character(len={max_len}) :: {terms_lit}], [{dfs_lit}])',
                                 st.comment,
                             )
                         else:
@@ -8538,20 +8649,50 @@ def emit_stmts(
                             (re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in lm_terms_by_fit)
                             or re.search(r"(?:\$|%)\s*lm_fit\s*$", sum_arg, re.IGNORECASE)
                         ):
-                            terms = lm_terms_by_fit.get(sum_arg, [])
-                            if terms:
-                                max_len = max(1, max(len(t) for t in terms))
-                                terms_lit = ", ".join(f'"{t}"' for t in terms)
-                                _wstmt(
-                                    f'call print_lm_summary({sum_arg_f}, [character(len={max_len}) :: {terms_lit}])',
-                                    st.comment,
-                                )
+                            if re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in glm_fits:
+                                terms = glm_terms_by_fit.get(sum_arg, lm_terms_by_fit.get(sum_arg, []))
+                                if terms:
+                                    max_len = max(1, max(len(t) for t in terms))
+                                    terms_lit = ", ".join(f'"{t}"' for t in terms)
+                                    _wstmt(
+                                        f'call print_glm_summary({sum_arg_f}, [character(len={max_len}) :: {terms_lit}])',
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(f"call print_glm_summary({sum_arg_f})", st.comment)
+                                if has_r_mod:
+                                    need_r_mod.add("print_glm_summary")
+                                    need_r_mod.add("glm_fit_t")
+                            elif re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in aov_fits:
+                                terms = lm_anova_terms_by_fit.get(sum_arg, lm_terms_by_fit.get(sum_arg, []))
+                                dfs = lm_anova_dfs_by_fit.get(sum_arg, [1 for _ in terms])
+                                if terms:
+                                    max_len = max(1, max(len(t) for t in terms))
+                                    terms_lit = ", ".join(f'"{t}"' for t in terms)
+                                    dfs_lit = ", ".join(str(int(d)) for d in dfs)
+                                    _wstmt(
+                                        f'call print_lm_anova({sum_arg_f}, [character(len={max_len}) :: {terms_lit}], [{dfs_lit}])',
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(f"call print_lm_anova({sum_arg_f})", st.comment)
+                                if has_r_mod:
+                                    need_r_mod.add("print_lm_anova")
                             else:
-                                _wstmt(f"call print_lm_summary({sum_arg_f})", st.comment)
+                                terms = lm_terms_by_fit.get(sum_arg, [])
+                                if terms:
+                                    max_len = max(1, max(len(t) for t in terms))
+                                    terms_lit = ", ".join(f'"{t}"' for t in terms)
+                                    _wstmt(
+                                        f'call print_lm_summary({sum_arg_f}, [character(len={max_len}) :: {terms_lit}])',
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(f"call print_lm_summary({sum_arg_f})", st.comment)
+                                if has_r_mod:
+                                    need_r_mod.add("print_lm_summary")
                             if helper_ctx is not None:
                                 helper_ctx["need_lm"] = True
-                            if has_r_mod:
-                                need_r_mod.add("print_lm_summary")
                         elif has_r_mod:
                             _wstmt(f"call print_summary({sum_arg_f})", st.comment)
                             need_r_mod.add("print_summary")
@@ -10467,7 +10608,7 @@ def infer_function_lm_names(fn: FuncDef) -> set[str]:
             if isinstance(st, Assign):
                 rhs = st.expr.strip()
                 c = parse_call_text(rhs)
-                if c is not None and c[0].lower() == "lm":
+                if c is not None and c[0].lower() in {"lm", "aov"}:
                     out.add(st.name)
                     continue
                 m = re.match(r"^([A-Za-z]\w*)$", rhs)
@@ -10661,12 +10802,16 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
 
 
 def collect_categorical_sample_labels(stmts: list[object]) -> dict[str, list[str]]:
-    """Find vars assigned from sample(c("A", ...)) and keep their level labels."""
+    """Find simple categorical assignments and keep their level labels."""
     out: dict[str, list[str]] = {}
 
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, Assign):
+                factor_rep = _factor_rep_string_info(st.expr.strip())
+                if factor_rep is not None:
+                    out[st.name.lower()] = factor_rep[0]
+                    continue
                 cinfo = parse_call_text(st.expr.strip())
                 if cinfo is not None and cinfo[0].lower() == "sample":
                     x_src = cinfo[1][0] if cinfo[1] else cinfo[2].get("x")
@@ -12140,6 +12285,11 @@ def transpile_r_to_fortran(
         "need_r_mod": set(),
         "need_lm": False,
         "lm_terms_by_fit": {},
+        "glm_terms_by_fit": {},
+        "glm_fits": set(),
+        "lm_anova_terms_by_fit": {},
+        "lm_anova_dfs_by_fit": {},
+        "aov_fits": set(),
         "return_array_fns": set(fn_return_array_kind.keys()),
     }
     helper_ctx_main: dict[str, object] = {
@@ -12150,6 +12300,11 @@ def transpile_r_to_fortran(
         "need_table_writer": False,
         "need_lm": False,
         "lm_terms_by_fit": {},
+        "glm_terms_by_fit": {},
+        "glm_fits": set(),
+        "lm_anova_terms_by_fit": {},
+        "lm_anova_dfs_by_fit": {},
+        "aov_fits": set(),
         "int_matrix_vars": set(),
         "real_matrix_vars": set(),
         "int_vector_vars": set(),
@@ -12375,6 +12530,7 @@ def transpile_r_to_fortran(
     main_list_specs: dict[str, ListReturnSpec] = {}
     main_list_var_fields: dict[str, dict[str, object]] = {}
     lm_vars: set[str] = set()
+    glm_vars: set[str] = set()
     t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
@@ -12410,8 +12566,12 @@ def transpile_r_to_fortran(
                 )
                 main_list_var_fields[st.name] = fields_main
                 continue
-            if parse_call_text(st.expr.strip()) is not None and parse_call_text(st.expr.strip())[0].lower() == "lm":
+            c_fit_main = parse_call_text(st.expr.strip())
+            if c_fit_main is not None and c_fit_main[0].lower() in {"lm", "aov"}:
                 lm_vars.add(st.name)
+                helper_ctx_main["need_lm"] = True
+            if c_fit_main is not None and c_fit_main[0].lower() == "glm":
+                glm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
@@ -12712,6 +12872,16 @@ def transpile_r_to_fortran(
 
     _force_main_list_component_alias_types(main_stmts)
 
+    if glm_vars:
+        for nm in glm_vars:
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            int_matrices.discard(nm)
+            real_matrices.discard(nm)
+            params.pop(nm, None)
+
     helper_ctx_main["int_matrix_vars"] = set(int_matrices)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
@@ -12753,6 +12923,9 @@ def transpile_r_to_fortran(
     if lm_vars:
         for nm in sorted(lm_vars):
             pbody.w(f"type(lm_fit_t) :: {nm}")
+    if glm_vars:
+        for nm in sorted(glm_vars):
+            pbody.w(f"type(glm_fit_t) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
     if main_object_list_vars:
@@ -14101,6 +14274,9 @@ def transpile_r_to_fortran(
         "lm_fit_general",
         "lm_r_squared_general",
         "lm_predict_general",
+        "glm_binomial_fit",
+        "glm_predict_response",
+        "print_glm_summary",
         "lm_predict_interval",
         "lm_cooks_distance",
         "print_lm_cooks_top",
@@ -14112,6 +14288,7 @@ def transpile_r_to_fortran(
         "print_lm_confint",
         "print_lm_anova",
         "lm_fit_t",
+        "glm_fit_t",
         "optim_result_t",
         "t_test_result_t",
         "t_test",
@@ -14184,6 +14361,10 @@ def transpile_r_to_fortran(
         mod_needed.add("lm_fit_t")
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("lm_fit_t")
+    if re.search(r"\btype\s*\(\s*glm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("glm_fit_t")
+    if re.search(r"\btype\s*\(\s*glm_fit_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("glm_fit_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("optim_result_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
