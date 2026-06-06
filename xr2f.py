@@ -39,6 +39,7 @@ _SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
+_KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
 _NULL_ARRAY_SENTINELS: dict[str, str] = {}
 _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
@@ -2954,7 +2955,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colSums|rowSums|rev|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colSums|rowSums|rev|append|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -5623,6 +5624,53 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("t requires an argument")
         return f"transpose({r_expr_to_fortran(x_src)})"
+    c_append = parse_call_text(s)
+    if c_append is not None and c_append[0].lower() == "append":
+        _napn, pos_apn, kw_apn = c_append
+        x_src = pos_apn[0] if pos_apn else kw_apn.get("x")
+        values_src = pos_apn[1] if len(pos_apn) >= 2 else kw_apn.get("values")
+        if x_src is None or values_src is None:
+            raise NotImplementedError("append requires x and values")
+        after_src = kw_apn.get("after")
+        if after_src is None and len(pos_apn) >= 3:
+            after_src = pos_apn[2]
+        x_txt = x_src.strip()
+        values_txt = values_src.strip()
+        x_f = r_expr_to_fortran(x_txt)
+        values_f = r_expr_to_fortran(values_txt)
+
+        def _expr_is_charish(src_txt: str, f_txt: str) -> bool:
+            t_src = src_txt.strip()
+            return (
+                t_src.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                or _dequote_string_literal(t_src) is not None
+                or (parse_call_text(t_src) is not None and parse_call_text(t_src)[0].lower() == "c" and _parse_string_c_vector(t_src) is not None)
+                or f_txt.strip().startswith("[character(")
+            )
+
+        def _expr_is_logicalish(src_txt: str, f_txt: str) -> bool:
+            t_src_l = src_txt.strip().lower()
+            return t_src_l in _KNOWN_LOGICAL_VECTOR_NAMES or f_txt.strip() in {".true.", ".false."} or (
+                f_txt.strip().startswith("[") and (".true." in f_txt.lower() or ".false." in f_txt.lower())
+            )
+
+        charish = _expr_is_charish(x_txt, x_f) or _expr_is_charish(values_txt, values_f)
+        logicalish = (not charish) and (_expr_is_logicalish(x_txt, x_f) or _expr_is_logicalish(values_txt, values_f))
+        if charish:
+            if _dequote_string_literal(values_txt) is not None:
+                values_f = r_expr_to_fortran(values_txt)
+            len_expr = f"max(len({x_f}), len({values_f}))"
+            if after_src is None:
+                return f"[character(len={len_expr}) :: {x_f}, {values_f}]"
+            after_f = _int_bound_expr(r_expr_to_fortran(after_src.strip()))
+            return f"[character(len={len_expr}) :: {x_f}(:{after_f}), {values_f}, {x_f}({after_f} + 1:)]"
+        if not logicalish:
+            if _is_int_literal(values_txt):
+                values_f = f"{_normalize_r_int_literal(values_txt)}.0_dp"
+        if after_src is None:
+            return f"[{x_f}, {values_f}]"
+        after_f = _int_bound_expr(r_expr_to_fortran(after_src.strip()))
+        return f"[{x_f}(:{after_f}), {values_f}, {x_f}({after_f} + 1:)]"
     c_aperm = parse_call_text(s)
     if c_aperm is not None and c_aperm[0].lower() == "aperm":
         _nap, pos_ap, kw_ap = c_aperm
@@ -7633,6 +7681,8 @@ def emit_stmts(
                 return _expr_rank_for_print(c[1][0])
             if nm_c == "c":
                 return 1
+            if nm_c == "append":
+                return 1
             if nm_c in {"table", "table2"}:
                 vals_c = list(c[1]) + list(c[2].values())
                 return 2 if len(vals_c) >= 2 or nm_c == "table2" else 1
@@ -8862,6 +8912,13 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if one in list_locals:
+                        _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
+                        continue
+                    if has_r_mod and one.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                        _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.add("print_char_vector")
+                        continue
                     m_pca_head_scores_early = re.match(
                         r"^head\s*\(\s*([A-Za-z]\w*)\s*(?:\$|%)\s*x\s*(?:,\s*([^)]+))?\)\s*$",
                         one,
@@ -8986,6 +9043,54 @@ def emit_stmts(
                             _wstmt(f"print *, {r_expr_to_fortran(first_arg)}", st.comment)
                             _wstmt(f"call print_matrix({r_expr_to_fortran(second_arg)})", "")
                             need_r_mod.add("print_matrix_rstyle")
+                            continue
+                    if c_one is not None and c_one[0].lower() == "class":
+                        arg_class = c_one[1][0].strip() if c_one[1] else c_one[2].get("x", "").strip()
+                        c_arg_class = parse_call_text(arg_class)
+                        if c_arg_class is not None and c_arg_class[0].lower() == "append":
+                            vals_class = c_arg_class[1][1].strip() if len(c_arg_class[1]) >= 2 else c_arg_class[2].get("values", "").strip()
+                            if _dequote_string_literal(vals_class) is not None or _parse_string_c_vector(vals_class) is not None:
+                                _wstmt('write(*,"(a)") "character"', st.comment)
+                                continue
+                    if c_one is not None and c_one[0].lower() == "append":
+                        x_app_print = c_one[1][0].strip() if c_one[1] else c_one[2].get("x", "").strip()
+                        vals_app_print = c_one[1][1].strip() if len(c_one[1]) >= 2 else c_one[2].get("values", "").strip()
+                        if parse_call_text(x_app_print) is not None and parse_call_text(x_app_print)[0].lower() == "list":
+                            _wstmt('write(*,"(a)") "[list append not translated]"', st.comment)
+                            continue
+                        if vals_app_print and parse_call_text(vals_app_print) is not None and parse_call_text(vals_app_print)[0].lower() == "list":
+                            _wstmt('write(*,"(a)") "[list append not translated]"', st.comment)
+                            continue
+                        app_is_char = (
+                            x_app_print.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                            or _dequote_string_literal(vals_app_print) is not None
+                            or _parse_string_c_vector(vals_app_print) is not None
+                        )
+                        if app_is_char and x_app_print.lower() not in _KNOWN_CHAR_VECTOR_NAMES:
+                            _wstmt('write(*,"(a)") "[character coercion append not translated]"', st.comment)
+                            continue
+                        app_f_print = r_expr_to_fortran(one)
+                        app_is_logical = (
+                            not app_is_char
+                            and (
+                                x_app_print.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                                or vals_app_print.strip().upper() in {"TRUE", "FALSE", "T", "F"}
+                                or (
+                                    parse_call_text(vals_app_print) is not None
+                                    and parse_call_text(vals_app_print)[0].lower() == "c"
+                                    and all(
+                                        v.strip().upper() in {"TRUE", "FALSE", "T", "F"}
+                                        for v in (parse_call_text(vals_app_print)[1] + list(parse_call_text(vals_app_print)[2].values()))
+                                    )
+                                )
+                            )
+                        )
+                        if app_is_char and has_r_mod:
+                            _wstmt(f"call print_char_vector({app_f_print})", st.comment)
+                            need_r_mod.add("print_char_vector")
+                            continue
+                        if app_is_logical:
+                            _wstmt(f'write(*,"(*(g0,1x))") {app_f_print}', st.comment)
                             continue
                     if (not has_r_mod) and c_one is not None and c_one[0].lower() in {"runif", "rnorm"}:
                         nm_rng = c_one[0].lower()
@@ -11836,6 +11941,10 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                 is_logical_vec = False
                 if re.match(r"^logical\s*\(", rhs_l):
                     is_logical_vec = True
+                elif rhs_l.startswith("c("):
+                    c_log = parse_call_text(rhs)
+                    vals_log = (c_log[1] + list(c_log[2].values())) if c_log is not None and c_log[0].lower() == "c" else []
+                    is_logical_vec = bool(vals_log) and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_log)
                 elif re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
@@ -12949,7 +13058,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
@@ -13382,6 +13491,7 @@ def transpile_r_to_fortran(
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
+    _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
     # Promote main-scope names referenced by local functions to module scope.
     main_name_map: dict[str, str] = {}
     for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices | int_rank3_arrays:
