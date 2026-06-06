@@ -2975,6 +2975,13 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^(?:sort\.list|sort_list)\s*\(", rhs, re.IGNORECASE):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -5929,6 +5936,15 @@ def r_expr_to_fortran(expr: str) -> str:
         if dec_src is not None:
             return f"sort({r_expr_to_fortran(x_src)}, decreasing={r_expr_to_fortran(dec_src)})"
         return f"sort({r_expr_to_fortran(x_src)})"
+    if c_usr is not None and c_usr[0].lower() in {"sort.list", "sort_list"}:
+        _nm_sortl, pos_sortl, kw_sortl = c_usr
+        x_src = pos_sortl[0] if pos_sortl else kw_sortl.get("x", "")
+        if not x_src:
+            raise NotImplementedError("sort.list requires x argument")
+        dec_src = kw_sortl.get("decreasing")
+        if dec_src is not None:
+            return f"sort_list({r_expr_to_fortran(x_src)}, decreasing={r_expr_to_fortran(dec_src)})"
+        return f"sort_list({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "head":
         _nm_head, pos_head, kw_head = c_usr
         x_src = pos_head[0] if pos_head else kw_head.get("x", "")
@@ -8251,11 +8267,16 @@ def emit_stmts(
                 ]
                 return 0 if all(scalar_dims) else 2
             return 1
-        if m_r_ix and (m_r_ix.group(1) in int_vector_vars or m_r_ix.group(1) in real_vector_vars):
+        if m_r_ix and (
+            m_r_ix.group(1) in int_vector_vars
+            or m_r_ix.group(1) in real_vector_vars
+            or m_r_ix.group(1).lower() in _KNOWN_CHAR_VECTOR_NAMES
+        ):
             inner = m_r_ix.group(2).strip()
             inner_l = inner.lower()
             if (
                 inner.startswith("-")
+                or inner_l in _KNOWN_VECTOR_NAMES
                 or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is\.na\s*\(", inner_l)
                 or re.match(r"^is_na\s*\(", inner_l)
@@ -10143,6 +10164,14 @@ def emit_stmts(
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
+                            m_char_subset_print = re.match(r"^([A-Za-z]\w*)\s*\[.+\]$", one.strip())
+                            if (
+                                m_char_subset_print is not None
+                                and m_char_subset_print.group(1).lower() in _KNOWN_CHAR_VECTOR_NAMES
+                            ):
+                                _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                need_r_mod.add("print_char_vector")
+                                continue
                             c_print_aperm = parse_call_text(one.strip())
                             if c_print_aperm is not None and c_print_aperm[0].lower() == "aperm":
                                 src_print_aperm = (
@@ -16475,6 +16504,7 @@ def transpile_r_to_fortran(
         "diag",
         "toeplitz",
         "sort",
+        "sort_list",
         "polyroot",
         "nchar",
         "is_na",
