@@ -610,8 +610,11 @@ def _looks_matrix_expr(expr: str) -> bool:
     c = parse_call_text(t)
     if c is None:
         return False
-    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol", "backsolve"}:
+    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol"}:
         return True
+    if c[0].lower() in {"forwardsolve", "backsolve"}:
+        rhs_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", c[2].get("x", "")).strip()
+        return _looks_matrix_expr(rhs_src) if rhs_src else False
     if c[0].lower() == "reshape":
         shape_src = ""
         if len(c[1]) >= 2:
@@ -2969,7 +2972,7 @@ def classify_vars(
                         known_arrays.discard(st.name)
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
-                elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer|chol|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag|toeplitz|autocov_matrices|read\.csv)\s*\(", rhs, re.IGNORECASE) or re.match(r"^try\s*\(\s*(?:matrix|array|chol|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag|toeplitz|autocov_matrices|read\.csv)\s*\(", rhs, re.IGNORECASE) or re.match(r"^try\s*\(\s*(?:matrix|array|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3647,7 +3650,7 @@ def _list_name_holds_matrices_in_texts(texts: list[str], name: str) -> bool:
     matrix_vars: set[str] = set()
     for t0 in texts:
         m_mat = re.match(
-            r"^\s*([A-Za-z]\w*)\s*<-\s*(?:matrix|array|diag|t|crossprod|tcrossprod|chol|backsolve|r_matmul)\s*\(",
+            r"^\s*([A-Za-z]\w*)\s*<-\s*(?:matrix|array|diag|t|crossprod|tcrossprod|chol|forwardsolve|backsolve|r_matmul)\s*\(",
             t0,
             re.IGNORECASE,
         )
@@ -3698,7 +3701,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         re.IGNORECASE,
     )
     pat_mat_call_rhs = re.compile(
-        rf"^\s*{nm}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|backsolve|t|diag|toeplitz)\s*\(",
+        rf"^\s*{nm}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|forwardsolve|backsolve|t|diag|toeplitz|qr\.(?:Q|R)|qr_[QR])\s*\(",
         re.IGNORECASE,
     )
     pat_spread_rhs = re.compile(
@@ -3725,7 +3728,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         mat_call_rhs = re.compile(
-            rf"^\s*{v}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|backsolve|t|diag|toeplitz)\s*\(",
+            rf"^\s*{v}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|forwardsolve|backsolve|t|diag|toeplitz)\s*\(",
             re.IGNORECASE,
         )
         spread_rhs = re.compile(rf"^\s*{v}\s*<-\s*.*\b(?:spread|r_matmul)\s*\(", re.IGNORECASE)
@@ -5232,6 +5235,9 @@ def r_expr_to_fortran(expr: str) -> str:
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
     s = _replace_dotted_var_refs(s)
+    s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
+    s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
+    s = re.sub(r"(?i)\bqr\.coef\s*\(", "qr_coef(", s)
     m_coef_named_early = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
     if m_coef_named_early is not None:
         fit_nm = m_coef_named_early.group(1)
@@ -8032,6 +8038,10 @@ def emit_stmts(
             nm_c = c[0].lower()
             if nm_c in {"confint", "lm_confint"}:
                 return 2
+            if nm_c in {"qr.r", "qr_r", "qr.q", "qr_q"}:
+                return 2
+            if nm_c in {"qr.coef", "qr_coef"}:
+                return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
             if nm_c == "aperm":
@@ -8042,6 +8052,10 @@ def emit_stmts(
                 return rr_ap if rr_ap is not None else 1
             if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz"}:
                 return 2
+            if nm_c in {"forwardsolve", "backsolve"}:
+                rhs_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", c[2].get("x", "")).strip()
+                rr_rhs = _expr_rank_for_print(rhs_src) if rhs_src else None
+                return rr_rhs if rr_rhs is not None else 1
             if nm_c == "reshape":
                 shape_src = ""
                 if len(c[1]) >= 2:
@@ -8403,6 +8417,21 @@ def emit_stmts(
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
+            m_diag_lhs = re.match(r"^diag\s*\(\s*([A-Za-z]\w*)\s*\)$", st.name.strip(), re.IGNORECASE)
+            if m_diag_lhs is not None:
+                mat_nm = r_expr_to_fortran(m_diag_lhs.group(1))
+                rhs_f = r_expr_to_fortran(st.expr.strip())
+                o.w("block")
+                o.push()
+                o.w("integer :: i_diag")
+                o.w(f"do i_diag = 1, min(size({mat_nm}, 1), size({mat_nm}, 2))")
+                o.push()
+                o.w(f"{mat_nm}(i_diag, i_diag) = {rhs_f}")
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             c_df = parse_call_text(st.expr.strip())
             if c_df is not None and c_df[0].lower() == "data.frame":
                 _df_nm, pos_df, kw_df = c_df
@@ -10363,6 +10392,25 @@ def emit_stmts(
             o.w("end if")
         elif isinstance(st, ExprStmt):
             if re.match(r"^\s*(?:colnames|rownames|names|storage\.mode)\s*\(", st.expr, re.IGNORECASE):
+                continue
+            m_diag_expr_lhs = re.match(
+                r"^\s*diag\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*(.+)$",
+                st.expr.strip(),
+                re.IGNORECASE,
+            )
+            if m_diag_expr_lhs is not None:
+                mat_nm = r_expr_to_fortran(m_diag_expr_lhs.group(1))
+                rhs_f = r_expr_to_fortran(m_diag_expr_lhs.group(2).strip())
+                o.w("block")
+                o.push()
+                o.w("integer :: i_diag")
+                o.w(f"do i_diag = 1, min(size({mat_nm}, 1), size({mat_nm}, 2))")
+                o.push()
+                o.w(f"{mat_nm}(i_diag, i_diag) = {rhs_f}")
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
                 continue
             if st.expr.strip() == "break":
                 o.w("exit")
@@ -12619,6 +12667,10 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
             if low.startswith("cbind(") or low.startswith("cbind2(") or low.startswith("rbind("):
                 out.add(st.name)
             if low.startswith("t("):
+                out.add(st.name)
+            if low.startswith("chol("):
+                out.add(st.name)
+            if low.startswith("qr.q(") or low.startswith("qr.r(") or low.startswith("qr_q(") or low.startswith("qr_r("):
                 out.add(st.name)
             if low.startswith("outer("):
                 cinfo_o = parse_call_text(rhs)
@@ -16128,6 +16180,7 @@ def transpile_r_to_fortran(
         "eigen_sym_values",
         "solve_real",
         "chol",
+        "forwardsolve",
         "backsolve",
         "print_matrix",
         "print_matrix_rstyle",
@@ -16154,6 +16207,9 @@ def transpile_r_to_fortran(
         "prcomp",
         "print_prcomp_summary",
         "qr",
+        "qr_Q",
+        "qr_R",
+        "qr_coef",
         "print_qr",
         "lm_predict_interval",
         "lm_cooks_distance",
