@@ -4980,6 +4980,20 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_out_ft = [r_expr_to_fortran(a) for a in pos_ft]
         kw_out_ft = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_ft.items()]
         return f"fisher_test({', '.join(pos_out_ft + kw_out_ft)})"
+    if c_usr is not None and c_usr[0].lower() in {"wilcox.test", "wilcox_test"}:
+        _nm_wx, pos_wx, kw_wx = c_usr
+        pos_out_wx = [r_expr_to_fortran(a) for a in pos_wx]
+        kw_out_wx = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_wx.items()]
+        return f"wilcox_test({', '.join(pos_out_wx + kw_out_wx)})"
+    if c_usr is not None and c_usr[0].lower() in {"kruskal.test", "kruskal_test"}:
+        _nm_kw, pos_kw, kw_kw = c_usr
+        arg_kw = pos_kw[0].strip() if pos_kw else kw_kw.get("formula", "").strip()
+        mm_kw = _split_top_level_token(arg_kw, "~", from_right=True)
+        if mm_kw is not None:
+            return f"kruskal_test({r_expr_to_fortran(mm_kw[0].strip())}, {r_expr_to_fortran(mm_kw[1].strip())})"
+        pos_out_kw = [r_expr_to_fortran(a) for a in pos_kw]
+        kw_out_kw = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_kw.items()]
+        return f"kruskal_test({', '.join(pos_out_kw + kw_out_kw)})"
     if c_usr is not None and c_usr[0].lower() == "lm_cooks_distance":
         _nm_cd, pos_cd, kw_cd = c_usr
         fit_src = pos_cd[0] if pos_cd else kw_cd.get("object", "")
@@ -8268,6 +8282,14 @@ def emit_stmts(
                         _wstmt(f"call print_fisher_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_fisher_test", "fisher_test", "fisher_test_result_t"})
                         continue
+                    if re.match(r"^wilcox_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_wilcox_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_wilcox_test", "wilcox_test", "wilcox_test_result_t"})
+                        continue
+                    if re.match(r"^kruskal_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_kruskal_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_kruskal_test", "kruskal_test", "kruskal_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -8287,6 +8309,14 @@ def emit_stmts(
                     if c_one is not None and c_one[0].lower() in {"fisher.test", "fisher_test"}:
                         _wstmt(f"call print_fisher_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"fisher_test", "print_fisher_test", "fisher_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"wilcox.test", "wilcox_test"}:
+                        _wstmt(f"call print_wilcox_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"wilcox_test", "print_wilcox_test", "wilcox_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"kruskal.test", "kruskal_test"}:
+                        _wstmt(f"call print_kruskal_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"kruskal_test", "print_kruskal_test", "kruskal_test_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
@@ -14390,6 +14420,12 @@ def transpile_r_to_fortran(
         "fisher_test_result_t",
         "fisher_test",
         "print_fisher_test",
+        "wilcox_test_result_t",
+        "wilcox_test",
+        "print_wilcox_test",
+        "kruskal_test_result_t",
+        "kruskal_test",
+        "print_kruskal_test",
         "max_col",
         "tabulate",
         "table2",
