@@ -40,6 +40,9 @@ _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
+_KNOWN_COMPLEX_VECTOR_NAMES: set[str] = set()
+_KNOWN_COMPLEX_MATRIX_NAMES: set[str] = set()
+_KNOWN_COMPLEX_SCALAR_NAMES: set[str] = set()
 _NULL_ARRAY_SENTINELS: dict[str, str] = {}
 _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
@@ -607,7 +610,18 @@ def _looks_matrix_expr(expr: str) -> bool:
     c = parse_call_text(t)
     if c is None:
         return False
-    return c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol", "backsolve"}
+    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol", "backsolve"}:
+        return True
+    if c[0].lower() == "reshape":
+        shape_src = ""
+        if len(c[1]) >= 2:
+            shape_src = c[1][1].strip()
+        elif "shape" in c[2]:
+            shape_src = c[2]["shape"].strip()
+        if _parse_matrix_dim2(shape_src) is not None:
+            return True
+        return shape_src.startswith("[") and shape_src.endswith("]") and len(split_top_level_commas(shape_src[1:-1])) >= 2
+    return False
 
 
 def _parse_if_head(line: str) -> tuple[str, str] | None:
@@ -2459,6 +2473,27 @@ def _strict_int_vector_literal_from_c(expr: str) -> str | None:
             return None
         out.append(_normalize_r_int_literal(t))
     return "[" + ", ".join(out) + "]"
+
+
+def _parse_matrix_dim2(expr: str) -> tuple[str, str] | None:
+    """Parse a 2-element matrix-dimension expression like c(2,3) or [2,3]."""
+    if not expr:
+        return None
+    t = expr.strip()
+    parts: list[str] | None = None
+    cinfo = parse_call_text(t)
+    if cinfo is not None and cinfo[0].lower() == "c":
+        vals = cinfo[1] + list(cinfo[2].values())
+        parts = [v.strip() for v in vals if v.strip()]
+    elif t.startswith("[") and t.endswith("]"):
+        parts = [v.strip() for v in split_top_level_commas(t[1:-1]) if v.strip()]
+    else:
+        return None
+    if len(parts) != 2:
+        return None
+    if not (_is_integerish_expr_with_names(parts[0]) and _is_integerish_expr_with_names(parts[1])):
+        return None
+    return parts[0], parts[1]
 
 
 def _matrix_has_integer_literal_data(expr: str) -> bool:
@@ -4739,6 +4774,124 @@ def _looks_integer_fortran_expr(expr: str) -> bool:
     return False
 
 
+def _contains_r_complex_literal(expr: str) -> bool:
+    stripped: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            i += 1
+            continue
+        stripped.append(ch)
+        i += 1
+    return re.search(r"(?<![A-Za-z0-9_.])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?i\b", "".join(stripped)) is not None
+
+
+def _expr_mentions_known_complex(expr: str) -> bool:
+    names = {n.lower() for n in re.findall(r"\b[A-Za-z]\w*\b", expr)}
+    return bool(names & (_KNOWN_COMPLEX_VECTOR_NAMES | _KNOWN_COMPLEX_MATRIX_NAMES | _KNOWN_COMPLEX_SCALAR_NAMES))
+
+
+def _is_complex_expr_source(expr: str) -> bool:
+    return _contains_r_complex_literal(expr) or _expr_mentions_known_complex(expr) or bool(
+        re.search(r"\b(?:complex|as\.complex|cmplx|conjg)\s*\(", expr, re.IGNORECASE)
+    )
+
+
+def _replace_complex_literals_outside_strings(expr: str) -> str:
+    out: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i = 0
+
+    def flush_code() -> None:
+        if not cur:
+            return
+        code = "".join(cur)
+
+        def repl(m: re.Match[str]) -> str:
+            raw = m.group(0)[:-1]
+            if raw in {"", "+", "-"}:
+                raw = raw + "1" if raw else "1"
+            sign = ""
+            val = raw
+            if val.startswith("+"):
+                val = val[1:]
+            elif val.startswith("-"):
+                sign = "-"
+                val = val[1:]
+            if _is_int_literal(val):
+                imag = f"{sign}{_normalize_r_int_literal(val)}.0_dp"
+            elif _is_real_literal(val):
+                imag = f"{sign}{val}_dp" if "_dp" not in val.lower() else f"{sign}{val}"
+            else:
+                imag = f"{sign}{val}"
+            return f"cmplx(0.0_dp, {imag}, kind=dp)"
+
+        out.append(
+            re.sub(
+                r"(?<![A-Za-z0-9_.])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?i\b",
+                repl,
+                code,
+            )
+        )
+        cur.clear()
+
+    while i < len(expr):
+        ch = expr[i]
+        if quote is not None:
+            flush_code()
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(expr):
+                i += 1
+                out.append(expr[i])
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {"'", '"'}:
+            flush_code()
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    flush_code()
+    return "".join(out)
+
+
+def _as_complex_fortran_expr(expr_f: str) -> str:
+    t = expr_f.strip()
+    if re.search(r"\b(?:cmplx|conjg)\s*\(", t, re.IGNORECASE):
+        return t
+    if _expr_mentions_known_complex(t):
+        return t
+    if _is_logical_expr_for_complex(t):
+        return f"cmplx(merge(1.0_dp, 0.0_dp, {t}), 0.0_dp, kind=dp)"
+    imag = "0.0_dp"
+    if _looks_matrix_expr(t) or t.lower() in _KNOWN_MATRIX_NAMES or t.lower() in _KNOWN_COMPLEX_MATRIX_NAMES:
+        imag = f"0.0_dp * real({t}, kind=dp)"
+    return f"cmplx(real({t}, kind=dp), {imag}, kind=dp)"
+
+
+def _is_logical_expr_for_complex(expr: str) -> bool:
+    t = expr.strip().lower()
+    if t in _KNOWN_LOGICAL_VECTOR_NAMES:
+        return True
+    return bool(re.search(r"\.true\.|\.false\.", t))
+
+
 def _int_bound_expr(expr: str) -> str:
     t = expr.strip()
     m = re.match(r"^int\s*\((.+)\)$", t, re.IGNORECASE)
@@ -5234,6 +5387,11 @@ def r_expr_to_fortran(expr: str) -> str:
         labels, each_src = factor_rep
         return f"r_rep_int(r_seq_int(1, {len(labels)}), each={_int_bound_expr(r_expr_to_fortran(each_src))})"
     c_cast0 = parse_call_text(s)
+    if c_cast0 is not None and c_cast0[0].lower() == "as.complex" and c_cast0[1]:
+        src_ac = c_cast0[1][0].strip()
+        if src_ac.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+            return "cmplx([real(kind=dp) :: ], [real(kind=dp) :: ], kind=dp)"
+        return _as_complex_fortran_expr(r_expr_to_fortran(src_ac))
     if c_cast0 is not None and c_cast0[0].lower() in {"as.numeric", "as.double"} and c_cast0[1]:
         return r_expr_to_fortran(c_cast0[1][0].strip())
     if c_cast0 is not None and c_cast0[0].lower() == "factor" and c_cast0[1]:
@@ -5243,6 +5401,8 @@ def r_expr_to_fortran(expr: str) -> str:
         if mm_op is not None:
             a_txt = mm_op[0].strip()
             b_txt = mm_op[1].strip()
+            if a_txt and b_txt and (_is_complex_expr_source(a_txt) or _is_complex_expr_source(b_txt)):
+                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
             if a_txt and b_txt and _looks_matrix_expr(a_txt) and _looks_matrix_expr(b_txt):
                 return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
             a_vec = _looks_vector_expr_for_recycle(a_txt) if a_txt else False
@@ -5311,6 +5471,8 @@ def r_expr_to_fortran(expr: str) -> str:
     if mm_div is not None:
         lhs = r_expr_to_fortran(mm_div[0])
         rhs = r_expr_to_fortran(mm_div[1])
+        if _is_complex_expr_source(mm_div[0]) or _is_complex_expr_source(mm_div[1]) or _expr_mentions_known_complex(lhs) or _expr_mentions_known_complex(rhs):
+            return f"({lhs}) / ({rhs})"
         return f"(real({lhs}, kind=dp)) / (real({rhs}, kind=dp))"
     c_usr = parse_call_text(s)
     if c_usr is not None and c_usr[0].lower() == "cor" and len(c_usr[1]) == 1 and not c_usr[2]:
@@ -5576,6 +5738,46 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"sample_int1({n_f}, replace={rep_f}, prob={prob_f})"
             return f"sample_int1({n_f}, replace={rep_f})"
         return call_f
+    c_complex_ctor = parse_call_text(s)
+    if c_complex_ctor is not None and c_complex_ctor[0].lower() == "complex":
+        _nzc, pos_zc, kw_zc = c_complex_ctor
+        length_src = kw_zc.get("length.out", kw_zc.get("length_out"))
+        real_src = kw_zc.get("real")
+        imag_src = kw_zc.get("imaginary")
+        mod_src = kw_zc.get("modulus")
+        arg_src = kw_zc.get("argument")
+        if length_src is None and pos_zc:
+            length_src = pos_zc[0]
+
+        def _complex_real_vec(src: str | None, default: str, n_f: str | None) -> str:
+            if src is None:
+                src = default
+            src_t = src.strip()
+            src_f = r_expr_to_fortran(src_t)
+            is_vec = (
+                src_t.lower() in _KNOWN_VECTOR_NAMES
+                or src_t.lower() in _KNOWN_COMPLEX_VECTOR_NAMES
+                or src_f.strip().startswith("[")
+                or re.match(r"^[A-Za-z]\w+\s*\(", src_f.strip()) is not None
+            )
+            if n_f is None:
+                return f"real({src_f}, kind=dp)"
+            if is_vec:
+                return f"r_rep_real(real({src_f}, kind=dp), len_out={n_f})"
+            return f"r_rep_real([real({src_f}, kind=dp)], len_out={n_f})"
+
+        n_f = _int_bound_expr(r_expr_to_fortran(length_src.strip())) if length_src is not None else None
+        if real_src is None and imag_src is None and mod_src is None and arg_src is None:
+            if n_f is None:
+                n_f = "0"
+            return f"cmplx(r_rep_real([0.0_dp], len_out={n_f}), r_rep_real([0.0_dp], len_out={n_f}), kind=dp)"
+        if mod_src is not None or arg_src is not None:
+            mod_vec = _complex_real_vec(mod_src, "1.0", n_f)
+            arg_vec = _complex_real_vec(arg_src, "0.0", n_f)
+            return f"cmplx({mod_vec} * cos({arg_vec}), {mod_vec} * sin({arg_vec}), kind=dp)"
+        real_vec = _complex_real_vec(real_src, "0.0", n_f)
+        imag_vec = _complex_real_vec(imag_src, "0.0", n_f)
+        return f"cmplx({real_vec}, {imag_vec}, kind=dp)"
     c_fmt = parse_call_text(s)
     if c_fmt is not None and c_fmt[0].lower() == "format":
         _nf, pos_f, kw_f = c_fmt
@@ -5782,11 +5984,14 @@ def r_expr_to_fortran(expr: str) -> str:
         "log10",
         lambda inner: f"log10(real({r_expr_to_fortran(inner.strip())}, kind=dp))",
     )
-    s = _replace_balanced_func_calls(
-        s,
-        "log",
-        lambda inner: f"log(real({r_expr_to_fortran(inner.strip())}, kind=dp))",
-    )
+    def _log_to_fortran(inner: str) -> str:
+        src = inner.strip()
+        inner_f = r_expr_to_fortran(src)
+        if _is_complex_expr_source(src) or _expr_mentions_known_complex(inner_f):
+            return f"log({inner_f})"
+        return f"log(real({inner_f}, kind=dp))"
+
+    s = _replace_balanced_func_calls(s, "log", _log_to_fortran)
     c_cospi = parse_call_text(s)
     if c_cospi is not None and c_cospi[0].lower() == "cospi":
         _ncp, pos_cp, kw_cp = c_cospi
@@ -5812,20 +6017,51 @@ def r_expr_to_fortran(expr: str) -> str:
         x_f = r_expr_to_fortran(x_src)
         return f"tan(pi * real({x_f}, kind=dp))"
     c_complex_real = parse_call_text(s)
-    if c_complex_real is not None and c_complex_real[0] in {"Mod", "Re", "Im", "Conj", "Arg"}:
-        nm_cr = c_complex_real[0]
+    if c_complex_real is not None and c_complex_real[0].lower() in {"mod", "re", "im", "conj", "arg"}:
+        nm_cr = c_complex_real[0].lower()
         pos_cr, kw_cr = c_complex_real[1], c_complex_real[2]
         z_src = pos_cr[0] if pos_cr else kw_cr.get("z")
         if z_src is None:
-            raise NotImplementedError(f"{nm_cr} requires an argument")
+            raise NotImplementedError(f"{c_complex_real[0]} requires an argument")
         z_f = r_expr_to_fortran(z_src)
-        if nm_cr == "Mod":
+        if nm_cr == "mod":
             return f"abs({z_f})"
-        if nm_cr in {"Re", "Conj"}:
-            return z_f
-        if nm_cr == "Im":
-            return f"(0.0_dp * real({z_f}, kind=dp))"
+        if nm_cr == "re":
+            return f"real({z_f}, kind=dp)"
+        z_is_complex = _is_complex_expr_source(z_src) or _expr_mentions_known_complex(z_f)
+        if nm_cr == "conj":
+            return f"conjg({z_f})" if z_is_complex else z_f
+        if nm_cr == "im":
+            return f"aimag({z_f})" if z_is_complex else f"(0.0_dp * real({z_f}, kind=dp))"
+        if z_is_complex:
+            return f"atan2(aimag({z_f}), real({z_f}, kind=dp))"
         return f"merge(acos(-1.0_dp), 0.0_dp, real({z_f}, kind=dp) < 0.0_dp)"
+
+    def _complex_component_call(fname: str, inner: str) -> str:
+        src = inner.strip()
+        z_f = r_expr_to_fortran(src)
+        z_is_complex = _is_complex_expr_source(src) or _expr_mentions_known_complex(z_f)
+        fl = fname.lower()
+        if fl == "mod":
+            return f"abs({z_f})"
+        if fl == "re":
+            return f"real({z_f}, kind=dp)"
+        if fl == "im":
+            return f"aimag({z_f})" if z_is_complex else f"(0.0_dp * real({z_f}, kind=dp))"
+        if fl == "conj":
+            return f"conjg({z_f})" if z_is_complex else z_f
+        if z_is_complex:
+            return f"atan2(aimag({z_f}), real({z_f}, kind=dp))"
+        return f"merge(acos(-1.0_dp), 0.0_dp, real({z_f}, kind=dp) < 0.0_dp)"
+
+    # Do not use the generic balanced-call replacer for short names such as
+    # Re/Mod/Conj; it can also match generated real/mod/conjg calls.
+    for _cx_name in ("Mod", "Im", "Conj", "Arg"):
+        s = re.sub(
+            rf"(?<![A-Za-z0-9_]){_cx_name}\s*\(([^()]*)\)",
+            lambda m, n=_cx_name: _complex_component_call(n, m.group(1)),
+            s,
+        )
     c_ord = parse_call_text(s)
     if c_ord is not None and c_ord[0].lower() == "order":
         _no, pos_o, kw_o = c_ord
@@ -5989,6 +6225,10 @@ def r_expr_to_fortran(expr: str) -> str:
             nr_src = pos_m[1]
         if nc_src is None and len(pos_m) >= 3:
             nc_src = pos_m[2]
+        if nc_src is None and nr_src is not None:
+            parsed_dims = _parse_matrix_dim2(nr_src)
+            if parsed_dims is not None:
+                nr_src, nc_src = parsed_dims
         byrow_src = kw_m.get("byrow")
         if byrow_src is None and len(pos_m) >= 4:
             byrow_src = pos_m[3]
@@ -6947,11 +7187,14 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "digamma", lambda inner: _binary_special_fn("r_digamma", inner))
     s = _replace_balanced_func_calls(s, "trigamma", lambda inner: _binary_special_fn("r_trigamma", inner))
     s = _replace_balanced_func_calls(s, "psigamma", _psigamma_to_fortran)
-    s = _replace_balanced_func_calls(
-        s,
-        "sqrt",
-        lambda inner: f"sqrt(real({r_expr_to_fortran(inner)}, kind=dp))",
-    )
+    def _sqrt_to_fortran(inner: str) -> str:
+        src = inner.strip()
+        inner_f = r_expr_to_fortran(src)
+        if _is_complex_expr_source(src) or _expr_mentions_known_complex(inner_f):
+            return f"sqrt({inner_f})"
+        return f"sqrt(real({inner_f}, kind=dp))"
+
+    s = _replace_balanced_func_calls(s, "sqrt", _sqrt_to_fortran)
     s = _replace_balanced_func_calls(s, "abs", lambda inner: f"abs({r_expr_to_fortran(inner.strip())})")
     def _sign_to_fortran(inner: str) -> str:
         x_f = r_expr_to_fortran(inner.strip())
@@ -7075,6 +7318,13 @@ def r_expr_to_fortran(expr: str) -> str:
             width = max(1, max(len(v) for v in vals_s))
             quoted = ", ".join('"' + v.replace('"', '""') + '"' for v in vals_s)
             return f"[character(len={width}) :: {quoted}]"
+        if any(_is_complex_expr_source(_strip_named_actual_value(p)) for p in parts if p.strip()):
+            vals_cplx: list[str] = []
+            for p in parts:
+                t = _strip_named_actual_value(p)
+                tf = r_expr_to_fortran(t)
+                vals_cplx.append(_as_complex_fortran_expr(tf))
+            return "[" + ", ".join(vals_cplx) + "]"
         vals = []
         for p in parts:
             t = _strip_named_actual_value(p)
@@ -7270,6 +7520,7 @@ def r_expr_to_fortran(expr: str) -> str:
     while prev_mod != s:
         prev_mod = s
         s = mod_pat.sub(r"mod(\1, \2)", s)
+    s = _replace_complex_literals_outside_strings(s)
     return s
 
 
@@ -7657,6 +7908,27 @@ def emit_stmts(
                 return rr_ap if rr_ap is not None else 1
             if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz"}:
                 return 2
+            if nm_c == "reshape":
+                shape_src = ""
+                if len(c[1]) >= 2:
+                    shape_src = c[1][1].strip()
+                elif "shape" in c[2]:
+                    shape_src = c[2]["shape"].strip()
+                if _parse_matrix_dim2(shape_src) is not None:
+                    return 2
+                if shape_src.startswith("[") and shape_src.endswith("]"):
+                    shape_body = shape_src[1:-1].strip()
+                    if shape_body:
+                        shape_parts = split_top_level_commas(shape_body)
+                        if len(shape_parts) >= 2:
+                            return 2
+                if shape_src:
+                    shape_call = parse_call_text(shape_src)
+                    if shape_call is not None and shape_call[0].lower() == "c" and len(shape_call[1]) >= 2:
+                        return 2
+                    if "," in shape_src:
+                        return 2
+                return 1
             if nm_c in return_array_fns:
                 return _USER_FUNC_RETURN_RANK.get(nm_c, 1)
             if nm_c in _USER_FUNC_ARG_KIND:
@@ -7683,6 +7955,13 @@ def emit_stmts(
                 return 1
             if nm_c == "append":
                 return 1
+            if nm_c in {"re", "im", "mod", "arg", "conj", "as.complex"}:
+                arg_cx = c[1][0].strip() if c[1] else c[2].get("z", c[2].get("x", "")).strip()
+                if arg_cx.lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
+                    return 1
+                if arg_cx.lower() in _KNOWN_COMPLEX_SCALAR_NAMES or _is_complex_expr_source(arg_cx):
+                    return 0
+                return 1 if nm_c == "as.complex" else None
             if nm_c in {"table", "table2"}:
                 vals_c = list(c[1]) + list(c[2].values())
                 return 2 if len(vals_c) >= 2 or nm_c == "table2" else 1
@@ -7841,6 +8120,8 @@ def emit_stmts(
         if not isinstance(matrix_labels_map, dict):
             matrix_labels_map = {}
         labels_map = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
+        if not isinstance(labels_map, dict) or not labels_map:
+            labels_map = _NAMED_VECTOR_LABELS
         if not isinstance(labels_map, dict):
             labels_map = _NAMED_VECTOR_LABELS
         t = expr_txt.strip()
@@ -8427,15 +8708,30 @@ def emit_stmts(
                         continue
                     # Generic fallback for matrix(data, nrow=, ncol=)
                     data_f = _strict_int_vector_literal_from_c(data_src.strip()) or r_expr_to_fortran(data_src)
-                    if nrow_src is None:
-                        nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
-                        nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
-                    else:
-                        nr_f = _int_bound_expr(r_expr_to_fortran(nrow_src))
-                        if ncol_src is None:
-                            nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
-                        else:
+                    explicit_shape = False
+                    if nrow_src is not None and ncol_src is None:
+                        dim_pair = _parse_matrix_dim2(nrow_src)
+                        if dim_pair is not None:
+                            nr_f = _int_bound_expr(r_expr_to_fortran(dim_pair[0]))
+                            nc_f = _int_bound_expr(r_expr_to_fortran(dim_pair[1]))
+                            explicit_shape = True
+                    if ncol_src is not None and nrow_src is None and (not explicit_shape):
+                        dim_pair = _parse_matrix_dim2(ncol_src)
+                        if dim_pair is not None:
+                            nr_f = _int_bound_expr(r_expr_to_fortran(dim_pair[0]))
+                            nc_f = _int_bound_expr(r_expr_to_fortran(dim_pair[1]))
+                            explicit_shape = True
+                    if not explicit_shape:
+                        if nrow_src is None:
                             nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
+                            nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
+                        else:
+                            nr_f = _int_bound_expr(r_expr_to_fortran(nrow_src))
+                            if ncol_src is None:
+                                nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
+                            else:
+                                nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
+
                     if data_f.strip().startswith("ieee_value("):
                         data_f = f"[{data_f}]"
                     elif not (
@@ -8919,6 +9215,36 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    c_complex_print = parse_call_text(one)
+                    if c_complex_print is not None and c_complex_print[0].lower() == "as.complex":
+                        arg_cxp = c_complex_print[1][0].strip() if c_complex_print[1] else c_complex_print[2].get("x", "").strip()
+                        if arg_cxp.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                            _wstmt('write(*,"(a)") "[character to complex not translated]"', st.comment)
+                            continue
+                    if c_complex_print is not None and c_complex_print[0].lower() in {"re", "im", "mod", "arg"}:
+                        arg_cxp = c_complex_print[1][0].strip() if c_complex_print[1] else c_complex_print[2].get("z", "").strip()
+                        one_cxp = r_expr_to_fortran(one)
+                        if arg_cxp.lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
+                            _wstmt(f"call print_real_vector(real({one_cxp}, kind=dp))", st.comment)
+                            need_r_mod.add("print_real_vector")
+                            continue
+                        if arg_cxp.lower() in _KNOWN_COMPLEX_SCALAR_NAMES or _is_complex_expr_source(arg_cxp):
+                            _wstmt(f'write(*,"(g0)") {one_cxp}', st.comment)
+                            continue
+                    if c_complex_print is not None and c_complex_print[0].lower() in {"complex", "as.complex", "conj"}:
+                        one_cxp = r_expr_to_fortran(one)
+                        rank_cxp = _expr_rank_for_print(one)
+                        if rank_cxp == 0:
+                            _wstmt(f'write(*,"(g0)") {one_cxp}', st.comment)
+                        else:
+                            _wstmt(f'write(*,"(*(g0,1x))") {one_cxp}', st.comment)
+                        continue
+                    if one.lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
+                        _wstmt(f'write(*,"(*(g0,1x))") {r_expr_to_fortran(one)}', st.comment)
+                        continue
+                    if one.lower() in _KNOWN_COMPLEX_SCALAR_NAMES or _is_complex_expr_source(one):
+                        _wstmt(f'write(*,"(g0)") {r_expr_to_fortran(one)}', st.comment)
+                        continue
                     m_pca_head_scores_early = re.match(
                         r"^head\s*\(\s*([A-Za-z]\w*)\s*(?:\$|%)\s*x\s*(?:,\s*([^)]+))?\)\s*$",
                         one,
@@ -8929,6 +9255,47 @@ def emit_stmts(
                         n_head = _int_bound_expr(r_expr_to_fortran((m_pca_head_scores_early.group(2) or "6").strip()))
                         _wstmt(f"call print_matrix({fit_nm}%x(1:min({n_head}, size({fit_nm}%x, 1)), :))", st.comment)
                         need_r_mod.add("print_matrix_rstyle")
+                        continue
+                    if _looks_matrix_expr(one):
+                        one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        if has_r_mod:
+                            labels = _matrix_col_labels_for_print(one)
+                            if labels is not None:
+                                int_cols = _int_col_mask_literal(labels)
+                                if int_cols is not None:
+                                    _wstmt(
+                                        f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)}, int_cols={int_cols})",
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(
+                                        f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)})",
+                                        st.comment,
+                                    )
+                                need_r_mod.add("print_matrix_rstyle_named")
+                            else:
+                                label_expr = _matrix_col_label_expr_for_print(one)
+                                if label_expr is not None:
+                                    _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
+                                    need_r_mod.add("print_matrix_rstyle_named")
+                                else:
+                                    _wstmt(f"call print_matrix({one_f})", st.comment)
+                                    need_r_mod.add("print_matrix_rstyle")
+                        else:
+                            o.w("block")
+                            o.push()
+                            o.w("integer :: i_pr")
+                            o.w(f"associate(m_pr => {one_f})")
+                            o.push()
+                            o.w("do i_pr = 1, size(m_pr, 1)")
+                            o.push()
+                            o.w('write(*,"(*(g0,1x))") m_pr(i_pr, :)')
+                            o.pop()
+                            o.w("end do")
+                            o.pop()
+                            o.w("end associate")
+                            o.pop()
+                            o.w("end block")
                         continue
                     one_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", one, flags=re.IGNORECASE)
                     c_one = parse_call_text(one_call_src)
@@ -11969,6 +12336,110 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
     return out
 
 
+def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None = None) -> tuple[set[str], set[str], set[str]]:
+    scalars: set[str] = set()
+    arrays: set[str] = set()
+    matrices: set[str] = set()
+    known_matrices = {n.lower() for n in (known_matrices or set())}
+
+    def _is_complex_scalar_expr(rhs: str) -> bool:
+        rhs_t = rhs.strip()
+        if rhs_t.lower() in _KNOWN_COMPLEX_SCALAR_NAMES:
+            return True
+        if _contains_r_complex_literal(rhs_t) and not rhs_t.lower().startswith("c("):
+            return True
+        return False
+
+    def _is_complex_matrix_expr(rhs: str) -> bool:
+        rhs_t = rhs.strip()
+        cinfo = parse_call_text(rhs_t)
+        if cinfo is not None:
+            nm = cinfo[0].lower()
+            if nm in {"complex", "as.complex"}:
+                arg = ""
+                if cinfo[1]:
+                    arg = cinfo[1][0]
+                elif "z" in cinfo[2]:
+                    arg = cinfo[2]["z"]
+                elif "x" in cinfo[2]:
+                    arg = cinfo[2]["x"]
+                return _is_complex_matrix_arg(arg)
+            if nm in {"conj"}:
+                arg = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("z", "").strip()
+                if arg.lower() in arrays or arg.lower() in scalars:
+                    return True
+                if arg.lower() in _KNOWN_MATRIX_NAMES or arg.lower() in matrices or arg.lower() in known_matrices:
+                    return True
+        return rhs_t.lower() in arrays
+
+    def _is_complex_matrix_arg(complex_name: str) -> bool:
+        arg_src = complex_name.strip() if complex_name is not None else ""
+        if not arg_src:
+            return False
+        arg_l = arg_src.lower()
+        if arg_l in matrices or arg_l in known_matrices or arg_l in _KNOWN_COMPLEX_MATRIX_NAMES or arg_l in _KNOWN_MATRIX_NAMES:
+            return True
+        if arg_l in _KNOWN_COMPLEX_VECTOR_NAMES:
+            return False
+        if _is_complex_expr_source(arg_src) or _expr_mentions_known_complex(arg_src):
+            return False
+        if _looks_matrix_expr(arg_src):
+            return True
+        if arg_l in _KNOWN_MATRIX_NAMES:
+            return True
+        return False
+
+    def _is_complex_array_expr(rhs: str) -> bool:
+        rhs_t = rhs.strip()
+        cinfo = parse_call_text(rhs_t)
+        if cinfo is not None:
+            nm = cinfo[0].lower()
+            if nm in {"complex", "as.complex"}:
+                arg = ""
+                if cinfo[1]:
+                    arg = cinfo[1][0]
+                elif "z" in cinfo[2]:
+                    arg = cinfo[2]["z"]
+                elif "x" in cinfo[2]:
+                    arg = cinfo[2]["x"]
+                if _is_complex_matrix_arg(arg):
+                    return False
+                return True
+            if nm == "c":
+                vals = cinfo[1] + list(cinfo[2].values())
+                return any(_is_complex_expr_source(v.strip()) for v in vals)
+            if nm in {"conj"}:
+                arg = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("z", "").strip()
+                return arg.lower() in arrays or arg.lower() in scalars
+        return rhs_t.lower() in arrays
+
+    changed = True
+    while changed:
+        changed = False
+        for st in stmts:
+            if not isinstance(st, Assign):
+                continue
+            rhs = st.expr.strip()
+            if _is_complex_matrix_expr(rhs):
+                if st.name not in matrices:
+                    matrices.add(st.name)
+                    scalars.discard(st.name)
+                    arrays.discard(st.name)
+                    changed = True
+                continue
+            if _is_complex_array_expr(rhs):
+                if st.name not in arrays:
+                    arrays.add(st.name)
+                    scalars.discard(st.name)
+                    changed = True
+                continue
+            if _is_complex_scalar_expr(rhs):
+                if st.name not in scalars and st.name not in arrays and st.name not in matrices:
+                    scalars.add(st.name)
+                    changed = True
+    return scalars, arrays, matrices
+
+
 def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] | None = None) -> set[str]:
     """Find variables that should be declared as rank-2 real allocatables."""
     out: set[str] = set()
@@ -13058,7 +13529,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
@@ -13072,6 +13543,9 @@ def transpile_r_to_fortran(
     _TABLE_LABELS = {}
     _FIT_TERM_LABELS = {}
     _ARRAY_DIM_LABELS = {}
+    _KNOWN_COMPLEX_VECTOR_NAMES = set()
+    _KNOWN_COMPLEX_SCALAR_NAMES = set()
+    _KNOWN_COMPLEX_MATRIX_NAMES = set()
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -13450,6 +13924,12 @@ def transpile_r_to_fortran(
     int_rank3_arrays = infer_main_integer_rank3_arrays(main_stmts)
     real_rank3_arrays = infer_main_real_rank3_arrays(main_stmts)
     real_rank4_arrays = infer_main_real_rank4_arrays(main_stmts)
+    complex_scalars, complex_arrays, complex_matrices = infer_main_complex_vars(
+        main_stmts, set(int_matrices) | set(real_matrices)
+    )
+    _KNOWN_COMPLEX_SCALAR_NAMES = {n.lower() for n in complex_scalars}
+    _KNOWN_COMPLEX_VECTOR_NAMES = {n.lower() for n in complex_arrays}
+    _KNOWN_COMPLEX_MATRIX_NAMES = {n.lower() for n in complex_matrices}
     changed_rank3 = True
     while changed_rank3:
         changed_rank3 = False
@@ -13489,7 +13969,7 @@ def transpile_r_to_fortran(
             ints.discard(nm_order)
             params.pop(nm_order, None)
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
-    _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices))}
+    _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
     # Promote main-scope names referenced by local functions to module scope.
@@ -13892,6 +14372,33 @@ def transpile_r_to_fortran(
         int_arrays.discard(nm)
         real_arrays.discard(nm)
         params.pop(nm, None)
+    for nm in complex_arrays:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        params.pop(nm, None)
+        array_params.pop(nm, None)
+    for nm in complex_matrices:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        params.pop(nm, None)
+        array_params.pop(nm, None)
+    for nm in complex_scalars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        params.pop(nm, None)
+        array_params.pop(nm, None)
     if "stats_list" in real_arrays:
         real_matrices.add("stats_list")
     for nm in real_matrices:
@@ -14071,6 +14578,8 @@ def transpile_r_to_fortran(
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(real_arrays)))
     if real_scalars:
         pbody.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
+    if complex_scalars:
+        pbody.w("complex(kind=dp) :: " + ", ".join(sorted(complex_scalars)))
     if int_matrices:
         pbody.w("integer, allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(int_matrices)))
     if real_matrices:
@@ -14081,6 +14590,10 @@ def transpile_r_to_fortran(
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:,:)" for x in sorted(real_rank3_arrays)))
     if real_rank4_arrays:
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:,:,:)" for x in sorted(real_rank4_arrays)))
+    if complex_arrays:
+        pbody.w("complex(kind=dp), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(complex_arrays)))
+    if complex_matrices:
+        pbody.w("complex(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(complex_matrices)))
     if t_test_vars:
         pbody.w("type(t_test_result_t) :: " + ", ".join(sorted(t_test_vars)))
     if char_scalars:
