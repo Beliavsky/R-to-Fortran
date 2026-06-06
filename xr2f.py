@@ -4603,6 +4603,121 @@ def rename_conflicting_reused_vars(
     return out
 
 
+def rename_case_conflicting_names(stmts: list[object]) -> list[object]:
+    """Rename names that only differ by case so Fortran gets distinct identifiers."""
+
+    def fresh(base: str, used_ci: dict[str, str]) -> str:
+        cand = base
+        i = 2
+        while cand.lower() in used_ci:
+            cand = f"{base}_{i}"
+            i += 1
+        used_ci[cand.lower()] = cand
+        return cand
+
+    def walk_block(
+        ss: list[object],
+        used_ci: dict[str, str],
+        rename_map: dict[str, str],
+    ) -> tuple[list[object], dict[str, str], dict[str, str]]:
+        used_ci = dict(used_ci)
+        rename_map = dict(rename_map)
+        out: list[object] = []
+        for st in ss:
+            st = _rename_stmt_obj(st, rename_map)
+            if isinstance(st, Assign):
+                name = st.name
+                known = used_ci.get(name.lower())
+                if known is not None and known != name:
+                    new_name = fresh(name, used_ci)
+                    rename_map[name] = new_name
+                    name = new_name
+                else:
+                    used_ci[name.lower()] = name
+                out.append(Assign(name=name, expr=st.expr, comment=st.comment))
+                continue
+            if isinstance(st, FuncDef):
+                local_used: dict[str, str] = {}
+                arg_map: dict[str, str] = {}
+                args_new: list[str] = []
+                for arg in st.args:
+                    a_known = local_used.get(arg.lower())
+                    if a_known is None:
+                        local_used[arg.lower()] = arg
+                        arg_new = arg
+                    elif a_known != arg:
+                        arg_new = fresh(arg, local_used)
+                    else:
+                        arg_new = arg
+                    arg_map[arg] = arg_new
+                    local_used[arg_new.lower()] = arg_new
+                    args_new.append(arg_new)
+                defaults_new = {
+                    arg_map.get(a, a): _replace_idents(v, arg_map)
+                    for a, v in st.defaults.items()
+                }
+                body, _, _ = walk_block(
+                    st.body,
+                    local_used,
+                    {**rename_map, **arg_map},
+                )
+                out.append(FuncDef(
+                    name=st.name,
+                    args=args_new,
+                    defaults=defaults_new,
+                    body=body,
+                    leading_comments=st.leading_comments,
+                ))
+                continue
+            if isinstance(st, ForStmt):
+                var = st.var
+                v_known = used_ci.get(var.lower())
+                if v_known is not None and v_known != var:
+                    new_var = fresh(var, used_ci)
+                    rename_map[var] = new_var
+                    var = new_var
+                else:
+                    used_ci[var.lower()] = var
+                body, used_ci, rename_map = walk_block(st.body, used_ci, rename_map)
+                out.append(ForStmt(var=var, iter_expr=_replace_idents(st.iter_expr, rename_map), body=body))
+                continue
+            if isinstance(st, WhileStmt):
+                body, used_ci, rename_map = walk_block(
+                    st.body,
+                    used_ci,
+                    rename_map,
+                )
+                out.append(WhileStmt(cond=_replace_idents(st.cond, rename_map), body=body))
+                continue
+            if isinstance(st, RepeatStmt):
+                body, used_ci, rename_map = walk_block(
+                    st.body,
+                    used_ci,
+                    rename_map,
+                )
+                out.append(RepeatStmt(body=body))
+                continue
+            if isinstance(st, IfStmt):
+                then_body, used_ci, rename_map = walk_block(st.then_body, used_ci, rename_map)
+                else_body, used_ci, rename_map = walk_block(st.else_body, used_ci, rename_map)
+                out.append(IfStmt(cond=_replace_idents(st.cond, rename_map), then_body=then_body, else_body=else_body))
+                continue
+            if isinstance(st, PrintStmt):
+                out.append(PrintStmt(args=[_replace_idents(a, rename_map) for a in st.args], comment=st.comment))
+                continue
+            if isinstance(st, CallStmt):
+                out.append(CallStmt(name=st.name, args=[_replace_idents(a, rename_map) for a in st.args], comment=st.comment))
+                continue
+            if isinstance(st, ExprStmt):
+                out.append(ExprStmt(expr=_replace_idents(st.expr, rename_map), comment=st.comment))
+                continue
+            out.append(st)
+        return out, used_ci, rename_map
+
+    out, _, _ = walk_block(stmts, {}, {})
+    return out
+
+
 def _stmt_tree_has_side_effect_ops(ss: list[object]) -> bool:
     """Conservative impurity test for R-subset function bodies."""
     bad_call_names = {"set.seed", "cat", "print"}
@@ -13454,6 +13569,7 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
     stmts = attach_function_adjacent_comments(stmts)
     stmts = rename_conflicting_loop_vars(stmts)
     stmts = rename_conflicting_reused_vars(stmts)
+    stmts = rename_case_conflicting_names(stmts)
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     raw_name = _raw_r_name_map_from_source(src)
@@ -13561,6 +13677,7 @@ def transpile_r_to_fortran(
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
+    stmts = rename_case_conflicting_names(stmts)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
         print(
