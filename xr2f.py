@@ -3956,6 +3956,11 @@ def _stmt_uses_name_in_model_formula(st: object, name: str) -> bool:
 
 def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
     """Inline simple single-use temporaries (`t = expr`) into their sole later use."""
+    df_alias_sources = {
+        alias.lower()
+        for aliases in _EXPANDED_DATA_FRAME_ALIASES.values()
+        for alias in aliases.values()
+    }
     out = list(stmts)
     changed = True
     while changed:
@@ -4003,6 +4008,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
                 i += 1
                 continue
             if "$" in st.expr:
+                i += 1
+                continue
+            if name.lower() in df_alias_sources:
                 i += 1
                 continue
             if re.search(rf"\b{re.escape(name)}\b", st.expr):
@@ -5085,6 +5093,10 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_pre is not None:
         nm_pre = c_pre[0].lower()
         pos_pre = c_pre[1]
+        if nm_pre in {"cbind", "cbind2"} and c_pre[2]:
+            args = [r_expr_to_fortran(a.strip()) for a in (pos_pre + list(c_pre[2].values()))]
+            if args:
+                return f"{c_pre[0]}({', '.join(args)})"
         if nm_pre == "names" and len(pos_pre) == 1:
             src_nm = pos_pre[0].strip()
             if src_nm.lower() in _NAMED_VECTOR_NAMES:
@@ -5630,6 +5642,30 @@ def r_expr_to_fortran(expr: str) -> str:
         "log",
         lambda inner: f"log(real({r_expr_to_fortran(inner.strip())}, kind=dp))",
     )
+    c_cospi = parse_call_text(s)
+    if c_cospi is not None and c_cospi[0].lower() == "cospi":
+        _ncp, pos_cp, kw_cp = c_cospi
+        x_src = pos_cp[0] if pos_cp else kw_cp.get("x")
+        if x_src is None:
+            raise NotImplementedError("cospi requires one argument")
+        x_f = r_expr_to_fortran(x_src)
+        return f"cos(pi * real({x_f}, kind=dp))"
+    c_sinpi = parse_call_text(s)
+    if c_sinpi is not None and c_sinpi[0].lower() == "sinpi":
+        _nsp, pos_sp, kw_sp = c_sinpi
+        x_src = pos_sp[0] if pos_sp else kw_sp.get("x")
+        if x_src is None:
+            raise NotImplementedError("sinpi requires one argument")
+        x_f = r_expr_to_fortran(x_src)
+        return f"sin(pi * real({x_f}, kind=dp))"
+    c_tanpi = parse_call_text(s)
+    if c_tanpi is not None and c_tanpi[0].lower() == "tanpi":
+        _ntp, pos_tp, kw_tp = c_tanpi
+        x_src = pos_tp[0] if pos_tp else kw_tp.get("x")
+        if x_src is None:
+            raise NotImplementedError("tanpi requires one argument")
+        x_f = r_expr_to_fortran(x_src)
+        return f"tan(pi * real({x_f}, kind=dp))"
     c_complex_real = parse_call_text(s)
     if c_complex_real is not None and c_complex_real[0] in {"Mod", "Re", "Im", "Conj", "Arg"}:
         nm_cr = c_complex_real[0]
@@ -11396,6 +11432,52 @@ def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) 
     return out
 
 
+def _collect_pi_trig_array_args(stmts: list[object]) -> set[str]:
+    """Collect simple array names passed to sinpi/cospi/tanpi calls."""
+    out: set[str] = set()
+
+    def _walk_expr(expr: str) -> None:
+        cinfo = parse_call_text(expr.strip())
+        if cinfo is None:
+            return
+        nm = cinfo[0].lower()
+        if nm not in {"sinpi", "cospi", "tanpi"}:
+            return
+        args = list(cinfo[1]) + list(cinfo[2].values())
+        for a in args:
+            aa = a.strip()
+            if re.fullmatch(r"[A-Za-z]\w*", aa):
+                out.add(aa)
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                _walk_expr(st.expr)
+            elif isinstance(st, PrintStmt):
+                for a in st.args:
+                    _walk_expr(a)
+            elif isinstance(st, CallStmt):
+                for a in st.args:
+                    _walk_expr(a)
+            elif isinstance(st, ExprStmt):
+                _walk_expr(st.expr)
+            elif isinstance(st, IfStmt):
+                _walk_expr(st.cond)
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                _walk_expr(st.iter_expr)
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                _walk_expr(st.cond)
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return {nm.lower() for nm in out}
+
+
 def infer_main_character_scalars(stmts: list[object]) -> set[str]:
     """Find scalar vars assigned from quoted string literals in main statements."""
     out: set[str] = set()
@@ -12678,6 +12760,8 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
     assign_counts = infer_assigned_names(main_stmts)
     ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
     array_params = infer_main_array_params(main_stmts, assign_counts)
+    pi_trig_args = _collect_pi_trig_array_args(main_stmts)
+    array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
     logical_scalars = infer_main_logical_scalars(main_stmts)
@@ -13057,6 +13141,8 @@ def transpile_r_to_fortran(
             ints.add(comp_nm)
             params.pop(comp_nm, None)
     array_params = infer_main_array_params(main_stmts, assign_counts)
+    pi_trig_args = _collect_pi_trig_array_args(main_stmts)
+    array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
     for nm in set(char_scalars) | set(char_arrays):
