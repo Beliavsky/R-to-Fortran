@@ -3913,6 +3913,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
         return False
+    if re.search(r"\bread\.[a-z]+\s*\(", t, re.IGNORECASE):
+        return False
     if re.search(r"\b(?:sample|sample\.int|runif|rnorm|rexp|rbinom|rpois)\s*\(", t, re.IGNORECASE):
         return False
     if _split_top_level_colon(fscan.strip_redundant_outer_parens_expr(t)) is not None:
@@ -10608,6 +10610,16 @@ def emit_function(
                         local_ranks[nm] = rk_new
                         changed = True
                     break
+        for nm in set(local_list_types) | set(object_list_locals):
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            logical_arrays.discard(nm)
+            logical_scalars.discard(nm)
+            char_scalars_loc.discard(nm)
+            char_arrays_loc.discard(nm)
+            params.pop(nm, None)
         if ints - int64_locals:
             o.w("integer :: " + ", ".join(sorted(ints - int64_locals)))
         if int64_locals:
@@ -13124,6 +13136,21 @@ def transpile_r_to_fortran(
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
+
+    for nm in set(list_vars) | set(main_object_list_vars):
+        ints.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        real_scalars.discard(nm)
+        logical_arrays.discard(nm)
+        logical_scalars.discard(nm)
+        char_scalars.discard(nm)
+        char_arrays.discard(nm)
+        params.pop(nm, None)
 
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
