@@ -5423,7 +5423,18 @@ def r_expr_to_fortran(expr: str) -> str:
         nm_pre = c_pre[0].lower()
         pos_pre = c_pre[1]
         if nm_pre in {"cbind", "cbind2"} and c_pre[2]:
-            args = [r_expr_to_fortran(a.strip()) for a in (pos_pre + list(c_pre[2].values()))]
+            arg_srcs = [a.strip() for a in (pos_pre + list(c_pre[2].values()))]
+            ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
+            ref_f = r_expr_to_fortran(ref_src) if ref_src else ""
+            args: list[str] = []
+            for a in arg_srcs:
+                af = r_expr_to_fortran(a)
+                if ref_f and (_is_int_literal(a) or _is_real_literal(a)):
+                    if _is_int_literal(a):
+                        af = f"real({_int_bound_expr(af)}, kind=dp)"
+                    args.append(f"spread({af}, dim=1, ncopies=size({ref_f}))")
+                else:
+                    args.append(af)
             if args:
                 return f"{c_pre[0]}({', '.join(args)})"
         if nm_pre == "names" and len(pos_pre) == 1:
@@ -7691,6 +7702,7 @@ def emit_stmts(
     return_array_fns: set[str] = set()
     object_list_vars: dict[str, str] = {}
     t_test_vars_ctx: set[str] = set()
+    qr_vars_ctx: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -7761,6 +7773,9 @@ def emit_stmts(
         ttv = helper_ctx.get("t_test_vars")
         if isinstance(ttv, set):
             t_test_vars_ctx = {str(x) for x in ttv}
+        qrv = helper_ctx.get("qr_vars")
+        if isinstance(qrv, set):
+            qr_vars_ctx = {str(x) for x in qrv}
     if not matrix_vars:
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
@@ -7945,6 +7960,10 @@ def emit_stmts(
         if t.startswith("[") and t.endswith("]"):
             return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
+        if m_field_print is not None and m_field_print.group(1).lower() == "rank":
+            return 0
+        if m_field_print is not None and m_field_print.group(1).lower() == "pivot":
+            return 1
         if m_field_print is not None and m_field_print.group(1).lower() in {
             "ar",
             "ma",
@@ -9475,6 +9494,10 @@ def emit_stmts(
                         _wstmt(f"call print_t_test({one})", st.comment)
                         need_r_mod.update({"print_t_test", "t_test_result_t"})
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in qr_vars_ctx:
+                        _wstmt(f"call print_qr({one})", st.comment)
+                        need_r_mod.update({"print_qr", "qr_fit_t"})
+                        continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in _EXPANDED_DATA_FRAME_FIELDS:
                         fields_df = _EXPANDED_DATA_FRAME_FIELDS.get(one, [])
                         if fields_df:
@@ -9809,6 +9832,8 @@ def emit_stmts(
                             continue
                         m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
                         if m_int_arr_scalar is not None and m_int_arr_scalar.group(1) in int_matrix_vars:
+                            _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
+                        elif re.match(r"^[A-Za-z]\w*%rank$", one_f.strip(), re.IGNORECASE):
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
                         elif re.match(r"^[A-Za-z]\w*\s*\(.*\)$", one_f.strip()):
                             _wstmt(f"call print_real_scalar({one_f})", st.comment)
@@ -14212,6 +14237,7 @@ def transpile_r_to_fortran(
     lm_vars: set[str] = set()
     glm_vars: set[str] = set()
     prcomp_vars: set[str] = set()
+    qr_vars: set[str] = set()
     t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
@@ -14265,6 +14291,9 @@ def transpile_r_to_fortran(
                 helper_ctx_main["need_lm"] = True
             if c_fit_main is not None and c_fit_main[0].lower() == "prcomp":
                 prcomp_vars.add(st.name)
+            if c_fit_main is not None and c_fit_main[0].lower() == "qr":
+                qr_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -14453,6 +14482,17 @@ def transpile_r_to_fortran(
         real_scalars.discard(nm)
         int_arrays.discard(nm)
         real_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in qr_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
         params.pop(nm, None)
     for nm in t_test_vars:
         ints.discard(nm)
@@ -14664,6 +14704,18 @@ def transpile_r_to_fortran(
             real_matrices.discard(nm)
             int_rank3_arrays.discard(nm)
             params.pop(nm, None)
+    if qr_vars:
+        for nm in qr_vars:
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            int_matrices.discard(nm)
+            real_matrices.discard(nm)
+            int_rank3_arrays.discard(nm)
+            real_rank3_arrays.discard(nm)
+            real_rank4_arrays.discard(nm)
+            params.pop(nm, None)
 
     helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
@@ -14736,6 +14788,9 @@ def transpile_r_to_fortran(
     if prcomp_vars:
         for nm in sorted(prcomp_vars):
             pbody.w(f"type(prcomp_fit_t) :: {nm}")
+    if qr_vars:
+        for nm in sorted(qr_vars):
+            pbody.w(f"type(qr_fit_t) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
     if main_object_list_vars:
@@ -14743,6 +14798,8 @@ def transpile_r_to_fortran(
         _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in main_object_list_vars)
     if t_test_vars:
         helper_ctx_main["t_test_vars"] = set(t_test_vars)
+    if qr_vars:
+        helper_ctx_main["qr_vars"] = set(qr_vars)
     pbody.w("")
     if ("r_mod" in helper_modules) and (not int_like_print):
         pbody.w("call set_print_int_like(.false.)")
@@ -16096,6 +16153,8 @@ def transpile_r_to_fortran(
         "print_glm_summary",
         "prcomp",
         "print_prcomp_summary",
+        "qr",
+        "print_qr",
         "lm_predict_interval",
         "lm_cooks_distance",
         "print_lm_cooks_top",
@@ -16109,6 +16168,7 @@ def transpile_r_to_fortran(
         "lm_fit_t",
         "glm_fit_t",
         "prcomp_fit_t",
+        "qr_fit_t",
         "optim_result_t",
         "t_test_result_t",
         "t_test",
@@ -16206,6 +16266,10 @@ def transpile_r_to_fortran(
         mod_needed.add("prcomp_fit_t")
     if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("prcomp_fit_t")
+    if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("qr_fit_t")
+    if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("qr_fit_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("optim_result_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
