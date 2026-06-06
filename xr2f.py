@@ -6741,6 +6741,7 @@ def emit_stmts(
     lm_terms_by_fit: dict[str, list[str]] = {}
     glm_terms_by_fit: dict[str, list[str]] = {}
     glm_fits: set[str] = set()
+    prcomp_fits: set[str] = set()
     lm_design_exprs_by_fit: dict[str, list[str]] = {}
     lm_design_first_by_fit: dict[str, str] = {}
     lm_anova_terms_by_fit: dict[str, list[str]] = {}
@@ -6772,6 +6773,9 @@ def emit_stmts(
         gfs = helper_ctx.get("glm_fits")
         if isinstance(gfs, set):
             glm_fits = gfs
+        pfs = helper_ctx.get("prcomp_fits")
+        if isinstance(pfs, set):
+            prcomp_fits = pfs
         lme = helper_ctx.get("lm_design_exprs_by_fit")
         if isinstance(lme, dict):
             lm_design_exprs_by_fit = lme
@@ -7438,6 +7442,48 @@ def emit_stmts(
                 if fit_src_cook:
                     cooks_fit_by_var[st.name] = fit_src_cook
             rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
+            c_prcomp = parse_call_text(rhs)
+            if c_prcomp is not None and c_prcomp[0].lower() == "prcomp":
+                _nm_pc, pos_pc, kw_pc = c_prcomp
+                x_src = pos_pc[0].strip() if pos_pc else kw_pc.get("x", "").strip()
+                if not x_src:
+                    raise NotImplementedError("prcomp requires x argument")
+                x_f = ""
+                if re.fullmatch(r"[A-Za-z]\w*", x_src):
+                    fields_pc = _EXPANDED_DATA_FRAME_FIELDS.get(x_src) or _EXPANDED_DATA_FRAME_FIELDS.get(x_src.lower())
+                    if fields_pc:
+                        cols_pc = [
+                            _expanded_data_frame_col_expr(x_src, f) or f"{x_src}_{_sanitize_fortran_kwarg_name(f)}"
+                            for f in fields_pc
+                        ]
+                        if len(cols_pc) == 1:
+                            x_f = f"reshape({cols_pc[0]}, [size({cols_pc[0]}), 1])"
+                        elif len(cols_pc) == 2:
+                            x_f = f"cbind2({cols_pc[0]}, {cols_pc[1]})"
+                        elif len(cols_pc) >= 3:
+                            x_f = f"reshape([{', '.join(cols_pc)}], [size({cols_pc[0]}), {len(cols_pc)}])"
+                if not x_f:
+                    x_f = r_expr_to_fortran(x_src)
+                center_src = kw_pc.get("center", "TRUE")
+                scale_src = kw_pc.get("scale.", kw_pc.get("scale_", kw_pc.get("scale", "FALSE")))
+                for extra_pc in pos_pc[1:]:
+                    asn_pc = split_top_level_assignment(extra_pc.strip())
+                    if asn_pc is None:
+                        continue
+                    key_pc = asn_pc[0].strip().lower().replace("_", ".")
+                    if key_pc == "center":
+                        center_src = asn_pc[1].strip()
+                    elif key_pc == "scale.":
+                        scale_src = asn_pc[1].strip()
+                _wstmt(
+                    f"{st.name} = prcomp({x_f}, center={r_expr_to_fortran(center_src)}, "
+                    f"scale_={r_expr_to_fortran(scale_src)})",
+                    st.comment,
+                )
+                prcomp_fits.add(st.name)
+                if helper_ctx is not None:
+                    helper_ctx["need_r_mod"].update({"prcomp", "prcomp_fit_t", "cbind", "cbind2"})
+                continue
             if _emit_optim_bfgs_assignment(o, st.name, rhs, st.comment):
                 continue
             c_read_csv = parse_call_text(rhs)
@@ -8259,6 +8305,17 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    m_pca_head_scores_early = re.match(
+                        r"^head\s*\(\s*([A-Za-z]\w*)\s*(?:\$|%)\s*x\s*(?:,\s*([^)]+))?\)\s*$",
+                        one,
+                        re.IGNORECASE,
+                    )
+                    if has_r_mod and m_pca_head_scores_early is not None:
+                        fit_nm = r_expr_to_fortran(m_pca_head_scores_early.group(1))
+                        n_head = _int_bound_expr(r_expr_to_fortran((m_pca_head_scores_early.group(2) or "6").strip()))
+                        _wstmt(f"call print_matrix({fit_nm}%x(1:min({n_head}, size({fit_nm}%x, 1)), :))", st.comment)
+                        need_r_mod.add("print_matrix_rstyle")
+                        continue
                     one_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", one, flags=re.IGNORECASE)
                     c_one = parse_call_text(one_call_src)
                     one_f_early = r_expr_to_fortran(_rewrite_predict_expr(one))
@@ -8755,7 +8812,10 @@ def emit_stmts(
                     if m_sum:
                         sum_arg = m_sum.group(1).strip()
                         sum_arg_f = r_expr_to_fortran(sum_arg)
-                        if (
+                        if re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in prcomp_fits:
+                            _wstmt(f"call print_prcomp_summary({sum_arg_f})", st.comment)
+                            need_r_mod.update({"print_prcomp_summary", "prcomp_fit_t"})
+                        elif (
                             (re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg in lm_terms_by_fit)
                             or re.search(r"(?:\$|%)\s*lm_fit\s*$", sum_arg, re.IGNORECASE)
                         ):
@@ -8808,6 +8868,22 @@ def emit_stmts(
                             need_r_mod.add("print_summary")
                         else:
                             _wstmt(f"print *, summary({sum_arg_f})", st.comment)
+                        continue
+                    m_pca_rot = re.match(r"^([A-Za-z]\w*)\s*(?:\$|%)\s*rotation\s*$", one, re.IGNORECASE)
+                    if has_r_mod and m_pca_rot is not None:
+                        _wstmt(f"call print_matrix({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.add("print_matrix_rstyle")
+                        continue
+                    m_pca_head_scores = re.match(
+                        r"^head\s*\(\s*([A-Za-z]\w*)\s*(?:\$|%)\s*x\s*(?:,\s*([^)]+))?\)\s*$",
+                        one,
+                        re.IGNORECASE,
+                    )
+                    if has_r_mod and m_pca_head_scores is not None:
+                        fit_nm = r_expr_to_fortran(m_pca_head_scores.group(1))
+                        n_head = _int_bound_expr(r_expr_to_fortran((m_pca_head_scores.group(2) or "6").strip()))
+                        _wstmt(f"call print_matrix({fit_nm}%x(1:min({n_head}, size({fit_nm}%x, 1)), :))", st.comment)
+                        need_r_mod.add("print_matrix_rstyle")
                         continue
                     m_coef = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", one, re.IGNORECASE)
                     if m_coef:
@@ -12398,6 +12474,7 @@ def transpile_r_to_fortran(
         "lm_terms_by_fit": {},
         "glm_terms_by_fit": {},
         "glm_fits": set(),
+        "prcomp_fits": set(),
         "lm_anova_terms_by_fit": {},
         "lm_anova_dfs_by_fit": {},
         "aov_fits": set(),
@@ -12413,6 +12490,7 @@ def transpile_r_to_fortran(
         "lm_terms_by_fit": {},
         "glm_terms_by_fit": {},
         "glm_fits": set(),
+        "prcomp_fits": set(),
         "lm_anova_terms_by_fit": {},
         "lm_anova_dfs_by_fit": {},
         "aov_fits": set(),
@@ -12642,6 +12720,7 @@ def transpile_r_to_fortran(
     main_list_var_fields: dict[str, dict[str, object]] = {}
     lm_vars: set[str] = set()
     glm_vars: set[str] = set()
+    prcomp_vars: set[str] = set()
     t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
@@ -12684,6 +12763,8 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "glm":
                 glm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
+            if c_fit_main is not None and c_fit_main[0].lower() == "prcomp":
+                prcomp_vars.add(st.name)
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -12992,6 +13073,15 @@ def transpile_r_to_fortran(
             int_matrices.discard(nm)
             real_matrices.discard(nm)
             params.pop(nm, None)
+    if prcomp_vars:
+        for nm in prcomp_vars:
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            int_matrices.discard(nm)
+            real_matrices.discard(nm)
+            params.pop(nm, None)
 
     helper_ctx_main["int_matrix_vars"] = set(int_matrices)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays)
@@ -13037,6 +13127,9 @@ def transpile_r_to_fortran(
     if glm_vars:
         for nm in sorted(glm_vars):
             pbody.w(f"type(glm_fit_t) :: {nm}")
+    if prcomp_vars:
+        for nm in sorted(prcomp_vars):
+            pbody.w(f"type(prcomp_fit_t) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
     if main_object_list_vars:
@@ -14391,6 +14484,8 @@ def transpile_r_to_fortran(
         "glm_predict_response",
         "glm_pearson_resid",
         "print_glm_summary",
+        "prcomp",
+        "print_prcomp_summary",
         "lm_predict_interval",
         "lm_cooks_distance",
         "print_lm_cooks_top",
@@ -14403,6 +14498,7 @@ def transpile_r_to_fortran(
         "print_lm_anova",
         "lm_fit_t",
         "glm_fit_t",
+        "prcomp_fit_t",
         "optim_result_t",
         "t_test_result_t",
         "t_test",
@@ -14485,6 +14581,10 @@ def transpile_r_to_fortran(
         mod_needed.add("glm_fit_t")
     if re.search(r"\btype\s*\(\s*glm_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("glm_fit_t")
+    if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("prcomp_fit_t")
+    if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("prcomp_fit_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("optim_result_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
