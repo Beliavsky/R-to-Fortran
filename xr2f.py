@@ -2880,6 +2880,13 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^cutree\s*\(", rhs, re.IGNORECASE):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^vector\s*\(\s*['\"]list['\"]", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -4198,6 +4205,272 @@ def rename_conflicting_loop_vars(
     return walk_block(stmts)
 
 
+def _find_r_assign_line(src: str, var: str) -> int | None:
+    found: int | None = None
+    for i, raw in enumerate(src.splitlines(), start=1):
+        code, _cmt = split_r_code_comment(raw)
+        for cand in _r_name_candidates(var):
+            if re.search(rf"\b{re.escape(cand)}\s*<-\s*", code):
+                found = i
+    return found
+
+
+def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> int:
+    """Heuristic rank hint used for conflict-aware variable renaming."""
+    expr = expr.strip()
+    if not expr:
+        return 0
+
+    expr_l = expr.lower()
+    expr_f = r_expr_to_fortran(expr)
+
+    m_seq = _split_top_level_colon(expr)
+    if m_seq is not None and ("[" not in expr) and ("]" not in expr):
+        return 1
+
+    if expr_l.startswith("c(") or expr_f.startswith("c("):
+        return 1
+
+    if re.match(r"^[A-Za-z]\w*\(", expr_l):
+        c_call = parse_call_text(expr)
+        if c_call is not None:
+            fn_name = c_call[0].lower()
+            if fn_name in {
+                "c",
+                "vector",
+                "matrix",
+                "array",
+                "cbind",
+                "cbind2",
+                "rbind",
+                "outer",
+                "diag",
+                "chol",
+                "backsolve",
+                "sweep",
+                "crossprod",
+                "tcrossprod",
+                "t",
+                "r_matmul",
+                "toeplitz",
+                "chol2inv",
+                "as.matrix",
+                "read.table",
+                "read.csv",
+                "read.csv2",
+                "read.delim",
+                "read.delim2",
+                "read.fwf",
+                "readRDS",
+                "cbindlist",
+                "rbindlist",
+                "rep",
+                "numeric",
+                "double",
+                "integer",
+                "char",
+                "seq",
+                "seq.int",
+                "seq_len",
+                "seq_along",
+                "factorial",
+                "lfactorial",
+                "beta",
+                "lbeta",
+                "choose",
+                "lchoose",
+                "gamma",
+                "lgamma",
+                "psigamma",
+                "digamma",
+                "trigamma",
+            }:
+                return 1
+            if fn_name in {"as.integer", "as.numeric", "as.double"}:
+                return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
+            if fn_name in {
+                "coef",
+                "residuals",
+                "fitted",
+                "predict",
+                "sum",
+                "mean",
+                "sd",
+                "min",
+                "max",
+                "rowSums",
+                "colSums",
+            }:
+                return 0
+
+    if expr_l.startswith("r_seq_"):
+        return 1
+
+    m_var = re.match(r"^([A-Za-z]\w*)$", expr_l)
+    if m_var is not None:
+        return inferred_ranks.get(m_var.group(1), 0)
+
+    if expr_l.startswith("[" ) and "]" in expr_l:
+        m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^]]+\]$", expr_l)
+        if m_idx is None:
+            return 0
+        base = m_idx.group(1)
+        return inferred_ranks.get(base, 0)
+
+    if (":" in expr_l) and re.match(r"^[^\\[]*:[^\\]]*$", expr_l):
+        return 1
+
+    return 0
+
+
+def rename_conflicting_reused_vars(
+    stmts: list[object],
+    warnings: list[tuple[str, str, int | None]] | None = None,
+    src: str = "",
+) -> list[object]:
+    """Rename variable reuse sites that switch between scalar and array-like assignment.
+
+    R allows rebinding by assignment; Fortran cannot change variable type/shape.
+    """
+
+    def fresh(base: str, used: set[str]) -> str:
+        cand = f"{base}_2"
+        i = 3
+        used_l = {u.lower() for u in used}
+        while cand.lower() in used_l:
+            cand = f"{base}_{i}"
+            i += 1
+        used.add(cand)
+        return cand
+
+    def walk_block(
+        ss: list[object],
+        var_ranks: dict[str, int],
+        rename_map: dict[str, str],
+        used_names: set[str],
+        local_only: bool = False,
+    ) -> tuple[list[object], dict[str, int], dict[str, str]]:
+        out: list[object] = []
+        var_ranks = dict(var_ranks)
+        rename_map = dict(rename_map)
+        for st in ss:
+            if local_only:
+                rename_map = {**rename_map}
+            st = _rename_stmt_obj(st, rename_map)
+            if isinstance(st, Assign):
+                rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
+                name = st.name
+                if name in var_ranks and var_ranks[name] != rhs_rank:
+                    new_name = fresh(name, used_names)
+                    if warnings is not None:
+                        line_no = _find_r_assign_line(src, name) if src else None
+                        warnings.append((name, new_name, line_no))
+                    var_ranks[name] = rhs_rank
+                    used_names.add(new_name)
+                    rename_map[name] = new_name
+                    name = new_name
+                else:
+                    var_ranks[name] = rhs_rank
+                st = Assign(name=name, expr=st.expr, comment=st.comment)
+                out.append(st)
+            elif isinstance(st, FuncDef):
+                body, child_ranks, child_map = walk_block(
+                    st.body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                out.append(FuncDef(name=st.name, args=list(st.args), defaults=dict(st.defaults), body=body, leading_comments=st.leading_comments))
+                # keep function-local renames only
+                used_names = used_names | set(child_map.values())
+            elif isinstance(st, ForStmt):
+                body, child_ranks, child_map = walk_block(
+                    st.body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                st_ren = ForStmt(
+                    var=st.var,
+                    iter_expr=_replace_idents(st.iter_expr, child_map),
+                    body=body,
+                )
+                var_ranks = child_ranks
+                rename_map = child_map
+                out.append(st_ren)
+            elif isinstance(st, IfStmt):
+                then_body, then_ranks, _ = walk_block(
+                    st.then_body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                else_body, else_ranks, _ = walk_block(
+                    st.else_body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                merged = var_ranks.copy()
+                for nm, r in then_ranks.items():
+                    if nm in merged and merged[nm] != r:
+                        merged[nm] = max(merged[nm], r)
+                    else:
+                        merged[nm] = r
+                for nm, r in else_ranks.items():
+                    if nm in merged and merged[nm] != r:
+                        merged[nm] = max(merged[nm], r)
+                    else:
+                        merged[nm] = r
+                var_ranks = merged
+                out.append(
+                    IfStmt(
+                        cond=_replace_idents(st.cond, rename_map),
+                        then_body=then_body,
+                        else_body=else_body,
+                    )
+                )
+            elif isinstance(st, WhileStmt):
+                body, child_ranks, child_map = walk_block(
+                    st.body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                var_ranks = child_ranks
+                rename_map = child_map
+                out.append(WhileStmt(cond=_replace_idents(st.cond, rename_map), body=body))
+            elif isinstance(st, RepeatStmt):
+                body, child_ranks, child_map = walk_block(
+                    st.body,
+                    {k: v for k, v in var_ranks.items()},
+                    rename_map,
+                    used_names.copy(),
+                    local_only=False,
+                )
+                var_ranks = child_ranks
+                rename_map = child_map
+                out.append(RepeatStmt(body=body))
+            elif isinstance(st, PrintStmt):
+                out.append(PrintStmt(args=[_replace_idents(a, rename_map) for a in st.args], comment=st.comment))
+            elif isinstance(st, CallStmt):
+                out.append(CallStmt(name=st.name, args=[_replace_idents(a, rename_map) for a in st.args], comment=st.comment))
+            elif isinstance(st, ExprStmt):
+                out.append(ExprStmt(expr=_replace_idents(st.expr, rename_map), comment=st.comment))
+            else:
+                out.append(st)
+        return out, var_ranks, rename_map
+
+    used = {nm.lower() for nm in _assigned_names_in_stmts(stmts)} | {nm.lower() for nm in _r_name_candidates("x")}
+    out, _, _ = walk_block(stmts, {}, {}, used, local_only=False)
+    return out
+
+
 def _stmt_tree_has_side_effect_ops(ss: list[object]) -> bool:
     """Conservative impurity test for R-subset function bodies."""
     bad_call_names = {"set.seed", "cat", "print"}
@@ -4807,14 +5080,14 @@ def r_expr_to_fortran(expr: str) -> str:
                 nlab_y = len(_CATEGORICAL_LABELS.get(vals[1].strip().lower(), []))
                 x_tab = x_f if nlab_x else f"({x_f} - minval({x_f}) + 1)"
                 y_tab = y_f if nlab_y else f"({y_f} - minval({y_f}) + 1)"
-                nx = str(nlab_x) if nlab_x else f"maxval({x_f}) - minval({x_f}) + 1"
-                ny = str(nlab_y) if nlab_y else f"maxval({y_f}) - minval({y_f}) + 1"
+                nx = str(nlab_x) if nlab_x else _int_bound_expr(f"maxval({x_f}) - minval({x_f}) + 1")
+                ny = str(nlab_y) if nlab_y else _int_bound_expr(f"maxval({y_f}) - minval({y_f}) + 1")
                 return f"table2({x_tab}, {y_tab}, {nx}, {ny})"
             if vals:
                 vtab = r_expr_to_fortran(vals[0])
                 nlab = len(_CATEGORICAL_LABELS.get(vals[0].strip().lower(), []))
                 vtab_shifted = vtab if nlab else f"({vtab} - minval({vtab}) + 1)"
-                nbins = str(nlab) if nlab else f"maxval({vtab}) - minval({vtab}) + 1"
+                nbins = str(nlab) if nlab else _int_bound_expr(f"maxval({vtab}) - minval({vtab}) + 1")
                 return f"tabulate({vtab_shifted}, {nbins})"
             return "[0]"
         if nm_pre in {"prop.table", "prop_table"}:
@@ -6403,6 +6676,65 @@ def r_expr_to_fortran(expr: str) -> str:
         "dnorm",
         lambda inner: "dnorm(" + re.sub(r"\blog\s*=", "log_=", inner) + ")",
     )
+    def _binary_special_fn(fn_name: str, outer: str) -> str:
+        ci = parse_call_text(f"{fn_name}({outer})")
+        if ci is None:
+            return f"{fn_name}({outer})"
+        _nm, pos, kw = ci
+        n_pos = len(pos)
+        if n_pos < 1:
+            return f"{fn_name}({outer})"
+        args: list[str] = [p for p in pos]
+        if "beta" in fn_name:
+            if n_pos < 2:
+                args.extend([kw.get("a", "0.0"), kw.get("b", "0.0")][: 2 - n_pos])
+            if len(args) < 2:
+                return f"{fn_name}({outer})"
+            left = r_expr_to_fortran(args[0].strip())
+            right = r_expr_to_fortran(args[1].strip())
+            return f"{fn_name}(real({left}, kind=dp), real({right}, kind=dp))"
+        if "choose" in fn_name:
+            if n_pos < 2:
+                args.extend([kw.get("n", "0.0"), kw.get("k", "0.0")][: 2 - n_pos])
+            if len(args) < 2:
+                return f"{fn_name}({outer})"
+            left = r_expr_to_fortran(args[0].strip())
+            right = r_expr_to_fortran(args[1].strip())
+            return f"{fn_name}(real({left}, kind=dp), real({right}, kind=dp))"
+        if "r_factorial" in fn_name or "r_lfactorial" in fn_name:
+            left = r_expr_to_fortran(args[0].strip() if args else "0")
+            return f"{fn_name}(real({left}, kind=dp))"
+        left = r_expr_to_fortran(args[0].strip() if args else outer)
+        return f"{fn_name}(real({left}, kind=dp))"
+
+    def _psigamma_to_fortran(inner: str) -> str:
+        ci = parse_call_text("psigamma(" + inner + ")")
+        if ci is None:
+            return "psigamma(" + inner + ")"
+        _nm, pos, kw = ci
+        if pos:
+            x_src = pos[0]
+            deriv_src = pos[1] if len(pos) >= 2 else kw.get("deriv", "0")
+        else:
+            x_src = kw.get("x") or kw.get("arg") or ""
+            deriv_src = kw.get("deriv", "0")
+        if not x_src:
+            return "psigamma(" + inner + ")"
+        x_f = r_expr_to_fortran(x_src)
+        deriv_f = _int_bound_expr(r_expr_to_fortran(deriv_src))
+        return f"r_psigamma(real({x_f}, kind=dp), {deriv_f})"
+
+    s = _replace_balanced_func_calls(s, "beta", lambda inner: _binary_special_fn("r_beta", inner))
+    s = _replace_balanced_func_calls(s, "lbeta", lambda inner: _binary_special_fn("r_lbeta", inner))
+    s = _replace_balanced_func_calls(s, "choose", lambda inner: _binary_special_fn("r_choose", inner))
+    s = _replace_balanced_func_calls(s, "lchoose", lambda inner: _binary_special_fn("r_lchoose", inner))
+    s = _replace_balanced_func_calls(s, "gamma", lambda inner: _binary_special_fn("r_gamma", inner))
+    s = _replace_balanced_func_calls(s, "lgamma", lambda inner: _binary_special_fn("r_lgamma", inner))
+    s = _replace_balanced_func_calls(s, "factorial", lambda inner: _binary_special_fn("r_factorial", inner))
+    s = _replace_balanced_func_calls(s, "lfactorial", lambda inner: _binary_special_fn("r_lfactorial", inner))
+    s = _replace_balanced_func_calls(s, "digamma", lambda inner: _binary_special_fn("r_digamma", inner))
+    s = _replace_balanced_func_calls(s, "trigamma", lambda inner: _binary_special_fn("r_trigamma", inner))
+    s = _replace_balanced_func_calls(s, "psigamma", _psigamma_to_fortran)
     s = _replace_balanced_func_calls(
         s,
         "sqrt",
@@ -6867,7 +7199,15 @@ def emit_stmts(
             return_var = rv
 
     def _emit_alloc_1d(name: str, extent: str) -> None:
-        if name in alloc_seen:
+        if (
+            name in alloc_seen
+            or name in real_vector_vars
+            or name in int_vector_vars
+            or name in real_matrix_vars
+            or name in int_matrix_vars
+            or name in real_arrays
+            or name in int_arrays
+        ):
             o.w(f"if (allocated({name})) deallocate({name})")
         o.w(f"allocate({name}({extent}))")
         alloc_seen.add(name)
@@ -7027,7 +7367,15 @@ def emit_stmts(
         if t.startswith("[") and t.endswith("]"):
             return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
-        if m_field_print is not None and m_field_print.group(1).lower() in {"ar", "ma", "sigma", "resid", "fitted", "centers"}:
+        if m_field_print is not None and m_field_print.group(1).lower() in {
+            "ar",
+            "ma",
+            "sigma",
+            "resid",
+            "fitted",
+            "centers",
+            "merge",
+        }:
             return 2
         if re.match(r"^[A-Za-z]\w*\s*\$\s*a\s*\[\[", t):
             return 2
@@ -7127,7 +7475,18 @@ def emit_stmts(
                 return 1
             if nm_c in {"dim", "rev", "rep.int"}:
                 return 1
-            if nm_c in {"head", "sort", "lm_cooks_distance", "cooks.distance"}:
+            if nm_c == "head":
+                x_arg = None
+                if c[1]:
+                    x_arg = c[1][0].strip()
+                elif "x" in c[2]:
+                    x_arg = c[2]["x"].strip()
+                if x_arg is not None:
+                    rr = _expr_rank_for_print(x_arg)
+                    if rr is not None:
+                        return rr
+                return 1
+            if nm_c in {"sort", "lm_cooks_distance", "cooks.distance"}:
                 return 1
             if nm_c in {
                 "r_seq_int",
@@ -7174,18 +7533,18 @@ def emit_stmts(
                 return 2
             if t in int_vector_vars or t in real_vector_vars:
                 return 1
-        if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
-            fld = re.split(r"[$%]", t)[-1].lower()
-            if fld in {"centers", "table", "design", "sigma", "y"}:
-                return 2
-            if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
-                return 1
+            if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
+                fld = re.split(r"[$%]", t)[-1].lower()
+                if fld in {"centers", "table", "design", "sigma", "y", "merge"}:
+                    return 2
+                if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
+                    return 1
         m_comp_ix = re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+\s*\((.*)\)$", t)
         if m_comp_ix is not None:
             head = t[: t.find("(")].strip()
             fld = re.split(r"[$%]", head)[-1].lower()
             dims = _split_index_dims(m_comp_ix.group(1).strip())
-            if fld == "a" and len(dims) >= 2:
+            if fld in {"a", "merge"} and len(dims) >= 2:
                 return 2
             if fld in {"centers", "table", "design", "sigma", "y"} and len(dims) >= 2:
                 scalar_dims = [d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None for d in dims]
@@ -10242,6 +10601,13 @@ def emit_function(
                                 need_r_mod.add("kmeans")
                                 need_r_mod.add("kmeans_result_t")
                             continue
+                        if callee.lower() == "hclust":
+                            local_list_types[lhs_nm] = "hclust_result_t"
+                            if has_r_mod:
+                                need_r_mod.add("hclust")
+                                need_r_mod.add("hclust_result_t")
+                                need_r_mod.add("cutree")
+                            continue
                         if callee.lower() == "optim":
                             local_list_types[lhs_nm] = "optim_result_t"
                             if has_r_mod:
@@ -10377,6 +10743,13 @@ def emit_function(
             "centers": "numeric(0)",
             "withinss": "numeric(0)",
         }
+        list_type_fields["hclust_result_t"] = {
+            "merge": "integer(0)",
+            "height": "numeric(0)",
+            "order": "integer(0)",
+            "labels": "integer(0)",
+            "method": "0",
+        }
         list_type_fields["optim_result_t"] = {
             "par": "numeric(0)",
             "value": "0.0",
@@ -10468,10 +10841,41 @@ def emit_function(
             return False
 
         def _force_local_vector_component_aliases(ss_alias: list[object]) -> None:
-            int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial", "size", "cluster"}
+            int_fields = {
+                "n",
+                "k",
+                "p",
+                "q",
+                "aic_p",
+                "aic_q",
+                "bic_p",
+                "bic_q",
+                "aic_row",
+                "bic_row",
+                "nobs",
+                "nseries",
+                "convergence",
+                "n_iter",
+                "order",
+                "trial",
+                "size",
+                "cluster",
+                "method",
+            }
             real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
-            vector_fields = {"par", "coef", "fitted", "resid", "mu", "pi", "weights", "nk", "withinss"}
-            matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers"}
+            vector_fields = {
+                "height",
+                "par",
+                "coef",
+                "fitted",
+                "resid",
+                "mu",
+                "pi",
+                "weights",
+                "nk",
+                "withinss",
+            }
+            matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers", "merge"}
             for st_alias in ss_alias:
                 if isinstance(st_alias, Assign):
                     rhs_alias = st_alias.expr.strip()
@@ -12217,6 +12621,7 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
     stmts = _lower_dim_assignments(stmts)
     stmts = attach_function_adjacent_comments(stmts)
     stmts = rename_conflicting_loop_vars(stmts)
+    stmts = rename_conflicting_reused_vars(stmts)
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     raw_name = _raw_r_name_map_from_source(src)
@@ -12316,11 +12721,19 @@ def transpile_r_to_fortran(
     stmts = attach_function_adjacent_comments(stmts)
     loop_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
+    reused_shadow_warnings: list[tuple[str, str, int | None]] = []
+    stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
         print(
             f"Warning: R loop variable `{old}`{loc} reuses an earlier assigned name; "
             f"translating loop variable as `{new}`."
+        )
+    for old, new, line_no in reused_shadow_warnings:
+        loc = f" at R line {line_no}" if line_no is not None else ""
+        print(
+            f"Warning: R variable `{old}`{loc} is reused with a different inferred shape; "
+            f"translating as `{new}`."
         )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
@@ -12808,6 +13221,11 @@ def transpile_r_to_fortran(
                 list_vars[st.name] = "kmeans_result_t"
                 helper_ctx_main["need_r_mod"].add("kmeans")
                 helper_ctx_main["need_r_mod"].add("kmeans_result_t")
+            if c_fit_main is not None and c_fit_main[0].lower() == "hclust":
+                list_vars[st.name] = "hclust_result_t"
+                helper_ctx_main["need_r_mod"].add("hclust")
+                helper_ctx_main["need_r_mod"].add("hclust_result_t")
+                helper_ctx_main["need_r_mod"].add("cutree")
             if c_fit_main is not None and c_fit_main[0].lower() == "glm":
                 glm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
@@ -13069,9 +13487,41 @@ def transpile_r_to_fortran(
         real_matrices.discard(nm)
 
     def _force_main_list_component_alias_types(ss_alias: list[object]) -> None:
-        int_fields = {"n", "k", "p", "q", "aic_p", "aic_q", "bic_p", "bic_q", "aic_row", "bic_row", "nobs", "nseries", "convergence", "n_iter", "order", "trial", "size", "cluster"}
+        int_fields = {
+            "n",
+            "k",
+            "p",
+            "q",
+            "aic_p",
+            "aic_q",
+            "bic_p",
+            "bic_q",
+            "aic_row",
+            "bic_row",
+            "nobs",
+            "nseries",
+            "convergence",
+            "n_iter",
+            "order",
+            "trial",
+            "size",
+            "cluster",
+            "method",
+        }
         real_fields = {"loglik", "aic", "bic", "npar", "ridge", "sigma2"}
-        matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers"}
+        vector_fields = {
+            "height",
+            "par",
+            "coef",
+            "fitted",
+            "resid",
+            "mu",
+            "pi",
+            "weights",
+            "nk",
+            "withinss",
+        }
+        matrix_fields = {"ar", "ma", "sigma", "table", "design", "y", "centers", "merge"}
         for st_alias in ss_alias:
             if isinstance(st_alias, Assign):
                 rhs_alias = st_alias.expr.strip()
@@ -13093,6 +13543,15 @@ def transpile_r_to_fortran(
                 elif fld in real_fields:
                     real_scalars.add(st_alias.name)
                     ints.discard(st_alias.name)
+                elif fld in vector_fields:
+                    real_arrays.add(st_alias.name)
+                    int_arrays.discard(st_alias.name)
+                    real_scalars.discard(st_alias.name)
+                    int_matrices.discard(st_alias.name)
+                    real_matrices.discard(st_alias.name)
+                    real_rank3_arrays.discard(st_alias.name)
+                    real_rank4_arrays.discard(st_alias.name)
+                    params.pop(st_alias.name, None)
                 elif fld in matrix_fields:
                     real_matrices.add(st_alias.name)
                     ints.discard(st_alias.name)
@@ -14508,6 +14967,9 @@ def transpile_r_to_fortran(
         "r_div",
         "match",
         "findInterval",
+        "hclust",
+        "cutree",
+        "dist",
         "cumsum",
         "cumprod",
         "diff",
@@ -14593,6 +15055,17 @@ def transpile_r_to_fortran(
         "print_table1",
         "print_table2",
         "nested_matrix_list_len",
+        "r_beta",
+        "r_lbeta",
+        "r_choose",
+        "r_lchoose",
+        "r_gamma",
+        "r_lgamma",
+        "r_psigamma",
+        "r_digamma",
+        "r_trigamma",
+        "r_factorial",
+        "r_lfactorial",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
@@ -14653,6 +15126,10 @@ def transpile_r_to_fortran(
         mod_needed.add("optim_result_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("optim_result_t")
+    if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("hclust_result_t")
+    if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("hclust_result_t")
 
     module_iface_lines: list[str] = []
     if emit_local_typeof:
@@ -14756,6 +15233,21 @@ def transpile_r_to_fortran(
         o.w("integer :: convergence")
         o.pop()
         o.w("end type optim_result_t")
+        o.w("")
+    need_hclust_result = bool(
+        re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now + "\n" + main_text_now, re.IGNORECASE)
+    )
+    if need_hclust_result and ("r_mod" not in helper_modules):
+        o.w("")
+        o.w("type :: hclust_result_t")
+        o.push()
+        o.w("integer, allocatable :: merge(:,:)")
+        o.w("real(kind=dp), allocatable :: height(:)")
+        o.w("integer, allocatable :: order(:)")
+        o.w("integer, allocatable :: labels(:)")
+        o.w("integer :: method = 1")
+        o.pop()
+        o.w("end type hclust_result_t")
         o.w("")
     # Derived types for list-return functions and main list constructors.
     emitted_types: set[str] = set()
