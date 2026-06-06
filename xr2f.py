@@ -46,6 +46,7 @@ _CATEGORICAL_LABELS: dict[str, list[str]] = {}
 _TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
 _FIT_TERM_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
+_ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
@@ -934,6 +935,58 @@ def _parse_string_c_vector(expr: str) -> list[str] | None:
         if lab is None:
             return None
         labels.append(lab)
+    return labels
+
+
+def _array_dim_parts(expr: str) -> list[str] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "array":
+        return None
+    _nm, pos, kw = cinfo
+    dim_src = kw.get("dim")
+    if dim_src is None and len(pos) >= 2:
+        dim_src = pos[1]
+    if dim_src is None:
+        return None
+    dim_txt = dim_src.strip()
+    cdim = parse_call_text(dim_txt)
+    if cdim is not None and cdim[0].lower() == "c":
+        return [p.strip() for p in cdim[1] + list(cdim[2].values()) if p.strip()]
+    if dim_txt.startswith("[") and dim_txt.endswith("]"):
+        return [p.strip() for p in split_top_level_commas(dim_txt[1:-1]) if p.strip()]
+    return None
+
+
+def _array_data_is_integer(expr: str) -> bool:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "array":
+        return False
+    data_src = cinfo[1][0] if cinfo[1] else cinfo[2].get("data", "0")
+    data_txt = data_src.strip()
+    return (
+        _is_int_literal(data_txt)
+        or _split_top_level_colon(data_txt) is not None
+        or data_txt.lower().startswith(("integer(", "raw(", "r_seq_int(", "r_seq_len(", "r_rep_int("))
+    )
+
+
+def _parse_array_dim_labels(expr: str) -> list[list[str]] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "array":
+        return None
+    dimnames_src = cinfo[2].get("dimnames")
+    if dimnames_src is None:
+        return None
+    linfo = parse_call_text(dimnames_src.strip())
+    if linfo is None or linfo[0].lower() != "list":
+        return None
+    items = linfo[1] + list(linfo[2].values())
+    labels: list[list[str]] = []
+    for item in items:
+        labs = _parse_string_c_vector(item.strip())
+        if labs is None:
+            return None
+        labels.append(labs)
     return labels
 
 
@@ -2298,6 +2351,13 @@ def _index_dim_to_fortran(base: str, dimno: int, d: str) -> str:
     dt = d.strip()
     if dt == "":
         return ":"
+    dim_labels = _ARRAY_DIM_LABELS.get(base.lower())
+    lab_dt = _dequote_string_literal(dt)
+    if dim_labels is not None and lab_dt is not None and 1 <= dimno <= len(dim_labels):
+        try:
+            return str(dim_labels[dimno - 1].index(lab_dt) + 1)
+        except ValueError:
+            pass
     if dimno == 2 and dt == "price_names":
         return "price_names + 1"
     if dimno == 2 and base == "coef_mat":
@@ -5563,6 +5623,36 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("t requires an argument")
         return f"transpose({r_expr_to_fortran(x_src)})"
+    c_aperm = parse_call_text(s)
+    if c_aperm is not None and c_aperm[0].lower() == "aperm":
+        _nap, pos_ap, kw_ap = c_aperm
+        x_src = pos_ap[0] if pos_ap else kw_ap.get("a", kw_ap.get("x"))
+        if x_src is None:
+            raise NotImplementedError("aperm requires an array argument")
+        x_f = r_expr_to_fortran(x_src)
+        perm_src = kw_ap.get("perm")
+        if perm_src is None and len(pos_ap) >= 2:
+            perm_src = pos_ap[1]
+        resize_src = kw_ap.get("resize", "TRUE")
+        resize = r_expr_to_fortran(resize_src)
+        if perm_src is None:
+            return f"transpose({x_f})"
+        perm_parts = _array_dim_parts("array(0, dim=" + perm_src.strip() + ")")
+        if perm_parts is None:
+            c_perm = parse_call_text(perm_src.strip())
+            if c_perm is not None and c_perm[0].lower() == "c":
+                perm_parts = [p.strip() for p in c_perm[1] + list(c_perm[2].values()) if p.strip()]
+        if perm_parts is None:
+            return f"aperm({x_f}, {r_expr_to_fortran(perm_src)})"
+        perm_int = [_int_bound_expr(r_expr_to_fortran(p)) for p in perm_parts]
+        if len(perm_int) == 2 and perm_int == ["2", "1"]:
+            return f"transpose({x_f})"
+        perm_vec = "[" + ", ".join(perm_int) + "]"
+        if resize.strip().lower() in {".false.", "false"}:
+            shape_vec = f"shape({x_f})"
+        else:
+            shape_vec = "[" + ", ".join(f"size({x_f}, {p})" for p in perm_int) + "]"
+        return f"reshape({x_f}, {shape_vec}, order={perm_vec})"
     c_rb = parse_call_text(s)
     if c_rb is not None and c_rb[0].lower() == "rbind":
         rows = [r_expr_to_fortran(a) for a in c_rb[1]]
@@ -5607,6 +5697,13 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError("dim requires an argument")
         return f"shape({r_expr_to_fortran(x_src)})"
+    c_dimnames = parse_call_text(s)
+    if c_dimnames is not None and c_dimnames[0].lower() == "dimnames":
+        _ndn, pos_dn, kw_dn = c_dimnames
+        x_src = pos_dn[0] if pos_dn else kw_dn.get("x")
+        if x_src is not None and x_src.strip().lower() in _ARRAY_DIM_LABELS:
+            return '"[dimnames]"'
+        return '"NULL"'
     c_drop = parse_call_text(s)
     if c_drop is not None and c_drop[0].lower() == "drop":
         _ndr, pos_dr, kw_dr = c_drop
@@ -6045,6 +6142,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 or ("\"" in dt and dt.startswith("c("))
                 or ("'" in dt and dt.startswith("c("))
             )
+            dim_parts = _array_dim_parts(s)
+            if dim_parts is not None and len(dim_parts) > 2:
+                return f"reshape({data_f}, {dim_f}, pad={data_f})"
             if is_char:
                 return f"r_array_char({data_f}, {dim_f})"
             if _is_int_literal(dt) or _split_top_level_colon(dt) is not None:
@@ -7501,6 +7601,12 @@ def emit_stmts(
                 return 2
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
+            if nm_c == "aperm":
+                src_ap = c[1][0].strip() if c[1] else c[2].get("a", c[2].get("x", "")).strip()
+                if src_ap.lower() in _KNOWN_RANK3_NAMES:
+                    return 1
+                rr_ap = _expr_rank_for_print(src_ap) if src_ap else None
+                return rr_ap if rr_ap is not None else 1
             if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz"}:
                 return 2
             if nm_c in return_array_fns:
@@ -9114,7 +9220,10 @@ def emit_stmts(
                             _wstmt(f"call print_t_test({one_f})", st.comment)
                             need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
                             continue
-                        if re.match(r"^[A-Za-z]\w*\s*\(.*\)$", one_f.strip()):
+                        m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
+                        if m_int_arr_scalar is not None and m_int_arr_scalar.group(1) in int_matrix_vars:
+                            _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
+                        elif re.match(r"^[A-Za-z]\w*\s*\(.*\)$", one_f.strip()):
                             _wstmt(f"call print_real_scalar({one_f})", st.comment)
                         elif _looks_integer_fortran_expr(one_f):
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
@@ -9128,6 +9237,15 @@ def emit_stmts(
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
+                            c_print_aperm = parse_call_text(one.strip())
+                            if c_print_aperm is not None and c_print_aperm[0].lower() == "aperm":
+                                src_print_aperm = (
+                                    c_print_aperm[1][0].strip()
+                                    if c_print_aperm[1]
+                                    else c_print_aperm[2].get("a", c_print_aperm[2].get("x", "")).strip()
+                                )
+                                if src_print_aperm.lower() in _KNOWN_RANK3_NAMES:
+                                    one_f = f"reshape({one_f}, [size({one_f})])"
                             _wstmt(f"call print_real_vector(real({one_f}, kind=dp))", st.comment)
                             need_r_mod.add("print_real_vector")
                         else:
@@ -11873,6 +11991,9 @@ def infer_main_integer_matrices(stmts: list[object]) -> set[str]:
                 out.add(st.name)
                 continue
         if cinfo_o is not None and cinfo_o[0].lower() == "array":
+            dim_parts = _array_dim_parts(rhs)
+            if dim_parts is not None and len(dim_parts) != 2:
+                continue
             data_src = cinfo_o[1][0] if cinfo_o[1] else cinfo_o[2].get("data", "")
             data_txt = data_src.strip()
             if (
@@ -12084,8 +12205,22 @@ def infer_main_real_rank3_arrays(stmts: list[object]) -> set[str]:
     out: set[str] = set()
     for st in stmts:
         if isinstance(st, Assign):
+            dim_parts = _array_dim_parts(st.expr.strip())
+            if dim_parts is not None and len(dim_parts) == 3 and not _array_data_is_integer(st.expr.strip()):
+                out.add(st.name)
+                continue
             list_arr = _numeric_list_array_expr(st.expr.strip())
             if list_arr is not None and list_arr[1] == 3:
+                out.add(st.name)
+    return out
+
+
+def infer_main_integer_rank3_arrays(stmts: list[object]) -> set[str]:
+    out: set[str] = set()
+    for st in stmts:
+        if isinstance(st, Assign):
+            dim_parts = _array_dim_parts(st.expr.strip())
+            if dim_parts is not None and len(dim_parts) == 3 and _array_data_is_integer(st.expr.strip()):
                 out.add(st.name)
     return out
 
@@ -12815,7 +12950,7 @@ def transpile_r_to_fortran(
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _NULL_ARRAY_SENTINELS
-    global _KNOWN_RANK3_NAMES
+    global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
     global _NO_RECYCLE
@@ -12827,6 +12962,7 @@ def transpile_r_to_fortran(
     _CATEGORICAL_LABELS = {}
     _TABLE_LABELS = {}
     _FIT_TERM_LABELS = {}
+    _ARRAY_DIM_LABELS = {}
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -12906,6 +13042,54 @@ def transpile_r_to_fortran(
     _NAMED_VECTOR_NAMES = {nm.lower(): f"{nm}_names" for nm in named_vectors}
     _NAMED_VECTOR_LABELS = {nm.lower(): labels for nm, (labels, _vals) in named_vectors.items()}
     _NAMED_VECTOR_LABELS.update(collect_colname_labels(stmts))
+    for st_adl in main_stmts:
+        if isinstance(st_adl, Assign):
+            labs_adl = _parse_array_dim_labels(st_adl.expr.strip())
+            if labs_adl is not None:
+                _ARRAY_DIM_LABELS[st_adl.name.lower()] = labs_adl
+    changed_dimlabs = True
+    while changed_dimlabs:
+        changed_dimlabs = False
+        for st_adl in main_stmts:
+            if not isinstance(st_adl, Assign):
+                continue
+            c_adl = parse_call_text(st_adl.expr.strip())
+            if c_adl is None or c_adl[0].lower() != "aperm":
+                continue
+            src_adl = c_adl[1][0].strip() if c_adl[1] else c_adl[2].get("a", c_adl[2].get("x", "")).strip()
+            src_labs = _ARRAY_DIM_LABELS.get(src_adl.lower())
+            if src_labs is None:
+                continue
+            perm_src = c_adl[2].get("perm")
+            if perm_src is None and len(c_adl[1]) >= 2:
+                perm_src = c_adl[1][1]
+            if perm_src is None:
+                perm = list(range(len(src_labs), 0, -1))
+            else:
+                c_perm = parse_call_text(perm_src.strip())
+                if c_perm is None or c_perm[0].lower() != "c":
+                    continue
+                perm = []
+                ok_perm = True
+                for p in c_perm[1] + list(c_perm[2].values()):
+                    pf = _int_bound_expr(r_expr_to_fortran(p.strip()))
+                    try:
+                        perm.append(int(pf))
+                    except ValueError:
+                        ok_perm = False
+                        break
+                if not ok_perm:
+                    continue
+            if any(p < 1 or p > len(src_labs) for p in perm):
+                continue
+            resize_src = c_adl[2].get("resize", "TRUE").strip().lower()
+            if resize_src in {"false", ".false.", "f"}:
+                new_labs = src_labs
+            else:
+                new_labs = [src_labs[p - 1] for p in perm]
+            if _ARRAY_DIM_LABELS.get(st_adl.name.lower()) != new_labs:
+                _ARRAY_DIM_LABELS[st_adl.name.lower()] = new_labs
+                changed_dimlabs = True
     list_specs = _list_return_specs(funcs)
     fn_matrix_col_labels = {f.name: collect_colname_labels(f.body) for f in funcs}
     fn_alias_return_type: dict[str, str] = {}
@@ -13154,9 +13338,28 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    int_rank3_arrays = infer_main_integer_rank3_arrays(main_stmts)
     real_rank3_arrays = infer_main_real_rank3_arrays(main_stmts)
     real_rank4_arrays = infer_main_real_rank4_arrays(main_stmts)
-    _KNOWN_RANK3_NAMES.update(nm.lower() for nm in real_rank3_arrays)
+    changed_rank3 = True
+    while changed_rank3:
+        changed_rank3 = False
+        known_i3 = {x.lower() for x in int_rank3_arrays}
+        known_r3 = {x.lower() for x in real_rank3_arrays}
+        for st_r3 in main_stmts:
+            if not isinstance(st_r3, Assign):
+                continue
+            c_r3 = parse_call_text(st_r3.expr.strip())
+            if c_r3 is None or c_r3[0].lower() != "aperm":
+                continue
+            src_r3 = c_r3[1][0].strip() if c_r3[1] else c_r3[2].get("a", c_r3[2].get("x", "")).strip()
+            if src_r3.lower() in known_i3 and st_r3.name not in int_rank3_arrays:
+                int_rank3_arrays.add(st_r3.name)
+                changed_rank3 = True
+            elif src_r3.lower() in known_r3 and st_r3.name not in real_rank3_arrays:
+                real_rank3_arrays.add(st_r3.name)
+                changed_rank3 = True
+    _KNOWN_RANK3_NAMES.update(nm.lower() for nm in set(real_rank3_arrays) | set(int_rank3_arrays))
     logical_arrays = infer_main_logical_arrays(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
@@ -13181,7 +13384,7 @@ def transpile_r_to_fortran(
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     # Promote main-scope names referenced by local functions to module scope.
     main_name_map: dict[str, str] = {}
-    for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices:
+    for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices | int_rank3_arrays:
         main_name_map[nm.lower()] = nm
     promoted_l: set[str] = set()
     for fn in funcs:
@@ -13209,6 +13412,8 @@ def transpile_r_to_fortran(
             promoted_kind[nm] = "real_vec"
         elif nm in int_matrices:
             promoted_kind[nm] = "int_mat"
+        elif nm in int_rank3_arrays:
+            promoted_kind[nm] = "int_rank3"
         elif nm in real_matrices:
             promoted_kind[nm] = "real_mat"
         elif nm in real_rank3_arrays:
@@ -13226,11 +13431,12 @@ def transpile_r_to_fortran(
         char_scalars.discard(nm)
         char_arrays.discard(nm)
         real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
         real_rank3_arrays.discard(nm)
         real_rank4_arrays.discard(nm)
         int_matrices.discard(nm)
-    helper_ctx_main["int_matrix_vars"] = set(int_matrices)
-    helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays)
+    helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
+    helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
@@ -13584,12 +13790,21 @@ def transpile_r_to_fortran(
         int_arrays.discard(nm)
         real_arrays.discard(nm)
         params.pop(nm, None)
+    for nm in int_rank3_arrays:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        params.pop(nm, None)
     for nm in real_rank3_arrays:
         ints.discard(nm)
         real_scalars.discard(nm)
         int_arrays.discard(nm)
         real_arrays.discard(nm)
         real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
         params.pop(nm, None)
     for nm in real_rank4_arrays:
         ints.discard(nm)
@@ -13606,6 +13821,7 @@ def transpile_r_to_fortran(
         real_arrays.discard(nm)
         params.pop(nm, None)
         real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
 
     def _force_main_list_component_alias_types(ss_alias: list[object]) -> None:
         int_fields = {
@@ -13656,6 +13872,7 @@ def transpile_r_to_fortran(
                     real_arrays.discard(st_alias.name)
                     int_matrices.discard(st_alias.name)
                     real_matrices.discard(st_alias.name)
+                    int_rank3_arrays.discard(st_alias.name)
                     real_rank3_arrays.discard(st_alias.name)
                     real_rank4_arrays.discard(st_alias.name)
                 if fld in int_fields:
@@ -13670,6 +13887,7 @@ def transpile_r_to_fortran(
                     real_scalars.discard(st_alias.name)
                     int_matrices.discard(st_alias.name)
                     real_matrices.discard(st_alias.name)
+                    int_rank3_arrays.discard(st_alias.name)
                     real_rank3_arrays.discard(st_alias.name)
                     real_rank4_arrays.discard(st_alias.name)
                     params.pop(st_alias.name, None)
@@ -13700,6 +13918,7 @@ def transpile_r_to_fortran(
             real_scalars.discard(nm)
             int_matrices.discard(nm)
             real_matrices.discard(nm)
+            int_rank3_arrays.discard(nm)
             params.pop(nm, None)
     if prcomp_vars:
         for nm in prcomp_vars:
@@ -13709,10 +13928,11 @@ def transpile_r_to_fortran(
             real_scalars.discard(nm)
             int_matrices.discard(nm)
             real_matrices.discard(nm)
+            int_rank3_arrays.discard(nm)
             params.pop(nm, None)
 
-    helper_ctx_main["int_matrix_vars"] = set(int_matrices)
-    helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays)
+    helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
+    helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
@@ -13723,6 +13943,7 @@ def transpile_r_to_fortran(
         real_arrays.discard(nm)
         int_matrices.discard(nm)
         real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
         real_rank3_arrays.discard(nm)
         real_rank4_arrays.discard(nm)
         real_scalars.discard(nm)
@@ -13744,6 +13965,8 @@ def transpile_r_to_fortran(
         pbody.w("integer, allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(int_matrices)))
     if real_matrices:
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(real_matrices)))
+    if int_rank3_arrays:
+        pbody.w("integer, allocatable :: " + ", ".join(f"{x}(:,:,:)" for x in sorted(int_rank3_arrays)))
     if real_rank3_arrays:
         pbody.w("real(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:,:)" for x in sorted(real_rank3_arrays)))
     if real_rank4_arrays:
@@ -15998,14 +16221,17 @@ def rewrite_optional_init_size_checks(lines: list[str]) -> list[str]:
 
 
 def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
-    rank3: set[str] = set()
-    decl_re = re.compile(r"\breal\s*\([^)]*\)\s*,\s*allocatable\s*::\s*(.*)", re.IGNORECASE)
+    rank3: dict[str, str] = {}
+    decl_re = re.compile(r"\b(real\s*\([^)]*\)|integer)\s*,\s*allocatable\s*::\s*(.*)", re.IGNORECASE)
     for ln in lines:
         m = decl_re.search(ln)
         if m is None:
             continue
+        kind = "integer" if m.group(1).lower().startswith("integer") else "real"
         for name in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*,\s*:\s*\)", m.group(1)):
-            rank3.add(name)
+            rank3[name] = kind
+        for name in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*,\s*:\s*\)", m.group(2)):
+            rank3[name] = kind
     if not rank3:
         return lines
     out: list[str] = []
@@ -16013,7 +16239,10 @@ def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
         m_call = re.match(r"^(\s*)call\s+print_matrix\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", ln, re.IGNORECASE)
         if m_call is not None and m_call.group(2) in rank3:
             nm = m_call.group(2)
-            out.append(f"{m_call.group(1)}call print_real_vector(reshape({nm}, [size({nm})]))")
+            expr = f"reshape({nm}, [size({nm})])"
+            if rank3[nm] == "integer":
+                expr = f"real({expr}, kind=dp)"
+            out.append(f"{m_call.group(1)}call print_real_vector({expr})")
         else:
             out.append(ln)
     return out
