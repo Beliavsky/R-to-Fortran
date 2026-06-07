@@ -4513,6 +4513,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 2
     if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)values", expr_l):
         return 1
+    if _split_top_level_token(expr, "%in%", from_right=True) is not None:
+        return 1
     expr_f = r_expr_to_fortran(expr)
 
     # Unary +/- (strip simple unary sign).
@@ -4618,6 +4620,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
+            if fn_name in {"is.element", "is_element", "r_in", "union", "intersect", "setdiff"}:
+                return 1
+            if fn_name == "setequal":
+                return 0
             if fn_name in {"cov", "cor"}:
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 0
@@ -6032,7 +6038,19 @@ def r_expr_to_fortran(expr: str) -> str:
         if _is_complex_expr_source(mm_div[0]) or _is_complex_expr_source(mm_div[1]) or _expr_mentions_known_complex(lhs) or _expr_mentions_known_complex(rhs):
             return f"({lhs}) / ({rhs})"
         return f"(real({lhs}, kind=dp)) / (real({rhs}, kind=dp))"
+    mm_in = _split_top_level_token(s, "%in%", from_right=True)
+    if mm_in is not None:
+        lhs = r_expr_to_fortran(mm_in[0])
+        rhs = r_expr_to_fortran(mm_in[1])
+        return f"r_in({lhs}, {rhs})"
     c_usr = parse_call_text(s)
+    if c_usr is not None and c_usr[0].lower() in {"is.element", "is_element"}:
+        _nm_ie, pos_ie, kw_ie = c_usr
+        x_src = pos_ie[0] if pos_ie else kw_ie.get("x", "")
+        table_src = pos_ie[1] if len(pos_ie) >= 2 else kw_ie.get("table", kw_ie.get("y", ""))
+        if not x_src or not table_src:
+            raise NotImplementedError("is.element requires x and table arguments")
+        return f"r_in({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(table_src)})"
     if c_usr is not None and c_usr[0].lower() == "cor" and len(c_usr[1]) == 1 and not c_usr[2]:
         df_src = c_usr[1][0].strip()
         if re.fullmatch(r"[A-Za-z]\w*", df_src):
@@ -8013,6 +8031,10 @@ def r_expr_to_fortran(expr: str) -> str:
                 tf = r_expr_to_fortran(t)
                 vals_cplx.append(_as_complex_fortran_expr(tf))
             return "[" + ", ".join(vals_cplx) + "]"
+        nonempty_parts = [p for p in parts if p.strip()]
+        if nonempty_parts and all(re.fullmatch(r"[+-]?\d+[lL]", _strip_named_actual_value(p).strip()) for p in nonempty_parts):
+            vals_i = [re.sub(r"[lL]$", "", _strip_named_actual_value(p).strip()) for p in nonempty_parts]
+            return "[" + ", ".join(vals_i) + "]"
         vals = []
         for p in parts:
             t = _strip_named_actual_value(p)
@@ -8257,6 +8279,7 @@ def emit_stmts(
     real_matrix_vars: set[str] = set()
     int_vector_vars: set[str] = set()
     real_vector_vars: set[str] = set()
+    logical_vector_vars: set[str] = set()
     matrix_vars: set[str] = set()
     vector_vars: set[str] = set()
     local_ranks_ctx: dict[str, int] = {}
@@ -8316,6 +8339,9 @@ def emit_stmts(
         rvv = helper_ctx.get("real_vector_vars")
         if isinstance(rvv, set):
             real_vector_vars = rvv
+        lvv = helper_ctx.get("logical_vector_vars")
+        if isinstance(lvv, set):
+            logical_vector_vars = lvv
         mv = helper_ctx.get("matrix_vars")
         if isinstance(mv, set):
             matrix_vars = mv
@@ -8349,7 +8375,7 @@ def emit_stmts(
     if not matrix_vars:
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
-        vector_vars = set(int_vector_vars) | set(real_vector_vars)
+        vector_vars = set(int_vector_vars) | set(real_vector_vars) | set(logical_vector_vars)
     list_locals: dict[str, dict[str, object]] = {}
     if helper_ctx is not None:
         ll = helper_ctx.get("list_locals")
@@ -8366,6 +8392,7 @@ def emit_stmts(
             name in alloc_seen
             or name in real_vector_vars
             or name in int_vector_vars
+            or name in logical_vector_vars
             or name in real_matrix_vars
             or name in int_matrix_vars
             or name in real_arrays
@@ -8593,6 +8620,8 @@ def emit_stmts(
                 return 1
             if r1 == 1 and r2 == 1:
                 return 0
+        if _split_top_level_token(t, "%in%", from_right=True) is not None:
+            return 1
         for op_pr in ["+", "-", "*", "/"]:
             mm_pr = _split_top_level_token(t, op_pr, from_right=True)
             if mm_pr is None:
@@ -8617,6 +8646,10 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
+            if nm_c in {"is.element", "is_element", "r_in", "union", "intersect", "setdiff"}:
+                return 1
+            if nm_c == "setequal":
+                return 0
             if nm_c in {"besselj", "bessely", "besseli", "besselk"}:
                 x_arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
                 rr_b = _expr_rank_for_print(x_arg) if x_arg else None
@@ -9967,6 +10000,11 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    one_in_f = r_expr_to_fortran(one)
+                    if re.match(r"^r_in\s*\(", one_in_f.strip(), re.IGNORECASE):
+                        _wstmt(f'write(*,"(*(g0,1x))") {one_in_f}', st.comment)
+                        need_r_mod.add("r_in")
+                        continue
                     c_complex_print = parse_call_text(one)
                     if c_complex_print is not None and c_complex_print[0].lower() == "as.complex":
                         arg_cxp = c_complex_print[1][0].strip() if c_complex_print[1] else c_complex_print[2].get("x", "").strip()
@@ -10456,6 +10494,9 @@ def emit_stmts(
                             _wstmt(f"call print_t_test({one_f})", st.comment)
                             need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
                             continue
+                        if re.match(r"^(?:r_in|setequal|all|any|is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE):
+                            _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                            continue
                         m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
                         if m_int_arr_scalar is not None and m_int_arr_scalar.group(1) in int_matrix_vars:
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
@@ -10474,6 +10515,16 @@ def emit_stmts(
                         or _split_top_level_token(one, "%*%", from_right=True) is not None
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        one_f_simple = one_f.strip()
+                        if (
+                            re.fullmatch(r"[A-Za-z]\w*", one_f_simple)
+                            and (
+                                one_f_simple in logical_vector_vars
+                                or one_f_simple.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                            )
+                        ) or re.match(r"^r_in\s*\(", one_f_simple, re.IGNORECASE):
+                            _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                            continue
                         if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in int_vector_vars:
                             _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
                             continue
@@ -10486,6 +10537,20 @@ def emit_stmts(
                                 _wstmt(f"call print_char_vector({one_f})", st.comment)
                                 need_r_mod.add("print_char_vector")
                                 continue
+                            c_set_print = parse_call_text(one.strip())
+                            if c_set_print is not None and c_set_print[0].lower() in {"union", "intersect", "setdiff"}:
+                                set_args = list(c_set_print[1]) + list(c_set_print[2].values())
+                                if any(a.strip() in int_vector_vars for a in set_args[:2]):
+                                    _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                                    continue
+                                if any(a.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES for a in set_args[:2]):
+                                    _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                    need_r_mod.add("print_char_vector")
+                                    continue
+                                if any(a.strip() in real_vector_vars for a in set_args[:2]):
+                                    _wstmt(f"call print_real_vector({one_f})", st.comment)
+                                    need_r_mod.add("print_real_vector")
+                                    continue
                             c_print_aperm = parse_call_text(one.strip())
                             if c_print_aperm is not None and c_print_aperm[0].lower() == "aperm":
                                 src_print_aperm = (
@@ -10495,7 +10560,10 @@ def emit_stmts(
                                 )
                                 if src_print_aperm.lower() in _KNOWN_RANK3_NAMES:
                                     one_f = f"reshape({one_f}, [size({one_f})])"
-                            _wstmt(f"call print_real_vector(real({one_f}, kind=dp))", st.comment)
+                            if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in real_vector_vars:
+                                _wstmt(f"call print_real_vector({one_f})", st.comment)
+                            else:
+                                _wstmt(f"call print_real_vector(real({one_f}, kind=dp))", st.comment)
                             need_r_mod.add("print_real_vector")
                         else:
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
@@ -12139,6 +12207,13 @@ def emit_function(
             for st_la in ss_la:
                 if isinstance(st_la, Assign):
                     rhs_la = st_la.expr.strip()
+                    rhs_la_l = rhs_la.lower()
+                    if (
+                        _split_top_level_token(rhs_la, "%in%", from_right=True) is not None
+                        or re.match(r"^(?:is\.element|is_element|r_in)\s*\(", rhs_la_l)
+                    ):
+                        logical_arrays.add(st_la.name)
+                        continue
                     is_cmp = any(
                         _split_top_level_token(rhs_la, op, from_right=True) is not None
                         for op in ["==", "!=", ">=", "<=", ">", "<"]
@@ -12707,6 +12782,9 @@ def emit_function(
         helper_ctx_loc["real_vector_vars"] = {
             x for x in real_arrays if local_ranks.get(x, _infer_local_array_rank(body_use, x)) < 2
         }
+        helper_ctx_loc["logical_vector_vars"] = {
+            x for x in logical_arrays if local_ranks.get(x, _infer_local_array_rank(body_use, x)) < 2
+        }
         helper_ctx_loc["local_ranks"] = dict(local_ranks)
         if not emit_as_subroutine:
             helper_ctx_loc["return_var"] = rname
@@ -12934,6 +13012,12 @@ def _infer_literal_array_parameter(rhs: str) -> tuple[str, int, str] | None:
 
     Returns `(kind, n, expr_f)` where kind is `"integer"` or `"real"`.
     """
+    c_orig = parse_call_text(rhs.strip())
+    if c_orig is not None and c_orig[0].lower() == "c" and c_orig[1] and not c_orig[2]:
+        vals_orig = [_strip_named_actual_value(p).strip() for p in c_orig[1]]
+        if vals_orig and all(re.fullmatch(r"[+-]?\d+[lL]", v) for v in vals_orig):
+            vals_i = [re.sub(r"[lL]$", "", v) for v in vals_orig]
+            return "integer", len(vals_i), "[" + ", ".join(vals_i) + "]"
     expr_f = r_expr_to_fortran(rhs.strip())
     t = expr_f.strip()
     if not (t.startswith("[") and t.endswith("]")):
@@ -13269,6 +13353,10 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                     vals_log = (c_log[1] + list(c_log[2].values())) if c_log is not None and c_log[0].lower() == "c" else []
                     is_logical_vec = bool(vals_log) and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_log)
                 elif re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
+                    is_logical_vec = True
+                elif _split_top_level_token(rhs, "%in%", from_right=True) is not None:
+                    is_logical_vec = True
+                elif re.match(r"^(?:is\.element|is_element|r_in)\s*\(", rhs_l):
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
                     names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
@@ -14837,6 +14925,7 @@ def transpile_r_to_fortran(
         "real_matrix_vars": set(),
         "int_vector_vars": set(),
         "real_vector_vars": set(),
+        "logical_vector_vars": set(),
         "named_vector_names": dict(_NAMED_VECTOR_NAMES),
         "return_array_fns": set(fn_return_array_kind.keys()),
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
@@ -15042,6 +15131,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
+    helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
 
     # Main program declarations/body (without header/footer).
@@ -15710,6 +15800,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
+    helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
 
     for nm in set(list_vars) | set(main_object_list_vars):
@@ -17111,6 +17202,11 @@ def transpile_r_to_fortran(
         "r_mul",
         "r_div",
         "match",
+        "r_in",
+        "union",
+        "intersect",
+        "setdiff",
+        "setequal",
         "findInterval",
         "hclust",
         "cutree",
