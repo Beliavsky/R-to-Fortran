@@ -4632,9 +4632,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
-            if fn_name in {"is.element", "is_element", "r_in", "unique", "union", "intersect", "setdiff"}:
+            if fn_name in {"is.element", "is_element", "r_in", "unique", "duplicated", "union", "intersect", "setdiff"}:
                 return 1
-            if fn_name == "setequal":
+            if fn_name in {"anyduplicated", "anyDuplicated".lower(), "setequal"}:
                 return 0
             if fn_name in {"cov", "cor"}:
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
@@ -8700,9 +8700,9 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
-            if nm_c in {"is.element", "is_element", "r_in", "unique", "union", "intersect", "setdiff"}:
+            if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "union", "intersect", "setdiff"}:
                 return 1
-            if nm_c == "setequal":
+            if nm_c in {"anyduplicated", "setequal"}:
                 return 0
             if nm_c in {"besselj", "bessely", "besseli", "besselk"}:
                 x_arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
@@ -10551,6 +10551,9 @@ def emit_stmts(
                         if re.match(r"^(?:r_in|setequal|all|any|is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
+                        if re.match(r"^anyDuplicated\s*\(", one_f.strip(), re.IGNORECASE):
+                            _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
+                            continue
                         m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
                         if m_int_arr_scalar is not None and m_int_arr_scalar.group(1) in int_matrix_vars:
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
@@ -10576,7 +10579,7 @@ def emit_stmts(
                                 one_f_simple in logical_vector_vars
                                 or one_f_simple.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
                             )
-                        ) or re.match(r"^r_in\s*\(", one_f_simple, re.IGNORECASE):
+                        ) or re.match(r"^(?:r_in|duplicated)\s*\(", one_f_simple, re.IGNORECASE):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
                         if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in int_vector_vars:
@@ -12323,7 +12326,7 @@ def emit_function(
                     rhs_la_l = rhs_la.lower()
                     if (
                         _split_top_level_token(rhs_la, "%in%", from_right=True) is not None
-                        or re.match(r"^(?:is\.element|is_element|r_in)\s*\(", rhs_la_l)
+                        or re.match(r"^(?:is\.element|is_element|r_in|duplicated)\s*\(", rhs_la_l)
                     ):
                         logical_arrays.add(st_la.name)
                         continue
@@ -13474,7 +13477,7 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                     is_logical_vec = True
                 elif _split_top_level_token(rhs, "%in%", from_right=True) is not None:
                     is_logical_vec = True
-                elif re.match(r"^(?:is\.element|is_element|r_in)\s*\(", rhs_l):
+                elif re.match(r"^(?:is\.element|is_element|r_in|duplicated)\s*\(", rhs_l):
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
                     names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
@@ -17323,6 +17326,8 @@ def transpile_r_to_fortran(
         "match",
         "r_in",
         "unique",
+        "duplicated",
+        "anyDuplicated",
         "union",
         "intersect",
         "setdiff",
