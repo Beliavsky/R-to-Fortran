@@ -4242,6 +4242,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
         return False
+    if re.match(r"^rle\s*\(", t, re.IGNORECASE):
+        return False
     if re.search(r"\b(?:scan|read\.[a-z]+)\s*\(", t, re.IGNORECASE):
         return False
     if re.search(r"\b(?:sample|sample\.int|runif|rnorm|rexp|rbinom|rpois)\s*\(", t, re.IGNORECASE):
@@ -4708,6 +4710,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "tanh",
             }:
                 return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
+            if fn_name in {"inverse.rle", "inverse_rle"}:
+                return 1
+            if fn_name == "rle":
+                return 0
             if fn_name in {
                 "coef",
                 "residuals",
@@ -4748,6 +4754,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 2 if len(parts) > 1 else 1
 
     if expr_l.startswith("r_seq_"):
+        return 1
+
+    if re.match(r"^[A-Za-z]\w*\s*%\s*(?:lengths|values)$", expr_l):
         return 1
 
     m_var = re.match(r"^([A-Za-z]\w*)$", expr_l)
@@ -4807,6 +4816,15 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
             if x_kind == "integer" and value_kind in {"integer", "unknown"}:
                 return "integer"
             return x_kind if x_kind != "unknown" else value_kind
+        if nm in {"inverse.rle", "inverse_rle"} and vals:
+            fit_kind = _infer_assignment_kind_hint(vals[0], inferred_kinds)
+            if fit_kind.startswith("rle_"):
+                return fit_kind[len("rle_") :]
+            return fit_kind
+        if nm == "rle" and vals:
+            return "rle_" + _infer_assignment_kind_hint(vals[0], inferred_kinds)
+        if nm == "rle":
+            return "rle_unknown"
         if nm in {"matrix", "array", "c", "as.vector", "as.numeric", "as.double", "t"} and vals:
             if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals):
                 return "complex"
@@ -4820,6 +4838,11 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
     m_var = re.match(r"^([A-Za-z]\w*)$", expr)
     if m_var is not None:
         return inferred_kinds.get(m_var.group(1), "unknown")
+    m_field = re.match(r"^([A-Za-z]\w*)\s*(?:\$|%)\s*(lengths|values)$", expr, re.IGNORECASE)
+    if m_field is not None:
+        if m_field.group(2).lower() == "lengths":
+            return "integer"
+        return inferred_kinds.get(m_field.group(1), "unknown")
     if re.search(r"\d", expr):
         return "real"
     return "unknown"
@@ -6125,6 +6148,16 @@ def r_expr_to_fortran(expr: str) -> str:
         if not mask_src:
             raise NotImplementedError("which requires x argument")
         return f"which({r_expr_to_fortran(mask_src)})"
+    if c_usr is not None and c_usr[0].lower() == "rle":
+        x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
+        if not x_src:
+            raise NotImplementedError("rle requires x argument")
+        return f"rle({r_expr_to_fortran(x_src)})"
+    if c_usr is not None and c_usr[0].lower() in {"inverse.rle", "inverse_rle"}:
+        x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
+        if not x_src:
+            raise NotImplementedError("inverse.rle requires x argument")
+        return f"inverse_rle({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "replace":
         _nm_rep, pos_rep, kw_rep = c_usr
         x_src = pos_rep[0] if pos_rep else kw_rep.get("x", "")
@@ -6752,6 +6785,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"all_equal({', '.join(args_eq)})"
 
     s = _replace_balanced_func_calls(s, "all.equal", _all_equal_to_fortran)
+    s = _replace_balanced_func_calls(s, "identical", _all_equal_to_fortran)
 
     def _log_to_fortran(inner: str) -> str:
         c_log = parse_call_text("log(" + inner.strip() + ")")
@@ -8447,6 +8481,7 @@ def emit_stmts(
     qr_vars_ctx: set[str] = set()
     eigen_vars_ctx: set[str] = set()
     arima_vars_ctx: set[str] = set()
+    rle_vars_ctx: dict[str, str] = {}
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -8529,6 +8564,9 @@ def emit_stmts(
         arv = helper_ctx.get("arima_vars")
         if isinstance(arv, set):
             arima_vars_ctx = {str(x) for x in arv}
+        rlv = helper_ctx.get("rle_vars")
+        if isinstance(rlv, dict):
+            rle_vars_ctx = {str(k): str(v) for k, v in rlv.items()}
     if not matrix_vars:
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
@@ -8726,6 +8764,18 @@ def emit_stmts(
         ):
             return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:lengths|values)\b", t):
+            if re.search(r"\[[^\]]+\]\s*$", t):
+                inner_rle = re.search(r"\[([^\]]+)\]\s*$", t)
+                inner_txt = inner_rle.group(1).strip() if inner_rle is not None else ""
+                inner_l = inner_txt.lower()
+                if (
+                    inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                    or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", "&", "|", ".and.", ".or."))
+                ):
+                    return 1
+                return 0
+            return 1
         if m_field_print is not None and m_field_print.group(1).lower() == "rank":
             return 0
         if m_field_print is not None and m_field_print.group(1).lower() == "pivot":
@@ -8811,6 +8861,10 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
+            if nm_c in {"inverse.rle", "inverse_rle"}:
+                return 1
+            if nm_c == "rle":
+                return 0
             if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c in {"anyduplicated", "setequal"}:
@@ -10337,6 +10391,14 @@ def emit_stmts(
                         _wstmt(f"call print_arima_fit({one})", st.comment)
                         need_r_mod.update({"print_arima_fit", "arima_fit_t"})
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in rle_vars_ctx:
+                        _wstmt(f"call print_rle({one})", st.comment)
+                        need_r_mod.update({"print_rle", rle_vars_ctx[one]})
+                        continue
+                    if c_one is not None and c_one[0].lower() == "rle":
+                        _wstmt(f"call print_rle({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"rle", "print_rle"})
+                        continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in _EXPANDED_DATA_FRAME_FIELDS:
                         fields_df = _EXPANDED_DATA_FRAME_FIELDS.get(one, [])
                         if fields_df:
@@ -10694,6 +10756,38 @@ def emit_stmts(
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         one_f_simple = one_f.strip()
+                        m_rle_field_print = re.match(r"^([A-Za-z]\w*)%((?:lengths)|(?:values))(?:\s*\(.*\))?$", one_f_simple, re.IGNORECASE)
+                        if m_rle_field_print is not None and m_rle_field_print.group(1) in rle_vars_ctx:
+                            rle_nm = m_rle_field_print.group(1)
+                            rle_field = m_rle_field_print.group(2).lower()
+                            rle_tn = rle_vars_ctx[rle_nm]
+                            if rle_field == "lengths" or rle_tn == "rle_int_t":
+                                _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                            elif rle_tn == "rle_char_t":
+                                _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                need_r_mod.add("print_char_vector")
+                            elif rle_tn == "rle_logical_t":
+                                _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                            else:
+                                _wstmt(f"call print_real_vector({one_f})", st.comment)
+                                need_r_mod.add("print_real_vector")
+                            continue
+                        c_rle_inv_print = parse_call_text(one.strip())
+                        if c_rle_inv_print is not None and c_rle_inv_print[0].lower() in {"inverse.rle", "inverse_rle"}:
+                            inv_arg = c_rle_inv_print[1][0].strip() if c_rle_inv_print[1] else c_rle_inv_print[2].get("x", "").strip()
+                            inv_tn = rle_vars_ctx.get(inv_arg)
+                            if inv_tn == "rle_int_t":
+                                _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                            elif inv_tn == "rle_char_t":
+                                _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                need_r_mod.add("print_char_vector")
+                            elif inv_tn == "rle_logical_t":
+                                _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                            else:
+                                _wstmt(f"call print_real_vector({one_f})", st.comment)
+                                need_r_mod.add("print_real_vector")
+                            need_r_mod.add("inverse_rle")
+                            continue
                         if (
                             re.fullmatch(r"[A-Za-z]\w*", one_f_simple)
                             and (
@@ -11496,10 +11590,44 @@ def emit_stmts(
                 continue
             # In R, a bare expression at statement level is evaluated and printed.
             expr_print_src = st.expr.strip()
+            c_expr_print = parse_call_text(expr_print_src)
+            if re.fullmatch(r"[A-Za-z]\w*", expr_print_src) and expr_print_src in rle_vars_ctx:
+                _wstmt(f"call print_rle({expr_print_src})", st.comment)
+                need_r_mod.update({"print_rle", rle_vars_ctx[expr_print_src]})
+                continue
+            if c_expr_print is not None and c_expr_print[0].lower() == "rle":
+                _wstmt(f"call print_rle({r_expr_to_fortran(expr_print_src)})", st.comment)
+                need_r_mod.update({"rle", "print_rle"})
+                continue
             rank_expr_print = _expr_rank_for_print(expr_print_src)
             if rank_expr_print == 1:
                 def _vector_print_kind_from_expr(src_vpk: str) -> str:
                     t_vpk = fscan.strip_redundant_outer_parens_expr(src_vpk.strip())
+                    tf_vpk = r_expr_to_fortran(t_vpk)
+                    if re.match(r"^pack\s*\(\s*[A-Za-z]\w*%lengths\s*,", tf_vpk.strip(), re.IGNORECASE):
+                        return "integer"
+                    m_pack_rle_values = re.match(r"^pack\s*\(\s*([A-Za-z]\w*)%values\s*,", tf_vpk.strip(), re.IGNORECASE)
+                    if m_pack_rle_values is not None and m_pack_rle_values.group(1) in rle_vars_ctx:
+                        tn_vpk = rle_vars_ctx[m_pack_rle_values.group(1)]
+                        if tn_vpk == "rle_int_t":
+                            return "integer"
+                        if tn_vpk == "rle_char_t":
+                            return "character"
+                        if tn_vpk == "rle_logical_t":
+                            return "logical"
+                        return "real"
+                    m_rle_vpk = re.match(r"^([A-Za-z]\w*)%((?:lengths)|(?:values))(?:\s*\(.*\))?$", tf_vpk.strip(), re.IGNORECASE)
+                    if m_rle_vpk is not None and m_rle_vpk.group(1) in rle_vars_ctx:
+                        if m_rle_vpk.group(2).lower() == "lengths":
+                            return "integer"
+                        tn_vpk = rle_vars_ctx[m_rle_vpk.group(1)]
+                        if tn_vpk == "rle_int_t":
+                            return "integer"
+                        if tn_vpk == "rle_char_t":
+                            return "character"
+                        if tn_vpk == "rle_logical_t":
+                            return "logical"
+                        return "real"
                     if re.fullmatch(r"[A-Za-z]\w*", t_vpk):
                         if t_vpk in int_vector_vars:
                             return "integer"
@@ -11518,6 +11646,15 @@ def emit_stmts(
                         return "logical"
                     if c_vpk is not None and c_vpk[0].lower() == "which":
                         return "integer"
+                    if c_vpk is not None and c_vpk[0].lower() in {"inverse.rle", "inverse_rle"}:
+                        arg_vpk = c_vpk[1][0].strip() if c_vpk[1] else c_vpk[2].get("x", "").strip()
+                        tn_vpk = rle_vars_ctx.get(arg_vpk)
+                        if tn_vpk == "rle_int_t":
+                            return "integer"
+                        if tn_vpk == "rle_char_t":
+                            return "character"
+                        if tn_vpk == "rle_logical_t":
+                            return "logical"
                     return "real"
 
                 expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
@@ -15342,6 +15479,34 @@ def transpile_r_to_fortran(
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
+    rle_vars: dict[str, str] = {}
+    for st_rle in main_stmts:
+        if not isinstance(st_rle, Assign):
+            continue
+        c_rle = parse_call_text(st_rle.expr.strip())
+        if c_rle is None or c_rle[0].lower() != "rle":
+            continue
+        src_rle = c_rle[1][0].strip() if c_rle[1] else c_rle[2].get("x", "").strip()
+        src_l = src_rle.lower()
+        if src_rle in int_arrays or src_l in {x.lower() for x in int_arrays}:
+            tn_rle = "rle_int_t"
+        elif src_l in _KNOWN_CHAR_VECTOR_NAMES:
+            tn_rle = "rle_char_t"
+        elif src_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+            tn_rle = "rle_logical_t"
+        else:
+            tn_rle = "rle_real_t"
+        rle_vars[st_rle.name] = tn_rle
+        helper_ctx_main["need_r_mod"].update({"rle", "inverse_rle", "print_rle", tn_rle})
+    for nm in rle_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        char_scalars.discard(nm)
+        char_arrays.discard(nm)
+        logical_arrays.discard(nm)
+        params.pop(nm, None)
     # Promote main-scope names referenced by local functions to module scope.
     main_name_map: dict[str, str] = {}
     for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices | int_rank3_arrays:
@@ -16149,6 +16314,9 @@ def transpile_r_to_fortran(
     if qr_vars:
         for nm in sorted(qr_vars):
             pbody.w(f"type(qr_fit_t) :: {nm}")
+    if rle_vars:
+        for nm, tn in sorted(rle_vars.items()):
+            pbody.w(f"type({tn}) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
     if main_object_list_vars:
@@ -16162,6 +16330,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["eigen_vars"] = set(eigen_vars)
     if arima_vars:
         helper_ctx_main["arima_vars"] = set(arima_vars)
+    if rle_vars:
+        helper_ctx_main["rle_vars"] = dict(rle_vars)
     pbody.w("")
     if ("r_mod" in helper_modules) and (not int_like_print):
         pbody.w("call set_print_int_like(.false.)")
@@ -17498,6 +17668,9 @@ def transpile_r_to_fortran(
         "is_na",
         "which",
         "replace",
+        "rle",
+        "inverse_rle",
+        "print_rle",
         "r_typeof",
         "r_character",
         "rank_average",
@@ -17561,6 +17734,10 @@ def transpile_r_to_fortran(
         "eigen_result_t",
         "arima_fit_t",
         "qr_fit_t",
+        "rle_real_t",
+        "rle_int_t",
+        "rle_char_t",
+        "rle_logical_t",
         "optim_result_t",
         "t_test_result_t",
         "t_test",
