@@ -2580,6 +2580,39 @@ def _strict_int_vector_literal_from_c(expr: str) -> str | None:
     return "[" + ", ".join(out) + "]"
 
 
+def _real_vector_constructor_from_mixed_c(expr: str) -> str | None:
+    c = parse_call_text(expr.strip())
+    if c is None or c[0].lower() != "c":
+        return None
+    vals = list(c[1]) + list(c[2].values())
+    if not vals:
+        return None
+    lowered = [r_expr_to_fortran(v.strip()) for v in vals if v.strip()]
+    if not lowered:
+        return None
+    has_real = any(
+        re.search(r"\bkind\s*=\s*dp\b|_dp\b", v, re.IGNORECASE)
+        or re.match(r"^[A-Za-z]\w*$", v.strip()) and v.strip().lower() in _KNOWN_VECTOR_NAMES - {
+            x.lower() for x in _KNOWN_LOGICAL_VECTOR_NAMES
+        }
+        for v in lowered
+    )
+    has_int_vec = any(re.match(r"^[A-Za-z]\w*$", v.strip()) and v.strip().lower() not in _KNOWN_VECTOR_NAMES for v in lowered)
+    if not has_real or not has_int_vec:
+        return None
+    return "[" + ", ".join(f"real({v}, kind=dp)" for v in lowered) + "]"
+
+
+def _coerce_array_constructor_real(expr: str) -> str:
+    t = expr.strip()
+    if not (t.startswith("[") and t.endswith("]")):
+        return expr
+    parts = split_top_level_commas(t[1:-1])
+    if not parts:
+        return expr
+    return "[" + ", ".join(f"real({p.strip()}, kind=dp)" for p in parts if p.strip()) + "]"
+
+
 def _parse_matrix_dim2(expr: str) -> tuple[str, str] | None:
     """Parse a 2-element matrix-dimension expression like c(2,3) or [2,3]."""
     if not expr:
@@ -6725,7 +6758,11 @@ def r_expr_to_fortran(expr: str) -> str:
             byrow_src = pos_m[3]
         if nr_src is None and nc_src is None:
             raise NotImplementedError("matrix(...) requires nrow or ncol in this subset")
-        data_f = _strict_int_vector_literal_from_c(data_src.strip()) or r_expr_to_fortran(data_src)
+        data_f = (
+            _strict_int_vector_literal_from_c(data_src.strip())
+            or _real_vector_constructor_from_mixed_c(data_src.strip())
+            or r_expr_to_fortran(data_src)
+        )
         nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
         if nc_src is None:
             nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
@@ -9269,7 +9306,11 @@ def emit_stmts(
                         need_rnorm["used"] = True
                         continue
                     # Generic fallback for matrix(data, nrow=, ncol=)
-                    data_f = _strict_int_vector_literal_from_c(data_src.strip()) or r_expr_to_fortran(data_src)
+                    data_f = (
+                        _strict_int_vector_literal_from_c(data_src.strip())
+                        or _real_vector_constructor_from_mixed_c(data_src.strip())
+                        or r_expr_to_fortran(data_src)
+                    )
                     explicit_shape = False
                     if nrow_src is not None and ncol_src is None:
                         dim_pair = _parse_matrix_dim2(nrow_src)
@@ -9302,6 +9343,8 @@ def emit_stmts(
                         or re.match(r"^[A-Za-z]\w*\s*\(", data_f.strip())
                     ):
                         data_f = f"[{data_f}]"
+                    if st.name in real_matrix_vars:
+                        data_f = _coerce_array_constructor_real(data_f)
                     byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
                     if byrow_true:
                         _wstmt(
