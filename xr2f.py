@@ -19211,6 +19211,7 @@ def main() -> int:
     f90_lines = fpost.simplify_norm2_patterns(f90_lines)
     f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
+    f90_lines = fpost.fold_simple_integer_intrinsics(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
