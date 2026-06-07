@@ -56,6 +56,7 @@ _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
+_MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -973,6 +974,17 @@ def _array_dim_parts(expr: str) -> list[str] | None:
     if dim_txt.startswith("[") and dim_txt.endswith("]"):
         return [p.strip() for p in split_top_level_commas(dim_txt[1:-1]) if p.strip()]
     return None
+
+
+def _warn_mixed_character_coercion(expr: str) -> None:
+    key = " ".join(expr.strip().split())
+    if key in _MIXED_CHARACTER_COERCION_WARNINGS:
+        return
+    _MIXED_CHARACTER_COERCION_WARNINGS.add(key)
+    print(
+        f"Warning: R expression `{key}` mixes character and non-character values; "
+        "translating by coercing all elements to character."
+    )
 
 
 def _array_data_is_integer(expr: str) -> bool:
@@ -4620,7 +4632,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
-            if fn_name in {"is.element", "is_element", "r_in", "union", "intersect", "setdiff"}:
+            if fn_name in {"is.element", "is_element", "r_in", "unique", "union", "intersect", "setdiff"}:
                 return 1
             if fn_name == "setequal":
                 return 0
@@ -4732,6 +4744,9 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
         if nm in {"re", "im", "mod", "arg", "abs"}:
             return "real"
         vals = list(c_call[1]) + list(c_call[2].values())
+        if nm == "c" and vals:
+            if any(_dequote_string_literal(_strip_named_actual_value(v)) is not None for v in vals):
+                return "character"
         if nm in {"complex", "as.complex"}:
             return "complex"
         if nm in {"solve", "qr.solve", "qr_solve"}:
@@ -8024,6 +8039,37 @@ def r_expr_to_fortran(expr: str) -> str:
             width = max(1, max(len(v) for v in vals_s))
             quoted = ", ".join('"' + v.replace('"', '""') + '"' for v in vals_s)
             return f"[character(len={width}) :: {quoted}]"
+        nonempty_c_parts = [p for p in parts if p.strip()]
+        has_character_part = any(
+            _dequote_string_literal(_strip_named_actual_value(p).strip()) is not None
+            or _strip_named_actual_value(p).strip().upper() == "NA_CHARACTER_"
+            for p in nonempty_c_parts
+        )
+        has_non_character_part = any(
+            _dequote_string_literal(_strip_named_actual_value(p).strip()) is None
+            and _strip_named_actual_value(p).strip().upper() != "NA_CHARACTER_"
+            for p in nonempty_c_parts
+        )
+        if any(v is not None for v in string_vals):
+            if has_character_part and has_non_character_part:
+                _warn_mixed_character_coercion("c(" + inner.strip() + ")")
+            vals_s_mixed: list[str] = []
+            for p in parts:
+                t = _strip_named_actual_value(p).strip()
+                lit = _dequote_string_literal(t)
+                if lit is not None:
+                    vals_s_mixed.append(str(lit))
+                elif re.fullmatch(r"[+-]?\d+[lL]?", t):
+                    vals_s_mixed.append(re.sub(r"[lL]$", "", t))
+                elif re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", t) or re.fullmatch(r"[+-]?\d+[eE][+-]?\d+", t):
+                    vals_s_mixed.append(t)
+                elif t.upper() in {"TRUE", "FALSE", "T", "F"}:
+                    vals_s_mixed.append("TRUE" if t.upper() in {"TRUE", "T"} else "FALSE")
+                else:
+                    vals_s_mixed.append(t)
+            width = max(1, max(len(v) for v in vals_s_mixed))
+            quoted = ", ".join('"' + v.replace('"', '""') + '"' for v in vals_s_mixed)
+            return f"[character(len={width}) :: {quoted}]"
         if any(_is_complex_expr_source(_strip_named_actual_value(p)) for p in parts if p.strip()):
             vals_cplx: list[str] = []
             for p in parts:
@@ -8560,6 +8606,14 @@ def emit_stmts(
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
             return 1
+        if re.fullmatch(r"[A-Za-z]\w*", t) and (
+            t in int_vector_vars
+            or t in real_vector_vars
+            or t in logical_vector_vars
+            or t.lower() in _KNOWN_CHAR_VECTOR_NAMES
+            or t.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+        ):
+            return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
         if m_field_print is not None and m_field_print.group(1).lower() == "rank":
             return 0
@@ -8646,7 +8700,7 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
-            if nm_c in {"is.element", "is_element", "r_in", "union", "intersect", "setdiff"}:
+            if nm_c in {"is.element", "is_element", "r_in", "unique", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c == "setequal":
                 return 0
@@ -10538,6 +10592,23 @@ def emit_stmts(
                                 need_r_mod.add("print_char_vector")
                                 continue
                             c_set_print = parse_call_text(one.strip())
+                            if c_set_print is not None and c_set_print[0].lower() == "unique":
+                                set_args = list(c_set_print[1]) + list(c_set_print[2].values())
+                                src_arg = set_args[0].strip() if set_args else ""
+                                if src_arg in int_vector_vars:
+                                    _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                                    continue
+                                if src_arg.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                                    _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                    need_r_mod.add("print_char_vector")
+                                    continue
+                                if src_arg in real_vector_vars:
+                                    _wstmt(f"call print_real_vector({one_f})", st.comment)
+                                    need_r_mod.add("print_real_vector")
+                                    continue
+                                if src_arg in logical_vector_vars or src_arg.lower() in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                    _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                                    continue
                             if c_set_print is not None and c_set_print[0].lower() in {"union", "intersect", "setdiff"}:
                                 set_args = list(c_set_print[1]) + list(c_set_print[2].values())
                                 if any(a.strip() in int_vector_vars for a in set_args[:2]):
@@ -11275,7 +11346,49 @@ def emit_stmts(
                 _wstmt(f"{lhs} = {rhs}", st.comment)
                 continue
             # In R, a bare expression at statement level is evaluated and printed.
-            _wstmt(f"print *, {r_expr_to_fortran(_rewrite_predict_expr(st.expr.strip()))}", st.comment)
+            expr_print_src = st.expr.strip()
+            rank_expr_print = _expr_rank_for_print(expr_print_src)
+            if rank_expr_print == 1:
+                def _vector_print_kind_from_expr(src_vpk: str) -> str:
+                    t_vpk = fscan.strip_redundant_outer_parens_expr(src_vpk.strip())
+                    if re.fullmatch(r"[A-Za-z]\w*", t_vpk):
+                        if t_vpk in int_vector_vars:
+                            return "integer"
+                        if t_vpk.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                            return "character"
+                        if t_vpk in logical_vector_vars or t_vpk.lower() in _KNOWN_LOGICAL_VECTOR_NAMES:
+                            return "logical"
+                        if t_vpk in real_vector_vars or t_vpk.lower() in _KNOWN_VECTOR_NAMES:
+                            return "real"
+                    c_vpk = parse_call_text(t_vpk)
+                    if c_vpk is not None and c_vpk[0].lower() in {"unique", "sort"}:
+                        arg_vpk = c_vpk[1][0].strip() if c_vpk[1] else c_vpk[2].get("x", "").strip()
+                        if arg_vpk:
+                            return _vector_print_kind_from_expr(arg_vpk)
+                    return "real"
+
+                expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
+                kind_print = _vector_print_kind_from_expr(expr_print_src)
+                if kind_print == "integer":
+                    _wstmt(f'write(*,"(*(1x,i0))") {expr_print_f}', st.comment)
+                elif kind_print == "character":
+                    _wstmt(f"call print_char_vector({expr_print_f})", st.comment)
+                    need_r_mod.add("print_char_vector")
+                elif kind_print == "logical":
+                    _wstmt(f'write(*,"(*(g0,1x))") {expr_print_f}', st.comment)
+                else:
+                    _wstmt(f"call print_real_vector({expr_print_f})", st.comment)
+                    need_r_mod.add("print_real_vector")
+                continue
+            if rank_expr_print == 2:
+                expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
+                if has_r_mod:
+                    _wstmt(f"call print_matrix({expr_print_f})", st.comment)
+                    need_r_mod.add("print_matrix_rstyle")
+                else:
+                    _wstmt(f"print *, {expr_print_f}", st.comment)
+                continue
+            _wstmt(f"print *, {r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))}", st.comment)
             continue
         else:
             raise NotImplementedError(f"unsupported statement: {type(st).__name__}")
@@ -13149,6 +13262,11 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
                     out.add(st.name)
                     continue
+                if c_rhs is not None and c_rhs[0].lower() == "unique":
+                    src = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+                    if src.lower() in {x.lower() for x in out} or src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                        out.add(st.name)
+                    continue
                 if not low.startswith("c("):
                     continue
                 cinfo = c_rhs
@@ -14616,7 +14734,7 @@ def transpile_r_to_fortran(
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
-    global _NO_RECYCLE
+    global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
@@ -14629,6 +14747,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_VECTOR_NAMES = set()
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
+    _MIXED_CHARACTER_COERCION_WARNINGS = set()
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -14654,7 +14773,7 @@ def transpile_r_to_fortran(
     for old, new, line_no in reused_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
         print(
-            f"Warning: R variable `{old}`{loc} is reused with a different inferred shape; "
+            f"Warning: R variable `{old}`{loc} is reused with a different inferred shape or kind; "
             f"translating as `{new}`."
         )
 
@@ -17203,6 +17322,7 @@ def transpile_r_to_fortran(
         "r_div",
         "match",
         "r_in",
+        "unique",
         "union",
         "intersect",
         "setdiff",
