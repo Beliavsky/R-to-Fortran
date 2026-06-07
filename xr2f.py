@@ -1830,7 +1830,7 @@ def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | No
     if cinfo is not None:
         nm, pos, kw = cinfo
         args = list(pos) + [f"{k}={v}" for k, v in kw.items()]
-        if nm.lower() in {"print", "stopifnot", "set.seed", "cat", "stop", "writelines", "write.table"}:
+        if nm.lower() in {"print", "stopifnot", "set.seed", "cat", "stop", "write", "writelines", "write.table"}:
             return CallStmt(name=nm, args=args, comment=cmt)
         return ExprStmt(expr=ln, comment=cmt)
     return ExprStmt(expr=ln, comment=cmt)
@@ -4509,6 +4509,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 
     expr = fscan.strip_redundant_outer_parens_expr(expr)
     expr_l = expr.lower()
+    if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)vectors", expr_l):
+        return 2
+    if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)values", expr_l):
+        return 1
     expr_f = r_expr_to_fortran(expr)
 
     # Unary +/- (strip simple unary sign).
@@ -4545,7 +4549,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             fn_name = c_call[0].lower()
             if fn_name == "diag":
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
-                return 1 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) > 0 else 2
+                arg_rank = _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
+                return 1 if arg_rank >= 2 else 2
             if fn_name == "t":
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
@@ -4560,8 +4565,6 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "apply_col_sd":
                 return 1
             if fn_name in {
-                "c",
-                "vector",
                 "matrix",
                 "array",
                 "cbind",
@@ -4569,7 +4572,6 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "rbind",
                 "outer",
                 "chol",
-                "backsolve",
                 "sweep",
                 "crossprod",
                 "tcrossprod",
@@ -4586,6 +4588,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "readRDS",
                 "cbindlist",
                 "rbindlist",
+            }:
+                return 2
+            if fn_name in {
+                "c",
+                "vector",
+                "backsolve",
                 "rep",
                 "numeric",
                 "double",
@@ -4610,6 +4618,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
+            if fn_name in {"cov", "cor"}:
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 0
+            if fn_name == "scale":
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "solve":
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
                 if b_src is None:
@@ -4632,7 +4646,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "floor",
                 "log",
                 "log10",
+                "log2",
                 "log1p",
+                "logb",
                 "round",
                 "sign",
                 "sin",
@@ -4647,6 +4663,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "residuals",
                 "fitted",
                 "predict",
+                "all.equal",
                 "sum",
                 "mean",
                 "sd",
@@ -5858,6 +5875,28 @@ def r_expr_to_fortran(expr: str) -> str:
         return r_expr_to_fortran(c_cast0[1][0].strip())
     if c_cast0 is not None and c_cast0[0].lower() == "factor" and c_cast0[1]:
         return r_expr_to_fortran(c_cast0[1][0].strip())
+    def _arith_known_array_rank(txt: str) -> int:
+        t = fscan.strip_redundant_outer_parens_expr(txt.strip())
+        if not t:
+            return 0
+        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_MATRIX_NAMES:
+            return 2
+        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_VECTOR_NAMES:
+            return 1
+        if _looks_matrix_expr(t):
+            return 2
+        for op_probe in ["+", "-", "*", "/"]:
+            mm_probe = _split_top_level_token(t, op_probe, from_right=True)
+            if mm_probe is not None:
+                return max(_arith_known_array_rank(mm_probe[0]), _arith_known_array_rank(mm_probe[1]))
+        c_probe = parse_call_text(t)
+        if c_probe is not None:
+            nm_probe = c_probe[0].lower()
+            arg_ranks = [_arith_known_array_rank(a.strip()) for a in c_probe[1]]
+            if nm_probe in {"log", "logb", "log10", "log2", "log1p", "exp", "expm1", "sqrt", "abs"}:
+                return max(arg_ranks or [0])
+        return 0
+
     for op, fn in [("+", "r_add"), ("-", "r_sub"), ("*", "r_mul"), ("/", "r_div")]:
         mm_op = _split_top_level_token(s, op, from_right=True)
         if mm_op is not None:
@@ -5867,14 +5906,22 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
             if a_txt and b_txt and _looks_matrix_expr(a_txt) and _looks_matrix_expr(b_txt):
                 return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
-            a_vec = _looks_vector_expr_for_recycle(a_txt) if a_txt else False
-            b_vec = _looks_vector_expr_for_recycle(b_txt) if b_txt else False
+            a_probe = fscan.strip_redundant_outer_parens_expr(a_txt) if a_txt else ""
+            b_probe = fscan.strip_redundant_outer_parens_expr(b_txt) if b_txt else ""
+            a_rank = _arith_known_array_rank(a_probe)
+            b_rank = _arith_known_array_rank(b_probe)
+            if a_rank >= 2 or b_rank >= 2:
+                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
+            a_vec = (_looks_vector_expr_for_recycle(a_probe) if a_probe else False) or a_rank == 1
+            b_vec = (_looks_vector_expr_for_recycle(b_probe) if b_probe else False) or b_rank == 1
             if a_txt and b_txt and a_vec and b_vec:
                 a_f = r_expr_to_fortran(a_txt)
                 b_f = r_expr_to_fortran(b_txt)
                 if _NO_RECYCLE:
                     return f"({a_f}) {op} ({b_f})"
                 return f"{fn}(real({a_f}, kind=dp), real({b_f}, kind=dp))"
+            if a_txt and b_txt and (a_vec or b_vec):
+                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
     c_cor0 = parse_call_text(s)
     if c_cor0 is not None and c_cor0[0].lower() in {"cor", "cov"}:
         vals_cor = list(c_cor0[1])
@@ -5935,9 +5982,10 @@ def r_expr_to_fortran(expr: str) -> str:
     c_predict0 = parse_call_text(s)
     if c_predict0 is not None and c_predict0[0].lower() == "predict":
         _nm_pr, pos_pr, kw_pr = c_predict0
-        fit_src = pos_pr[0] if pos_pr else kw_pr.get("object", "")
-        n_src = kw_pr.get("n.ahead", kw_pr.get("n_ahead", pos_pr[1] if len(pos_pr) >= 2 else "1"))
-        return f"arima_predict({r_expr_to_fortran(fit_src)}, {_int_bound_expr(r_expr_to_fortran(n_src))})"
+        n_src = kw_pr.get("n.ahead", kw_pr.get("n_ahead"))
+        if n_src is not None:
+            fit_src = pos_pr[0] if pos_pr else kw_pr.get("object", "")
+            return f"arima_predict({r_expr_to_fortran(fit_src)}, {_int_bound_expr(r_expr_to_fortran(n_src))})"
     c_rpois0 = parse_call_text(s)
     if c_rpois0 is not None and c_rpois0[0].lower() == "rpois":
         _nm_rp0, pos_rp0, kw_rp0 = c_rpois0
@@ -6522,14 +6570,67 @@ def r_expr_to_fortran(expr: str) -> str:
         "log10",
         lambda inner: f"log10(real({r_expr_to_fortran(inner.strip())}, kind=dp))",
     )
-    def _log_to_fortran(inner: str) -> str:
+    s = _replace_balanced_func_calls(
+        s,
+        "log2",
+        lambda inner: f"(log(real({r_expr_to_fortran(inner.strip())}, kind=dp)) / log(2.0_dp))",
+    )
+    s = _replace_balanced_func_calls(
+        s,
+        "log1p",
+        lambda inner: f"log(1.0_dp + real({r_expr_to_fortran(inner.strip())}, kind=dp))",
+    )
+    s = _replace_balanced_func_calls(
+        s,
+        "expm1",
+        lambda inner: f"(exp(real({r_expr_to_fortran(inner.strip())}, kind=dp)) - 1.0_dp)",
+    )
+
+    def _exp_to_fortran(inner: str) -> str:
         src = inner.strip()
         inner_f = r_expr_to_fortran(src)
         if _is_complex_expr_source(src) or _expr_mentions_known_complex(inner_f):
+            return f"exp({inner_f})"
+        return f"exp(real({inner_f}, kind=dp))"
+
+    s = _replace_balanced_func_calls(s, "exp", _exp_to_fortran)
+
+    def _all_equal_to_fortran(inner: str) -> str:
+        c_eq = parse_call_text("all.equal(" + inner.strip() + ")")
+        if c_eq is None:
+            return "all_equal(" + r_expr_to_fortran(inner.strip()) + ")"
+        _nm_eq, pos_eq, kw_eq = c_eq
+        if len(pos_eq) < 2:
+            raise NotImplementedError("all.equal requires target and current")
+        args_eq = [r_expr_to_fortran(pos_eq[0].strip()), r_expr_to_fortran(pos_eq[1].strip())]
+        tol_src = kw_eq.get("tolerance")
+        if tol_src is not None:
+            args_eq.append(f"tolerance={r_expr_to_fortran(tol_src.strip())}")
+        return f"all_equal({', '.join(args_eq)})"
+
+    s = _replace_balanced_func_calls(s, "all.equal", _all_equal_to_fortran)
+
+    def _log_to_fortran(inner: str) -> str:
+        c_log = parse_call_text("log(" + inner.strip() + ")")
+        if c_log is not None:
+            _nm_log, pos_log, kw_log = c_log
+            src = pos_log[0].strip() if pos_log else kw_log.get("x", "").strip()
+            base_src = kw_log.get("base")
+            if not src:
+                raise NotImplementedError("log requires x argument")
+            inner_f = r_expr_to_fortran(src)
+            if base_src is not None:
+                base_f = r_expr_to_fortran(base_src.strip())
+                return f"(r_log(real({inner_f}, kind=dp)) / log(real({base_f}, kind=dp)))"
+        else:
+            src = inner.strip()
+            inner_f = r_expr_to_fortran(src)
+        if _is_complex_expr_source(src) or _expr_mentions_known_complex(inner_f):
             return f"log({inner_f})"
-        return f"log(real({inner_f}, kind=dp))"
+        return f"r_log(real({inner_f}, kind=dp))"
 
     s = _replace_balanced_func_calls(s, "log", _log_to_fortran)
+    s = _replace_balanced_func_calls(s, "logb", _log_to_fortran)
     c_cospi = parse_call_text(s)
     if c_cospi is not None and c_cospi[0].lower() == "cospi":
         _ncp, pos_cp, kw_cp = c_cospi
@@ -6795,13 +6896,15 @@ def r_expr_to_fortran(expr: str) -> str:
             or _real_vector_constructor_from_mixed_c(data_src.strip())
             or r_expr_to_fortran(data_src)
         )
-        nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
-        if nc_src is None:
-            nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
-        else:
-            nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
         if nr_src is None:
+            nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
             nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
+        else:
+            nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
+            if nc_src is None:
+                nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
+            else:
+                nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
         if data_f.strip().startswith("ieee_value("):
             data_f = f"[{data_f}]"
         elif not (
@@ -8162,6 +8265,7 @@ def emit_stmts(
     object_list_vars: dict[str, str] = {}
     t_test_vars_ctx: set[str] = set()
     qr_vars_ctx: set[str] = set()
+    eigen_vars_ctx: set[str] = set()
     arima_vars_ctx: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
@@ -8236,6 +8340,9 @@ def emit_stmts(
         qrv = helper_ctx.get("qr_vars")
         if isinstance(qrv, set):
             qr_vars_ctx = {str(x) for x in qrv}
+        eigv = helper_ctx.get("eigen_vars")
+        if isinstance(eigv, set):
+            eigen_vars_ctx = {str(x) for x in eigv}
         arv = helper_ctx.get("arima_vars")
         if isinstance(arv, set):
             arima_vars_ctx = {str(x) for x in arv}
@@ -8293,6 +8400,10 @@ def emit_stmts(
             return expr
         _np, posp, kwp = c
         fit_nm = posp[0].strip() if posp else kwp.get("object", "").strip()
+        type_src = kwp.get("type", "").strip()
+        type_val = (_dequote_string_literal(type_src) or type_src).lower()
+        if fit_nm in glm_fits and (not kwp.get("newdata", "").strip()) and type_val == "response":
+            return f"{fit_nm}%fitted"
         newd = kwp.get("newdata", "").strip()
         if not fit_nm or not newd:
             return expr
@@ -10005,6 +10116,10 @@ def emit_stmts(
                         _wstmt(f"call print_qr({one})", st.comment)
                         need_r_mod.update({"print_qr", "qr_fit_t"})
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in eigen_vars_ctx:
+                        _wstmt(f"call print_eigen({one})", st.comment)
+                        need_r_mod.update({"print_eigen", "eigen_result_t"})
+                        continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in arima_vars_ctx:
                         _wstmt(f"call print_arima_fit({one})", st.comment)
                         need_r_mod.update({"print_arima_fit", "arima_fit_t"})
@@ -10718,6 +10833,49 @@ def emit_stmts(
                 o.w(f"do i_wl = 1, size({data_f})")
                 o.push()
                 o.w(f'write(fp, "{write_fmt}") {data_f}(i_wl)')
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end if")
+                o.w("close(fp)")
+                o.pop()
+                o.w("end block")
+                continue
+            if nm == "write":
+                call_text = f"{st.name}(" + ", ".join(st.args) + ")"
+                cinfo = parse_call_text(call_text)
+                if cinfo is None:
+                    raise NotImplementedError("write parse failure")
+                _nmc, pos, kw = cinfo
+                if pos:
+                    data_src = pos[0]
+                elif "x" in kw:
+                    data_src = kw["x"]
+                else:
+                    raise NotImplementedError("write requires first argument x")
+                file_src = kw.get("file", '""')
+                data_f = r_expr_to_fortran(data_src)
+                file_f = r_expr_to_fortran(file_src)
+                ncols_src = kw.get("ncolumns", kw.get("n_cols", "1"))
+                ncols_f = _int_bound_expr(r_expr_to_fortran(ncols_src))
+                o.w("block")
+                o.push()
+                o.w("integer :: fp, i_wr")
+                o.w(f'open(newunit=fp, file={file_f}, status="replace", action="write")')
+                o.w(f"if ({ncols_f} <= 1) then")
+                o.push()
+                o.w(f"do i_wr = 1, size({data_f})")
+                o.push()
+                o.w(f'write(fp, "(g0.17)") {data_f}(i_wr)')
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("else")
+                o.push()
+                o.w(f"do i_wr = 1, size({data_f})")
+                o.push()
+                o.w(f'write(fp, "(g0.17,1x)", advance="no") {data_f}(i_wr)')
+                o.w(f"if (mod(i_wr, {ncols_f}) == 0 .or. i_wr == size({data_f})) write(fp,*)")
                 o.pop()
                 o.w("end do")
                 o.pop()
@@ -13304,6 +13462,12 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                         out.add(st.name)
             if low.startswith("qr.q(") or low.startswith("qr.r(") or low.startswith("qr_q(") or low.startswith("qr_r("):
                 out.add(st.name)
+            if low.startswith("cov(") or low.startswith("cor("):
+                c_cov = parse_call_text(rhs)
+                if c_cov is not None:
+                    cov_arg = c_cov[1][0].strip() if c_cov[1] else c_cov[2].get("x", "").strip()
+                    if cov_arg in out or cov_arg in known_int_matrices:
+                        out.add(st.name)
             if low.startswith("outer("):
                 cinfo_o = parse_call_text(rhs)
                 is_int_outer = False
@@ -14941,6 +15105,7 @@ def transpile_r_to_fortran(
     lm_vars: set[str] = set()
     glm_vars: set[str] = set()
     prcomp_vars: set[str] = set()
+    eigen_vars: set[str] = set()
     arima_vars: set[str] = set()
     qr_vars: set[str] = set()
     t_test_vars: set[str] = set()
@@ -14996,6 +15161,9 @@ def transpile_r_to_fortran(
                 helper_ctx_main["need_lm"] = True
             if c_fit_main is not None and c_fit_main[0].lower() == "prcomp":
                 prcomp_vars.add(st.name)
+            if c_fit_main is not None and c_fit_main[0].lower() == "eigen":
+                eigen_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"eigen", "eigen_result_t"})
             if c_fit_main is not None and c_fit_main[0].lower() == "arima":
                 arima_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"arima_fit_t", "arima_fit"})
@@ -15459,6 +15627,18 @@ def transpile_r_to_fortran(
             real_matrices.discard(nm)
             int_rank3_arrays.discard(nm)
             params.pop(nm, None)
+    if eigen_vars:
+        for nm in eigen_vars:
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            int_matrices.discard(nm)
+            real_matrices.discard(nm)
+            int_rank3_arrays.discard(nm)
+            real_rank3_arrays.discard(nm)
+            real_rank4_arrays.discard(nm)
+            params.pop(nm, None)
     if arima_vars:
         for nm in arima_vars:
             ints.discard(nm)
@@ -15594,6 +15774,9 @@ def transpile_r_to_fortran(
     if prcomp_vars:
         for nm in sorted(prcomp_vars):
             pbody.w(f"type(prcomp_fit_t) :: {nm}")
+    if eigen_vars:
+        for nm in sorted(eigen_vars):
+            pbody.w(f"type(eigen_result_t) :: {nm}")
     if arima_vars:
         for nm in sorted(arima_vars):
             pbody.w(f"type(arima_fit_t) :: {nm}")
@@ -15609,6 +15792,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["t_test_vars"] = set(t_test_vars)
     if qr_vars:
         helper_ctx_main["qr_vars"] = set(qr_vars)
+    if eigen_vars:
+        helper_ctx_main["eigen_vars"] = set(eigen_vars)
     if arima_vars:
         helper_ctx_main["arima_vars"] = set(arima_vars)
     pbody.w("")
@@ -16901,6 +17086,9 @@ def transpile_r_to_fortran(
         "apply_col_sd",
         "cov",
         "cor",
+        "scale",
+        "all_equal",
+        "r_log",
         "r_seq_int",
         "r_seq_len",
         "r_seq_int_by",
@@ -16970,6 +17158,8 @@ def transpile_r_to_fortran(
         "print_glm_summary",
         "prcomp",
         "print_prcomp_summary",
+        "eigen",
+        "print_eigen",
         "arima_sim",
         "arima_fit",
         "arima_predict",
@@ -16992,6 +17182,7 @@ def transpile_r_to_fortran(
         "lm_fit_t",
         "glm_fit_t",
         "prcomp_fit_t",
+        "eigen_result_t",
         "arima_fit_t",
         "qr_fit_t",
         "optim_result_t",
@@ -17095,6 +17286,10 @@ def transpile_r_to_fortran(
         mod_needed.add("prcomp_fit_t")
     if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("prcomp_fit_t")
+    if re.search(r"\btype\s*\(\s*eigen_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("eigen_result_t")
+    if re.search(r"\btype\s*\(\s*eigen_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("eigen_result_t")
     if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("arima_fit_t")
     if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", main_text_now, re.IGNORECASE):
