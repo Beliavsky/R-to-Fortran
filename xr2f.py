@@ -10474,6 +10474,9 @@ def emit_stmts(
                         or _split_top_level_token(one, "%*%", from_right=True) is not None
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in int_vector_vars:
+                            _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                            continue
                         if has_r_mod:
                             m_char_subset_print = re.match(r"^([A-Za-z]\w*)\s*\[.+\]$", one.strip())
                             if (
