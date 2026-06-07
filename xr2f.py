@@ -2982,7 +2982,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|apply|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3400,6 +3400,19 @@ def classify_vars(
                 elif any(re.search(rf"\b{re.escape(a)}\b", rhs) for a in (known_arrays | int_arrays | real_arrays)):
                     # Array references can still yield scalar results via reductions/indexing.
                     if st.name in known_arrays or st.name in real_arrays or st.name in int_arrays:
+                        real_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
+                    elif _infer_assignment_rank_hint(
+                        rhs,
+                        {
+                            **{n: 1 for n in known_arrays | int_arrays | real_arrays},
+                            **{n.lower(): 1 for n in known_arrays | int_arrays | real_arrays},
+                        },
+                    ) >= 1:
                         real_arrays.add(st.name)
                         known_arrays.add(st.name)
                         params.pop(st.name, None)
@@ -3985,6 +3998,8 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         m_exp_rhs = re.match(rf"^\s*{nm}\s*<-\s*exp\s*\((.*)\)\s*$", t, re.IGNORECASE)
         if m_exp_rhs is not None:
             inner = fscan.strip_redundant_outer_parens_expr(m_exp_rhs.group(1).strip())
+            if re.match(r"^[A-Za-z]\w*$", inner) and _has_rank2_evidence(inner):
+                return 2
             for op in ["+", "-", "*", "/"]:
                 mm = _split_top_level_token(inner, op, from_right=True)
                 if mm is None:
@@ -4569,6 +4584,28 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
                 return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks) if b_src is not None else 1
             if fn_name in {"as.integer", "as.numeric", "as.double"}:
+                return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
+            if fn_name in {
+                "abs",
+                "acos",
+                "asin",
+                "atan",
+                "cos",
+                "cosh",
+                "exp",
+                "expm1",
+                "floor",
+                "log",
+                "log10",
+                "log1p",
+                "round",
+                "sign",
+                "sin",
+                "sinh",
+                "sqrt",
+                "tan",
+                "tanh",
+            }:
                 return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
             if fn_name in {
                 "coef",
@@ -6352,6 +6389,10 @@ def r_expr_to_fortran(expr: str) -> str:
                         return True
                     if rs.startswith("r_matmul") or rs.startswith("reshape(") or rs.startswith("transpose("):
                         return True
+                if "apply_col_cumsum(" in r_expr_to_fortran(raw_row):
+                    return True
+                if _infer_assignment_rank_hint(raw_row, {}) >= 2:
+                    return True
                 return False
 
             if any(_row_is_matrix_expr(a) for a in c_rb[1]):
@@ -7560,8 +7601,18 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"sum(exp({a_f} - spread({b_f}, dim=1, ncopies=size({a_f},1))), dim=1)"
         return f"sum({inner}, dim=1)"
 
+    def _rowmeans_to_fortran(inner: str) -> str:
+        x_f = r_expr_to_fortran(inner.strip())
+        return f"(sum({x_f}, dim=2)/real(size({x_f}, 2), kind=dp))"
+
+    def _colmeans_to_fortran(inner: str) -> str:
+        x_f = r_expr_to_fortran(inner.strip())
+        return f"(sum({x_f}, dim=1)/real(size({x_f}, 1), kind=dp))"
+
     s = _replace_balanced_func_calls(s, "rowSums", _rowsums_to_fortran)
     s = _replace_balanced_func_calls(s, "colSums", _colsums_to_fortran)
+    s = _replace_balanced_func_calls(s, "rowMeans", _rowmeans_to_fortran)
+    s = _replace_balanced_func_calls(s, "colMeans", _colmeans_to_fortran)
     def _max_to_fortran(inner: str) -> str:
         parts, na_rm = _split_reduction_arg_list(inner)
         if len(parts) <= 1:
@@ -12129,7 +12180,7 @@ def emit_function(
                     real_scalars.discard(target)
                     params.pop(target, None)
                     return True
-                if cn_expr in {"c", "numeric", "as.numeric", "coef", "fitted", "residuals", "colmeans", "rowsums", "colsums"}:
+                if cn_expr in {"c", "numeric", "as.numeric", "coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums"}:
                     real_arrays.add(target)
                     known_arrays.add(target)
                     ints.discard(target)
@@ -14686,7 +14737,11 @@ def transpile_r_to_fortran(
         main_name_map[nm.lower()] = nm
     promoted_l: set[str] = set()
     for fn in funcs:
-        for nm_l in _infer_function_free_names(fn):
+        free_names_l = _infer_function_free_names(fn)
+        spec_free = list_specs.get(fn.name)
+        if spec_free is not None:
+            free_names_l -= {str(k).lower() for k in spec_free.root_fields}
+        for nm_l in free_names_l:
             if nm_l in main_name_map:
                 promoted_l.add(nm_l)
     promoted_names: set[str] = {main_name_map[nm_l] for nm_l in promoted_l}
@@ -15202,6 +15257,42 @@ def transpile_r_to_fortran(
         for st_alias in ss_alias:
             if isinstance(st_alias, Assign):
                 rhs_alias = st_alias.expr.strip()
+                m_alias_full = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*$", rhs_alias)
+                if m_alias_full is not None:
+                    base_alias, fld_alias = m_alias_full.group(1), m_alias_full.group(2)
+                    spec_alias = _list_spec_from_type_name(list_vars.get(base_alias, ""))
+                    expr_alias = spec_alias.root_fields.get(fld_alias) if spec_alias is not None else None
+                    if isinstance(expr_alias, str):
+                        fn_obj_alias = next((f_obj for f_obj in funcs if f_obj.name == spec_alias.fn_name), None) if spec_alias is not None else None
+                        fn_body_alias = (
+                            (fn_obj_alias.body[:-1] if isinstance(fn_obj_alias.body[-1], ExprStmt) else fn_obj_alias.body)
+                            if fn_obj_alias is not None and fn_obj_alias.body
+                            else []
+                        )
+                        expr_rank_alias = (
+                            _infer_local_array_rank(fn_body_alias, expr_alias.strip())
+                            if re.match(r"^[A-Za-z]\w*$", expr_alias.strip())
+                            else _infer_assignment_rank_hint(expr_alias, {})
+                        )
+                        if expr_rank_alias >= 2:
+                            real_matrices.add(st_alias.name)
+                            ints.discard(st_alias.name)
+                            int_arrays.discard(st_alias.name)
+                            real_arrays.discard(st_alias.name)
+                            real_scalars.discard(st_alias.name)
+                            params.pop(st_alias.name, None)
+                            continue
+                        if expr_rank_alias == 1:
+                            real_arrays.add(st_alias.name)
+                            int_arrays.discard(st_alias.name)
+                            real_scalars.discard(st_alias.name)
+                            int_matrices.discard(st_alias.name)
+                            real_matrices.discard(st_alias.name)
+                            int_rank3_arrays.discard(st_alias.name)
+                            real_rank3_arrays.discard(st_alias.name)
+                            real_rank4_arrays.discard(st_alias.name)
+                            params.pop(st_alias.name, None)
+                            continue
                 m_alias = re.match(r"^[A-Za-z]\w*\$([A-Za-z]\w*)\s*$", rhs_alias)
                 if m_alias is None:
                     continue
@@ -17100,7 +17191,7 @@ def transpile_r_to_fortran(
                 return f"real(kind=dp), allocatable :: {k}(:)"
             if cn_l in {"r_matmul", "crossprod", "tcrossprod", "t", "matrix", "array", "cbind", "cbind2"}:
                 return f"real(kind=dp), allocatable :: {k}(:,:)"
-            if cn_l in {"coef", "fitted", "residuals", "colmeans", "rowsums", "colsums", "numeric", "r_rep_real"}:
+            if cn_l in {"coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums", "numeric", "r_rep_real"}:
                 return f"real(kind=dp), allocatable :: {k}(:)"
             if cn_l == "as.numeric":
                 return f"real(kind=dp), allocatable :: {k}(:)"
