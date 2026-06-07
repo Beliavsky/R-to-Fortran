@@ -3027,6 +3027,38 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif cinfo is not None and cinfo[0].lower() == "replace":
+                    vals_replace = list(cinfo[1]) + list(cinfo[2].values())
+                    x_replace = vals_replace[0].strip() if vals_replace else ""
+                    values_replace = vals_replace[2].strip() if len(vals_replace) >= 3 else ""
+                    c_values_replace = parse_call_text(values_replace)
+                    values_replace_integer = (
+                        _is_int_literal(values_replace)
+                        or (
+                            c_values_replace is not None
+                            and c_values_replace[0].lower() == "c"
+                            and c_values_replace[1]
+                            and not c_values_replace[2]
+                            and all(
+                                re.fullmatch(r"[+-]?\d+[lL]", _strip_named_actual_value(v).strip())
+                                for v in c_values_replace[1]
+                            )
+                        )
+                    )
+                    if x_replace in int_arrays and values_replace_integer:
+                        int_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        real_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
+                    else:
+                        real_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
                 elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -4632,7 +4664,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
-            if fn_name in {"is.element", "is_element", "r_in", "unique", "duplicated", "union", "intersect", "setdiff"}:
+            if fn_name in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if fn_name in {"anyduplicated", "anyDuplicated".lower(), "setequal"}:
                 return 0
@@ -4736,11 +4768,19 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
     expr_l = expr.lower()
     if expr_l.startswith(("+", "-")) and len(expr_l) > 1 and expr_l[1].isalnum():
         return _infer_assignment_kind_hint(expr[1:].strip(), inferred_kinds)
+    if _split_top_level_colon(expr) is not None:
+        return "integer"
     if _contains_r_complex_literal(expr):
         return "complex"
     c_call = parse_call_text(expr)
     if c_call is not None:
         nm = c_call[0].lower()
+        if nm == "c":
+            vals_kind = list(c_call[1]) + list(c_call[2].values())
+            if vals_kind and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_kind):
+                return "logical"
+            if vals_kind and all(re.fullmatch(r"[+-]?\d+[lL]", _strip_named_actual_value(v).strip()) for v in vals_kind):
+                return "integer"
         if nm in {"re", "im", "mod", "arg", "abs"}:
             return "real"
         vals = list(c_call[1]) + list(c_call[2].values())
@@ -4753,6 +4793,20 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
             if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals[:2]):
                 return "complex"
             return "real"
+        if nm == "replace" and vals:
+            x_kind = _infer_assignment_kind_hint(vals[0], inferred_kinds)
+            value_kind = _infer_assignment_kind_hint(vals[2], inferred_kinds) if len(vals) >= 3 else "unknown"
+            if "character" in {x_kind, value_kind}:
+                return "character"
+            if "complex" in {x_kind, value_kind}:
+                return "complex"
+            if x_kind == "logical" and value_kind in {"logical", "unknown"}:
+                return "logical"
+            if "real" in {x_kind, value_kind}:
+                return "real"
+            if x_kind == "integer" and value_kind in {"integer", "unknown"}:
+                return "integer"
+            return x_kind if x_kind != "unknown" else value_kind
         if nm in {"matrix", "array", "c", "as.vector", "as.numeric", "as.double", "t"} and vals:
             if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals):
                 return "complex"
@@ -6066,6 +6120,50 @@ def r_expr_to_fortran(expr: str) -> str:
         if not x_src or not table_src:
             raise NotImplementedError("is.element requires x and table arguments")
         return f"r_in({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(table_src)})"
+    if c_usr is not None and c_usr[0].lower() == "which":
+        mask_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
+        if not mask_src:
+            raise NotImplementedError("which requires x argument")
+        return f"which({r_expr_to_fortran(mask_src)})"
+    if c_usr is not None and c_usr[0].lower() == "replace":
+        _nm_rep, pos_rep, kw_rep = c_usr
+        x_src = pos_rep[0] if pos_rep else kw_rep.get("x", "")
+        list_src = pos_rep[1] if len(pos_rep) >= 2 else kw_rep.get("list", "")
+        values_src = pos_rep[2] if len(pos_rep) >= 3 else kw_rep.get("values", "")
+        if not x_src or not list_src or not values_src:
+            raise NotImplementedError("replace requires x, list, and values arguments")
+        x_f = r_expr_to_fortran(x_src)
+        list_t = fscan.strip_redundant_outer_parens_expr(list_src.strip())
+        list_l = list_t.lower()
+        list_f_raw = r_expr_to_fortran(list_t)
+        if (
+            list_l in _KNOWN_LOGICAL_VECTOR_NAMES
+            or re.match(r"^(?:is\.na|is_na|is\.nan|duplicated)\s*\(", list_l)
+            or list_l.startswith("!")
+            or any(_split_top_level_token(list_t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"])
+        ):
+            list_f = list_f_raw
+        else:
+            if _is_int_literal(list_t) or _is_real_literal(list_t):
+                list_f = f"[{_int_bound_expr(list_f_raw)}]"
+            else:
+                list_f = f"int({list_f_raw})"
+        values_f = r_expr_to_fortran(values_src)
+        c_values_src = parse_call_text(values_src.strip())
+        if c_values_src is not None and c_values_src[0].lower() == "c" and c_values_src[1] and not c_values_src[2]:
+            vals_values_src = [_strip_named_actual_value(p).strip() for p in c_values_src[1]]
+            if vals_values_src and all(re.fullmatch(r"[+-]?\d+[lL]", v) for v in vals_values_src):
+                values_f = "[" + ", ".join(re.sub(r"[lL]$", "", v) for v in vals_values_src) + "]"
+        extra_replace_args: list[str] = []
+        values_lit = _dequote_string_literal(values_src.strip())
+        if x_src.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES and values_lit is not None:
+            values_f = f'[character(len={max(1, len(values_lit))}) :: "{values_lit.replace(chr(34), chr(34) + chr(34))}"]'
+            extra_replace_args.append(f"value_len={max(1, len(values_lit))}")
+        if _is_int_literal(values_src.strip()) and not re.match(r"^[A-Za-z]\w*$", x_src.strip()):
+            values_f = f"real({values_f}, kind=dp)"
+        elif _is_int_literal(values_src.strip()) and x_src.strip().lower() in _KNOWN_VECTOR_NAMES:
+            values_f = f"real({values_f}, kind=dp)"
+        return f"replace({', '.join([x_f, list_f, values_f] + extra_replace_args)})"
     if c_usr is not None and c_usr[0].lower() == "cor" and len(c_usr[1]) == 1 and not c_usr[2]:
         df_src = c_usr[1][0].strip()
         if re.fullmatch(r"[A-Za-z]\w*", df_src):
@@ -6247,6 +6345,18 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"{lhs} {op_f} {rhs}"
             lhs = r_expr_to_fortran(lhs_src)
             rhs = r_expr_to_fortran(rhs_src)
+            lhs_logical = (
+                lhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or lhs.strip() in {".true.", ".false."}
+                or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", lhs.strip(), re.IGNORECASE) is not None
+            )
+            rhs_logical = (
+                rhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or rhs.strip() in {".true.", ".false."}
+                or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", rhs.strip(), re.IGNORECASE) is not None
+            )
+            if (lhs_logical or rhs_logical) and op_r in {"==", "!="}:
+                return f"{lhs} {'.eqv.' if op_r == '==' else '.neqv.'} {rhs}"
             return f"{lhs} {op_f} {rhs}"
     mm_mod = _split_top_level_token(s, "%%", from_right=True)
     if mm_mod is not None:
@@ -7655,6 +7765,7 @@ def r_expr_to_fortran(expr: str) -> str:
         lambda inner: split_top_level_commas(inner.strip())[0].strip() if split_top_level_commas(inner.strip()) else inner.strip(),
     )
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
+    s = _replace_balanced_func_calls(s, "is.nan", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(
         s,
         "complete.cases",
@@ -8700,7 +8811,7 @@ def emit_stmts(
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
-            if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "union", "intersect", "setdiff"}:
+            if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c in {"anyduplicated", "setequal"}:
                 return 0
@@ -9774,6 +9885,10 @@ def emit_stmts(
                     lhs_b = f"spread({lhs_fv}, dim=2, ncopies=size({rhs_fm},2))"
                     rhs_f = f"{lhs_b} {op} {rhs_fm}"
                     break
+            m_lhs_obj_index = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+)\s*\]\]$", st.name)
+            if m_lhs_obj_index is not None and m_lhs_obj_index.group(1) not in object_list_vars:
+                _wstmt(f"{r_expr_to_fortran(st.name)} = {rhs_f}", st.comment)
+                continue
             m_lhs_mask = re.match(r"^([A-Za-z]\w*)\s*\[\s*(.+)\s*\]$", st.name)
             if m_lhs_mask is not None:
                 base_lhs = m_lhs_mask.group(1)
@@ -9788,6 +9903,12 @@ def emit_stmts(
                     ):
                         mask_f = r_expr_to_fortran(inner_lhs)
                         _wstmt(f"where ({mask_f}) {base_lhs} = {rhs_f}", st.comment)
+                        continue
+                    if _index_assignment_needs_replace(inner_lhs):
+                        idx_raw = r_expr_to_fortran(inner_lhs)
+                        idx_f = f"[{_int_bound_expr(idx_raw)}]" if (_is_int_literal(inner_lhs) or _is_real_literal(inner_lhs)) else f"int({idx_raw})"
+                        _wstmt(f"{base_lhs} = replace({base_lhs}, {idx_f}, {rhs_f})", st.comment)
+                        need_r_mod.add("replace")
                         continue
             if rhs_f == st.name:
                 # identity cast/normalization (e.g. x <- as.numeric(x))
@@ -10595,6 +10716,22 @@ def emit_stmts(
                                 need_r_mod.add("print_char_vector")
                                 continue
                             c_set_print = parse_call_text(one.strip())
+                            if c_set_print is not None and c_set_print[0].lower() == "replace":
+                                rep_args = list(c_set_print[1]) + list(c_set_print[2].values())
+                                src_arg = rep_args[0].strip() if rep_args else ""
+                                if src_arg in int_vector_vars:
+                                    _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                                    continue
+                                if src_arg.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                                    _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                    need_r_mod.add("print_char_vector")
+                                    continue
+                                if src_arg in logical_vector_vars or src_arg.lower() in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                    _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                                    continue
+                                _wstmt(f"call print_real_vector({one_f})", st.comment)
+                                need_r_mod.add("print_real_vector")
+                                continue
                             if c_set_print is not None and c_set_print[0].lower() == "unique":
                                 set_args = list(c_set_print[1]) + list(c_set_print[2].values())
                                 src_arg = set_args[0].strip() if set_args else ""
@@ -11314,6 +11451,9 @@ def emit_stmts(
                     idx_obj = _int_bound_expr(r_expr_to_fortran(m_obj_list_lhs.group(2).strip()))
                     _wstmt(f"{m_obj_list_lhs.group(1)}({idx_obj}) = {rhs}", st.comment)
                     continue
+                if m_obj_list_lhs is not None:
+                    _wstmt(f"{r_expr_to_fortran(lhs_src)} = {rhs}", st.comment)
+                    continue
                 m_lhs_mask = re.match(r"^([A-Za-z]\w*)\s*\[\s*(.+)\s*\]$", lhs_src)
                 if m_lhs_mask is not None:
                     base_lhs = m_lhs_mask.group(1)
@@ -11328,6 +11468,12 @@ def emit_stmts(
                         ):
                             mask_f = r_expr_to_fortran(inner_lhs)
                             _wstmt(f"where ({mask_f}) {base_lhs} = {rhs}", st.comment)
+                            continue
+                        if _index_assignment_needs_replace(inner_lhs):
+                            idx_raw = r_expr_to_fortran(inner_lhs)
+                            idx_f = f"[{_int_bound_expr(idx_raw)}]" if (_is_int_literal(inner_lhs) or _is_real_literal(inner_lhs)) else f"int({idx_raw})"
+                            _wstmt(f"{base_lhs} = replace({base_lhs}, {idx_f}, {rhs})", st.comment)
+                            need_r_mod.add("replace")
                             continue
                 lhs = _named_subscript_lhs_to_fortran(lhs_src) or r_expr_to_fortran(lhs_src)
                 m_row_assign = re.match(r"^([A-Za-z]\w*)\s*\[\s*([^,\]]+)\s*,\s*\]\s*$", lhs_src)
@@ -11364,10 +11510,14 @@ def emit_stmts(
                         if t_vpk in real_vector_vars or t_vpk.lower() in _KNOWN_VECTOR_NAMES:
                             return "real"
                     c_vpk = parse_call_text(t_vpk)
-                    if c_vpk is not None and c_vpk[0].lower() in {"unique", "sort"}:
+                    if c_vpk is not None and c_vpk[0].lower() in {"unique", "sort", "replace"}:
                         arg_vpk = c_vpk[1][0].strip() if c_vpk[1] else c_vpk[2].get("x", "").strip()
                         if arg_vpk:
                             return _vector_print_kind_from_expr(arg_vpk)
+                    if c_vpk is not None and c_vpk[0].lower() in {"duplicated", "r_in"}:
+                        return "logical"
+                    if c_vpk is not None and c_vpk[0].lower() == "which":
+                        return "integer"
                     return "real"
 
                 expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
@@ -17346,6 +17496,8 @@ def transpile_r_to_fortran(
         "polyroot",
         "nchar",
         "is_na",
+        "which",
+        "replace",
         "r_typeof",
         "r_character",
         "rank_average",
@@ -18432,6 +18584,41 @@ def protect_rep_helper_calls(lines: list[str], *, restore: bool = False) -> list
     return out
 
 
+def _index_assignment_needs_replace(inner: str) -> bool:
+    s = inner.strip()
+    sl = s.lower()
+    if len(split_top_level_commas(s)) > 1:
+        return True
+    if re.match(r"^c\s*\(", sl):
+        return True
+    if re.match(r"^which\s*\(", sl):
+        return True
+    return False
+
+
+def rewrite_vector_bracket_assignment_with_replace(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    changed = False
+    pat = re.compile(r"^(\s*)([A-Za-z]\w*)\s*\[\[\s*(.+?)\s*\]\]\s*=\s*(.+)$")
+    for ln in lines:
+        m = pat.match(ln)
+        if m is None:
+            out.append(ln)
+            continue
+        indent, name, inner, rhs = m.group(1), m.group(2), m.group(3).strip(), m.group(4).strip()
+        idx = f"int({inner})" if inner.startswith("[") and inner.endswith("]") else f"int([{inner}])"
+        out.append(f"{indent}{name} = replace({name}, {idx}, {rhs})")
+        changed = True
+    if not changed:
+        return out
+    for i, ln in enumerate(out):
+        if re.match(r"^\s*use\s+r_mod\s*,\s*only\s*:", ln, re.IGNORECASE):
+            if not re.search(r"\breplace\b", ln):
+                out[i] = ln.rstrip() + ", replace"
+            break
+    return out
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -19433,6 +19620,7 @@ def main() -> int:
     f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
     f90_lines = fpost.fold_simple_integer_intrinsics(f90_lines)
+    f90_lines = rewrite_vector_bracket_assignment_with_replace(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
