@@ -3015,7 +3015,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -4198,7 +4198,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
         return False
-    if re.search(r"\bread\.[a-z]+\s*\(", t, re.IGNORECASE):
+    if re.search(r"\b(?:scan|read\.[a-z]+)\s*\(", t, re.IGNORECASE):
         return False
     if re.search(r"\b(?:sample|sample\.int|runif|rnorm|rexp|rbinom|rpois)\s*\(", t, re.IGNORECASE):
         return False
@@ -4607,6 +4607,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "digamma",
                 "trigamma",
             }:
+                return 1
+            if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
             if fn_name == "solve":
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
@@ -5906,6 +5908,36 @@ def r_expr_to_fortran(expr: str) -> str:
             f"{_int_bound_expr(r_expr_to_fortran(size_src or '1'))}, "
             f"{r_expr_to_fortran(prob_src or '0.5')})"
         )
+    c_arima_sim0 = parse_call_text(s)
+    if c_arima_sim0 is not None and c_arima_sim0[0].lower() in {"arima.sim", "arima_sim"}:
+        _nm_asim, pos_asim, kw_asim = c_arima_sim0
+        model_src = kw_asim.get("model", pos_asim[0] if pos_asim else "")
+        n_src = kw_asim.get("n", pos_asim[1] if len(pos_asim) >= 2 else "0")
+        ar_src = "0.0"
+        ma_src = "0.0"
+        c_model = parse_call_text(model_src.strip())
+        if c_model is not None and c_model[0].lower() == "list":
+            ar_src = c_model[2].get("ar", ar_src)
+            ma_src = c_model[2].get("ma", ma_src)
+        return f"arima_sim({r_expr_to_fortran(ar_src)}, {r_expr_to_fortran(ma_src)}, {_int_bound_expr(r_expr_to_fortran(n_src))})"
+    c_arima0 = parse_call_text(s)
+    if c_arima0 is not None and c_arima0[0].lower() == "arima":
+        _nm_ar, pos_ar, kw_ar = c_arima0
+        x_src = pos_ar[0] if pos_ar else kw_ar.get("x", "")
+        order_src = kw_ar.get("order", pos_ar[1] if len(pos_ar) >= 2 else "c(0,0,0)")
+        order_f = _strict_int_vector_literal_from_c(order_src.strip()) or f"int({r_expr_to_fortran(order_src)})"
+        include_src = kw_ar.get("include.mean", kw_ar.get("include_mean", ".true."))
+        return f"arima_fit({r_expr_to_fortran(x_src)}, {order_f}, include_mean={r_expr_to_fortran(include_src)})"
+    c_aic0 = parse_call_text(s)
+    if c_aic0 is not None and c_aic0[0].lower() == "aic":
+        fit_src = c_aic0[1][0] if c_aic0[1] else ""
+        return f"{r_expr_to_fortran(fit_src)}%aic"
+    c_predict0 = parse_call_text(s)
+    if c_predict0 is not None and c_predict0[0].lower() == "predict":
+        _nm_pr, pos_pr, kw_pr = c_predict0
+        fit_src = pos_pr[0] if pos_pr else kw_pr.get("object", "")
+        n_src = kw_pr.get("n.ahead", kw_pr.get("n_ahead", pos_pr[1] if len(pos_pr) >= 2 else "1"))
+        return f"arima_predict({r_expr_to_fortran(fit_src)}, {_int_bound_expr(r_expr_to_fortran(n_src))})"
     c_rpois0 = parse_call_text(s)
     if c_rpois0 is not None and c_rpois0[0].lower() == "rpois":
         _nm_rp0, pos_rp0, kw_rp0 = c_rpois0
@@ -8130,6 +8162,7 @@ def emit_stmts(
     object_list_vars: dict[str, str] = {}
     t_test_vars_ctx: set[str] = set()
     qr_vars_ctx: set[str] = set()
+    arima_vars_ctx: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -8203,6 +8236,9 @@ def emit_stmts(
         qrv = helper_ctx.get("qr_vars")
         if isinstance(qrv, set):
             qr_vars_ctx = {str(x) for x in qrv}
+        arv = helper_ctx.get("arima_vars")
+        if isinstance(arv, set):
+            arima_vars_ctx = {str(x) for x in arv}
     if not matrix_vars:
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
@@ -9968,6 +10004,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in qr_vars_ctx:
                         _wstmt(f"call print_qr({one})", st.comment)
                         need_r_mod.update({"print_qr", "qr_fit_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in arima_vars_ctx:
+                        _wstmt(f"call print_arima_fit({one})", st.comment)
+                        need_r_mod.update({"print_arima_fit", "arima_fit_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in _EXPANDED_DATA_FRAME_FIELDS:
                         fields_df = _EXPANDED_DATA_FRAME_FIELDS.get(one, [])
@@ -14901,6 +14941,7 @@ def transpile_r_to_fortran(
     lm_vars: set[str] = set()
     glm_vars: set[str] = set()
     prcomp_vars: set[str] = set()
+    arima_vars: set[str] = set()
     qr_vars: set[str] = set()
     t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
@@ -14955,6 +14996,9 @@ def transpile_r_to_fortran(
                 helper_ctx_main["need_lm"] = True
             if c_fit_main is not None and c_fit_main[0].lower() == "prcomp":
                 prcomp_vars.add(st.name)
+            if c_fit_main is not None and c_fit_main[0].lower() == "arima":
+                arima_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"arima_fit_t", "arima_fit"})
             if c_fit_main is not None and c_fit_main[0].lower() == "qr":
                 qr_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
@@ -15148,6 +15192,17 @@ def transpile_r_to_fortran(
         real_arrays.discard(nm)
         params.pop(nm, None)
     for nm in qr_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in arima_vars:
         ints.discard(nm)
         real_scalars.discard(nm)
         int_arrays.discard(nm)
@@ -15404,6 +15459,16 @@ def transpile_r_to_fortran(
             real_matrices.discard(nm)
             int_rank3_arrays.discard(nm)
             params.pop(nm, None)
+    if arima_vars:
+        for nm in arima_vars:
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            int_matrices.discard(nm)
+            real_matrices.discard(nm)
+            int_rank3_arrays.discard(nm)
+            params.pop(nm, None)
     if qr_vars:
         for nm in qr_vars:
             ints.discard(nm)
@@ -15529,6 +15594,9 @@ def transpile_r_to_fortran(
     if prcomp_vars:
         for nm in sorted(prcomp_vars):
             pbody.w(f"type(prcomp_fit_t) :: {nm}")
+    if arima_vars:
+        for nm in sorted(arima_vars):
+            pbody.w(f"type(arima_fit_t) :: {nm}")
     if qr_vars:
         for nm in sorted(qr_vars):
             pbody.w(f"type(qr_fit_t) :: {nm}")
@@ -15541,6 +15609,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["t_test_vars"] = set(t_test_vars)
     if qr_vars:
         helper_ctx_main["qr_vars"] = set(qr_vars)
+    if arima_vars:
+        helper_ctx_main["arima_vars"] = set(arima_vars)
     pbody.w("")
     if ("r_mod" in helper_modules) and (not int_like_print):
         pbody.w("call set_print_int_like(.false.)")
@@ -16900,6 +16970,10 @@ def transpile_r_to_fortran(
         "print_glm_summary",
         "prcomp",
         "print_prcomp_summary",
+        "arima_sim",
+        "arima_fit",
+        "arima_predict",
+        "print_arima_fit",
         "qr",
         "qr_Q",
         "qr_R",
@@ -16918,6 +16992,7 @@ def transpile_r_to_fortran(
         "lm_fit_t",
         "glm_fit_t",
         "prcomp_fit_t",
+        "arima_fit_t",
         "qr_fit_t",
         "optim_result_t",
         "t_test_result_t",
@@ -17020,6 +17095,10 @@ def transpile_r_to_fortran(
         mod_needed.add("prcomp_fit_t")
     if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("prcomp_fit_t")
+    if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("arima_fit_t")
+    if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("arima_fit_t")
     if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("qr_fit_t")
     if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", main_text_now, re.IGNORECASE):
@@ -18782,6 +18861,7 @@ def main() -> int:
         out_path = (Path(args.out_dir) / f"{in_path.stem}_r.f90") if args.out_dir else in_path.with_name(f"{in_path.stem}_r.f90")
     out_path = out_path.resolve()
     artifact_dir = Path(args.out_dir).resolve() if args.out_dir else out_path.parent.resolve()
+    run_cwd = Path.cwd().resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     annotate_r_path: Path | None = None
     if args.annotate_r is not None:
@@ -18812,7 +18892,7 @@ def main() -> int:
     if args.time_both or args.run_both:
         cmd = [args.rscript, str(in_path.resolve())]
         t0 = time.perf_counter() if args.time_both else None
-        r_run = _run_capture(cmd, cwd=in_path.parent.resolve())
+        r_run = _run_capture(cmd, cwd=run_cwd)
         if args.time_both:
             timings["r_run"] = time.perf_counter() - t0
         print("Run (r):", " ".join(cmd))
@@ -19084,7 +19164,7 @@ def main() -> int:
 
                 if args.run:
                     t0 = time.perf_counter()
-                    frun = _run_capture([str(exe.resolve())], cwd=artifact_dir)
+                    frun = _run_capture([str(exe.resolve())], cwd=run_cwd)
                     timings["fortran_run"] = time.perf_counter() - t0
                     if frun.returncode != 0:
                         print(f"Run: FAIL (exit {frun.returncode})")
@@ -19125,7 +19205,7 @@ def main() -> int:
 
         if args.run:
             t0 = time.perf_counter()
-            frun = _run_capture([str(exe.resolve())], cwd=artifact_dir)
+            frun = _run_capture([str(exe.resolve())], cwd=run_cwd)
             timings["fortran_run"] = time.perf_counter() - t0
             if frun.returncode != 0:
                 print(f"Run: FAIL (exit {frun.returncode})")
