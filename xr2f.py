@@ -3059,7 +3059,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -4244,7 +4244,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^rle\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^acf\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
     if re.search(r"\b(?:scan|read\.[a-z]+)\s*\(", t, re.IGNORECASE):
         return False
@@ -4673,11 +4673,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "psigamma",
                 "digamma",
                 "trigamma",
+                "armaacf",
             }:
                 return 1
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
-            if fn_name == "acf":
+            if fn_name in {"acf", "pacf", "ccf"}:
                 return 0
             if fn_name in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
@@ -4699,6 +4700,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks) if b_src is not None else 1
             if fn_name in {"as.integer", "as.numeric", "as.double"}:
                 return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
+            if fn_name == "as.vector":
+                return 1
             if fn_name in {
                 "abs",
                 "acos",
@@ -4773,6 +4776,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 3
     if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*lag$", expr_l):
         return 1
+    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:ar|aic)$", expr_l):
+        return 1
+    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:order|var\.pred)$", expr_l):
+        return 0
     if re.match(r"^[A-Za-z]\w*\s*%\s*(?:lengths|values)$", expr_l):
         return 1
 
@@ -5801,6 +5808,16 @@ def r_expr_to_fortran(expr: str) -> str:
     m_df_resid = re.match(r"^([A-Za-z]\w*)\s*\$\s*df\.residual\s*$", s, re.IGNORECASE)
     if m_df_resid is not None:
         return f"{r_expr_to_fortran(m_df_resid.group(1))}%df"
+    m_var_pred = re.match(r"^([A-Za-z]\w*)\s*\$\s*var\.pred\s*$", s, re.IGNORECASE)
+    if m_var_pred is not None:
+        return f"{r_expr_to_fortran(m_var_pred.group(1))}%var_pred"
+    m_order_field = re.match(r"^([A-Za-z]\w*)\s*\$\s*order\s*$", s, re.IGNORECASE)
+    if m_order_field is not None:
+        return f"real({r_expr_to_fortran(m_order_field.group(1))}%order, kind=dp)"
+    m_asnum_loglik = re.match(r"^as\.numeric\s*\(\s*logLik\s*\((.*)\)\s*\)\s*$", s, re.IGNORECASE)
+    if m_asnum_loglik is not None:
+        fit_src = m_asnum_loglik.group(1).strip()
+        return f"(-0.5_dp * {r_expr_to_fortran(fit_src)}%aic)"
     m_coef_named = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
     if m_coef_named is not None:
         fit_nm = m_coef_named.group(1)
@@ -5873,6 +5890,10 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_pre is not None:
         nm_pre = c_pre[0].lower()
         pos_pre = c_pre[1]
+        if nm_pre == "class":
+            return '"acf"'
+        if nm_pre == "names":
+            return '"acf type n.used lag series snames"'
         if nm_pre in {"besselj", "bessely", "besseli", "besselk"}:
             if len(pos_pre) < 2:
                 raise NotImplementedError(f"{c_pre[0]} requires x and nu arguments")
@@ -5900,10 +5921,20 @@ def r_expr_to_fortran(expr: str) -> str:
                     args.append(f"spread({af}, dim=1, ncopies=size({ref_f}))")
                 else:
                     args.append(af)
+            if any(re.search(r"_dp\b|real\s*\(|anint\s*\(|r_acf_values|ARMAacf", a, re.IGNORECASE) for a in args):
+                args = [f"real({a}, kind=dp)" if re.match(r"^(?:r_seq_int|r_seq_len|int\s*\(|\[)", a, re.IGNORECASE) else a for a in args]
             if args:
                 if nm_pre == "cbind" and len(args) > 3:
                     return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
                 return f"{c_pre[0]}({', '.join(args)})"
+        if nm_pre in {"cbind", "cbind2"} and len(pos_pre) >= 2 and not c_pre[2]:
+            arg_srcs = [a.strip() for a in pos_pre]
+            args = [r_expr_to_fortran(a) for a in arg_srcs]
+            if any(re.search(r"_dp\b|real\s*\(|anint\s*\(|r_acf_values|ARMAacf", a, re.IGNORECASE) for a in args):
+                args = [f"real({a}, kind=dp)" if re.match(r"^(?:r_seq_int|r_seq_len|int\s*\(|\[)", a, re.IGNORECASE) else a for a in args]
+            if nm_pre == "cbind" and len(args) > 3:
+                return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
+            return f"{c_pre[0]}({', '.join(args)})"
         if nm_pre == "cbind" and len(pos_pre) > 3 and not c_pre[2]:
             args = [r_expr_to_fortran(a.strip()) for a in pos_pre]
             return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
@@ -6092,12 +6123,48 @@ def r_expr_to_fortran(expr: str) -> str:
         order_f = _strict_int_vector_literal_from_c(order_src.strip()) or f"int({r_expr_to_fortran(order_src)})"
         include_src = kw_ar.get("include.mean", kw_ar.get("include_mean", ".true."))
         return f"arima_fit({r_expr_to_fortran(x_src)}, {order_f}, include_mean={r_expr_to_fortran(include_src)})"
+    c_arfit0 = parse_call_text(s)
+    if c_arfit0 is not None and c_arfit0[0].lower() in {"ar", "ar.yw", "ar.burg", "ar.ols", "ar.mle"}:
+        _nm_arf, pos_arf, kw_arf = c_arfit0
+        x_src = pos_arf[0] if pos_arf else kw_arf.get("x", "")
+        if not x_src:
+            raise NotImplementedError(f"{c_arfit0[0]} requires x argument")
+        args_arf = [r_expr_to_fortran(x_src)]
+        order_src = kw_arf.get("order.max", kw_arf.get("order_max"))
+        if order_src is not None:
+            args_arf.append(f"order_max={_int_bound_expr(r_expr_to_fortran(order_src))}")
+        aic_src = kw_arf.get("aic")
+        if aic_src is not None:
+            args_arf.append(f"aic={r_expr_to_fortran(aic_src)}")
+        method_src = kw_arf.get("method")
+        if method_src is not None:
+            args_arf.append(f"method={r_expr_to_fortran(method_src)}")
+        return f"ar_fit({', '.join(args_arf)})"
+    m_acf_field0 = re.match(r"^acf\s*\((.*)\)\s*\$\s*acf\s*$", s, re.IGNORECASE)
+    if m_acf_field0 is not None:
+        c_acff = parse_call_text("acf(" + m_acf_field0.group(1).strip() + ")")
+        if c_acff is not None:
+            _nm_acff, pos_acff, kw_acff = c_acff
+            x_src = pos_acff[0] if pos_acff else kw_acff.get("x", "")
+            if not x_src:
+                raise NotImplementedError("acf$acf requires x argument")
+            args_acff = [r_expr_to_fortran(x_src)]
+            lag_src = kw_acff.get("lag.max", kw_acff.get("lag_max"))
+            if lag_src is not None:
+                args_acff.append(f"lag_max={_int_bound_expr(r_expr_to_fortran(lag_src))}")
+            type_src = kw_acff.get("type")
+            if type_src is not None:
+                args_acff.append(f"type={r_expr_to_fortran(type_src)}")
+            plot_src = kw_acff.get("plot")
+            if plot_src is not None:
+                args_acff.append(f"plot={r_expr_to_fortran(plot_src)}")
+            return f"r_acf_values({', '.join(args_acff)})"
     c_acf0 = parse_call_text(s)
-    if c_acf0 is not None and c_acf0[0].lower() == "acf":
+    if c_acf0 is not None and c_acf0[0].lower() in {"acf", "pacf"}:
         _nm_acf, pos_acf, kw_acf = c_acf0
         x_src = pos_acf[0] if pos_acf else kw_acf.get("x", "")
         if not x_src:
-            raise NotImplementedError("acf requires x argument")
+            raise NotImplementedError(f"{c_acf0[0]} requires x argument")
         args_acf = [r_expr_to_fortran(x_src)]
         lag_src = kw_acf.get("lag.max", kw_acf.get("lag_max"))
         if lag_src is not None:
@@ -6109,10 +6176,32 @@ def r_expr_to_fortran(expr: str) -> str:
         if plot_src is not None:
             args_acf.append(f"plot={r_expr_to_fortran(plot_src)}")
         return f"r_acf({', '.join(args_acf)})"
+    c_ccf0 = parse_call_text(s)
+    if c_ccf0 is not None and c_ccf0[0].lower() == "ccf":
+        _nm_ccf, pos_ccf, kw_ccf = c_ccf0
+        x_src = pos_ccf[0] if pos_ccf else kw_ccf.get("x", "")
+        y_src = pos_ccf[1] if len(pos_ccf) >= 2 else kw_ccf.get("y", "")
+        if not x_src or not y_src:
+            raise NotImplementedError("ccf requires x and y arguments")
+        args_ccf = [r_expr_to_fortran(x_src), r_expr_to_fortran(y_src)]
+        lag_src = kw_ccf.get("lag.max", kw_ccf.get("lag_max"))
+        if lag_src is not None:
+            args_ccf.append(f"lag_max={_int_bound_expr(r_expr_to_fortran(lag_src))}")
+        type_src = kw_ccf.get("type")
+        if type_src is not None:
+            args_ccf.append(f"type={r_expr_to_fortran(type_src)}")
+        plot_src = kw_ccf.get("plot")
+        if plot_src is not None:
+            args_ccf.append(f"plot={r_expr_to_fortran(plot_src)}")
+        return f"r_ccf({', '.join(args_ccf)})"
     c_aic0 = parse_call_text(s)
     if c_aic0 is not None and c_aic0[0].lower() == "aic":
         fit_src = c_aic0[1][0] if c_aic0[1] else ""
         return f"{r_expr_to_fortran(fit_src)}%aic"
+    c_loglik0 = parse_call_text(s)
+    if c_loglik0 is not None and c_loglik0[0].lower() == "loglik":
+        fit_src = c_loglik0[1][0] if c_loglik0[1] else ""
+        return f"(-0.5_dp * {r_expr_to_fortran(fit_src)}%aic)"
     c_predict0 = parse_call_text(s)
     if c_predict0 is not None and c_predict0[0].lower() == "predict":
         _nm_pr, pos_pr, kw_pr = c_predict0
@@ -6705,7 +6794,8 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"reshape({x_f}, {shape_vec}, order={perm_vec})"
     c_rb = parse_call_text(s)
     if c_rb is not None and c_rb[0].lower() == "rbind":
-        rows = [r_expr_to_fortran(a) for a in c_rb[1]]
+        row_srcs = list(c_rb[1]) + list(c_rb[2].values())
+        rows = [r_expr_to_fortran(a) for a in row_srcs]
         if len(rows) < 1:
             raise NotImplementedError("rbind requires at least one row")
         if _HAS_R_MOD and len(rows) > 1:
@@ -6726,7 +6816,7 @@ def r_expr_to_fortran(expr: str) -> str:
                     return True
                 return False
 
-            if any(_row_is_matrix_expr(a) for a in c_rb[1]):
+            if any(_row_is_matrix_expr(a) for a in row_srcs):
                 out = rows[0]
                 for row in rows[1:]:
                     out = f"rbind({out}, {row})"
@@ -7266,9 +7356,10 @@ def r_expr_to_fortran(expr: str) -> str:
         if fn == "rnorm":
             mean_f = r_expr_to_fortran(kw_g.get("mean", "0.0"))
             sd_f = r_expr_to_fortran(kw_g.get("sd", "1.0"))
+            rn_base = "rnorm1()" if n_f.strip() in {"1", "1_int64"} else f"rnorm_vec({n_f})"
             if mean_f == "0.0_dp" and sd_f == "1.0_dp":
-                return f"rnorm_vec({n_f})"
-            return f"({mean_f}) + ({sd_f}) * rnorm_vec({n_f})"
+                return rn_base
+            return f"({mean_f}) + ({sd_f}) * {rn_base}"
         rate_src = kw_g.get("rate")
         if rate_src is None and len(pos_g) >= 2:
             rate_src = pos_g[1]
@@ -8132,7 +8223,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if len(parts) >= 2 and parts[1].strip():
             digits_f = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
             scale = f"(10.0_dp ** ({digits_f}))"
-            return f"(anint(({xr}) * {scale}) / {scale})"
+            return f"anint(({xr}) * {scale}) / {scale}"
         return f"anint({xr})"
 
     s = _replace_balanced_func_calls(s, "sign", _sign_to_fortran)
@@ -8537,6 +8628,7 @@ def emit_stmts(
     qr_vars_ctx: set[str] = set()
     eigen_vars_ctx: set[str] = set()
     arima_vars_ctx: set[str] = set()
+    arima_pred_vars_ctx: set[str] = set()
     acf_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
     if helper_ctx is not None:
@@ -8621,6 +8713,9 @@ def emit_stmts(
         arv = helper_ctx.get("arima_vars")
         if isinstance(arv, set):
             arima_vars_ctx = {str(x) for x in arv}
+        apv = helper_ctx.get("arima_pred_vars")
+        if isinstance(apv, set):
+            arima_pred_vars_ctx = {str(x) for x in apv}
         acfv = helper_ctx.get("acf_vars")
         if isinstance(acfv, set):
             acf_vars_ctx = {str(x) for x in acfv}
@@ -8842,13 +8937,19 @@ def emit_stmts(
             return 3
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*lag\b", t):
             return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:pred|se)\b", t):
+            return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:ar|aic)\b", t):
+            return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*var\.pred\b", t):
+            return 0
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*order\b", t):
+            return 0
         if m_field_print is not None and m_field_print.group(1).lower() == "rank":
             return 0
         if m_field_print is not None and m_field_print.group(1).lower() == "pivot":
             return 1
         if m_field_print is not None and m_field_print.group(1).lower() in {
-            "ar",
-            "ma",
             "sigma",
             "resid",
             "fitted",
@@ -9676,6 +9777,17 @@ def emit_stmts(
             c_pred = parse_call_text(rhs)
             if c_pred is not None and c_pred[0].lower() == "predict":
                 _np, posp, kwp = c_pred
+                n_ahead_src = kwp.get("n.ahead", kwp.get("n_ahead"))
+                if n_ahead_src is not None:
+                    fit_src = posp[0].strip() if posp else kwp.get("object", "").strip()
+                    if not fit_src:
+                        raise NotImplementedError("predict with n.ahead requires object in this subset")
+                    o.w(
+                        f"{st.name} = arima_predict_result({r_expr_to_fortran(fit_src)}, "
+                        f"{_int_bound_expr(r_expr_to_fortran(n_ahead_src))})"
+                    )
+                    need_r_mod.update({"arima_predict_result", "arima_predict_result_t"})
+                    continue
                 fit_nm = posp[0].strip() if posp else kwp.get("object", "").strip()
                 newd = kwp.get("newdata", "").strip()
                 if not fit_nm or not newd:
@@ -9907,26 +10019,27 @@ def emit_stmts(
                     n_f = _int_bound_expr(r_expr_to_fortran(n_src))
                     mean_f = r_expr_to_fortran(kw_i.get("mean", "0.0"))
                     sd_f = r_expr_to_fortran(kw_i.get("sd", "1.0"))
+                    rn_scalar = n_f.strip() in {"1", "1_int64"}
                     rn_count = len(re.findall(r"\brnorm\s*\(", rhs, re.IGNORECASE))
                     if rhs.strip() == rn_call and has_r_mod:
                         if mean_f == "0.0_dp" and sd_f == "1.0_dp":
-                            o.w(f"{st.name} = rnorm_vec({n_f})")
+                            o.w(f"{st.name} = {'rnorm1()' if rn_scalar else f'rnorm_vec({n_f})'}")
                         elif mean_f == "0.0_dp":
-                            o.w(f"{st.name} = {_mul_factor_expr(sd_f)} * rnorm_vec({n_f})")
+                            o.w(f"{st.name} = {_mul_factor_expr(sd_f)} * {'rnorm1()' if rn_scalar else f'rnorm_vec({n_f})'}")
                         else:
-                            o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * rnorm_vec({n_f})")
-                        need_r_mod.add("rnorm_vec")
+                            o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * {'rnorm1()' if rn_scalar else f'rnorm_vec({n_f})'}")
+                        need_r_mod.add("rnorm1" if rn_scalar else "rnorm_vec")
                         continue
                     if has_r_mod and rn_count == 1:
                         if mean_f == "0.0_dp" and sd_f == "1.0_dp":
-                            rn_expr = f"rnorm_vec({n_f})"
+                            rn_expr = "rnorm1()" if rn_scalar else f"rnorm_vec({n_f})"
                         elif mean_f == "0.0_dp":
-                            rn_expr = f"{_mul_factor_expr(sd_f)} * rnorm_vec({n_f})"
+                            rn_expr = f"{_mul_factor_expr(sd_f)} * {'rnorm1()' if rn_scalar else f'rnorm_vec({n_f})'}"
                         else:
-                            rn_expr = f"(({mean_f}) + ({sd_f}) * rnorm_vec({n_f}))"
+                            rn_expr = f"(({mean_f}) + ({sd_f}) * {'rnorm1()' if rn_scalar else f'rnorm_vec({n_f})'})"
                         rhs_i = rhs.replace(rn_call, rn_expr)
                         _wstmt(f"{st.name} = {r_expr_to_fortran(rhs_i)}", st.comment)
-                        need_r_mod.add("rnorm_vec")
+                        need_r_mod.add("rnorm1" if rn_scalar else "rnorm_vec")
                         need_rnorm["used"] = True
                         continue
                     if has_r_mod:
@@ -15754,7 +15867,9 @@ def transpile_r_to_fortran(
     glm_vars: set[str] = set()
     prcomp_vars: set[str] = set()
     eigen_vars: set[str] = set()
+    ar_fit_vars: set[str] = set()
     arima_vars: set[str] = set()
+    arima_pred_vars: set[str] = set()
     acf_vars: set[str] = set()
     qr_vars: set[str] = set()
     t_test_vars: set[str] = set()
@@ -15813,12 +15928,20 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "eigen":
                 eigen_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"eigen", "eigen_result_t"})
+            if c_fit_main is not None and c_fit_main[0].lower() in {"ar", "ar.yw", "ar.burg", "ar.ols", "ar.mle"}:
+                ar_fit_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"ar_fit", "ar_fit_t"})
             if c_fit_main is not None and c_fit_main[0].lower() == "arima":
                 arima_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"arima_fit_t", "arima_fit"})
-            if c_fit_main is not None and c_fit_main[0].lower() == "acf":
+            if c_fit_main is not None and c_fit_main[0].lower() == "predict":
+                _nm_pr_main, pos_pr_main, kw_pr_main = c_fit_main
+                if kw_pr_main.get("n.ahead", kw_pr_main.get("n_ahead")) is not None:
+                    arima_pred_vars.add(st.name)
+                    helper_ctx_main["need_r_mod"].update({"arima_predict_result_t", "arima_predict_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() in {"acf", "pacf", "ccf"}:
                 acf_vars.add(st.name)
-                helper_ctx_main["need_r_mod"].update({"acf_fit_t", "r_acf", "print_acf"})
+                helper_ctx_main["need_r_mod"].update({"acf_fit_t", "r_acf", "r_ccf", "print_acf"})
             if c_fit_main is not None and c_fit_main[0].lower() == "qr":
                 qr_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
@@ -16023,6 +16146,28 @@ def transpile_r_to_fortran(
         real_rank4_arrays.discard(nm)
         params.pop(nm, None)
     for nm in arima_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in ar_fit_vars:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in arima_pred_vars:
         ints.discard(nm)
         real_scalars.discard(nm)
         int_arrays.discard(nm)
@@ -16441,9 +16586,15 @@ def transpile_r_to_fortran(
     if eigen_vars:
         for nm in sorted(eigen_vars):
             pbody.w(f"type(eigen_result_t) :: {nm}")
+    if ar_fit_vars:
+        for nm in sorted(ar_fit_vars):
+            pbody.w(f"type(ar_fit_t) :: {nm}")
     if arima_vars:
         for nm in sorted(arima_vars):
             pbody.w(f"type(arima_fit_t) :: {nm}")
+    if arima_pred_vars:
+        for nm in sorted(arima_pred_vars):
+            pbody.w(f"type(arima_predict_result_t) :: {nm}")
     if acf_vars:
         for nm in sorted(acf_vars):
             pbody.w(f"type(acf_fit_t) :: {nm}")
@@ -16466,6 +16617,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["eigen_vars"] = set(eigen_vars)
     if arima_vars:
         helper_ctx_main["arima_vars"] = set(arima_vars)
+    if arima_pred_vars:
+        helper_ctx_main["arima_pred_vars"] = set(arima_pred_vars)
     if acf_vars:
         helper_ctx_main["acf_vars"] = set(acf_vars)
     if rle_vars:
@@ -17847,12 +18000,17 @@ def transpile_r_to_fortran(
         "print_prcomp_summary",
         "eigen",
         "print_eigen",
+        "ar_fit",
         "arima_sim",
         "arima_fit",
         "arima_predict",
+        "arima_predict_result",
         "print_arima_fit",
         "r_acf",
+        "r_acf_values",
+        "r_ccf",
         "print_acf",
+        "ARMAacf",
         "qr",
         "qr_Q",
         "qr_R",
@@ -17872,7 +18030,9 @@ def transpile_r_to_fortran(
         "glm_fit_t",
         "prcomp_fit_t",
         "eigen_result_t",
+        "ar_fit_t",
         "arima_fit_t",
+        "arima_predict_result_t",
         "acf_fit_t",
         "qr_fit_t",
         "rle_real_t",
@@ -17984,10 +18144,18 @@ def transpile_r_to_fortran(
         mod_needed.add("eigen_result_t")
     if re.search(r"\btype\s*\(\s*eigen_result_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("eigen_result_t")
+    if re.search(r"\btype\s*\(\s*ar_fit_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("ar_fit_t")
+    if re.search(r"\btype\s*\(\s*ar_fit_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("ar_fit_t")
     if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("arima_fit_t")
     if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("arima_fit_t")
+    if re.search(r"\btype\s*\(\s*arima_predict_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("arima_predict_result_t")
+    if re.search(r"\btype\s*\(\s*arima_predict_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("arima_predict_result_t")
     if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("qr_fit_t")
     if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", main_text_now, re.IGNORECASE):
