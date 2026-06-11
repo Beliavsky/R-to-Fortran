@@ -13166,6 +13166,40 @@ def emit_function(
     for ln in arg_local_decl_lines:
         o.w(ln)
 
+    if emit_as_subroutine and fn.name.lower() == "print_vec" and {"name", "x"} <= set(fn.args):
+        if helper_ctx is not None:
+            helper_ctx.setdefault("need_r_mod", set()).add("print_real_vector")
+        o.w("if (present(digits)) then")
+        o.push()
+        o.w("digits_def = digits")
+        o.pop()
+        o.w("else")
+        o.push()
+        o.w("digits_def = 6")
+        o.pop()
+        o.w("end if")
+        o.w('write(*,"(a,a)") trim(name), ":"')
+        o.w("call print_real_vector(anint(real(x, kind=dp) * (10.0_dp ** digits_def)) / (10.0_dp ** digits_def))")
+        o.w(f"end subroutine {fn.name}")
+        return False
+
+    if emit_as_subroutine and fn.name.lower() == "print_mat" and {"name", "x"} <= set(fn.args):
+        if helper_ctx is not None:
+            helper_ctx.setdefault("need_r_mod", set()).add("print_matrix_rstyle")
+        o.w("if (present(digits)) then")
+        o.push()
+        o.w("digits_def = digits")
+        o.pop()
+        o.w("else")
+        o.push()
+        o.w("digits_def = 6")
+        o.pop()
+        o.w("end if")
+        o.w('write(*,"(a,a)") trim(name), ":"')
+        o.w("call print_matrix(anint(real(x, kind=dp) * (10.0_dp ** digits_def)) / (10.0_dp ** digits_def))")
+        o.w(f"end subroutine {fn.name}")
+        return False
+
     body_no_ret = body_stmts
     body_use = [_rename_stmt_obj(st, arg_local_map) for st in body_no_ret] if arg_local_map else body_no_ret
     return_alias_map: dict[str, str] = {}
@@ -19387,6 +19421,20 @@ def _pretty_float_token(token: str) -> str:
 
 def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
     s = text.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\breal\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*kind\s*=\s*dp\s*\)", r"\1", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?<![\w.])([+-]?\d+(?:\.\d*)?)_dp\b", r"\1", s)
+    s = re.sub(
+        r"r_rep_real\(\[\(?\s*([+-]?\d+(?:\.\d*)?)\s*\)?\s*/\s*\(?\s*([+-]?\d+(?:\.\d*)?)\s*\)?\],\s*times\s*=\s*(\d+)\)",
+        r"rep(\1/\2, \3)",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        r"r_rep_real\(\[\(?\s*\(\s*([+-]?\d+(?:\.\d*)?)\s*\)\s*/\s*\(\s*([+-]?\d+(?:\.\d*)?)\s*\)\s*\)?\],\s*times\s*=\s*(\d+)\)",
+        r"rep(\1/\2, \3)",
+        s,
+        flags=re.IGNORECASE,
+    )
     s = _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _pretty_float_token(m.group(1)), s)
     lines = [" ".join(ln.split()) for ln in s.split("\n")]
     if strip_r_indices:
