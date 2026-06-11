@@ -6527,8 +6527,21 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), real({r_expr_to_fortran(df_src)}, kind=dp))"
     if c_usr is not None and c_usr[0].lower() == "pnorm":
         _nm_pn, pos_pn, kw_pn = c_usr
-        x_src = pos_pn[0] if pos_pn else kw_pn.get("q", "0.0")
-        return f"normal_cdf(real({r_expr_to_fortran(x_src)}, kind=dp))"
+        kw_pn_norm = {_sanitize_fortran_kwarg_name(k).lower(): v for k, v in kw_pn.items()}
+        x_src = pos_pn[0] if pos_pn else kw_pn_norm.get("q", "0.0")
+        mean_src = kw_pn_norm.get("mean", pos_pn[1] if len(pos_pn) >= 2 else "0.0")
+        sd_src = kw_pn_norm.get("sd", pos_pn[2] if len(pos_pn) >= 3 else "1.0")
+        lower_src = kw_pn_norm.get("lower_tail", "TRUE").strip().lower()
+        log_src = kw_pn_norm.get("log_p", "FALSE").strip().lower()
+        val = (
+            f"normal_cdf((real({r_expr_to_fortran(x_src)}, kind=dp) - "
+            f"real({r_expr_to_fortran(mean_src)}, kind=dp)) / real({r_expr_to_fortran(sd_src)}, kind=dp))"
+        )
+        if lower_src in {"false", "f", ".false."}:
+            val = f"(1.0_dp - {val})"
+        if log_src in {"true", "t", ".true."}:
+            val = f"log(max(tiny(1.0_dp), {val}))"
+        return val
     if c_usr is not None and c_usr[0].lower() in {"ppois", "qpois"}:
         nm_pois, pos_pois, kw_pois = c_usr
         out_args: list[str] = []
@@ -8948,6 +8961,103 @@ def emit_stmts(
         t = text.strip()
         if t:
             o.w(f"! {t}")
+
+    def _emit_show_distribution_call(
+        show_kind: str,
+        pos_show: list[str],
+        kw_show: dict[str, str],
+        comment: str,
+    ) -> bool:
+        actuals = {_sanitize_fortran_kwarg_name(k).lower(): v for k, v in kw_show.items()}
+        for raw_actual in pos_show:
+            asn = split_top_level_assignment(raw_actual.strip())
+            if asn is not None:
+                actuals[_sanitize_fortran_kwarg_name(asn[0].strip()).lower()] = asn[1].strip()
+        name_src = actuals.get("name", pos_show[0] if len(pos_show) >= 1 else f'"{show_kind}"')
+        x_src = actuals.get("x", pos_show[5] if len(pos_show) >= 6 else "")
+        probs_src = actuals.get("probs", pos_show[6] if len(pos_show) >= 7 else "")
+        dfun_src = (actuals.get("dfun", pos_show[1] if len(pos_show) >= 2 else "")).strip().lower()
+        pfun_src = (actuals.get("pfun", pos_show[2] if len(pos_show) >= 3 else "")).strip().lower()
+        qfun_src = (actuals.get("qfun", pos_show[3] if len(pos_show) >= 4 else "")).strip().lower()
+        rfun_src = (actuals.get("rfun", pos_show[4] if len(pos_show) >= 5 else "")).strip().lower()
+        nsim_src = actuals.get("nsim", pos_show[7] if len(pos_show) >= 8 else ("10" if show_kind == "show_discrete" else "5"))
+        title_lit = _dequote_string_literal(name_src)
+        title_f = _fortran_str_literal(title_lit) if title_lit is not None else r_expr_to_fortran(name_src)
+        x_f = r_expr_to_fortran(x_src) if x_src else ""
+        probs_f = r_expr_to_fortran(probs_src) if probs_src else ""
+
+        def rf(src: str, default: str = "0.0") -> str:
+            return f"real({r_expr_to_fortran(src or default)}, kind=dp)"
+
+        def iarg(src: str, default: str = "0") -> str:
+            return _int_bound_expr(r_expr_to_fortran(src or default))
+
+        cont: dict[str, tuple[str, list[str]]] = {
+            "dunif": ("unif", [rf(actuals.get("min", "0.0")), rf(actuals.get("max", "1.0"))]),
+            "dexp": ("exp", [rf(actuals.get("rate", "1.0"))]),
+            "dgamma": ("gamma", [rf(actuals.get("shape", "1.0")), rf(actuals.get("rate", "1.0"))]),
+            "dbeta": ("beta", [rf(actuals.get("shape1", "1.0")), rf(actuals.get("shape2", "1.0"))]),
+            "dchisq": ("chisq", [rf(actuals.get("df", "1.0"))]),
+            "dt": ("t", [rf(actuals.get("df", "1.0"))]),
+            "df": ("f", [rf(actuals.get("df1", "1.0")), rf(actuals.get("df2", "1.0"))]),
+            "dlogis": ("logis", [rf(actuals.get("location", "0.0")), rf(actuals.get("scale", "1.0"))]),
+            "dlnorm": ("lnorm", [rf(actuals.get("meanlog", "0.0")), rf(actuals.get("sdlog", "1.0"))]),
+            "dweibull": ("weibull", [rf(actuals.get("shape", "1.0")), rf(actuals.get("scale", "1.0"))]),
+            "dcauchy": ("cauchy", [rf(actuals.get("location", "0.0")), rf(actuals.get("scale", "1.0"))]),
+        }
+        disc: dict[str, tuple[str, list[str]]] = {
+            "dbinom": ("binom", [iarg(actuals.get("size", "1")), rf(actuals.get("prob", "0.5"))]),
+            "dpois": ("pois", [rf(actuals.get("lambda", "1.0"))]),
+            "dgeom": ("geom", [rf(actuals.get("prob", "0.5"))]),
+            "dnbinom": ("nbinom", [iarg(actuals.get("size", "1")), rf(actuals.get("prob", "0.5"))]),
+            "dhyper": ("hyper", [iarg(actuals.get("m", "1")), iarg(actuals.get("n", "1")), iarg(actuals.get("k", "1"))]),
+            "dwilcox": ("wilcox", [iarg(actuals.get("m", "1")), iarg(actuals.get("n", "1"))]),
+            "dsignrank": ("signrank", [iarg(actuals.get("n", "1"))]),
+        }
+        is_normal = dfun_src == "dnorm" and pfun_src == "pnorm" and qfun_src == "qnorm" and rfun_src == "rnorm"
+        info = cont.get(dfun_src) or disc.get(dfun_src)
+        if not is_normal and info is None:
+            return False
+        if is_normal:
+            base = "norm"
+            args = [rf(actuals.get("mean", "0.0")), rf(actuals.get("sd", "1.0"))]
+        else:
+            base, args = info
+        arg_txt = ", ".join(args)
+        comma_args = (", " + arg_txt) if arg_txt else ""
+        x_real = f"real({x_f}, kind=dp)"
+        p_real = f"real({probs_f}, kind=dp)"
+        density_label = "probability mass d*:" if show_kind == "show_discrete" else "density d*:"
+        check_label = "Check p(q(p)) >= p for discrete distributions:" if show_kind == "show_discrete" else "Check p(q(p)) approximately equals p:"
+        dcall = f"d{base}({x_real}{comma_args})"
+        pcall = f"p{base}({x_real}{comma_args})" if base != "norm" else f"normal_cdf(({x_real} - {args[0]}) / {args[1]})"
+        qcall = f"q{base}({p_real}{comma_args})" if base != "norm" else f"qnorm({p_real}, mean={args[0]}, sd={args[1]})"
+        rcall = f"q{base}(runif_vec({_int_bound_expr(r_expr_to_fortran(nsim_src))}){comma_args})" if base != "norm" else f"{args[0]} + {args[1]} * rnorm_vec({_int_bound_expr(r_expr_to_fortran(nsim_src))})"
+        check = f"p{base}({qcall}{comma_args})" if base != "norm" else f"normal_cdf(({qcall} - {args[0]}) / {args[1]})"
+        _wstmt(f"call print_header({title_f})", comment)
+        _wstmt("write(*,*)", "")
+        _wstmt('write(*,*) "x values:"', "")
+        _wstmt(f"write(*,*) {x_f}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt(f'write(*,*) "{density_label}"', "")
+        _wstmt(f"write(*,*) {dcall}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt('write(*,*) "CDF p*:"', "")
+        _wstmt(f"write(*,*) {pcall}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt('write(*,*) "probabilities:"', "")
+        _wstmt(f"write(*,*) {probs_f}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt('write(*,*) "quantiles q*:"', "")
+        _wstmt(f"write(*,*) {qcall}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt(f'write(*,*) "random sample r*:"', "")
+        _wstmt(f"write(*,*) {rcall}", "")
+        _wstmt("write(*,*)", "")
+        _wstmt(f'write(*,*) "{check_label}"', "")
+        _wstmt(f"write(*,*) {check}", "")
+        _wstmt("write(*,*)", "")
+        return True
 
     def _rewrite_predict_expr(expr: str) -> str:
         c = parse_call_text(expr.strip())
@@ -11489,6 +11599,8 @@ def emit_stmts(
                 c_show = parse_call_text(st.name + "(" + ", ".join(st.args) + ")")
                 if c_show is not None:
                     _nm_show, pos_show, kw_show = c_show
+                    if _emit_show_distribution_call(nm, pos_show, kw_show, st.comment):
+                        continue
                     name_src = kw_show.get("name", pos_show[0] if len(pos_show) >= 1 else f'"{st.name}"')
                     x_src = kw_show.get("x", pos_show[5] if len(pos_show) >= 6 else "")
                     probs_src = kw_show.get("probs", pos_show[6] if len(pos_show) >= 7 else "")
@@ -11899,6 +12011,8 @@ def emit_stmts(
                 nm_expr = c_expr[0].lower()
                 if nm_expr in {"show_continuous", "show_discrete"}:
                     _nm_show, pos_show, kw_show = c_expr
+                    if _emit_show_distribution_call(nm_expr, pos_show, kw_show, st.comment):
+                        continue
                     name_src = kw_show.get("name", pos_show[0] if len(pos_show) >= 1 else f'"{c_expr[0]}"')
                     x_src = kw_show.get("x", pos_show[5] if len(pos_show) >= 6 else "")
                     probs_src = kw_show.get("probs", pos_show[6] if len(pos_show) >= 7 else "")
@@ -13894,11 +14008,14 @@ def _rewrite_named_calls(
     expr: str,
     fn_arg_order: dict[str, list[str]],
     fn_arg_defaults: dict[str, dict[str, str]],
+    variadic_funcs: set[str] | None = None,
 ) -> str:
     cinfo = parse_call_text(expr)
     if cinfo is None:
         return expr
     nm, pos, kw = cinfo
+    if variadic_funcs is not None and nm.lower() in variadic_funcs:
+        return expr
     order = fn_arg_order.get(nm)
     if order is None or not kw:
         return expr
@@ -15675,17 +15792,25 @@ def transpile_r_to_fortran(
     _R_SD_CALL_NAME = "r_sd" if sd_name_collision else "sd"
     fn_arg_order = {f.name: list(f.args) for f in funcs}
     fn_arg_defaults = {f.name: dict(f.defaults) for f in funcs}
+    variadic_funcs: set[str] = set()
+    for ln_variadic in lines:
+        fn_head_variadic = _parse_function_assign_head(ln_variadic)
+        if fn_head_variadic is None:
+            continue
+        fname_variadic, arg_txt_variadic, _tail_variadic = fn_head_variadic
+        if any(part.strip() == "..." for part in split_top_level_commas(arg_txt_variadic or "")):
+            variadic_funcs.add(fname_variadic.lower())
     for f in funcs:
         for st in f.body:
             if isinstance(st, Assign):
-                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
+                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
             elif isinstance(st, ExprStmt):
-                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
+                st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
     for st in main_stmts:
         if isinstance(st, Assign):
-            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
+            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
         elif isinstance(st, ExprStmt):
-            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults)
+            st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
     main_stmts = inline_single_use_temporaries(main_stmts)
     named_vectors: dict[str, tuple[list[str], list[str]]] = {}
     for st_nv in main_stmts:
@@ -18452,6 +18577,57 @@ def transpile_r_to_fortran(
         "qnorm",
         "ppois",
         "qpois",
+        "dunif",
+        "punif",
+        "qunif",
+        "dexp",
+        "pexp",
+        "qexp",
+        "dgamma",
+        "pgamma",
+        "qgamma",
+        "dbeta",
+        "pbeta",
+        "qbeta",
+        "dchisq",
+        "qchisq",
+        "dt",
+        "pt",
+        "qt",
+        "df",
+        "pf",
+        "qf",
+        "dlogis",
+        "plogis",
+        "qlogis",
+        "dlnorm",
+        "plnorm",
+        "qlnorm",
+        "dweibull",
+        "pweibull",
+        "qweibull",
+        "dcauchy",
+        "pcauchy",
+        "qcauchy",
+        "dbinom",
+        "pbinom",
+        "qbinom",
+        "dpois",
+        "dgeom",
+        "pgeom",
+        "qgeom",
+        "dnbinom",
+        "pnbinom",
+        "qnbinom",
+        "dhyper",
+        "phyper",
+        "qhyper",
+        "dwilcox",
+        "pwilcox",
+        "qwilcox",
+        "dsignrank",
+        "psignrank",
+        "qsignrank",
         "set_print_int_like",
         "set_recycle_warn",
         "set_recycle_stop",
@@ -19093,10 +19269,12 @@ def _pretty_float_token(token: str) -> str:
     return out
 
 
-def _pretty_output_text(text: str) -> str:
+def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
     s = text.replace("\r\n", "\n").replace("\r", "\n")
     s = _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _pretty_float_token(m.group(1)), s)
     lines = [" ".join(ln.split()) for ln in s.split("\n")]
+    if strip_r_indices:
+        lines = [re.sub(r"^\[\d+(?:,\d+)?\]\s*", "", ln) for ln in lines]
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
@@ -19759,6 +19937,7 @@ def _print_captured(
     cp: subprocess.CompletedProcess[str],
     normalize_num_output: bool = False,
     pretty: bool = False,
+    strip_r_indices: bool = False,
     round_digits: int | None = None,
 ) -> None:
     out = cp.stdout or ""
@@ -19767,8 +19946,8 @@ def _print_captured(
         out = fscan.normalize_numeric_leading_zeros_text(out)
         err = fscan.normalize_numeric_leading_zeros_text(err)
     if pretty:
-        out = _pretty_output_text(out)
-        err = _pretty_output_text(err)
+        out = _pretty_output_text(out, strip_r_indices=strip_r_indices)
+        err = _pretty_output_text(err, strip_r_indices=strip_r_indices)
     if round_digits is not None:
         out = _round_output_text(out, round_digits)
         err = _round_output_text(err, round_digits)
@@ -20487,7 +20666,7 @@ def main() -> int:
                 print("Run (r): no stdout/stderr captured; process may have crashed before producing output.")
             return r_run.returncode
         print("Run (r): PASS")
-        _print_captured(r_run, round_digits=args.round_both)
+        _print_captured(r_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both)
         if args.run_both:
             print()
 
@@ -20813,6 +20992,8 @@ def main() -> int:
 
             if args.run_diff and r_run is not None:
                 r_blob = (r_run.stdout or "") + (("\n" + r_run.stderr) if r_run.stderr else "")
+                if args.pretty:
+                    r_blob = _pretty_output_text(r_blob, strip_r_indices=True)
                 if args.round_both is not None:
                     r_blob = _round_output_text(r_blob, args.round_both)
                 r_lines = _norm_output(r_blob)
