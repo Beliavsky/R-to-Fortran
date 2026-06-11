@@ -16,6 +16,7 @@ import glob
 import hashlib
 import os
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -20190,6 +20191,153 @@ def _ratio(a: int | None, b: int | None) -> str:
     return f"{(b / a):.2f}"
 
 
+def _with_fortran_cpp_flag(cparts: list[str]) -> list[str]:
+    out = list(cparts)
+    if not any(p.lower() == "-cpp" for p in out):
+        out.append("-cpp")
+    return out
+
+
+def _with_r_rng_fortran_flags(cparts: list[str]) -> list[str]:
+    out = _with_fortran_cpp_flag(cparts)
+    if not any(p == "-DXR2F_USE_R_RNG" for p in out):
+        out.append("-DXR2F_USE_R_RNG")
+    return out
+
+
+def _r_command_from_rscript(rscript_cmd: str) -> str:
+    parts = shlex.split(rscript_cmd)
+    if not parts:
+        return "R"
+    exe = Path(parts[0])
+    stem = exe.stem.lower()
+    if stem == "rscript":
+        cand = exe.with_name("R.exe" if exe.suffix.lower() == ".exe" else "R")
+        if exe.parent != Path(".") and cand.exists():
+            return str(cand)
+    return "R"
+
+
+def _r_cmd_config(rscript_cmd: str, key: str) -> tuple[list[str], subprocess.CompletedProcess[str]]:
+    rcmd = _r_command_from_rscript(rscript_cmd)
+    cmd = [rcmd, "CMD", "config", key]
+    return cmd, _run_capture(cmd)
+
+
+def _r_home(rscript_cmd: str) -> tuple[list[str], subprocess.CompletedProcess[str]]:
+    rcmd = _r_command_from_rscript(rscript_cmd)
+    cmd = [rcmd, "RHOME"]
+    return cmd, _run_capture(cmd)
+
+
+def _compile_r_rng_shim(
+    rscript_cmd: str,
+) -> tuple[Path, list[str], subprocess.CompletedProcess[str] | None, str]:
+    shim_src = Path(__file__).resolve().with_name("xr2f_r_rng.c")
+    fallback_obj = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / "xr2f_r_rng_failed.o"
+    if not shim_src.exists():
+        return fallback_obj, [], subprocess.CompletedProcess([], 1, "", f"missing R RNG shim source: {shim_src}\n"), ""
+
+    cmd_cc, cp_cc = _r_cmd_config(rscript_cmd, "CC")
+    if cp_cc.returncode != 0:
+        return fallback_obj, [], cp_cc, " ".join(cmd_cc)
+    cmd_cpp, cp_cpp = _r_cmd_config(rscript_cmd, "--cppflags")
+    if cp_cpp.returncode != 0:
+        return fallback_obj, [], cp_cpp, " ".join(cmd_cpp)
+    cmd_cflags, cp_cflags = _r_cmd_config(rscript_cmd, "CFLAGS")
+    if cp_cflags.returncode != 0:
+        return fallback_obj, [], cp_cflags, " ".join(cmd_cflags)
+    cmd_ld, cp_ld = _r_cmd_config(rscript_cmd, "--ldflags")
+    if cp_ld.returncode != 0:
+        return fallback_obj, [], cp_ld, " ".join(cmd_ld)
+    cmd_home, cp_home = _r_home(rscript_cmd)
+    if cp_home.returncode != 0:
+        return fallback_obj, [], cp_home, " ".join(cmd_home)
+
+    cc = shlex.split((cp_cc.stdout or "").strip() or "gcc")
+    cppflags = shlex.split((cp_cpp.stdout or "").strip())
+    cflags = shlex.split((cp_cflags.stdout or "").strip())
+    ldflags = shlex.split((cp_ld.stdout or "").strip())
+    rhome = (cp_home.stdout or "").strip().replace("\\", "/")
+    rhome_define = f'-DXR2F_R_HOME="{rhome}"'
+    key_src = "\0".join([
+        "xr2f-r-rng-shim-v2",
+        str(shim_src.resolve()),
+        _sha256_file(shim_src),
+        " ".join(cc),
+        " ".join(cppflags),
+        " ".join(cflags),
+        " ".join(ldflags),
+        rhome,
+    ])
+    key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
+    cache_dir = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key
+    obj = cache_dir / "xr2f_r_rng.o"
+    if obj.exists():
+        return obj, ldflags, None, f"cached {obj}"
+
+    lock_dir = cache_dir.with_name(cache_dir.name + ".lock")
+    have_lock = False
+    start = time.monotonic()
+    while not have_lock:
+        try:
+            lock_dir.mkdir(parents=True)
+            have_lock = True
+        except FileExistsError:
+            if obj.exists():
+                return obj, ldflags, None, f"cached {obj}"
+            if time.monotonic() - start > 120:
+                return obj, ldflags, subprocess.CompletedProcess(
+                    [], 1, "", f"timed out waiting for R RNG shim cache lock: {lock_dir}\n"
+                ), ""
+            time.sleep(0.1)
+    if obj.exists():
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+        return obj, ldflags, None, f"cached {obj}"
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cmd = cc + cppflags + cflags + [rhome_define, "-c", str(shim_src), "-o", str(obj)]
+    try:
+        cp = _run_capture(cmd, cwd=cache_dir)
+        return obj, ldflags, cp, " ".join(cmd)
+    finally:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+
+
+def _build_exe_cache_path(
+    out_path: Path,
+    cparts: list[str],
+    include_dirs: list[str],
+    build_helpers: list[str],
+    link_flags: list[str],
+) -> Path:
+    helper_keys: list[str] = []
+    for h in build_helpers:
+        hp = Path(h)
+        if hp.exists() and hp.is_file():
+            helper_keys.append(str(hp.resolve()))
+            helper_keys.append(_sha256_file(hp))
+        else:
+            helper_keys.append(h)
+    key_src = "\0".join([
+        "xr2f-exe-v1",
+        str(out_path.resolve()),
+        _sha256_file(out_path),
+        *cparts,
+        *include_dirs,
+        *helper_keys,
+        *link_flags,
+    ])
+    key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key / "program.exe"
+
+
 def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
     cmd: list[str] = [sys.executable, str(Path(__file__).resolve()), input_r]
     cmd.extend(args.helpers)
@@ -20249,6 +20397,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--allow-library")
     if args.self_contained:
         cmd.append("--self-contained")
+    if getattr(args, "r_rng", False):
+        cmd.append("--r-rng")
     if args.out_dir:
         cmd.extend(["--out-dir", args.out_dir])
     if args.real_print_fmt != "f0.6":
@@ -20445,6 +20595,11 @@ def main() -> int:
     )
     ap.add_argument("--compiler", default=DEFAULT_COMPILER, help='compiler command, e.g. "gfortran -O2 -Wall"')
     ap.add_argument("--rscript", default="rscript", help="command to run R scripts")
+    ap.add_argument(
+        "--r-rng",
+        action="store_true",
+        help="use R's embedded RNG for set.seed(), runif(), and rnorm() helpers; requires R headers/libs",
+    )
     ap.add_argument(
         "--normalize-num-output",
         action="store_true",
@@ -20858,11 +21013,24 @@ def main() -> int:
 
     if args.compile or args.run:
         cparts = shlex.split(args.compiler)
+        cparts = _with_fortran_cpp_flag(cparts)
+        r_rng_ldflags: list[str] = []
+        if args.r_rng:
+            cparts = _with_r_rng_fortran_flags(cparts)
         exe = out_path.with_suffix(".exe")
         t0 = time.perf_counter()
         build_helpers: list[str] = []
         include_dirs: list[str] = []
         using_cached_runtime = False
+        if args.r_rng:
+            shim_obj, r_rng_ldflags, shim_cp, shim_cmd = _compile_r_rng_shim(args.rscript)
+            print("Build R RNG shim:", shim_cmd)
+            if shim_cp is not None and shim_cp.returncode != 0:
+                timings["compile"] = time.perf_counter() - t0
+                print(f"Build: FAIL (exit {shim_cp.returncode})")
+                _print_captured(shim_cp)
+                return shim_cp.returncode
+            build_helpers.append(str(shim_obj))
         if not args.self_contained:
             use_runtime_cache = bool(cparts) and "gfortran" in Path(cparts[0]).name.lower()
             for hp in helper_paths:
@@ -20916,7 +21084,7 @@ def main() -> int:
                     print(f"Build: FAIL (exit {cp_prog.returncode})")
                     _print_captured(cp_prog)
                     return cp_prog.returncode
-                link_cmd = cparts + build_helpers + [str(mod_obj), str(prog_obj)]
+                link_cmd = cparts + build_helpers + [str(mod_obj), str(prog_obj)] + r_rng_ldflags
                 if args.run:
                     link_cmd += ["-o", str(exe)]
                 print("Build:", " ".join(link_cmd))
@@ -20954,20 +21122,31 @@ def main() -> int:
                         if k_t in timings:
                             print(f"  {k_t}: {timings[k_t]:.6f} s")
                 return 0
-        cmd = cparts + include_dirs + build_helpers + [str(out_path)]
+        cmd = cparts + include_dirs + build_helpers + [str(out_path)] + r_rng_ldflags
         if args.run:
             cmd += ["-o", str(exe)]
         if args.time:
             print("Compile options:", " ".join(cparts[1:]) if len(cparts) > 1 else "<none>")
-        print("Build:", " ".join(cmd))
-        cp = _run_capture(cmd, cwd=artifact_dir)
-        timings["compile"] = time.perf_counter() - t0
-        if cp.returncode != 0:
-            print(f"Build: FAIL (exit {cp.returncode})")
-            _print_captured(cp)
-            _explain_compile_failure(cp, out_path, src)
-            return cp.returncode
-        print("Build: PASS")
+        exe_cache = _build_exe_cache_path(out_path, cparts, include_dirs, build_helpers, r_rng_ldflags) if args.run else None
+        if exe_cache is not None and exe_cache.exists():
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(exe_cache, exe)
+            timings["compile"] = time.perf_counter() - t0
+            print("Build: cached", str(exe_cache))
+            print("Build: PASS")
+        else:
+            print("Build:", " ".join(cmd))
+            cp = _run_capture(cmd, cwd=artifact_dir)
+            timings["compile"] = time.perf_counter() - t0
+            if cp.returncode != 0:
+                print(f"Build: FAIL (exit {cp.returncode})")
+                _print_captured(cp)
+                _explain_compile_failure(cp, out_path, src)
+                return cp.returncode
+            if exe_cache is not None and exe.exists():
+                exe_cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(exe, exe_cache)
+            print("Build: PASS")
 
         if args.run:
             t0 = time.perf_counter()
