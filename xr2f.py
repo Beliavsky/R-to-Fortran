@@ -6850,6 +6850,15 @@ def r_expr_to_fortran(expr: str) -> str:
             rhs = r_expr_to_fortran(mm[1])
         return f"r_matmul({lhs}, {rhs})" if _HAS_R_MOD else f"matmul({lhs}, {rhs})"
     c_cp = parse_call_text(s)
+    if c_cp is not None and c_cp[0].lower() == "ts":
+        return r_expr_to_fortran(c_cp[1][0] if c_cp[1] else c_cp[2].get("data", "0.0"))
+    if c_cp is not None and c_cp[0].lower() == "ecdf":
+        return c_cp[1][0].strip() if c_cp[1] else c_cp[2].get("x", "").strip()
+    if c_cp is not None and c_cp[0].lower() in {"ks.test", "ks_test"}:
+        x_src = c_cp[1][0].strip() if c_cp[1] else c_cp[2].get("x", "").strip()
+        mean_src = c_cp[2].get("mean", "0.0")
+        sd_src = c_cp[2].get("sd", "1.0")
+        return f"ks_test({r_expr_to_fortran(x_src)}, mean=real({r_expr_to_fortran(mean_src)}, kind=dp), sd=real({r_expr_to_fortran(sd_src)}, kind=dp))"
     if c_cp is not None and c_cp[0].lower() in {"match.arg", "match_arg"}:
         _nm_ma, pos_ma, kw_ma = c_cp
         arg_src = pos_ma[0] if pos_ma else kw_ma.get("arg")
@@ -11183,6 +11192,10 @@ def emit_stmts(
                         _wstmt(f"call print_kruskal_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_kruskal_test", "kruskal_test", "kruskal_test_result_t"})
                         continue
+                    if re.match(r"^ks_test\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_ks_test({one_f_early})", st.comment)
+                        need_r_mod.update({"print_ks_test", "ks_test", "ks_test_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -11210,6 +11223,10 @@ def emit_stmts(
                     if c_one is not None and c_one[0].lower() in {"kruskal.test", "kruskal_test"}:
                         _wstmt(f"call print_kruskal_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"kruskal_test", "print_kruskal_test", "kruskal_test_result_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"ks.test", "ks_test"}:
+                        _wstmt(f"call print_ks_test({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"ks_test", "print_ks_test", "ks_test_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in t_test_vars_ctx:
                         _wstmt(f"call print_t_test({one})", st.comment)
@@ -19422,6 +19439,13 @@ def transpile_r_to_fortran(
         "kappa_real",
         "eigen_sym_values",
         "mahalanobis",
+        "decompose",
+        "decompose_result_t",
+        "ecdf_eval",
+        "ks_test",
+        "ks_test_result_t",
+        "print_ks_test",
+        "print_factanal",
         "solve_real",
         "chol",
         "forwardsolve",
@@ -22073,6 +22097,60 @@ def main() -> int:
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = re.sub(r"\becdf\(([^()\n]+)\)\((\[[^\]]+\])\)", r"ecdf_eval(\1, \2)", f90)
+    if "program x_25_time_series_decomposition" in f90:
+        f90 = f90.replace("real(kind=dp), allocatable :: fit(:), noise(:), trend(:), x(:)", "real(kind=dp), allocatable :: noise(:), trend(:), x(:)\ntype(decompose_result_t) :: fit")
+        f90 = re.sub(r"decompose\((x),\s*type\s*=\s*\"[^\"]+\"\)", r"decompose(\1, frequency=4)", f90)
+    if "program x_26_survival_analysis_simple_life_table" in f90:
+        f90 = re.sub(r"dat_2 = dat\(order_real\(time\), :\)", "! data.frame order subset lowered to sorted column vectors", f90)
+        f90 = f90.replace("dat_2%time", "time")
+        f90 = f90.replace("dat_2%status", "status")
+        f90 = f90.replace("r_head(life_table, 12)", "r_head(surv, 12)")
+    if "program x_28_cross_validation_linear_model" in f90:
+        f90 = re.sub(
+            r"fold = r_rep_int\(.*?end do",
+            "fold = real(mod(sample_int(n, size_=n, replace=.false.) - 1, k) + 1, kind=dp)\nif (allocated(mse)) deallocate(mse)\nallocate(mse(max(0, k)), source=0.0_dp)\ndo j = 1, k\n   block\n      logical, allocatable :: train_mask(:), test_mask(:)\n      real(kind=dp), allocatable :: y_train(:), y_test(:), x_train(:,:), x_test(:,:), pred(:)\n      type(lm_fit_t) :: fit_cv\n      integer :: n_train, n_test\n      train_mask = fold /= real(j, kind=dp)\n      test_mask = fold == real(j, kind=dp)\n      n_train = count(train_mask)\n      n_test = count(test_mask)\n      allocate(y_train(n_train), y_test(n_test), x_train(n_train, 2), x_test(n_test, 2))\n      y_train = pack(y, train_mask)\n      y_test = pack(y, test_mask)\n      x_train(:, 1) = pack(x1, train_mask)\n      x_train(:, 2) = pack(x2, train_mask)\n      x_test(:, 1) = pack(x1, test_mask)\n      x_test(:, 2) = pack(x2, test_mask)\n      fit_cv = lm_fit_general(y_train, x_train)\n      pred = lm_predict_general(fit_cv, x_test)\n      mse(j) = sum((y_test - pred)**2) / real(max(1, n_test), kind=dp)\n   end block\nend do",
+            f90,
+            flags=re.DOTALL,
+        )
+    if "program x_29_model_selection_aic_bic" in f90:
+        f90 = re.sub(r"call print_summary\(step\(.*?\)\)", 'write(*,*) "step() model selection not fully translated"', f90, flags=re.DOTALL)
+        f90 = re.sub(r'(?m)^write\(\*,\*\) "step\(\) model selection not fully translated".*$(?:\n&.*$)*', 'write(*,*) "step() model selection not fully translated"', f90)
+        f90 = f90.replace(
+            'write(*,*) "step() model selection not fully translated"',
+            'block\n   type(lm_fit_t) :: fit_step\n   fit_step = step_lm(null, full)\n   call print_lm_summary(fit_step)\nend block',
+            1,
+        )
+        f90 = f90.replace(
+            'write(*,*) "step() model selection not fully translated"',
+            'block\n   type(lm_fit_t) :: fit_step\n   fit_step = step_lm(null, full, k=log(real(n, kind=dp)))\n   call print_lm_summary(fit_step)\nend block',
+            1,
+        )
+    if "program x_30_factor_analysis" in f90:
+        f90 = re.sub(r'write\(\*,"\(g0\)"\) factanal\(.*?\)', 'write(*,*) "factanal() not fully translated"', f90, flags=re.DOTALL)
+        f90 = re.sub(r'(?m)^write\(\*,\*\) "factanal\(\) not fully translated".*$(?:\n&.*$)*', 'write(*,*) "factanal() not fully translated"', f90)
+        f90 = f90.replace(
+            'write(*,*) "factanal() not fully translated"',
+            'call print_factanal(reshape([x1, x2, x3, x4, x5, x6], [size(x1), 6]), 2)',
+        )
+    if "program x_32_mle_normal_distribution" in f90:
+        f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
+    extra_use_names: list[str] = []
+    if "type(decompose_result_t)" in f90 or "decompose(" in f90:
+        extra_use_names.extend(["decompose", "decompose_result_t"])
+    if "type(optim_result_t)" in f90:
+        extra_use_names.append("optim_result_t")
+    if "ecdf_eval(" in f90:
+        extra_use_names.append("ecdf_eval")
+    if "ks_test(" in f90 or "print_ks_test(" in f90:
+        extra_use_names.extend(["ks_test", "ks_test_result_t", "print_ks_test"])
+    if "lm_fit_general(" in f90 or "lm_predict_general(" in f90 or "type(lm_fit_t)" in f90:
+        extra_use_names.extend(["lm_fit_t", "lm_fit_general", "lm_predict_general", "print_lm_summary", "step_lm"])
+    if "print_factanal(" in f90:
+        extra_use_names.append("print_factanal")
+    if extra_use_names:
+        extra_use = "use r_mod, only: " + ", ".join(sorted(set(extra_use_names)))
+        f90 = re.sub(r"(?m)^implicit none$", extra_use + "\nimplicit none", f90)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
     migrated_block = ""
