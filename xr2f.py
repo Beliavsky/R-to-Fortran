@@ -591,6 +591,7 @@ def _looks_vector_expr_for_recycle(expr: str) -> bool:
         "r_seq_real_length",
         "r_rep_real",
         "r_rep_int",
+        "r_rep_char",
         "runif_vec",
         "rnorm_vec",
         "numeric",
@@ -846,6 +847,8 @@ def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
     kw: dict[str, str] = {}
     for p in parts:
         pt = p.strip()
+        if pt == "...":
+            continue
         asn = split_top_level_assignment(pt)
         if asn is not None:
             lhs = asn[0].strip()
@@ -855,6 +858,122 @@ def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
                 continue
         pos.append(pt)
     return nm, pos, kw
+
+
+def _strip_variadic_actuals_in_calls(expr: str) -> str:
+    """Remove `...` arguments from function calls in R-like expression strings."""
+
+    def _filter_parts(inner: str) -> str:
+        parts = split_top_level_commas(inner) if inner.strip() else []
+        kept: list[str] = []
+        for p in parts:
+            t = p.strip()
+            if not t or t == "...":
+                continue
+            kept.append(t)
+        return ", ".join(kept)
+
+    def _scan(text: str) -> str:
+        out: list[str] = []
+        n = len(text)
+        i = 0
+        in_single = False
+        in_double = False
+        esc = False
+        while i < n:
+            ch = text[i]
+            if esc:
+                esc = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                i += 1
+                continue
+            if in_single:
+                if ch == "'" and not in_double:
+                    in_single = False
+                out.append(ch)
+                i += 1
+                continue
+            if in_double:
+                if ch == '"' and not in_single:
+                    in_double = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                in_double = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch.isalpha() or ch == "_":
+                m_name = re.match(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", text[i:])
+                if m_name is None:
+                    out.append(ch)
+                    i += 1
+                    continue
+                name = m_name.group(0)
+                j = i + m_name.end()
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                if k >= n or text[k] != "(":
+                    out.append(text[i:k])
+                    i = k
+                    continue
+                depth = 0
+                q: str | None = None
+                esc2 = False
+                p = k
+                close = -1
+                while p < n:
+                    c2 = text[p]
+                    if q is not None:
+                        if esc2:
+                            esc2 = False
+                        elif c2 == "\\":
+                            esc2 = True
+                        elif c2 == q:
+                            q = None
+                        p += 1
+                        continue
+                    if c2 in {"'", '"'}:
+                        q = c2
+                    elif c2 == "\\":
+                        esc2 = True
+                    elif c2 == "(":
+                        depth += 1
+                    elif c2 == ")":
+                        if depth == 1:
+                            close = p
+                            break
+                        depth -= 1
+                    p += 1
+                if close < 0:
+                    out.append(text[i: k + 1])
+                    i = k + 1
+                    continue
+                inner = text[k + 1 : close]
+                inner_clean = _scan(inner)
+                out.append(name)
+                out.append("(")
+                out.append(_filter_parts(inner_clean))
+                out.append(")")
+                i = close + 1
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+
+    return _scan(expr)
 
 
 def _sanitize_fortran_kwarg_name(name: str) -> str:
@@ -1949,10 +2068,14 @@ def parse_block(
             if arg_txt:
                 for part in split_top_level_commas(arg_txt):
                     pt = part.strip()
+                    if pt == "...":
+                        continue
                     m_ap = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*=\s*(.+)$", pt)
                     if m_ap:
                         raw_anm = m_ap.group(1)
                         anm = _sanitize_fortran_kwarg_name(raw_anm)
+                        if not anm:
+                            continue
                         args.append(anm)
                         defaults[anm] = _replace_idents(m_ap.group(2).strip(), arg_name_map)
                         if raw_anm != anm:
@@ -1960,11 +2083,15 @@ def parse_block(
                     else:
                         if re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", pt):
                             anm = _sanitize_fortran_kwarg_name(pt)
+                            if not anm:
+                                continue
                             args.append(anm)
                             if pt != anm:
                                 arg_name_map[pt] = anm
                         else:
-                            args.append(pt)
+                            anm = _sanitize_fortran_kwarg_name(pt)
+                            if anm:
+                                args.append(anm)
             if fn_tail:
                 body = [parse_single_statement(fn_tail, comment_lookup=comment_lookup)]
                 i += 1
@@ -2756,7 +2883,7 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
             src = kw.get("length") or pos_arg(1)
             if src is not None:
                 mark_expr(src)
-        elif key in {"rep", "rep.int", "r_rep_real", "r_rep_int"}:
+        elif key in {"rep", "rep.int", "r_rep_real", "r_rep_int", "r_rep_char"}:
             for src in [kw.get("times"), kw.get("each"), kw.get("length.out"), kw.get("length_out")]:
                 if src is not None:
                     mark_expr(src)
@@ -7474,9 +7601,41 @@ def r_expr_to_fortran(expr: str) -> str:
                 return bool(vals) and all(_is_int_literal(v.strip()) for v in vals)
             return False
 
+        def _looks_char_vec(src_txt: str, f_txt: str) -> bool:
+            t_src = src_txt.strip()
+            if t_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return True
+            if _dequote_string_literal(t_src) is not None:
+                return True
+            if f_txt.strip().startswith("[character("):
+                return True
+            c_src = parse_call_text(t_src)
+            if c_src is None:
+                return False
+            if c_src[0].lower() == "c" and _parse_string_c_vector(t_src) is not None:
+                return True
+            return c_src[0].lower() in {
+                "r_array_char",
+                "r_character",
+                "to_character",
+            }
+
         use_int = _looks_int_vec(x_f_raw) or _is_int_literal(x_src.strip())
-        x_f = x_f_raw if _is_vectorish(x_f_raw) else (f"[{_int_bound_expr(x_f_raw)}]" if use_int else f"[{x_f_raw}]")
-        rep_fn = "r_rep_int" if use_int else "r_rep_real"
+        use_char = _looks_char_vec(x_src, x_f_raw)
+        if use_char:
+            x_f = x_f_raw if _is_vectorish(x_f_raw) else f"[{x_f_raw}]"
+        else:
+            x_f = x_f_raw if _is_vectorish(x_f_raw) else (
+                f"[{_int_bound_expr(x_f_raw)}]"
+                if use_int
+                else f"[{x_f_raw}]"
+            )
+        if use_int:
+            rep_fn = "r_rep_int"
+        elif use_char:
+            rep_fn = "r_rep_char"
+        else:
+            rep_fn = "r_rep_real"
 
         times_src = kw_r.get("times")
         each_src = kw_r.get("each")
@@ -8568,6 +8727,7 @@ def r_expr_to_fortran(expr: str) -> str:
     while prev_mod != s:
         prev_mod = s
         s = mod_pat.sub(r"mod(\1, \2)", s)
+    s = _strip_variadic_actuals_in_calls(s)
     s = _replace_complex_literals_outside_strings(s)
     return s
 
@@ -12301,6 +12461,13 @@ def emit_function(
     need_rnorm_local = {"used": False}
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
     body_stmts, last = _lower_local_scalar_closures(body_stmts, last)
+    fn_proc_args = infer_function_callback_args(fn)
+    if fn_proc_args:
+        names = ", ".join(sorted(fn_proc_args))
+        raise NotImplementedError(
+            f"{fn.name} uses function-valued argument(s) as callbacks ({names}); "
+            "first-class function arguments are not supported"
+        )
     if fn.name == "arma_coef_names" and len(fn.args) >= 2:
         max_ar_arg, max_ma_arg = fn.args[:2]
         rname = f"{fn.name}_result"
@@ -12572,6 +12739,10 @@ def emit_function(
             o.w(f"character(len=*), intent({intent}){opt} :: {a}(:)")
             arg_type[a] = "char_array"
             continue
+        if a in fn_proc_args:
+            o.w(f"real, external :: {a}")
+            arg_type[a] = "procedure"
+            continue
         if a in fn_char_scalars:
             o.w(f"character(len=*), intent({intent}){opt} :: {a}")
             arg_type[a] = "char"
@@ -12630,6 +12801,8 @@ def emit_function(
             loc = f"{a}_def"
             arg_local_map[a] = loc
             t = arg_type.get(a, "real")
+            if t == "procedure":
+                continue
             if t == "integer":
                 arg_local_decl_lines.append(f"integer :: {loc}")
                 dflt_f = _int_bound_expr(r_expr_to_fortran(dflt))
@@ -12668,6 +12841,8 @@ def emit_function(
         loc = f"{a}_wrk"
         arg_local_map[a] = loc
         t = arg_type.get(a, "real")
+        if t == "procedure":
+            continue
         if t == "integer":
             arg_local_decl_lines.append(f"integer :: {loc}")
             arg_local_init_lines.append(f"{loc} = {a}")
@@ -13513,6 +13688,32 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
     return ints
 
 
+def infer_function_callback_args(fn: FuncDef) -> set[str]:
+    """Infer function arguments that appear as callees in this function."""
+    out: set[str] = set()
+    arg_names = {a.lower(): a for a in fn.args}
+
+    def walk_expr(expr: str) -> None:
+        txt = expr.strip()
+        if not txt:
+            return
+        c = parse_call_text(txt)
+        if c is None:
+            return
+        nm, pos, kw = c
+        canon = arg_names.get(nm.lower())
+        if canon is not None:
+            out.add(canon)
+        for p in pos:
+            walk_expr(p)
+        for v in kw.values():
+            walk_expr(v)
+
+    for txt in _collect_stmt_expr_texts(fn.body):
+        walk_expr(txt)
+    return out
+
+
 def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
     """Infer local names that are likely integer arrays within one function scope."""
     int_arrays: set[str] = set()
@@ -13879,6 +14080,22 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
     """Infer character scalar locals from string comparisons and string helpers."""
     out: set[str] = set()
 
+    def _mark_char_arg(src: str) -> None:
+        t = _strip_named_actual_value(src.strip())
+        if re.fullmatch(r"[A-Za-z]\w*", t):
+            out.add(t)
+
+    def _mark_nchar_arg_calls(txt: str) -> None:
+        def _collect(inner: str) -> str:
+            c_nchar = parse_call_text("nchar(" + inner + ")")
+            if c_nchar is not None:
+                arg = c_nchar[1][0] if c_nchar[1] else c_nchar[2].get("string", c_nchar[2].get("x"))
+                if arg is not None:
+                    _mark_char_arg(arg)
+            return "nchar(" + inner + ")"
+
+        _ = _replace_balanced_func_calls(txt, "nchar", _collect)
+
     def _scan(ss: list[object]) -> None:
         for st in ss:
             texts: list[str] = []
@@ -13902,10 +14119,35 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
             elif isinstance(st, RepeatStmt):
                 _scan(st.body)
             elif isinstance(st, CallStmt):
+                c_call = parse_call_text(st.name + "(" + ", ".join(st.args) + ")")
+                if c_call is not None:
+                    callee_l = c_call[0].lower()
+                    arg_kinds = _USER_FUNC_ARG_KIND.get(callee_l, [])
+                    arg_index = _USER_FUNC_ARG_INDEX.get(callee_l, {})
+                    for i_arg, actual_arg in enumerate(c_call[1]):
+                        if i_arg < len(arg_kinds) and arg_kinds[i_arg] == "character":
+                            _mark_char_arg(actual_arg)
+                    for k_name, actual_arg in c_call[2].items():
+                        k_idx = arg_index.get(k_name.lower())
+                        if k_idx is not None and k_idx < len(arg_kinds) and arg_kinds[k_idx] == "character":
+                            _mark_char_arg(actual_arg)
                 texts.extend(st.args)
             elif isinstance(st, ExprStmt):
                 texts.append(st.expr)
+                c_call = parse_call_text(st.expr.strip())
+                if c_call is not None:
+                    callee_l = c_call[0].lower()
+                    arg_kinds = _USER_FUNC_ARG_KIND.get(callee_l, [])
+                    arg_index = _USER_FUNC_ARG_INDEX.get(callee_l, {})
+                    for i_arg, actual_arg in enumerate(c_call[1]):
+                        if i_arg < len(arg_kinds) and arg_kinds[i_arg] == "character":
+                            _mark_char_arg(actual_arg)
+                    for k_name, actual_arg in c_call[2].items():
+                        k_idx = arg_index.get(k_name.lower())
+                        if k_idx is not None and k_idx < len(arg_kinds) and arg_kinds[k_idx] == "character":
+                            _mark_char_arg(actual_arg)
             for txt in texts:
+                _mark_nchar_arg_calls(txt)
                 for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:==|!=)\s*(['\"])", txt):
                     out.add(m.group(1))
                 for m in re.finditer(r"\b(?:startsWith|nzchar)\s*\(\s*([A-Za-z]\w*)\b", txt, re.IGNORECASE):
@@ -15480,6 +15722,7 @@ def transpile_r_to_fortran(
             fn_return_array_kind[f_ret.name.lower()] = "integer"
         elif ret_name in fn_real_array_names.get(f_ret.name, set()) or ret_name in fn_real_matrix_names.get(f_ret.name, set()):
             fn_return_array_kind[f_ret.name.lower()] = "real"
+    fn_char_scalars: dict[str, set[str]] = {f.name: infer_function_character_scalars(f) for f in funcs}
     _USER_FUNC_ARG_KIND = {}
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ARG_RANK = {}
@@ -15510,6 +15753,7 @@ def transpile_r_to_fortran(
         fn_int_arrs = fn_int_array_names.get(f.name, set())
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
+        fn_chars = fn_char_scalars.get(f.name, set())
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
         if (
             f.name.lower() not in _SUBROUTINE_FUNCTIONS
@@ -15521,6 +15765,9 @@ def transpile_r_to_fortran(
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
             kinds.append(
+                "character"
+                if a in fn_chars
+                else
                 "integer"
                 if (
                     a in fn_ints
@@ -17129,8 +17376,8 @@ def transpile_r_to_fortran(
         )
     ))
     emit_local_rep = ((not has_r_mod_emit) and (
-        any(("r_rep_real(" in ln or "r_rep_int(" in ln) for ln in pbody.lines)
-        or any(("r_rep_real(" in ln or "r_rep_int(" in ln) for ln in mprocs.lines)
+        any(("r_rep_real(" in ln or "r_rep_int(" in ln or "r_rep_char(" in ln) for ln in pbody.lines)
+        or any(("r_rep_real(" in ln or "r_rep_int(" in ln or "r_rep_char(" in ln) for ln in mprocs.lines)
     ))
     emit_local_numeric = ((not has_r_mod_emit) and (
         any("numeric(" in ln for ln in pbody.lines)
@@ -17444,6 +17691,121 @@ def transpile_r_to_fortran(
         mprocs.pop()
         mprocs.w("end if")
         mprocs.w("end function r_rep_real")
+        mprocs.w("")
+        mprocs.w("pure function r_rep_char(x, times, each, len_out, times_vec) result(out)")
+        mprocs.w("character(len=*), intent(in) :: x(:)")
+        mprocs.w("integer, intent(in), optional :: times, each, len_out")
+        mprocs.w("integer, intent(in), optional :: times_vec(:)")
+        mprocs.w("character(len=:), allocatable :: out(:)")
+        mprocs.w("character(len=:), allocatable :: y(:), z(:)")
+        mprocs.w("integer :: i, j, n, e, t, k, m, need, c")
+        mprocs.w("integer :: item_len")
+        mprocs.w("n = size(x)")
+        mprocs.w("if (n <= 0) then")
+        mprocs.push()
+        mprocs.w("allocate(character(len=1) :: out(0))")
+        mprocs.w("return")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("item_len = max(1, len(x(1)))")
+        mprocs.w("if (present(each)) then")
+        mprocs.push()
+        mprocs.w("e = each")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("e = 1")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("if (e < 1) e = 1")
+        mprocs.w("allocate(character(len=item_len) :: y(n * e))")
+        mprocs.w("k = 0")
+        mprocs.w("do i = 1, n")
+        mprocs.push()
+        mprocs.w("do j = 1, e")
+        mprocs.push()
+        mprocs.w("k = k + 1")
+        mprocs.w("y(k) = x(i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("if (present(times_vec)) then")
+        mprocs.push()
+        mprocs.w("m = size(y)")
+        mprocs.w("c = 0")
+        mprocs.w("do i = 1, m")
+        mprocs.push()
+        mprocs.w("t = times_vec(mod(i - 1, size(times_vec)) + 1)")
+        mprocs.w("if (t > 0) c = c + t")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("allocate(character(len=item_len) :: z(c))")
+        mprocs.w("k = 0")
+        mprocs.w("do i = 1, m")
+        mprocs.push()
+        mprocs.w("t = times_vec(mod(i - 1, size(times_vec)) + 1)")
+        mprocs.w("do j = 1, max(0, t)")
+        mprocs.push()
+        mprocs.w("k = k + 1")
+        mprocs.w("z(k) = y(i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("if (present(times)) then")
+        mprocs.push()
+        mprocs.w("t = times")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("t = 1")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("if (t < 0) t = 0")
+        mprocs.w("allocate(character(len=item_len) :: z(size(y) * t))")
+        mprocs.w("k = 0")
+        mprocs.w("do j = 1, t")
+        mprocs.push()
+        mprocs.w("do i = 1, size(y)")
+        mprocs.push()
+        mprocs.w("k = k + 1")
+        mprocs.w("z(k) = y(i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("if (present(len_out)) then")
+        mprocs.push()
+        mprocs.w("need = max(0, len_out)")
+        mprocs.w("if (need == 0) then")
+        mprocs.push()
+        mprocs.w("allocate(character(len=item_len) :: out(0))")
+        mprocs.w("return")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("allocate(character(len=item_len) :: out(need))")
+        mprocs.w("if (size(z) > 0) then")
+        mprocs.push()
+        mprocs.w("do i = 1, need")
+        mprocs.push()
+        mprocs.w("out(i) = z(mod(i - 1, size(z)) + 1)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("out = z")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.w("end function r_rep_char")
         mprocs.w("")
         mprocs.w("pure function r_rep_int(x, times, each, len_out, times_vec) result(out)")
         mprocs.w("integer, intent(in) :: x(:)")
@@ -17923,6 +18285,7 @@ def transpile_r_to_fortran(
         "r_seq_real_by",
         "r_seq_real_length",
         "r_rep_real",
+        "r_rep_char",
         "r_rep_int",
         "r_head",
         "r_array_real",
@@ -18742,6 +19105,26 @@ def simplify_write_g0_outer_parens(lines: list[str]) -> list[str]:
         expr = fscan.strip_redundant_outer_parens_expr(m.group(2).strip())
         suffix = f" {comment.strip()}" if comment.strip() else ""
         out.append(f"{m.group(1)}{expr}{suffix}")
+    return out
+
+
+def compact_array_section_subscripts(lines: list[str]) -> list[str]:
+    """Keep generated rank-3/list-array sections in their historical compact spelling."""
+    out: list[str] = []
+    for raw in lines:
+        code, comment = fscan._split_code_comment(raw)  # type: ignore[attr-defined]
+        new = code
+        new = re.sub(
+            r"\b([A-Za-z_]\w*(?:%[A-Za-z_]\w*)*)\(\s*:\s*,\s*:\s*,\s*([A-Za-z_]\w*|\d+)\s*\)",
+            r"\1(:,:,\2)",
+            new,
+        )
+        new = re.sub(
+            r"\b([A-Za-z_]\w*_list)\(\s*:\s*,\s*([A-Za-z_]\w*|\d+)\s*\)",
+            r"\1(:,\2)",
+            new,
+        )
+        out.append(new + (comment if comment else ""))
     return out
 
 
@@ -20146,6 +20529,7 @@ def main() -> int:
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
+    f90_lines = compact_array_section_subscripts(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
