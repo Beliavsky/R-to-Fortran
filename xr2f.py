@@ -6678,9 +6678,12 @@ def r_expr_to_fortran(expr: str) -> str:
             name_src = kw_u.get("name", pos_u[0] if len(pos_u) >= 1 else '""')
             x_src = kw_u.get("x", pos_u[1] if len(pos_u) >= 2 else "")
             if x_src:
+                x_f = r_expr_to_fortran(x_src)
+                if key_u == "print_mat" and _looks_vector_actual_for_matrix_arg(x_src, x_f):
+                    x_f = f"reshape({x_f}, [size({x_f}), 1])"
                 args_print = [
                     f"name={r_expr_to_fortran(name_src)}",
-                    f"x={r_expr_to_fortran(x_src)}",
+                    f"x={x_f}",
                 ]
                 digits_src = kw_u.get("digits", pos_u[2] if len(pos_u) >= 3 else "")
                 if digits_src:
@@ -20000,6 +20003,32 @@ def rewrite_named_actuals_inside_array_constructors(lines: list[str]) -> list[st
     return out
 
 
+def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
+    rank1: set[str] = set()
+    decl_pat = re.compile(r"^\s*(?:real(?:\([^)]*\))?|integer|logical)(?:\s*,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m = decl_pat.match(ln)
+        if m is None:
+            continue
+        for item in split_top_level_commas(m.group(1)):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", item)
+            if mm is not None:
+                rank1.add(mm.group(1))
+    if not rank1:
+        return lines
+    out: list[str] = []
+    call_pat = re.compile(r"(\bcall\s+print_mat\s*\([^)]*\bx\s*=\s*)([A-Za-z]\w*)(\s*[),])", re.IGNORECASE)
+    for ln in lines:
+        def repl(m: re.Match[str]) -> str:
+            nm = m.group(2)
+            if nm not in rank1:
+                return m.group(0)
+            return f"{m.group(1)}reshape({nm}, [size({nm}), 1]){m.group(3)}"
+
+        out.append(call_pat.sub(repl, ln))
+    return out
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -21218,6 +21247,7 @@ def main() -> int:
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = compact_array_section_subscripts(f90_lines)
+    f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
