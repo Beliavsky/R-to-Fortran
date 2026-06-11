@@ -6674,6 +6674,18 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_usr is not None:
         nm_u, pos_u, kw_u = c_usr
         key_u = nm_u.lower()
+        if key_u in {"print_vec", "print_mat"}:
+            name_src = kw_u.get("name", pos_u[0] if len(pos_u) >= 1 else '""')
+            x_src = kw_u.get("x", pos_u[1] if len(pos_u) >= 2 else "")
+            if x_src:
+                args_print = [
+                    f"name={r_expr_to_fortran(name_src)}",
+                    f"x={r_expr_to_fortran(x_src)}",
+                ]
+                digits_src = kw_u.get("digits", pos_u[2] if len(pos_u) >= 3 else "")
+                if digits_src:
+                    args_print.append(f"digits={_int_bound_expr(r_expr_to_fortran(digits_src))}")
+                return f"{nm_u}({', '.join(args_print)})"
         kinds = _USER_FUNC_ARG_KIND.get(key_u)
         if kinds is not None:
             idx_map = _USER_FUNC_ARG_INDEX.get(key_u, {})
@@ -19950,6 +19962,21 @@ def rewrite_residual_vector_bracket_subscripts(lines: list[str]) -> list[str]:
     return out
 
 
+def rewrite_named_actuals_inside_array_constructors(lines: list[str]) -> list[str]:
+    pat = re.compile(r"\[([^\[\]]*)\]")
+    out: list[str] = []
+    for ln in lines:
+        def repl(m: re.Match[str]) -> str:
+            inner = m.group(1)
+            if re.search(r",\s*[A-Za-z]\w*\s*=\s*[^,]+,\s*[^,]+", inner):
+                return "[" + inner + "]"
+            inner = re.sub(r"(^|,)\s*[A-Za-z]\w*\s*=", r"\1 ", inner)
+            return "[" + inner + "]"
+
+        out.append(pat.sub(repl, ln))
+    return out
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -21108,6 +21135,7 @@ def main() -> int:
     f90_lines = fpost.fold_simple_integer_intrinsics(f90_lines)
     f90_lines = rewrite_vector_bracket_assignment_with_replace(f90_lines)
     f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
+    f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
@@ -21118,6 +21146,7 @@ def main() -> int:
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = hoist_repeated_numeric_array_literals(f90_lines)
     f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
+    f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
     # NOTE: keep named-argument rewriting disabled here; the generic pass
     # can mis-handle array constructors in helper calls (e.g., r_rep_*).
     # Keep helper argument forms as emitted; avoid line-based rewrites that can
@@ -21136,6 +21165,7 @@ def main() -> int:
     f90_lines = fix_split_power_operator(f90_lines)
     f90_lines = fix_wrapped_closing_delims(f90_lines)
     f90_lines = fpost.rewrite_named_arguments(f90_lines)
+    f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
