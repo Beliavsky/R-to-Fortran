@@ -40,6 +40,7 @@ _SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
+_KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_MATRIX_NAMES: set[str] = set()
@@ -5840,6 +5841,19 @@ def r_expr_to_fortran(expr: str) -> str:
     if m_grep_subset0 is not None:
         base_gs = m_grep_subset0.group(1)
         return f"{base_gs}({r_expr_to_fortran('grep(' + m_grep_subset0.group(2) + ')')})"
+    m_mask_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]$", s)
+    if m_mask_subset0 is not None and m_mask_subset0.group(2).lower() in _KNOWN_LOGICAL_MATRIX_NAMES:
+        return f"pack({m_mask_subset0.group(1)}, {m_mask_subset0.group(2)})"
+    m_tri_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*((?:lower|upper)\.tri\s*\(.*\))\s*\]$", s, re.IGNORECASE)
+    if m_tri_subset0 is not None:
+        return f"pack({m_tri_subset0.group(1)}, {r_expr_to_fortran(m_tri_subset0.group(2))})"
+    c_tri0 = parse_call_text(s)
+    if c_tri0 is not None and c_tri0[0].lower() in {"lower.tri", "upper.tri"}:
+        _nm_tri, pos_tri, kw_tri = c_tri0
+        x_src = pos_tri[0] if pos_tri else kw_tri.get("x", "")
+        diag_src = kw_tri.get("diag", "FALSE")
+        fn_tri = "lower_tri" if c_tri0[0].lower() == "lower.tri" else "upper_tri"
+        return f"{fn_tri}(real({r_expr_to_fortran(x_src)}, kind=dp), diag={r_expr_to_fortran(diag_src)})"
     s = _replace_dotted_var_refs(s)
     s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
     s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
@@ -6488,6 +6502,9 @@ def r_expr_to_fortran(expr: str) -> str:
         mask_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
         if not mask_src:
             raise NotImplementedError("which requires x argument")
+        arr_ind_src = c_usr[2].get("arr.ind", c_usr[2].get("arr_ind", "FALSE")).strip().lower()
+        if arr_ind_src in {"true", "t", ".true."}:
+            return f"which_arr_ind({r_expr_to_fortran(mask_src)})"
         return f"which({r_expr_to_fortran(mask_src)})"
     if c_usr is not None and c_usr[0].lower() == "rle":
         x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
@@ -8200,6 +8217,8 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"size({r_expr_to_fortran(txt)}, 2)"
     s = _replace_balanced_func_calls(s, "nrow", _nrow_inner)
     s = _replace_balanced_func_calls(s, "ncol", _ncol_inner)
+    s = _replace_balanced_func_calls(s, "row", lambda inner: f"row_index_mat(real({r_expr_to_fortran(inner.strip())}, kind=dp))")
+    s = _replace_balanced_func_calls(s, "col", lambda inner: f"col_index_mat(real({r_expr_to_fortran(inner.strip())}, kind=dp))")
     def _nchar_inner(inner: str) -> str:
         txt = inner.strip()
         ft = r_expr_to_fortran(txt)
@@ -8263,6 +8282,17 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     s = _replace_balanced_func_calls(s, "typeof", lambda inner: f"r_typeof({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "commandArgs", lambda inner: "r_command_args()")
+    def _tri_to_fortran(inner: str, fn_name: str) -> str:
+        parts = split_top_level_commas(inner)
+        x_src = parts[0].strip() if parts else ""
+        diag_src = "FALSE"
+        for part in parts[1:]:
+            m_diag = re.match(r"^\s*diag\s*=\s*(.+)$", part, re.IGNORECASE)
+            if m_diag is not None:
+                diag_src = m_diag.group(1).strip()
+        return f"{fn_name}(real({r_expr_to_fortran(x_src)}, kind=dp), diag={r_expr_to_fortran(diag_src)})"
+    s = _replace_balanced_func_calls(s, "lower.tri", lambda inner: _tri_to_fortran(inner, "lower_tri"))
+    s = _replace_balanced_func_calls(s, "upper.tri", lambda inner: _tri_to_fortran(inner, "upper_tri"))
     def _strsplit_to_fortran(inner: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) >= 2:
@@ -8995,6 +9025,7 @@ def emit_stmts(
     int_vector_vars: set[str] = set()
     real_vector_vars: set[str] = set()
     logical_vector_vars: set[str] = set()
+    logical_matrix_vars: set[str] = set()
     matrix_vars: set[str] = set()
     vector_vars: set[str] = set()
     local_ranks_ctx: dict[str, int] = {}
@@ -9067,6 +9098,9 @@ def emit_stmts(
         lvv = helper_ctx.get("logical_vector_vars")
         if isinstance(lvv, set):
             logical_vector_vars = lvv
+        lmv = helper_ctx.get("logical_matrix_vars")
+        if isinstance(lmv, set):
+            logical_matrix_vars = lmv
         mv = helper_ctx.get("matrix_vars")
         if isinstance(mv, set):
             matrix_vars = mv
@@ -9404,9 +9438,20 @@ def emit_stmts(
             or t.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
         ):
             return 1
+        if re.fullmatch(r"[A-Za-z]\w*", t) and (
+            t in logical_matrix_vars or t.lower() in _KNOWN_LOGICAL_MATRIX_NAMES
+        ):
+            return 2
+        c_tri_rank = parse_call_text(t)
+        if c_tri_rank is not None and c_tri_rank[0].lower() in {"lower.tri", "upper.tri"}:
+            return 2
         if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
             return 3
         c_rank_print = parse_call_text(t)
+        if c_rank_print is not None and c_rank_print[0].lower() == "which":
+            arr_ind_src = c_rank_print[2].get("arr.ind", c_rank_print[2].get("arr_ind", "FALSE")).strip().lower()
+            if arr_ind_src in {"true", "t", ".true."}:
+                return 2
         if c_rank_print is not None and c_rank_print[0].lower() in {"sort", "unique", "replace"}:
             arg_rank_print = c_rank_print[1][0].strip() if c_rank_print[1] else c_rank_print[2].get("x", "").strip()
             if arg_rank_print:
@@ -12405,16 +12450,27 @@ def emit_stmts(
                 if m_lhs_mask is not None:
                     base_lhs = m_lhs_mask.group(1)
                     inner_lhs = m_lhs_mask.group(2).strip()
-                    if "," not in inner_lhs:
+                    is_tri_mask_lhs = bool(re.match(r"^!?\s*(?:lower\.tri|upper\.tri)\s*\(", inner_lhs, re.IGNORECASE))
+                    if "," not in inner_lhs or is_tri_mask_lhs:
                         inner_l = inner_lhs.lower()
                         if (
                             inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                            or inner_l in _KNOWN_LOGICAL_MATRIX_NAMES
                             or re.match(r"^is\.na\s*\(", inner_l)
                             or re.match(r"^is_na\s*\(", inner_l)
+                            or inner_l.startswith("!")
+                            or re.match(r"^(?:lower\.tri|upper\.tri)\s*\(", inner_l)
                             or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
                         ):
                             mask_f = r_expr_to_fortran(inner_lhs)
-                            _wstmt(f"where ({mask_f}) {base_lhs} = {rhs}", st.comment)
+                            rhs_where = rhs
+                            m_rhs_masked_t = re.match(r"^(?:t|transpose)\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*(.+)\s*\]\s*$", asn[1].strip(), re.IGNORECASE)
+                            if m_rhs_masked_t is not None:
+                                rhs_mask_src = re.sub(r"\s+", "", m_rhs_masked_t.group(2).strip().lower())
+                                lhs_mask_src = re.sub(r"\s+", "", inner_lhs.strip().lower())
+                                if rhs_mask_src == lhs_mask_src:
+                                    rhs_where = f"transpose({r_expr_to_fortran(m_rhs_masked_t.group(1))})"
+                            _wstmt(f"where ({mask_f}) {base_lhs} = {rhs_where}", st.comment)
                             continue
                         if _index_assignment_needs_replace(inner_lhs):
                             idx_raw = r_expr_to_fortran(inner_lhs)
@@ -14882,6 +14938,30 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
     return out
 
 
+def infer_main_logical_matrices(stmts: list[object]) -> set[str]:
+    """Find rank-2 logical mask variables."""
+    out: set[str] = set()
+
+    def _walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs_l = st.expr.strip().lower()
+                if re.match(r"^(?:lower\.tri|upper\.tri)\s*\(", rhs_l):
+                    out.add(st.name)
+            elif isinstance(st, IfStmt):
+                _walk(st.then_body)
+                _walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                _walk(st.body)
+            elif isinstance(st, WhileStmt):
+                _walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                _walk(st.body)
+
+    _walk(stmts)
+    return out
+
+
 def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None = None) -> tuple[set[str], set[str], set[str]]:
     scalars: set[str] = set()
     arrays: set[str] = set()
@@ -15154,6 +15234,14 @@ def infer_main_integer_matrices(stmts: list[object]) -> set[str]:
             continue
         rhs = st.expr.strip()
         cinfo_o = parse_call_text(rhs)
+        if cinfo_o is not None and cinfo_o[0].lower() == "which":
+            arr_ind_src = cinfo_o[2].get("arr.ind", cinfo_o[2].get("arr_ind", "FALSE")).strip().lower()
+            if arr_ind_src in {"true", "t", ".true."}:
+                out.add(st.name)
+                continue
+        if cinfo_o is not None and cinfo_o[0].lower() in {"row", "col"}:
+            out.add(st.name)
+            continue
         if cinfo_o is not None and cinfo_o[0].lower() == "table":
             vals = list(cinfo_o[1]) + list(cinfo_o[2].values())
             if len(vals) >= 2:
@@ -16122,7 +16210,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
@@ -16139,6 +16227,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_VECTOR_NAMES = set()
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
+    _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _MIXED_CHARACTER_COERCION_WARNINGS = set()
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
@@ -16508,6 +16597,13 @@ def transpile_r_to_fortran(
         if not isinstance(st_real_expr, Assign):
             continue
         rhs_real_f = r_expr_to_fortran(st_real_expr.expr.strip())
+        if re.search(r"\[\s*(?:lower\.tri|upper\.tri)\s*\(", st_real_expr.expr.strip(), re.IGNORECASE):
+            real_arrays.add(st_real_expr.name)
+            ints.discard(st_real_expr.name)
+            int_arrays.discard(st_real_expr.name)
+            real_scalars.discard(st_real_expr.name)
+            params.pop(st_real_expr.name, None)
+            continue
         if re.search(r"\b(?:lm_r_squared_general|pchisq)\s*\(", rhs_real_f, re.IGNORECASE):
             real_scalars.add(st_real_expr.name)
             ints.discard(st_real_expr.name)
@@ -16533,6 +16629,36 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    changed_matrix_aliases = True
+    while changed_matrix_aliases:
+        changed_matrix_aliases = False
+        known_int_mats_alias = {n.lower() for n in int_matrices}
+        known_real_mats_alias = {n.lower() for n in real_matrices}
+        for st_mat_alias in main_stmts:
+            if not isinstance(st_mat_alias, Assign):
+                continue
+            rhs_alias = st_mat_alias.expr.strip().lower()
+            if not re.match(r"^[A-Za-z]\w*$", rhs_alias):
+                c_alias = parse_call_text(st_mat_alias.expr.strip())
+                if c_alias is None or c_alias[0].lower() not in {"abs", "round", "sqrt", "log", "exp"}:
+                    continue
+                rhs_arg_alias = c_alias[1][0].strip().lower() if c_alias[1] else c_alias[2].get("x", "").strip().lower()
+                if not rhs_arg_alias:
+                    continue
+            else:
+                rhs_arg_alias = rhs_alias
+            if rhs_arg_alias in known_int_mats_alias and st_mat_alias.name not in int_matrices:
+                int_matrices.add(st_mat_alias.name)
+                changed_matrix_aliases = True
+            elif rhs_arg_alias in known_real_mats_alias and st_mat_alias.name not in real_matrices:
+                real_matrices.add(st_mat_alias.name)
+                changed_matrix_aliases = True
+            if changed_matrix_aliases:
+                int_arrays.discard(st_mat_alias.name)
+                real_arrays.discard(st_mat_alias.name)
+                real_scalars.discard(st_mat_alias.name)
+                ints.discard(st_mat_alias.name)
+                params.pop(st_mat_alias.name, None)
     for st_solve_mat in main_stmts:
         if not isinstance(st_solve_mat, Assign):
             continue
@@ -16578,6 +16704,16 @@ def transpile_r_to_fortran(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
     )
+    logical_matrices = infer_main_logical_matrices(main_stmts)
+    for nm in logical_matrices:
+        ints.discard(nm)
+        int_arrays.discard(nm)
+        real_scalars.discard(nm)
+        real_arrays.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        logical_arrays.discard(nm)
+        params.pop(nm, None)
     logical_arrays.discard("ok")
     int_arrays.discard("ok")
     real_arrays.discard("ok")
@@ -16596,6 +16732,7 @@ def transpile_r_to_fortran(
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
+    _KNOWN_LOGICAL_MATRIX_NAMES = {n.lower() for n in logical_matrices}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
     rle_vars: dict[str, str] = {}
     for st_rle in main_stmts:
@@ -16687,6 +16824,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
+    helper_ctx_main["logical_matrix_vars"] = set(logical_matrices)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
     helper_ctx_main["char_vector_vars"] = set(char_arrays)
 
@@ -17439,6 +17577,45 @@ def transpile_r_to_fortran(
         char_arrays.discard(nm)
         params.pop(nm, None)
 
+    for st_tri_vec in main_stmts:
+        if isinstance(st_tri_vec, Assign) and re.search(r"\[\s*(?:lower\.tri|upper\.tri)\s*\(", st_tri_vec.expr.strip(), re.IGNORECASE):
+            real_arrays.add(st_tri_vec.name)
+            ints.discard(st_tri_vec.name)
+            int_arrays.discard(st_tri_vec.name)
+            real_scalars.discard(st_tri_vec.name)
+            params.pop(st_tri_vec.name, None)
+
+    def _force_scalar_matrix_element_aliases(ss_scalar_alias: list[object]) -> None:
+        for st_scalar_alias in ss_scalar_alias:
+            if isinstance(st_scalar_alias, Assign):
+                rhs_scalar_alias = st_scalar_alias.expr.strip()
+                m_scalar_alias = re.match(r"^([A-Za-z]\w*)\s*\[\s*[^,\]]+\s*,\s*[^,\]]+\s*\]$", rhs_scalar_alias)
+                if m_scalar_alias is not None:
+                    base_scalar_alias = m_scalar_alias.group(1)
+                    if base_scalar_alias in int_matrices:
+                        ints.add(st_scalar_alias.name)
+                        int_arrays.discard(st_scalar_alias.name)
+                        real_arrays.discard(st_scalar_alias.name)
+                        real_scalars.discard(st_scalar_alias.name)
+                        params.pop(st_scalar_alias.name, None)
+                    elif base_scalar_alias in real_matrices:
+                        real_scalars.add(st_scalar_alias.name)
+                        ints.discard(st_scalar_alias.name)
+                        int_arrays.discard(st_scalar_alias.name)
+                        real_arrays.discard(st_scalar_alias.name)
+                        params.pop(st_scalar_alias.name, None)
+            elif isinstance(st_scalar_alias, IfStmt):
+                _force_scalar_matrix_element_aliases(st_scalar_alias.then_body)
+                _force_scalar_matrix_element_aliases(st_scalar_alias.else_body)
+            elif isinstance(st_scalar_alias, ForStmt):
+                _force_scalar_matrix_element_aliases(st_scalar_alias.body)
+            elif isinstance(st_scalar_alias, WhileStmt):
+                _force_scalar_matrix_element_aliases(st_scalar_alias.body)
+            elif isinstance(st_scalar_alias, RepeatStmt):
+                _force_scalar_matrix_element_aliases(st_scalar_alias.body)
+
+    _force_scalar_matrix_element_aliases(main_stmts)
+
     if char_arrays:
         ints.add("i_ew")
         ints.add("i_gr")
@@ -17476,6 +17653,8 @@ def transpile_r_to_fortran(
         pbody.w("character(len=:), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(char_arrays)))
     if logical_arrays:
         pbody.w("logical, allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(logical_arrays)))
+    if logical_matrices:
+        pbody.w("logical, allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(logical_matrices)))
     if logical_scalars:
         pbody.w("logical :: " + ", ".join(sorted(logical_scalars)))
     if list_vars:
@@ -19029,6 +19208,10 @@ def transpile_r_to_fortran(
         "replace_first_fixed",
         "replace_all_fixed",
         "chartr",
+        "lower_tri",
+        "upper_tri",
+        "row_index_mat",
+        "col_index_mat",
         "r_head",
         "r_array_real",
         "r_array_int",
@@ -19063,6 +19246,7 @@ def transpile_r_to_fortran(
         "nchar",
         "is_na",
         "which",
+        "which_arr_ind",
         "replace",
         "rle",
         "inverse_rle",
