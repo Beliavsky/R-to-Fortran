@@ -58,6 +58,33 @@ _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
+_APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
+    "strsplit": {"name": "strsplit", "category": "subset_semantics", "reason": "partial fixed-delimiter support; vector input/list semantics are not fully preserved"},
+    "arima": {"name": "arima", "category": "approximate_algorithm", "reason": "approximate fitter/predictor; does not reproduce stats::arima exactly"},
+    "armaacf": {"name": "ARMAacf", "category": "approximate_algorithm", "reason": "subset implementation; output and edge-case behavior may differ from R"},
+    "acf": {"name": "acf", "category": "subset_semantics", "reason": "subset implementation; output/lag handling may differ from R"},
+    "ccf": {"name": "ccf", "category": "subset_semantics", "reason": "subset implementation; output/lag handling may differ from R"},
+    "smooth": {"name": "smooth", "category": "approximate_algorithm", "reason": "approximation of R's Tukey smoothing behavior"},
+    "smooth.spline": {"name": "smooth.spline", "category": "approximate_algorithm", "reason": "approximate smoother; not R's exact penalized spline implementation"},
+    "loess": {"name": "loess", "category": "approximate_algorithm", "reason": "local regression approximation; not full stats::loess behavior"},
+    "lowess": {"name": "lowess", "category": "approximate_algorithm", "reason": "Cleveland-style approximation; not guaranteed equivalent to R"},
+    "ksmooth": {"name": "ksmooth", "category": "approximate_algorithm", "reason": "kernel semantics approximated; edge/numerical behavior may differ"},
+    "runmed": {"name": "runmed", "category": "approximate_algorithm", "reason": "median smoothing edge behavior is approximated"},
+    "lm": {"name": "lm", "category": "subset_semantics", "reason": "subset implementation; diagnostics/NA handling/contrasts/formula semantics are incomplete"},
+    "glm": {"name": "glm", "category": "subset_semantics", "reason": "subset implementation; formula/family/weights/NA semantics are incomplete"},
+    "prcomp": {"name": "prcomp", "category": "subset_semantics", "reason": "subset implementation; sign conventions and scaling/NA behavior may differ"},
+    "kmeans": {"name": "kmeans", "category": "approximate_algorithm", "reason": "subset implementation; initialization and convergence may differ"},
+    "hclust": {"name": "hclust", "category": "approximate_algorithm", "reason": "subset implementation; linkage/tie behavior may differ"},
+    "cutree": {"name": "cutree", "category": "subset_semantics", "reason": "subset implementation"},
+    "optim": {"name": "optim", "category": "approximate_algorithm", "reason": "subset/approximate optimizer behavior"},
+    "t.test": {"name": "t.test", "category": "subset_semantics", "reason": "subset implementation; edge cases may differ from R"},
+    "chisq.test": {"name": "chisq.test", "category": "subset_semantics", "reason": "subset implementation"},
+    "prop.test": {"name": "prop.test", "category": "subset_semantics", "reason": "subset implementation"},
+    "cor.test": {"name": "cor.test", "category": "subset_semantics", "reason": "subset implementation"},
+    "fisher.test": {"name": "fisher.test", "category": "subset_semantics", "reason": "subset implementation"},
+    "wilcox.test": {"name": "wilcox.test", "category": "subset_semantics", "reason": "subset implementation"},
+    "kruskal.test": {"name": "kruskal.test", "category": "subset_semantics", "reason": "subset implementation"},
+}
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -20798,6 +20825,54 @@ def _find_r_library_calls(src: str) -> list[tuple[int, str]]:
     return out
 
 
+def _strip_r_strings_for_scan(line: str) -> str:
+    out: list[str] = []
+    quote: str | None = None
+    esc = False
+    for ch in line:
+        if quote is not None:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                quote = None
+            out.append(" ")
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            out.append(" ")
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def _find_approximate_r_function_calls(src: str) -> list[tuple[int, dict[str, str]]]:
+    seen: set[str] = set()
+    out: list[tuple[int, dict[str, str]]] = []
+    for i, raw in enumerate(src.splitlines(), start=1):
+        code = _strip_r_strings_for_scan(raw.lstrip("\ufeff"))
+        for m in re.finditer(r"(?<![A-Za-z0-9_.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)?)\s*\(", code):
+            key = m.group(1).lower()
+            meta = _APPROXIMATE_R_FUNCTIONS.get(key)
+            if meta is None or key in seen:
+                continue
+            seen.add(key)
+            out.append((i, meta))
+    return out
+
+
+def _warn_approximate_r_function_calls(src: str) -> None:
+    calls = _find_approximate_r_function_calls(src)
+    if not calls:
+        return
+    print("Warning: approximate/subset R function translations detected:")
+    for line_no, meta in calls:
+        print(f"  line {line_no}: {meta['name']} ({meta['category']}): {meta['reason']}")
+
+
 def _text_metrics(text: str, comment_prefix: str) -> tuple[int, int, int]:
     chars = len(text)
     lines = text.splitlines()
@@ -21029,6 +21104,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--recycle-warn")
     if args.recycle_stop:
         cmd.append("--recycle-stop")
+    if args.warn_approx:
+        cmd.append("--warn-approx")
     if args.via_core_r:
         cmd.append("--via-core-r")
     if args.allow_library:
@@ -21290,6 +21367,11 @@ def main() -> int:
         help="error stop whenever vector recycling occurs (lengths differ; requires r_mod helper)",
     )
     ap.add_argument(
+        "--warn-approx",
+        action="store_true",
+        help="warn when the R source uses functions translated with approximate or subset semantics",
+    )
+    ap.add_argument(
         "--via-core-r",
         action="store_true",
         help="first rewrite input R via xr2r.py, then transpile the normalized Core-R output",
@@ -21531,6 +21613,8 @@ def main() -> int:
             print("Warning: package import detected; continuing with best-effort translation:")
             for ln, stmt in lib_calls:
                 print(f"  line {ln}: {stmt}")
+        if args.warn_approx:
+            _warn_approximate_r_function_calls(src)
         if annotate_r_path is not None:
             try:
                 annotated_r = annotate_r_source_with_declares(src, in_path.stem)
