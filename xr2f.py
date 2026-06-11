@@ -19469,6 +19469,29 @@ def _round_output_text(text: str, digits: int) -> str:
     return _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _round_float_token(m.group(1), digits), s)
 
 
+def _wrap_output_text(text: str, width: int) -> str:
+    if width <= 0:
+        return text
+    out: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if len(raw) <= width or not raw.strip():
+            out.append(raw)
+            continue
+        prefix = re.match(r"^\s*", raw).group(0)
+        words = raw.split()
+        cur = prefix
+        for word in words:
+            if not cur.strip():
+                cur = prefix + word
+            elif len(cur) + 1 + len(word) <= width:
+                cur += " " + word
+            else:
+                out.append(cur)
+                cur = prefix + word
+        out.append(cur)
+    return "\n".join(out)
+
+
 def normalize_fortran_lines(lines: list[str], max_consecutive_blank: int = 1) -> list[str]:
     out: list[str] = []
     blank_run = 0
@@ -20141,6 +20164,7 @@ def _print_captured(
     pretty: bool = False,
     strip_r_indices: bool = False,
     round_digits: int | None = None,
+    wrap_out: int | None = None,
 ) -> None:
     out = cp.stdout or ""
     err = cp.stderr or ""
@@ -20153,6 +20177,9 @@ def _print_captured(
     if round_digits is not None:
         out = _round_output_text(out, round_digits)
         err = _round_output_text(err, round_digits)
+    if wrap_out is not None:
+        out = _wrap_output_text(out, wrap_out)
+        err = _wrap_output_text(err, wrap_out)
     if out.strip():
         txt = out.rstrip()
         try:
@@ -20584,6 +20611,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.extend(["--round", str(args.round)])
     if args.round_both is not None:
         cmd.extend(["--round-both", str(args.round_both)])
+    if getattr(args, "wrap_out", None) is not None:
+        cmd.extend(["--wrap-out", str(args.wrap_out)])
     if args.disp_real:
         cmd.append("--disp-real")
     if args.no_recycle:
@@ -20826,6 +20855,13 @@ def main() -> int:
         help="round floating-point data in displayed R and Fortran runtime output to N decimal places",
     )
     ap.add_argument(
+        "--wrap-out",
+        type=int,
+        default=None,
+        metavar="N",
+        help="wrap displayed captured runtime output lines at N columns",
+    )
+    ap.add_argument(
         "--disp-real",
         action="store_true",
         help="disable integer-like printing of real matrices (always print reals)",
@@ -20869,6 +20905,9 @@ def main() -> int:
         return 1
     if args.round_both is not None and args.round_both < 0:
         print("Option error: --round-both requires a nonnegative integer.")
+        return 1
+    if args.wrap_out is not None and args.wrap_out <= 0:
+        print("Option error: --wrap-out requires a positive integer.")
         return 1
     if args.round is not None and args.round_both is not None:
         print("Options conflict: --round and --round-both cannot be used together.")
@@ -21022,7 +21061,7 @@ def main() -> int:
                 print("Run (r): no stdout/stderr captured; process may have crashed before producing output.")
             return r_run.returncode
         print("Run (r): PASS")
-        _print_captured(r_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both)
+        _print_captured(r_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both, wrap_out=args.wrap_out)
         if args.run_both:
             print()
 
@@ -21215,7 +21254,7 @@ def main() -> int:
             _print_captured(py_run)
             return py_run.returncode
         print("Run (translated-python): PASS")
-        _print_captured(py_run)
+        _print_captured(py_run, wrap_out=args.wrap_out)
 
     if args.compile or args.run:
         cparts = shlex.split(args.compiler)
@@ -21313,6 +21352,7 @@ def main() -> int:
                             normalize_num_output=args.normalize_num_output,
                             pretty=args.pretty,
                             round_digits=fortran_round_digits,
+                            wrap_out=args.wrap_out,
                         )
                         return frun.returncode
                     print("Run: PASS")
@@ -21321,6 +21361,7 @@ def main() -> int:
                         normalize_num_output=args.normalize_num_output,
                         pretty=args.pretty,
                         round_digits=fortran_round_digits,
+                        wrap_out=args.wrap_out,
                     )
                 if args.time:
                     print("Timing:")
@@ -21365,6 +21406,7 @@ def main() -> int:
                     normalize_num_output=args.normalize_num_output,
                     pretty=args.pretty,
                     round_digits=fortran_round_digits,
+                    wrap_out=args.wrap_out,
                 )
                 return frun.returncode
             print("Run: PASS")
@@ -21373,6 +21415,7 @@ def main() -> int:
                 normalize_num_output=args.normalize_num_output,
                 pretty=args.pretty,
                 round_digits=fortran_round_digits,
+                wrap_out=args.wrap_out,
             )
 
             if args.run_diff and r_run is not None:
@@ -21381,6 +21424,8 @@ def main() -> int:
                     r_blob = _pretty_output_text(r_blob, strip_r_indices=True)
                 if args.round_both is not None:
                     r_blob = _round_output_text(r_blob, args.round_both)
+                if args.wrap_out is not None:
+                    r_blob = _wrap_output_text(r_blob, args.wrap_out)
                 r_lines = _norm_output(r_blob)
                 f_blob = (frun.stdout or "") + (("\n" + frun.stderr) if frun.stderr else "")
                 if args.normalize_num_output:
@@ -21389,6 +21434,8 @@ def main() -> int:
                     f_blob = _pretty_output_text(f_blob)
                 if fortran_round_digits is not None:
                     f_blob = _round_output_text(f_blob, fortran_round_digits)
+                if args.wrap_out is not None:
+                    f_blob = _wrap_output_text(f_blob, args.wrap_out)
                 f_lines = _norm_output(f_blob)
                 if r_lines == f_lines:
                     print("Run diff: MATCH")
