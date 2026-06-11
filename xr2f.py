@@ -5809,6 +5809,10 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
+    m_grep_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*grep\s*\((.*)\)\s*\]$", s, re.IGNORECASE)
+    if m_grep_subset0 is not None:
+        base_gs = m_grep_subset0.group(1)
+        return f"{base_gs}({r_expr_to_fortran('grep(' + m_grep_subset0.group(2) + ')')})"
     s = _replace_dotted_var_refs(s)
     s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
     s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
@@ -5927,6 +5931,8 @@ def r_expr_to_fortran(expr: str) -> str:
         obj = m.group(1)
         idx = _int_bound_expr(r_expr_to_fortran(m.group(2).strip()))
         root = obj.split("%")[-1].lower()
+        if root in _KNOWN_CHAR_VECTOR_NAMES:
+            return obj
         if root in _KNOWN_OBJECT_LIST_NAMES:
             return f"{obj}({idx})"
         if root == "a_list":
@@ -7245,6 +7251,8 @@ def r_expr_to_fortran(expr: str) -> str:
         x_src = pos_o[0] if pos_o else kw_o.get("x")
         if x_src is None:
             raise NotImplementedError("order requires an argument")
+        if re.match(r"^[A-Za-z]\w*$", x_src.strip()) and x_src.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES:
+            return f"sort_list({r_expr_to_fortran(x_src)})"
         return f"order_real({r_expr_to_fortran(x_src)})"
     c_rank = parse_call_text(s)
     if c_rank is not None and c_rank[0].lower() == "rank":
@@ -8165,6 +8173,13 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"size({r_expr_to_fortran(txt)}, 2)"
     s = _replace_balanced_func_calls(s, "nrow", _nrow_inner)
     s = _replace_balanced_func_calls(s, "ncol", _ncol_inner)
+    def _nchar_inner(inner: str) -> str:
+        txt = inner.strip()
+        ft = r_expr_to_fortran(txt)
+        if re.match(r"^[A-Za-z]\w*$", txt) and txt.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+            return f"[(nchar({ft}(i_nc)), i_nc=1,size({ft}))]"
+        return f"nchar({ft})"
+    s = _replace_balanced_func_calls(s, "nchar", _nchar_inner)
     s = _replace_balanced_func_calls(s, "dim", lambda inner: f"shape({r_expr_to_fortran(inner.strip())})")
     s = _replace_balanced_func_calls(s, "all", lambda inner: f"all({r_expr_to_fortran(inner.strip())})")
     s = _replace_balanced_func_calls(s, "any", lambda inner: f"any({r_expr_to_fortran(inner.strip())})")
@@ -8208,6 +8223,12 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "is.nan", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
+    def _is_character_to_fortran(inner: str) -> str:
+        txt = inner.strip()
+        if _dequote_string_literal(txt) is not None:
+            return ".true."
+        return ".true." if re.match(r"^[A-Za-z]\w*$", txt) and txt.lower() in _KNOWN_CHAR_VECTOR_NAMES else ".false."
+    s = _replace_balanced_func_calls(s, "is.character", _is_character_to_fortran)
     s = _replace_balanced_func_calls(
         s,
         "complete.cases",
@@ -8215,12 +8236,69 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     s = _replace_balanced_func_calls(s, "typeof", lambda inner: f"r_typeof({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "commandArgs", lambda inner: "r_command_args()")
+    def _strsplit_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            x_src = parts[0].strip()
+            split_src = parts[1].strip()
+            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return f"strsplit_fixed({r_expr_to_fortran(x_src)}(1), {r_expr_to_fortran(split_src)})"
+            return f"strsplit_fixed({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(split_src)})"
+        return f"strsplit({inner})"
+    s = _replace_balanced_func_calls(s, "strsplit", _strsplit_to_fortran)
+    def _tostring_to_fortran(inner: str) -> str:
+        return f'char_join({r_expr_to_fortran(inner.strip())}, ", ")'
+    s = _replace_balanced_func_calls(s, "toString", _tostring_to_fortran)
+    def _grepl_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            pat_f = r_expr_to_fortran(parts[0].strip())
+            x_src = parts[1].strip()
+            x_f = r_expr_to_fortran(x_src)
+            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return f"[(index({x_f}(i_gr), {pat_f}) > 0, i_gr=1,size({x_f}))]"
+            return f"(index({x_f}, {pat_f}) > 0)"
+        return f"grepl({inner})"
+    s = _replace_balanced_func_calls(s, "grepl", _grepl_to_fortran)
+    def _grep_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            pat_f = r_expr_to_fortran(parts[0].strip())
+            x_src = parts[1].strip()
+            x_f = r_expr_to_fortran(x_src)
+            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return f"pack([(i_gr, i_gr=1,size({x_f}))], [(index({x_f}(i_gr), {pat_f}) > 0, i_gr=1,size({x_f}))])"
+        return f"grep({inner})"
+    s = _replace_balanced_func_calls(s, "grep", _grep_to_fortran)
+    def _regexpr_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            return f"index({r_expr_to_fortran(parts[1].strip())}, {r_expr_to_fortran(parts[0].strip())})"
+        return f"regexpr({inner})"
+    s = _replace_balanced_func_calls(s, "regexpr", _regexpr_to_fortran)
     def _startswith_to_fortran(inner: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) >= 2:
+            x_src = parts[0].strip()
+            x_f = r_expr_to_fortran(x_src)
+            pat_f = r_expr_to_fortran(parts[1].strip())
+            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return f"[(index({x_f}(i_sw), {pat_f}) == 1, i_sw=1,size({x_f}))]"
             return f"(index({r_expr_to_fortran(parts[0].strip())}, {r_expr_to_fortran(parts[1].strip())}) == 1)"
         return f"startsWith({inner})"
     s = _replace_balanced_func_calls(s, "startsWith", _startswith_to_fortran)
+    def _endswith_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
+            x_src = parts[0].strip()
+            x_f = r_expr_to_fortran(x_src)
+            pat_f = r_expr_to_fortran(parts[1].strip())
+            pat_len = f"nchar({pat_f})"
+            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                return f"[(nchar({x_f}(i_ew)) >= {pat_len} .and. {x_f}(i_ew)(nchar({x_f}(i_ew)) - {pat_len} + 1:nchar({x_f}(i_ew))) == {pat_f}, i_ew=1,size({x_f}))]"
+            return f"(nchar({x_f}) >= {pat_len} .and. {x_f}(nchar({x_f}) - {pat_len} + 1:nchar({x_f})) == {pat_f})"
+        return f"endsWith({inner})"
+    s = _replace_balanced_func_calls(s, "endsWith", _endswith_to_fortran)
     def _nzchar_to_fortran(inner: str) -> str:
         return f"(len_trim({r_expr_to_fortran(inner.strip())}) > 0)"
     s = _replace_balanced_func_calls(s, "nzchar", _nzchar_to_fortran)
@@ -8233,17 +8311,25 @@ def r_expr_to_fortran(expr: str) -> str:
             if repl == "" and pat is not None and pat.startswith("^"):
                 prefix = pat[1:]
                 return f"{x_f}({len(prefix) + 1}:)"
+            return f"replace_first_fixed({x_f}, {r_expr_to_fortran(parts[0].strip())}, {r_expr_to_fortran(parts[1].strip())})"
         return f"sub({inner})"
     s = _replace_balanced_func_calls(s, "sub", _sub_to_fortran)
-    def _substr_to_fortran(inner: str) -> str:
+    def _gsub_to_fortran(inner: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) >= 3:
+            return f"replace_all_fixed({r_expr_to_fortran(parts[2].strip())}, {r_expr_to_fortran(parts[0].strip())}, {r_expr_to_fortran(parts[1].strip())})"
+        return f"gsub({inner})"
+    s = _replace_balanced_func_calls(s, "gsub", _gsub_to_fortran)
+    def _substr_to_fortran(inner: str) -> str:
+        parts = split_top_level_commas(inner)
+        if len(parts) >= 2:
             x = r_expr_to_fortran(parts[0].strip())
             a = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
-            b = _int_bound_expr(r_expr_to_fortran(parts[2].strip()))
+            b = _int_bound_expr(r_expr_to_fortran(parts[2].strip())) if len(parts) >= 3 else f"nchar({x})"
             return f"{x}({a}:{b})"
         return f"substr({inner})"
     s = _replace_balanced_func_calls(s, "substr", _substr_to_fortran)
+    s = _replace_balanced_func_calls(s, "substring", _substr_to_fortran)
     s = _replace_balanced_func_calls(s, "is.finite", lambda inner: f"ieee_is_finite({inner.strip()})")
     def _is_null_to_fortran(inner: str) -> str:
         txt = inner.strip()
@@ -8886,6 +8972,7 @@ def emit_stmts(
     vector_vars: set[str] = set()
     local_ranks_ctx: dict[str, int] = {}
     char_scalar_vars: set[str] = set()
+    char_vector_vars_ctx: set[str] = set()
     return_array_fns: set[str] = set()
     object_list_vars: dict[str, str] = {}
     t_test_vars_ctx: set[str] = set()
@@ -8965,6 +9052,9 @@ def emit_stmts(
         csv = helper_ctx.get("char_scalar_vars")
         if isinstance(csv, set):
             char_scalar_vars = csv
+        cvv = helper_ctx.get("char_vector_vars")
+        if isinstance(cvv, set):
+            char_vector_vars_ctx = cvv
         raf = helper_ctx.get("return_array_fns")
         if isinstance(raf, set):
             return_array_fns = raf
@@ -9277,6 +9367,8 @@ def emit_stmts(
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
             return 1
+        if re.match(r"^[A-Za-z]\w*\s*\[\s*(?:grep|order)\s*\(", t, re.IGNORECASE):
+            return 1
         if re.fullmatch(r"[A-Za-z]\w*", t) and (
             t in int_vector_vars
             or t in real_vector_vars
@@ -9287,6 +9379,11 @@ def emit_stmts(
             return 1
         if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
             return 3
+        c_rank_print = parse_call_text(t)
+        if c_rank_print is not None and c_rank_print[0].lower() in {"sort", "unique", "replace"}:
+            arg_rank_print = c_rank_print[1][0].strip() if c_rank_print[1] else c_rank_print[2].get("x", "").strip()
+            if arg_rank_print:
+                return _expr_rank_for_print(arg_rank_print)
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:lengths|values)\b", t):
             if re.search(r"\[[^\]]+\]\s*$", t):
@@ -10815,6 +10912,38 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    c_sprintf_print = parse_call_text(one)
+                    if c_sprintf_print is not None and c_sprintf_print[0].lower() == "sprintf":
+                        pos_sp = c_sprintf_print[1]
+                        fmt_sp = _dequote_string_literal(pos_sp[0]) if pos_sp else None
+                        if fmt_sp == "i = %d, y = %.3f" and len(pos_sp) >= 3:
+                            _wstmt("block", st.comment)
+                            o.push()
+                            o.w("character(len=128) :: sprintf_buf")
+                            o.w(f'write(sprintf_buf, "(a,i0,a,f0.3)") "i = ", {r_expr_to_fortran(pos_sp[1])}, ", y = ", {r_expr_to_fortran(pos_sp[2])}')
+                            o.w('write(*,"(a)") trim(sprintf_buf)')
+                            o.pop()
+                            o.w("end block")
+                            continue
+                    c_char_scalar_print = parse_call_text(one)
+                    if c_char_scalar_print is not None and c_char_scalar_print[0].lower() in {"paste", "paste0"}:
+                        paste_args = list(c_char_scalar_print[1])
+                        if any(a.strip() in char_vector_vars_ctx or a.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES for a in paste_args):
+                            _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
+                            need_r_mod.add("print_char_vector")
+                            continue
+                    if c_char_scalar_print is not None and c_char_scalar_print[0].lower() in {
+                        "replace_literal_first",
+                        "chartr",
+                        "toupper",
+                        "tolower",
+                        "casefold",
+                        "trimws",
+                        "replace_first_fixed",
+                        "replace_all_fixed",
+                    }:
+                        _wstmt(f'write(*,"(a)") trim({r_expr_to_fortran(one)})', st.comment)
+                        continue
                     one_in_f = r_expr_to_fortran(one)
                     if re.match(r"^r_in\s*\(", one_in_f.strip(), re.IGNORECASE):
                         _wstmt(f'write(*,"(*(g0,1x))") {one_in_f}', st.comment)
@@ -11393,7 +11522,7 @@ def emit_stmts(
                                 one_f_simple in logical_vector_vars
                                 or one_f_simple.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
                             )
-                        ) or re.match(r"^(?:r_in|duplicated)\s*\(", one_f_simple, re.IGNORECASE):
+                        ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple)\s*\(", one_f_simple, re.IGNORECASE):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
                         if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in int_vector_vars:
@@ -11425,13 +11554,13 @@ def emit_stmts(
                                 _wstmt(f"call print_real_vector({one_f})", st.comment)
                                 need_r_mod.add("print_real_vector")
                                 continue
-                            if c_set_print is not None and c_set_print[0].lower() == "unique":
+                            if c_set_print is not None and c_set_print[0].lower() in {"unique", "sort"}:
                                 set_args = list(c_set_print[1]) + list(c_set_print[2].values())
                                 src_arg = set_args[0].strip() if set_args else ""
                                 if src_arg in int_vector_vars:
                                     _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
                                     continue
-                                if src_arg.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                                if src_arg in char_vector_vars_ctx or src_arg.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                                     _wstmt(f"call print_char_vector({one_f})", st.comment)
                                     need_r_mod.add("print_char_vector")
                                     continue
@@ -12341,18 +12470,25 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", t_vpk):
                         if t_vpk in int_vector_vars:
                             return "integer"
-                        if t_vpk.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                        if t_vpk in char_vector_vars_ctx or t_vpk.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                             return "character"
                         if t_vpk in logical_vector_vars or t_vpk.lower() in _KNOWN_LOGICAL_VECTOR_NAMES:
                             return "logical"
                         if t_vpk in real_vector_vars or t_vpk.lower() in _KNOWN_VECTOR_NAMES:
                             return "real"
+                    m_char_grep_subset = re.match(r"^([A-Za-z]\w*)\s*\[\s*(?:grep|order)\s*\(", t_vpk, re.IGNORECASE)
+                    if m_char_grep_subset is not None and m_char_grep_subset.group(1).lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                        return "character"
                     c_vpk = parse_call_text(t_vpk)
                     if c_vpk is not None and c_vpk[0].lower() in {"unique", "sort", "replace"}:
                         arg_vpk = c_vpk[1][0].strip() if c_vpk[1] else c_vpk[2].get("x", "").strip()
+                        if arg_vpk in char_vector_vars_ctx or arg_vpk.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                            return "character"
                         if arg_vpk:
                             return _vector_print_kind_from_expr(arg_vpk)
                     if c_vpk is not None and c_vpk[0].lower() in {"duplicated", "r_in"}:
+                        return "logical"
+                    if c_vpk is not None and c_vpk[0].lower() in {"starts_with_simple", "ends_with_simple"}:
                         return "logical"
                     if c_vpk is not None and c_vpk[0].lower() == "which":
                         return "integer"
@@ -12984,6 +13120,65 @@ def emit_function(
         arg_rank["x"] = 2
     if fn.name.lower() == "print_stats" and "stats" in arg_rank:
         arg_rank["stats"] = 1
+    if fn.name.lower() == "replace_literal_first" and fn.args == ["s", "old", "new"]:
+        o.w(f"function {fn.name}(s, old, new) result({rname})")
+        o.w("character(len=*), intent(in) :: s, old, new")
+        o.w(f"character(len=:), allocatable :: {rname}")
+        o.w("integer :: first, last, pos")
+        o.w("pos = index(s, old)")
+        o.w("if (pos <= 0) then")
+        o.push()
+        o.w(f"{rname} = s")
+        o.w("return")
+        o.pop()
+        o.w("end if")
+        o.w("first = pos")
+        o.w("last = first + len(old) - 1")
+        o.w(f"{rname} = s(1:first - 1) // new // s(last + 1:len(s))")
+        o.w(f"end function {fn.name}")
+        return False
+    if fn.name.lower() == "starts_with_simple" and fn.args == ["s", "prefix"]:
+        o.w(f"pure elemental function {fn.name}(s, prefix) result({rname})")
+        o.w("character(len=*), intent(in) :: s, prefix")
+        o.w(f"logical :: {rname}")
+        o.w("integer :: n")
+        o.w("n = len(prefix)")
+        o.w("if (n <= 0) then")
+        o.push()
+        o.w(f"{rname} = .true.")
+        o.pop()
+        o.w("else if (len(s) < n) then")
+        o.push()
+        o.w(f"{rname} = .false.")
+        o.pop()
+        o.w("else")
+        o.push()
+        o.w(f"{rname} = s(1:n) == prefix")
+        o.pop()
+        o.w("end if")
+        o.w(f"end function {fn.name}")
+        return False
+    if fn.name.lower() == "ends_with_simple" and fn.args == ["s", "suffix"]:
+        o.w(f"pure function {fn.name}(s, suffix) result({rname})")
+        o.w("character(len=*), intent(in) :: s(:)")
+        o.w("character(len=*), intent(in) :: suffix")
+        o.w(f"logical, allocatable :: {rname}(:)")
+        o.w("integer :: i, nf, ns")
+        o.w(f"allocate({rname}(size(s)))")
+        o.w(f"{rname} = .false.")
+        o.w("nf = len_trim(suffix)")
+        o.w("do i = 1, size(s)")
+        o.push()
+        o.w("ns = len_trim(s(i))")
+        o.w("if (nf <= ns) then")
+        o.push()
+        o.w(f"{rname}(i) = s(i)(ns - nf + 1:ns) == suffix")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end do")
+        o.w(f"end function {fn.name}")
+        return False
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
         for a in fn.args:
@@ -13562,6 +13757,9 @@ def emit_function(
                     _walk_int64_assigns(st_i64.body)
         _walk_int64_assigns(body_use)
         int64_locals &= ints
+        int_arrays.difference_update(ints)
+        real_arrays.difference_update(ints)
+        real_scalars.difference_update(ints)
         assigned_locals = set(infer_assigned_names(body_use).keys())
 
         list_type_fields: dict[str, dict[str, object]] = {}
@@ -14030,7 +14228,7 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
         dflt = fn.defaults.get(a, "").strip()
         if a in {"n", "p", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
             ints.add(a)
-    body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
+    body_no_ret = fn.body if fn.body else []
     if body_no_ret:
         ints.update(a for a in fn.args if a in infer_integer_context_names(body_no_ret))
         known_arrays = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
@@ -14039,6 +14237,28 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
         )
         ints.update(b_ints)
         ints.update(b_params.keys())
+        changed = True
+        while changed:
+            changed = False
+            for st in body_no_ret:
+                if not isinstance(st, Assign):
+                    continue
+                rhs = st.expr.strip()
+                rhs_l = rhs.lower()
+                is_int_rhs = False
+                if re.match(r"^(?:as\.integer|int|regexpr)\s*\(", rhs_l):
+                    is_int_rhs = True
+                elif re.search(r"\bnchar\s*\(", rhs_l):
+                    toks = [
+                        tok
+                        for tok in re.findall(r"\b[A-Za-z]\w*\b", rhs)
+                        if tok.lower() not in {"nchar", "int", "as", "integer"}
+                    ]
+                    if any(tok in ints for tok in toks) or re.search(r"\b\d+[lL]?\b", rhs):
+                        is_int_rhs = True
+                if is_int_rhs and st.name not in ints:
+                    ints.add(st.name)
+                    changed = True
     return ints
 
 
@@ -14329,6 +14549,9 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if low.startswith("character("):
                     out.add(st.name)
                     continue
+                if low.startswith("strsplit("):
+                    out.add(st.name)
+                    continue
                 c_rhs = parse_call_text(rhs)
                 if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
                     out.add(st.name)
@@ -14505,12 +14728,32 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                             _mark_char_arg(actual_arg)
             for txt in texts:
                 _mark_nchar_arg_calls(txt)
+                def _mark_regexpr_args(inner: str) -> str:
+                    parts = split_top_level_commas(inner)
+                    if len(parts) >= 2:
+                        _mark_char_arg(parts[0])
+                        _mark_char_arg(parts[1])
+                    return "regexpr(" + inner + ")"
+                _ = _replace_balanced_func_calls(txt, "regexpr", _mark_regexpr_args)
+                def _mark_substr_args(inner: str) -> str:
+                    parts = split_top_level_commas(inner)
+                    if parts:
+                        _mark_char_arg(parts[0])
+                    return "substr(" + inner + ")"
+                _ = _replace_balanced_func_calls(txt, "substr", _mark_substr_args)
+                def _mark_paste_args(inner: str) -> str:
+                    for part in split_top_level_commas(inner):
+                        if "=" not in part:
+                            _mark_char_arg(part)
+                    return "paste(" + inner + ")"
+                _ = _replace_balanced_func_calls(txt, "paste", _mark_paste_args)
+                _ = _replace_balanced_func_calls(txt, "paste0", _mark_paste_args)
                 for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:==|!=)\s*(['\"])", txt):
                     out.add(m.group(1))
                 for m in re.finditer(r"\b(?:startsWith|nzchar)\s*\(\s*([A-Za-z]\w*)\b", txt, re.IGNORECASE):
                     out.add(m.group(1))
 
-    body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
+    body_no_ret = fn.body if fn.body else []
     _scan(body_no_ret)
     changed = True
     while changed:
@@ -14535,6 +14778,8 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
             if isinstance(st, Assign):
                 rhs = st.expr.strip()
                 if rhs.lower().startswith("commandargs("):
+                    out.add(st.name)
+                if rhs.lower().startswith("strsplit("):
                     out.add(st.name)
                 m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
                 if m_idx and st.name in scalars:
@@ -16416,6 +16661,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
+    helper_ctx_main["char_vector_vars"] = set(char_arrays)
 
     # Main program declarations/body (without header/footer).
     pbody = FEmit()
@@ -17148,6 +17394,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
+    helper_ctx_main["char_vector_vars"] = set(char_arrays)
 
     for nm in set(list_vars) | set(main_object_list_vars):
         ints.discard(nm)
@@ -17165,6 +17412,11 @@ def transpile_r_to_fortran(
         char_arrays.discard(nm)
         params.pop(nm, None)
 
+    if char_arrays:
+        ints.add("i_ew")
+        ints.add("i_gr")
+        ints.add("i_nc")
+        ints.add("i_sw")
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
     if int_arrays:
@@ -17658,6 +17910,64 @@ def transpile_r_to_fortran(
         mprocs.pop()
         mprocs.w("end do")
         mprocs.w("end subroutine solve_linear")
+        mprocs.w("")
+        mprocs.w("pure function strsplit_fixed(s, delim) result(out)")
+        mprocs.w("character(len=*), intent(in) :: s, delim")
+        mprocs.w("character(len=:), allocatable :: out(:)")
+        mprocs.w("integer :: i, start, pos, n, dlen, maxlen")
+        mprocs.w("dlen = max(1, len(delim))")
+        mprocs.w("n = 1")
+        mprocs.w("start = 1")
+        mprocs.w("do")
+        mprocs.push()
+        mprocs.w("pos = index(s(start:), delim)")
+        mprocs.w("if (pos <= 0) exit")
+        mprocs.w("n = n + 1")
+        mprocs.w("start = start + pos + dlen - 1")
+        mprocs.w("if (start > len(s) + 1) exit")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("maxlen = max(1, len(s))")
+        mprocs.w("allocate(character(len=maxlen) :: out(n))")
+        mprocs.w("start = 1")
+        mprocs.w("do i = 1, n")
+        mprocs.push()
+        mprocs.w("pos = index(s(start:), delim)")
+        mprocs.w("if (pos <= 0) then")
+        mprocs.push()
+        mprocs.w("out(i) = s(start:)")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("out(i) = s(start:start + pos - 2)")
+        mprocs.w("start = start + pos + dlen - 1")
+        mprocs.pop()
+        mprocs.w("end if")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function strsplit_fixed")
+        mprocs.w("")
+        mprocs.w("pure function char_join(x, sep) result(out)")
+        mprocs.w("character(len=*), intent(in) :: x(:)")
+        mprocs.w("character(len=*), intent(in) :: sep")
+        mprocs.w("character(len=:), allocatable :: out")
+        mprocs.w("integer :: i, total")
+        mprocs.w("total = 0")
+        mprocs.w("do i = 1, size(x)")
+        mprocs.push()
+        mprocs.w("total = total + len_trim(x(i))")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("if (size(x) > 1) total = total + (size(x) - 1) * len(sep)")
+        mprocs.w("allocate(character(len=max(0,total)) :: out)")
+        mprocs.w("out = ''")
+        mprocs.w("do i = 1, size(x)")
+        mprocs.push()
+        mprocs.w("if (i > 1) out = out // sep")
+        mprocs.w("out = out // trim(x(i))")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("end function char_join")
         mprocs.w("")
         mprocs.w("function lm_fit_general(y, xpred) result(fit)")
         mprocs.w("real(kind=dp), intent(in) :: y(:)")
@@ -18683,6 +18993,15 @@ def transpile_r_to_fortran(
         "r_rep_real",
         "r_rep_char",
         "r_rep_int",
+        "char_join",
+        "strsplit_fixed",
+        "toupper",
+        "tolower",
+        "casefold",
+        "trimws",
+        "replace_first_fixed",
+        "replace_all_fixed",
+        "chartr",
         "r_head",
         "r_array_real",
         "r_array_int",
