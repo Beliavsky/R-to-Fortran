@@ -3834,6 +3834,10 @@ def classify_vars(
 
 
 def infer_arg_rank(fn: FuncDef, arg: str) -> int:
+    if fn.name.lower() == "print_mat" and arg == "x":
+        return 2
+    if fn.name.lower() == "print_vec" and arg == "x":
+        return 1
     pats_rank4 = [
         re.compile(rf"\b{re.escape(arg)}\s*\[\[[^\]]+\]\]\s*\[\[", re.IGNORECASE),
     ]
@@ -3858,6 +3862,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\b(?:sd|r_sd)\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bsprintf\s*\([^)]*,\s*{re.escape(arg)}\b"),
+        re.compile(rf"\bas\.vector\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bas\.numeric\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\b{re.escape(arg)}\s*\["),
     ]
@@ -6021,6 +6026,14 @@ def r_expr_to_fortran(expr: str) -> str:
         if nm_pre == "class":
             return '"acf"'
         if nm_pre == "names":
+            names_src = pos_pre[0].strip() if pos_pre else ""
+            names_src_l = names_src.lower()
+            if (
+                re.match(r"^loess_fit\s*\(", names_src_l)
+                or re.match(r"^loess\s*\(", names_src_l)
+                or (re.match(r"^[A-Za-z]\w*$", names_src) and "loess" in names_src_l)
+            ):
+                return '"n fitted residuals enp s one.delta two.delta trace.hat divisor robust pars kd call terms xnames x y weights"'
             return '"acf type n.used lag series snames"'
         if nm_pre in {"besselj", "bessely", "besseli", "besselk"}:
             if len(pos_pre) < 2:
@@ -6120,7 +6133,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 prefix = pat[1:]
                 return f"{x_f}({len(prefix) + 1}:)"
     c_filter = parse_call_text(s)
-    if c_filter is not None and c_filter[0].lower() == "filter":
+    if c_filter is not None and c_filter[0] == "Filter":
         _nm_filter, pos_filter, kw_filter = c_filter
         pred_src = pos_filter[0] if pos_filter else kw_filter.get("f")
         x_src = pos_filter[1] if len(pos_filter) >= 2 else kw_filter.get("x")
@@ -6131,6 +6144,48 @@ def r_expr_to_fortran(expr: str) -> str:
             raise NotImplementedError("Filter currently requires a named predicate function")
         x_f = r_expr_to_fortran(x_src)
         return f"pack({x_f}, {pred}({x_f}))"
+    if c_filter is not None and c_filter[0] == "filter":
+        _nm_filter, pos_filter, kw_filter = c_filter
+        x_src = pos_filter[0] if pos_filter else kw_filter.get("x", "")
+        filt_src = (
+            pos_filter[1]
+            if len(pos_filter) >= 2
+            else kw_filter.get("filter", kw_filter.get("f", ""))
+        )
+        sides_src = kw_filter.get("sides", pos_filter[2] if len(pos_filter) >= 3 else "2")
+        if not x_src or not filt_src:
+            raise NotImplementedError("filter requires x and filter arguments")
+        return (
+            f"r_filter_linear({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(filt_src)}, "
+            f"sides={_int_bound_expr(r_expr_to_fortran(sides_src))})"
+        )
+    c_smooth_call = parse_call_text(s)
+    if c_smooth_call is not None and c_smooth_call[0].lower() == "smooth.spline":
+        _nm_ss, pos_ss, kw_ss = c_smooth_call
+        x_src = pos_ss[0] if pos_ss else kw_ss.get("x", "")
+        y_src = pos_ss[1] if len(pos_ss) >= 2 else kw_ss.get("y", "")
+        df_src = kw_ss.get("df", "0.0")
+        spar_src = kw_ss.get("spar", "-1.0")
+        if not x_src or not y_src:
+            raise NotImplementedError("smooth.spline requires x and y arguments")
+        return (
+            f"smooth_spline({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(y_src)}, "
+            f"df=real({r_expr_to_fortran(df_src)}, kind=dp), "
+            f"spar=real({r_expr_to_fortran(spar_src)}, kind=dp))"
+        )
+    if c_smooth_call is not None and c_smooth_call[0].lower() == "loess":
+        _nm_lo, pos_lo, kw_lo = c_smooth_call
+        form_src = pos_lo[0].strip() if pos_lo else kw_lo.get("formula", "").strip()
+        m_lo = re.match(r"^([A-Za-z]\w*)\s*~\s*([A-Za-z]\w*)$", form_src)
+        if m_lo is None:
+            raise NotImplementedError("loess currently requires formula y ~ x")
+        y_src, x_src = m_lo.group(1), m_lo.group(2)
+        span_src = kw_lo.get("span", "0.75")
+        degree_src = kw_lo.get("degree", "2")
+        return (
+            f"loess_fit({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(y_src)}, "
+            f"span={r_expr_to_fortran(span_src)}, degree={_int_bound_expr(r_expr_to_fortran(degree_src))})"
+        )
     list_arr = _numeric_list_array_expr(s)
     nested_list_arr = _numeric_nested_matrix_list_array_expr(s)
     if nested_list_arr is not None:
@@ -8798,6 +8853,8 @@ def emit_stmts(
     glm_terms_by_fit: dict[str, list[str]] = {}
     glm_fits: set[str] = set()
     prcomp_fits: set[str] = set()
+    loess_fits: set[str] = set()
+    smooth_spline_fits: set[str] = set()
     lm_design_exprs_by_fit: dict[str, list[str]] = {}
     lm_design_first_by_fit: dict[str, str] = {}
     lm_anova_terms_by_fit: dict[str, list[str]] = {}
@@ -8839,6 +8896,12 @@ def emit_stmts(
         pfs = helper_ctx.get("prcomp_fits")
         if isinstance(pfs, set):
             prcomp_fits = pfs
+        lfs = helper_ctx.get("loess_fits")
+        if isinstance(lfs, set):
+            loess_fits = lfs
+        ssfs = helper_ctx.get("smooth_spline_fits")
+        if isinstance(ssfs, set):
+            smooth_spline_fits = ssfs
         lme = helper_ctx.get("lm_design_exprs_by_fit")
         if isinstance(lme, dict):
             lm_design_exprs_by_fit = lme
@@ -10078,6 +10141,28 @@ def emit_stmts(
                     need_r_mod.update({"arima_predict_result", "arima_predict_result_t"})
                     continue
                 fit_nm = posp[0].strip() if posp else kwp.get("object", "").strip()
+                if fit_nm in loess_fits or "loess" in fit_nm.lower():
+                    newd_lo = kwp.get("newdata", "").strip()
+                    if newd_lo:
+                        c_newd_lo = parse_call_text(newd_lo)
+                        if c_newd_lo is not None and c_newd_lo[0].lower() == "data.frame":
+                            xnew_src = c_newd_lo[2].get("x", c_newd_lo[1][0] if c_newd_lo[1] else "")
+                        else:
+                            xnew_src = newd_lo
+                    else:
+                        xnew_src = posp[1].strip() if len(posp) >= 2 else ""
+                    if not xnew_src:
+                        raise NotImplementedError("predict(loess) requires newdata or x values")
+                    o.w(f"{st.name} = predict_loess({r_expr_to_fortran(fit_nm)}, {r_expr_to_fortran(xnew_src)})")
+                    need_r_mod.update({"predict_loess", "loess_fit_t"})
+                    continue
+                if fit_nm in smooth_spline_fits or fit_nm.lower().startswith("ss_"):
+                    xnew_src = posp[1].strip() if len(posp) >= 2 else kwp.get("x", kwp.get("xout", "")).strip()
+                    if not xnew_src:
+                        raise NotImplementedError("predict(smooth.spline) requires x values")
+                    o.w(f"{st.name} = predict_smooth_spline({fit_nm}, {r_expr_to_fortran(xnew_src)})")
+                    need_r_mod.update({"predict_smooth_spline", "smooth_xy_t", "smooth_spline_fit_t"})
+                    continue
                 newd = kwp.get("newdata", "").strip()
                 if not fit_nm or not newd:
                     raise NotImplementedError("predict requires object and newdata in this subset")
@@ -12968,7 +13053,7 @@ def emit_function(
             o.w(f"character(len=*), intent({intent}){opt} :: {a}")
             arg_type[a] = "char"
             continue
-        if a == "name" and fn.name.lower() == "print_matrix":
+        if a == "name" and fn.name.lower().startswith("print_"):
             o.w(f"character(len=*), intent({intent}){opt} :: {a}")
             arg_type[a] = "char"
             continue
@@ -12985,7 +13070,6 @@ def emit_function(
         if (
             a in {"n", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
             or a.endswith("_order")
-            or (a == "name" and fn.name.lower().startswith("print_"))
             or a in fn_int_args
         ):
             o.w(f"integer, intent(in){opt} :: {a}")
@@ -15998,14 +16082,13 @@ def transpile_r_to_fortran(
         for i, a in enumerate(f.args):
             kinds.append(
                 "character"
-                if a in fn_chars
+                if a in fn_chars or (a == "name" and f.name.lower().startswith("print_") and f.name.lower() != "print_matrix")
                 else
                 "integer"
                 if (
                     a in fn_ints
                     or a in fn_int_arrs
                     or a in {"asset_names", "price_names"}
-                    or (a == "name" and f.name.lower().startswith("print_") and f.name.lower() != "print_matrix")
                 )
                 else "real"
             )
@@ -16021,6 +16104,8 @@ def transpile_r_to_fortran(
         "glm_terms_by_fit": {},
         "glm_fits": set(),
         "prcomp_fits": set(),
+        "loess_fits": set(),
+        "smooth_spline_fits": set(),
         "lm_anova_terms_by_fit": {},
         "lm_anova_dfs_by_fit": {},
         "aov_fits": set(),
@@ -16037,6 +16122,8 @@ def transpile_r_to_fortran(
         "glm_terms_by_fit": {},
         "glm_fits": set(),
         "prcomp_fits": set(),
+        "loess_fits": set(),
+        "smooth_spline_fits": set(),
         "lm_anova_terms_by_fit": {},
         "lm_anova_dfs_by_fit": {},
         "aov_fits": set(),
@@ -16394,6 +16481,17 @@ def transpile_r_to_fortran(
                 list_vars[st.name] = "kmeans_result_t"
                 helper_ctx_main["need_r_mod"].add("kmeans")
                 helper_ctx_main["need_r_mod"].add("kmeans_result_t")
+            if c_fit_main is not None and c_fit_main[0].lower() in {"ksmooth", "lowess"}:
+                list_vars[st.name] = "smooth_xy_t"
+                helper_ctx_main["need_r_mod"].update({c_fit_main[0].lower(), "smooth_xy_t"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "loess":
+                list_vars[st.name] = "loess_fit_t"
+                helper_ctx_main["loess_fits"].add(st.name)
+                helper_ctx_main["need_r_mod"].update({"loess_fit", "loess_fit_t"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "smooth.spline":
+                list_vars[st.name] = "smooth_spline_fit_t"
+                helper_ctx_main["smooth_spline_fits"].add(st.name)
+                helper_ctx_main["need_r_mod"].update({"smooth_spline", "smooth_spline_fit_t"})
             if c_fit_main is not None and c_fit_main[0].lower() == "hclust":
                 list_vars[st.name] = "hclust_result_t"
                 helper_ctx_main["need_r_mod"].add("hclust")
@@ -16418,6 +16516,11 @@ def transpile_r_to_fortran(
                 if kw_pr_main.get("n.ahead", kw_pr_main.get("n_ahead")) is not None:
                     arima_pred_vars.add(st.name)
                     helper_ctx_main["need_r_mod"].update({"arima_predict_result_t", "arima_predict_result"})
+                else:
+                    fit_pr_main = pos_pr_main[0].strip() if pos_pr_main else kw_pr_main.get("object", "").strip()
+                    if fit_pr_main in list_vars and list_vars[fit_pr_main] == "smooth_spline_fit_t":
+                        list_vars[st.name] = "smooth_xy_t"
+                        helper_ctx_main["need_r_mod"].update({"predict_smooth_spline", "smooth_xy_t", "smooth_spline_fit_t"})
             if c_fit_main is not None and c_fit_main[0].lower() in {"acf", "pacf", "ccf"}:
                 acf_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"acf_fit_t", "r_acf", "r_ccf", "print_acf"})
@@ -18502,6 +18605,18 @@ def transpile_r_to_fortran(
         "r_sd",
         "var",
         "r_format_vec",
+        "r_filter_linear",
+        "smooth_xy_t",
+        "loess_fit_t",
+        "smooth_spline_fit_t",
+        "smooth",
+        "runmed",
+        "ksmooth",
+        "lowess",
+        "loess_fit",
+        "predict_loess",
+        "smooth_spline",
+        "predict_smooth_spline",
         "colMeans",
         "apply_col_cumsum",
         "apply_col_sd",
@@ -19776,6 +19891,17 @@ def rewrite_vector_bracket_assignment_with_replace(lines: list[str]) -> list[str
     return out
 
 
+def rewrite_residual_vector_bracket_subscripts(lines: list[str]) -> list[str]:
+    pat = re.compile(r"\b([A-Za-z]\w*)\[([A-Za-z]\w*)\]")
+    out: list[str] = []
+    for ln in lines:
+        if "::" in ln or ln.lstrip().startswith("!"):
+            out.append(ln)
+            continue
+        out.append(pat.sub(r"\1(int(\2))", ln))
+    return out
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -20933,6 +21059,7 @@ def main() -> int:
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
     f90_lines = fpost.fold_simple_integer_intrinsics(f90_lines)
     f90_lines = rewrite_vector_bracket_assignment_with_replace(f90_lines)
+    f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
@@ -20942,6 +21069,7 @@ def main() -> int:
     f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = hoist_repeated_numeric_array_literals(f90_lines)
+    f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
     # NOTE: keep named-argument rewriting disabled here; the generic pass
     # can mis-handle array constructors in helper calls (e.g., r_rep_*).
     # Keep helper argument forms as emitted; avoid line-based rewrites that can
