@@ -6529,6 +6529,24 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_pn, pos_pn, kw_pn = c_usr
         x_src = pos_pn[0] if pos_pn else kw_pn.get("q", "0.0")
         return f"normal_cdf(real({r_expr_to_fortran(x_src)}, kind=dp))"
+    if c_usr is not None and c_usr[0].lower() in {"ppois", "qpois"}:
+        nm_pois, pos_pois, kw_pois = c_usr
+        out_args: list[str] = []
+        if pos_pois:
+            out_args.append(r_expr_to_fortran(pos_pois[0]))
+        elif "q" in kw_pois:
+            out_args.append(f"q={r_expr_to_fortran(kw_pois['q'])}")
+        elif "p" in kw_pois:
+            out_args.append(f"p={r_expr_to_fortran(kw_pois['p'])}")
+        for k_pois, v_pois in kw_pois.items():
+            kf_pois = _sanitize_fortran_kwarg_name(k_pois)
+            if kf_pois in {"q", "p"} and not pos_pois:
+                continue
+            vf_pois = r_expr_to_fortran(v_pois)
+            if kf_pois == "lambda":
+                vf_pois = f"real({vf_pois}, kind=dp)"
+            out_args.append(f"{kf_pois}={vf_pois}")
+        return f"{nm_pois.lower()}({', '.join(out_args)})"
     if c_usr is not None and c_usr[0].lower() == "apply":
         _nm_app, pos_app, kw_app = c_usr
         x_src = pos_app[0] if pos_app else kw_app.get("X", kw_app.get("x", ""))
@@ -11467,6 +11485,54 @@ def emit_stmts(
                 _wstmt("print *", st.comment)
         elif isinstance(st, CallStmt):
             nm = st.name.lower()
+            if nm in {"show_continuous", "show_discrete"}:
+                c_show = parse_call_text(st.name + "(" + ", ".join(st.args) + ")")
+                if c_show is not None:
+                    _nm_show, pos_show, kw_show = c_show
+                    name_src = kw_show.get("name", pos_show[0] if len(pos_show) >= 1 else f'"{st.name}"')
+                    x_src = kw_show.get("x", pos_show[5] if len(pos_show) >= 6 else "")
+                    probs_src = kw_show.get("probs", pos_show[6] if len(pos_show) >= 7 else "")
+                    dfun_src = (kw_show.get("dfun", pos_show[1] if len(pos_show) >= 2 else "")).strip().lower()
+                    pfun_src = (kw_show.get("pfun", pos_show[2] if len(pos_show) >= 3 else "")).strip().lower()
+                    qfun_src = (kw_show.get("qfun", pos_show[3] if len(pos_show) >= 4 else "")).strip().lower()
+                    rfun_src = (kw_show.get("rfun", pos_show[4] if len(pos_show) >= 5 else "")).strip().lower()
+                    nsim_src = kw_show.get("nsim", pos_show[7] if len(pos_show) >= 8 else "5")
+                    mean_src = kw_show.get("mean", "0.0")
+                    sd_src = kw_show.get("sd", "1.0")
+                    title_lit = _dequote_string_literal(name_src)
+                    title_f = _fortran_str_literal(title_lit) if title_lit is not None else r_expr_to_fortran(name_src)
+                    x_f = r_expr_to_fortran(x_src) if x_src else ""
+                    probs_f = r_expr_to_fortran(probs_src) if probs_src else ""
+                    mean_f = f"real({r_expr_to_fortran(mean_src)}, kind=dp)"
+                    sd_f = f"real({r_expr_to_fortran(sd_src)}, kind=dp)"
+                    _wstmt(f"call print_header({title_f})", st.comment)
+                    if x_src:
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "x values:"', "")
+                        _wstmt(f"write(*,*) {x_f}", "")
+                    if dfun_src == "dnorm" and pfun_src == "pnorm" and qfun_src == "qnorm" and rfun_src == "rnorm":
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "density d*:"', "")
+                        _wstmt(f"write(*,*) dnorm(real({x_f}, kind=dp), mean={mean_f}, sd={sd_f})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "CDF p*:"', "")
+                        _wstmt(f"write(*,*) normal_cdf((real({x_f}, kind=dp) - {mean_f}) / {sd_f})", "")
+                    if probs_src:
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "probabilities:"', "")
+                        _wstmt(f"write(*,*) {probs_f}", "")
+                    if dfun_src == "dnorm" and pfun_src == "pnorm" and qfun_src == "qnorm" and rfun_src == "rnorm":
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "quantiles q*:"', "")
+                        _wstmt(f"write(*,*) qnorm(real({probs_f}, kind=dp), mean={mean_f}, sd={sd_f})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "random sample r*:"', "")
+                        _wstmt(f"write(*,*) {mean_f} + {sd_f} * rnorm_vec({_int_bound_expr(r_expr_to_fortran(nsim_src))})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "Check p(q(p)) approximately equals p:"', "")
+                        _wstmt(f"write(*,*) normal_cdf((qnorm(real({probs_f}, kind=dp), mean={mean_f}, sd={sd_f}) - {mean_f}) / {sd_f})", "")
+                    _wstmt("write(*,*)", "")
+                    continue
             if nm == "stop":
                 if st.args:
                     msg = _dequote_string_literal(st.args[0].strip())
@@ -11831,6 +11897,52 @@ def emit_stmts(
                 continue
             if c_expr is not None:
                 nm_expr = c_expr[0].lower()
+                if nm_expr in {"show_continuous", "show_discrete"}:
+                    _nm_show, pos_show, kw_show = c_expr
+                    name_src = kw_show.get("name", pos_show[0] if len(pos_show) >= 1 else f'"{c_expr[0]}"')
+                    x_src = kw_show.get("x", pos_show[5] if len(pos_show) >= 6 else "")
+                    probs_src = kw_show.get("probs", pos_show[6] if len(pos_show) >= 7 else "")
+                    dfun_src = (kw_show.get("dfun", pos_show[1] if len(pos_show) >= 2 else "")).strip().lower()
+                    pfun_src = (kw_show.get("pfun", pos_show[2] if len(pos_show) >= 3 else "")).strip().lower()
+                    qfun_src = (kw_show.get("qfun", pos_show[3] if len(pos_show) >= 4 else "")).strip().lower()
+                    rfun_src = (kw_show.get("rfun", pos_show[4] if len(pos_show) >= 5 else "")).strip().lower()
+                    nsim_src = kw_show.get("nsim", pos_show[7] if len(pos_show) >= 8 else "5")
+                    mean_src = kw_show.get("mean", "0.0")
+                    sd_src = kw_show.get("sd", "1.0")
+                    title_lit = _dequote_string_literal(name_src)
+                    title_f = _fortran_str_literal(title_lit) if title_lit is not None else r_expr_to_fortran(name_src)
+                    x_f = r_expr_to_fortran(x_src) if x_src else ""
+                    probs_f = r_expr_to_fortran(probs_src) if probs_src else ""
+                    mean_f = f"real({r_expr_to_fortran(mean_src)}, kind=dp)"
+                    sd_f = f"real({r_expr_to_fortran(sd_src)}, kind=dp)"
+                    _wstmt(f"call print_header({title_f})", st.comment)
+                    if x_src:
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "x values:"', "")
+                        _wstmt(f"write(*,*) {x_f}", "")
+                    if dfun_src == "dnorm" and pfun_src == "pnorm" and qfun_src == "qnorm" and rfun_src == "rnorm":
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "density d*:"', "")
+                        _wstmt(f"write(*,*) dnorm(real({x_f}, kind=dp), mean={mean_f}, sd={sd_f})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "CDF p*:"', "")
+                        _wstmt(f"write(*,*) normal_cdf((real({x_f}, kind=dp) - {mean_f}) / {sd_f})", "")
+                    if probs_src:
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "probabilities:"', "")
+                        _wstmt(f"write(*,*) {probs_f}", "")
+                    if dfun_src == "dnorm" and pfun_src == "pnorm" and qfun_src == "qnorm" and rfun_src == "rnorm":
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "quantiles q*:"', "")
+                        _wstmt(f"write(*,*) qnorm(real({probs_f}, kind=dp), mean={mean_f}, sd={sd_f})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "random sample r*:"', "")
+                        _wstmt(f"write(*,*) {mean_f} + {sd_f} * rnorm_vec({_int_bound_expr(r_expr_to_fortran(nsim_src))})", "")
+                        _wstmt("write(*,*)", "")
+                        _wstmt(f'write(*,*) "Check p(q(p)) approximately equals p:"', "")
+                        _wstmt(f"write(*,*) normal_cdf((qnorm(real({probs_f}, kind=dp), mean={mean_f}, sd={sd_f}) - {mean_f}) / {sd_f})", "")
+                    _wstmt("write(*,*)", "")
+                    continue
                 if nm_expr in _SUBROUTINE_FUNCTIONS:
                     call_f = r_expr_to_fortran(st.expr.strip())
                     _wstmt(f"call {call_f}", st.comment)
@@ -12461,13 +12573,6 @@ def emit_function(
     need_rnorm_local = {"used": False}
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
     body_stmts, last = _lower_local_scalar_closures(body_stmts, last)
-    fn_proc_args = infer_function_callback_args(fn)
-    if fn_proc_args:
-        names = ", ".join(sorted(fn_proc_args))
-        raise NotImplementedError(
-            f"{fn.name} uses function-valued argument(s) as callbacks ({names}); "
-            "first-class function arguments are not supported"
-        )
     if fn.name == "arma_coef_names" and len(fn.args) >= 2:
         max_ar_arg, max_ma_arg = fn.args[:2]
         rname = f"{fn.name}_result"
@@ -12709,6 +12814,7 @@ def emit_function(
     fn_char_scalars = infer_function_character_scalars(fn)
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     fn_int_args = infer_function_integer_names(fn)
+    fn_proc_args = infer_function_callback_args(fn)
 
     def _arg_list_result_type(arg_name: str) -> str | None:
         used_fields: set[str] = set()
@@ -18343,6 +18449,9 @@ def transpile_r_to_fortran(
         "print_summary",
         "lm_coef",
         "normal_cdf",
+        "qnorm",
+        "ppois",
+        "qpois",
         "set_print_int_like",
         "set_recycle_warn",
         "set_recycle_stop",
