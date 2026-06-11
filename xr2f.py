@@ -20029,6 +20029,66 @@ def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
     return out
 
 
+def rewrite_named_vector_print_calls(lines: list[str]) -> list[str]:
+    named_vars: set[str] = set()
+    for ln in lines:
+        m = re.match(r"^\s*character\s*\([^)]*\)\s*,\s*parameter\s*::\s*([A-Za-z]\w*)_names\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            named_vars.add(m.group(1))
+    if not named_vars:
+        return lines
+    out: list[str] = []
+    changed = False
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if "print_real_vector" in ln:
+            block = [ln]
+            j = i + 1
+            while j < len(lines) and (block[-1].rstrip().endswith("&") or "&" in block[-1]):
+                block.append(lines[j])
+                if not lines[j].rstrip().endswith("&") and ")" in lines[j]:
+                    break
+                j += 1
+            block_txt = " ".join(x.replace("&", " ") for x in block)
+            hit_nm = next((nm for nm in sorted(named_vars, key=len, reverse=True) if re.search(rf"\b{re.escape(nm)}\b", block_txt)), None)
+            if hit_nm is not None and f"{hit_nm}_names" not in block_txt:
+                block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_named_real_vector", block[0], flags=re.IGNORECASE)
+                for k in range(len(block) - 1, -1, -1):
+                    if ")" in block[k]:
+                        block[k] = re.sub(r"\)\s*$", f", {hit_nm}_names)", block[k])
+                        break
+                out.extend(block)
+                changed = True
+                i += len(block)
+                continue
+        new_ln = ln
+        if "print_real_vector" in ln:
+            for nm in sorted(named_vars, key=len, reverse=True):
+                if re.search(rf"\b{re.escape(nm)}\b", ln) and f"{nm}_names" not in ln:
+                    new_ln = re.sub(
+                        r"\bcall\s+print_real_vector\s*\((.*)\)\s*$",
+                        rf"call print_named_real_vector(\1, {nm}_names)",
+                        ln,
+                        flags=re.IGNORECASE,
+                    )
+                    if new_ln != ln:
+                        changed = True
+                    break
+        out.append(new_ln)
+        i += 1
+    if changed:
+        for i, ln in enumerate(out):
+            if re.match(r"^\s*use\s+r_mod\s*,\s*only\s*:", ln, re.IGNORECASE):
+                if not re.search(r"\bprint_named_real_vector\b", ln):
+                    if ln.rstrip().endswith("&"):
+                        out[i] = re.sub(r",?\s*&\s*$", ", print_named_real_vector, &", ln.rstrip())
+                    else:
+                        out[i] = ln.rstrip() + ", print_named_real_vector"
+                break
+    return out
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -21248,6 +21308,7 @@ def main() -> int:
     f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = compact_array_section_subscripts(f90_lines)
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
+    f90_lines = rewrite_named_vector_print_calls(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
