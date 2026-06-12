@@ -14027,8 +14027,8 @@ def emit_function(
             arg_type[a] = "char"
             continue
         if a in {"asset_names", "price_names"}:
-            o.w(f"integer, intent(in){opt} :: {a}(:)")
-            arg_type[a] = "int_array"
+            o.w(f"character(len=*), intent({intent}){opt} :: {a}(:)")
+            arg_type[a] = "char_array"
             continue
         ar = arg_rank.get(a, 0)
         if ar >= 1:
