@@ -10326,12 +10326,12 @@ def emit_stmts(
                 return 2
             if t in int_vector_vars or t in real_vector_vars:
                 return 1
-            if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
-                fld = re.split(r"[$%]", t)[-1].lower()
-                if fld in {"centers", "table", "design", "sigma", "y", "merge"}:
-                    return 2
-                if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
-                    return 1
+        if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
+            fld = re.split(r"[$%]", t)[-1].lower()
+            if fld in {"centers", "table", "design", "sigma", "y", "merge"}:
+                return 2
+            if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
+                return 1
         m_comp_ix = re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+\s*\((.*)\)$", t)
         if m_comp_ix is not None:
             head = t[: t.find("(")].strip()
