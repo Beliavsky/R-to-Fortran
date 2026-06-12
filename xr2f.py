@@ -1130,7 +1130,7 @@ def _array_dim_parts(expr: str) -> list[str] | None:
         return [p.strip() for p in cdim[1] + list(cdim[2].values()) if p.strip()]
     if dim_txt.startswith("[") and dim_txt.endswith("]"):
         return [p.strip() for p in split_top_level_commas(dim_txt[1:-1]) if p.strip()]
-    return None
+    return [dim_txt] if dim_txt else None
 
 
 def _warn_mixed_character_coercion(expr: str) -> None:
@@ -6662,6 +6662,8 @@ def r_expr_to_fortran(expr: str) -> str:
         t = fscan.strip_redundant_outer_parens_expr(txt.strip())
         if not t:
             return 0
+        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
+            return 3
         if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_MATRIX_NAMES:
             return 2
         if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_VECTOR_NAMES:
@@ -8171,7 +8173,7 @@ def r_expr_to_fortran(expr: str) -> str:
             dparts = split_top_level_commas(inner_d) if inner_d else []
             dim_f = "[" + ", ".join(_int_bound_expr(r_expr_to_fortran(dp.strip())) for dp in dparts if dp.strip()) + "]"
         else:
-            dim_f = r_expr_to_fortran(dim_src)
+            dim_f = "[" + _int_bound_expr(r_expr_to_fortran(dim_src)) + "]"
         if _HAS_R_MOD:
             dt = data_txt.strip()
             is_char = (
@@ -8181,6 +8183,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 or ("'" in dt and dt.startswith("c("))
             )
             dim_parts = _array_dim_parts(s)
+            if dim_parts is not None and len(dim_parts) == 1:
+                return data_f
             if dim_parts is not None and len(dim_parts) > 2:
                 return f"reshape({data_f}, {dim_f}, pad={data_f})"
             if is_char:
@@ -8746,6 +8750,16 @@ def r_expr_to_fortran(expr: str) -> str:
             x_src = parts[0].strip()
             margin_src = parts[1].strip()
             fun_src = parts[2].strip().lower()
+            if fun_src == "sum" and x_src.lower() in _KNOWN_RANK3_NAMES:
+                x_f = r_expr_to_fortran(x_src)
+                if margin_src in {"1", "1L"}:
+                    return f"sum(sum({x_f}, dim=3), dim=2)"
+                if margin_src in {"2", "2L"}:
+                    return f"sum(sum({x_f}, dim=3), dim=1)"
+                if margin_src in {"3", "3L"}:
+                    return f"sum(sum({x_f}, dim=2), dim=1)"
+                if re.match(r"^c\s*\(\s*1\s*,\s*2\s*\)$", margin_src, re.IGNORECASE):
+                    return f"sum({x_f}, dim=3)"
             if margin_src in {"2", "2L"} and fun_src == "cumsum":
                 return f"apply_col_cumsum({r_expr_to_fortran(x_src)})"
             if margin_src in {"2", "2L"} and fun_src in {"sd", "r_sd"}:
@@ -8769,6 +8783,10 @@ def r_expr_to_fortran(expr: str) -> str:
     def _is_matrix_to_fortran(inner: str) -> str:
         return ".true." if _looks_matrix_expr(inner.strip()) else ".false."
     s = _replace_balanced_func_calls(s, "is.matrix", _is_matrix_to_fortran)
+    def _is_array_to_fortran(inner: str) -> str:
+        txt = inner.strip()
+        return ".true." if _looks_matrix_expr(txt) or txt.lower() in _KNOWN_RANK3_NAMES else ".false."
+    s = _replace_balanced_func_calls(s, "is.array", _is_array_to_fortran)
     s = _replace_balanced_func_calls(
         s,
         "complete.cases",
@@ -10002,6 +10020,8 @@ def emit_stmts(
             or t.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
         ):
             return 1
+        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
+            return 3
         if re.fullmatch(r"[A-Za-z]\w*", t) and (
             t in logical_matrix_vars or t.lower() in _KNOWN_LOGICAL_MATRIX_NAMES
         ):
@@ -10011,8 +10031,22 @@ def emit_stmts(
         c_tri_rank = parse_call_text(t)
         if c_tri_rank is not None and c_tri_rank[0].lower() in {"lower.tri", "upper.tri"}:
             return 2
-        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
-            return 3
+        m_rank3_index = re.match(r"^([A-Za-z]\w*)\s*\[(.*)\]\s*$", t)
+        if m_rank3_index is not None and m_rank3_index.group(1).lower() in _KNOWN_RANK3_NAMES:
+            dims_rank3_all = _split_index_dims(m_rank3_index.group(2).strip())
+            drop_false = any(
+                re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE)
+                for d in dims_rank3_all
+            )
+            dims_rank3 = [d for d in dims_rank3_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+            if drop_false:
+                return len(dims_rank3)
+            fixed_rank3 = sum(
+                1
+                for d in dims_rank3
+                if d.strip() and d.strip() != ":" and _split_top_level_colon(d.strip()) is None
+            )
+            return max(0, 3 - fixed_rank3)
         c_rank_print = parse_call_text(t)
         if c_rank_print is not None and c_rank_print[0].lower() == "which":
             arr_ind_src = c_rank_print[2].get("arr.ind", c_rank_print[2].get("arr_ind", "FALSE")).strip().lower()
@@ -10137,6 +10171,8 @@ def emit_stmts(
                 continue
             r1 = _expr_rank_for_print(mm_pr[0])
             r2 = _expr_rank_for_print(mm_pr[1])
+            if r1 == 3 or r2 == 3:
+                return 3
             if r1 == 2 or r2 == 2:
                 return 2
             if r1 == 1 or r2 == 1:
@@ -12585,6 +12621,14 @@ def emit_stmts(
                         re.search(rf"\b{re.escape(nm)}\b", one, re.IGNORECASE)
                         for nm in _KNOWN_RANK3_NAMES
                     )
+                    if rank_for_matrix_print == 3 and has_r_mod:
+                        one_for_r3_print = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        _wstmt(
+                            f"call print_real_vector(real(reshape({one_for_r3_print}, [size({one_for_r3_print})]), kind=dp))",
+                            st.comment,
+                        )
+                        need_r_mod.add("print_real_vector")
+                        continue
                     if rank_for_matrix_print == 2 and has_r_mod and not mentions_rank3_for_print:
                         one_for_matrix_print = r_expr_to_fortran(_rewrite_predict_expr(one))
                         _wstmt(f"call print_matrix({one_for_matrix_print})", st.comment)
@@ -13470,6 +13514,17 @@ def emit_stmts(
                 else:
                     _wstmt(f"call print_real_vector({expr_print_f})", st.comment)
                     need_r_mod.add("print_real_vector")
+                continue
+            if rank_expr_print == 3:
+                expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
+                if has_r_mod:
+                    _wstmt(
+                        f"call print_real_vector(real(reshape({expr_print_f}, [size({expr_print_f})]), kind=dp))",
+                        st.comment,
+                    )
+                    need_r_mod.add("print_real_vector")
+                else:
+                    _wstmt(f'write(*,"(*(g0,1x))") reshape({expr_print_f}, [size({expr_print_f})])', st.comment)
                 continue
             if rank_expr_print == 2:
                 expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
@@ -16053,6 +16108,10 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 out.add(st.name)
             if low.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs):
                 out.add(st.name)
+            if low.startswith("array("):
+                dim_parts_arr = _array_dim_parts(rhs)
+                if dim_parts_arr is not None and len(dim_parts_arr) == 2 and st.name not in known_int_matrices:
+                    out.add(st.name)
             if low.startswith("read.csv("):
                 out.add(st.name)
             if low.startswith("simulate_var("):
