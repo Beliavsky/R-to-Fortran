@@ -3254,7 +3254,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3994,6 +3994,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bn(?:row|col)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bdim\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bapply\s*\(\s*{re.escape(arg)}\b"),
+        re.compile(rf"\bas\.matrix\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b(?:chol|sweep|det)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b(?:fit_var|fit_var_orders|make_var_design)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b{re.escape(arg)}\s*\[\s*,"),
@@ -5061,7 +5062,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
                 return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks) if b_src is not None else 1
             if fn_name in {"as.integer", "as.numeric", "as.double"}:
-                return _infer_assignment_rank_hint(c_call[1][0].strip(), inferred_ranks) if c_call[1] else 0
+                if c_call[1]:
+                    cast_arg = c_call[1][0].strip()
+                    if _split_top_level_token(cast_arg, "%*%", from_right=True) is not None:
+                        return 1
+                    return _infer_assignment_rank_hint(cast_arg, inferred_ranks)
+                return 0
             if fn_name == "as.vector":
                 return 1
             if fn_name in {
@@ -5117,6 +5123,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         inside = fscan.strip_redundant_outer_parens_expr(m_idx.group(2).strip())
         base_rank = inferred_ranks.get(base, 0)
         parts = _split_index_dims(inside)
+        if len(parts) == 1 and re.search(
+            r"\b(?:is\.finite|is\.na|is\.nan|is\.infinite|complete\.cases)\s*\(",
+            parts[0],
+            re.IGNORECASE,
+        ):
+            return 1
         fixed = 0
         for p in parts:
             p0 = p.strip()
@@ -5273,7 +5285,18 @@ def rename_conflicting_reused_vars(
                 rename_map = {**rename_map}
             st = _rename_stmt_obj(st, rename_map)
             if isinstance(st, Assign):
+                m_self_as_matrix = re.match(
+                    rf"^\s*as\.matrix\s*\(\s*{re.escape(st.name)}\s*\)\s*$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_self_as_matrix is not None:
+                    var_ranks[st.name] = max(var_ranks.get(st.name, 0), 2)
+                    out.append(st)
+                    continue
                 rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
+                if re.match(r"^\s*as\.numeric\s*\(", st.expr, re.IGNORECASE) and "%*%" in st.expr:
+                    rhs_rank = 1
                 rhs_kind = _infer_assignment_kind_hint(st.expr, var_kinds)
                 name = st.name
                 old_kind = var_kinds.get(name, "unknown")
@@ -5301,10 +5324,13 @@ def rename_conflicting_reused_vars(
                 out.append(st)
             elif isinstance(st, FuncDef):
                 fn_rename_map = {k: v for k, v in rename_map.items() if k not in set(st.args)}
+                fn_seed_ranks: dict[str, int] = {}
+                for arg_seed in st.args:
+                    fn_seed_ranks[arg_seed] = infer_arg_rank(st, arg_seed)
                 body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
-                    {k: v for k, v in var_ranks.items()},
-                    {k: v for k, v in var_kinds.items()},
+                    fn_seed_ranks,
+                    {},
                     fn_rename_map,
                     used_names.copy(),
                     local_only=False,
@@ -9423,6 +9449,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 il in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is_na\s*\(", il)
                 or re.match(r"^is\.na\s*\(", il)
+                or re.match(r"^ieee_is_finite\s*\(", il)
                 or re.match(r"^complete\.cases\s*\(", il)
                 or re.match(r"^all\s*\(.+\bdim\s*=\s*2\s*\)\s*$", il)
                 or any(op in il for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
@@ -9438,6 +9465,7 @@ def r_expr_to_fortran(expr: str) -> str:
                     il in _KNOWN_LOGICAL_VECTOR_NAMES
                     or re.match(r"^is_na\s*\(", il)
                     or re.match(r"^is\.na\s*\(", il)
+                    or re.match(r"^ieee_is_finite\s*\(", il)
                     or re.match(r"^complete\.cases\s*\(", il)
                     or re.match(r"^all\s*\(.+\bdim\s*=\s*2\s*\)\s*$", il)
                     or any(op in il for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
@@ -10003,7 +10031,13 @@ def emit_stmts(
             return 2
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:minimum|code|iterations)\b", t):
             return 0
-        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:ar|aic)\b", t):
+        m_ar_ma_field_rank = re.match(r"^([A-Za-z]\w*)\s*(?:\$|%)\s*(ar|ma)\b", t)
+        if m_ar_ma_field_rank is not None:
+            root_ar_ma = m_ar_ma_field_rank.group(1)
+            if "varma" in object_list_vars.get(root_ar_ma, "").lower():
+                return 2
+            return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*aic\b", t):
             return 1
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*var\.pred\b", t):
             return 0
@@ -10322,6 +10356,12 @@ def emit_stmts(
     def _named_vector_print_parts(expr_txt: str) -> tuple[str, str, bool] | None:
         """Return (value_expr, names_expr, value_is_scalar) for printable named vectors."""
         t = expr_txt.strip()
+        t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
+        expr_names_map = helper_ctx.get("named_vector_name_exprs") if helper_ctx is not None else None
+        if isinstance(expr_names_map, dict):
+            src_names = expr_names_map.get(t_key)
+            if isinstance(src_names, str) and src_names.strip():
+                return r_expr_to_fortran(t), r_expr_to_fortran(src_names.strip()), False
         cinfo = parse_call_text(t)
         if cinfo is not None and cinfo[0].lower() == "unname":
             return None
@@ -10418,6 +10458,10 @@ def emit_stmts(
         c_round = parse_call_text(t)
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
+        t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
+        src_direct = expr_map.get(t_key)
+        if isinstance(src_direct, str) and src_direct.strip():
+            return r_expr_to_fortran(src_direct.strip())
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
@@ -10433,6 +10477,10 @@ def emit_stmts(
         c_round = parse_call_text(t)
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
+        t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
+        src_direct = expr_map.get(t_key)
+        if isinstance(src_direct, str) and src_direct.strip():
+            return r_expr_to_fortran(src_direct.strip())
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
@@ -14763,7 +14811,7 @@ def emit_function(
                     real_scalars.discard(target)
                     params.pop(target, None)
                     return True
-                if cn_expr in {"c", "numeric", "as.numeric", "coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums"}:
+                if cn_expr in {"c", "numeric", "as.numeric", "pack", "coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums"}:
                     real_arrays.add(target)
                     known_arrays.add(target)
                     ints.discard(target)
@@ -14980,6 +15028,20 @@ def emit_function(
             char_scalars_loc.discard(nm)
             char_arrays_loc.discard(nm)
             params.pop(nm, None)
+        for nm in list(real_scalars):
+            assigned_vector_filter = any(
+                isinstance(st_rank_fix, Assign)
+                and st_rank_fix.name == nm
+                and (
+                    re.match(r"^\s*pack\s*\(", r_expr_to_fortran(st_rank_fix.expr.strip()), re.IGNORECASE)
+                    or re.search(r"\[\s*(?:is\.finite|is\.na|ieee_is_finite|is_na)\s*\(", st_rank_fix.expr, re.IGNORECASE)
+                )
+                for st_rank_fix in body_use
+            )
+            if assigned_vector_filter:
+                real_scalars.discard(nm)
+                real_arrays.add(nm)
+                local_ranks[nm] = max(local_ranks.get(nm, 0), 1)
         if ints - int64_locals:
             o.w("integer :: " + ", ".join(sorted(ints - int64_locals)))
         if int64_locals:
@@ -16340,12 +16402,16 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
 
 def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
     sources: dict[str, str] = {}
+    target_pat = r"([A-Za-z]\w*(?:\s*(?:\$|%)\s*[A-Za-z]\w*)*)"
+
+    def key_for_target(txt: str) -> str:
+        return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
 
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, ExprStmt):
                 m = re.match(
-                    r"^\s*colnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
+                    rf"^\s*colnames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
                     st.expr.strip(),
                     re.IGNORECASE,
                 )
@@ -16361,7 +16427,7 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
                                 and parse_call_text(c_src[1][1].strip()) is not None
                             ):
                                 continue
-                        sources[m.group(1).lower()] = src
+                        sources[key_for_target(m.group(1))] = src
             elif isinstance(st, FuncDef):
                 walk(st.body)
             elif isinstance(st, IfStmt):
@@ -16380,17 +16446,54 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
 
 def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
     sources: dict[str, str] = {}
+    target_pat = r"([A-Za-z]\w*(?:\s*(?:\$|%)\s*[A-Za-z]\w*)*)"
+
+    def key_for_target(txt: str) -> str:
+        return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
 
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, ExprStmt):
                 m = re.match(
-                    r"^\s*rownames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
+                    rf"^\s*rownames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
                     st.expr.strip(),
                     re.IGNORECASE,
                 )
                 if m is not None:
-                    sources[m.group(1).lower()] = m.group(2).strip()
+                    sources[key_for_target(m.group(1))] = m.group(2).strip()
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return sources
+
+
+def collect_names_sources(stmts: list[object]) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    target_pat = r"([A-Za-z]\w*(?:\s*(?:\$|%)\s*[A-Za-z]\w*)*)"
+
+    def key_for_target(txt: str) -> str:
+        return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, ExprStmt):
+                m = re.match(
+                    rf"^\s*names\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m is not None:
+                    sources[key_for_target(m.group(1))] = m.group(2).strip()
             elif isinstance(st, FuncDef):
                 walk(st.body)
             elif isinstance(st, IfStmt):
@@ -17607,6 +17710,7 @@ def transpile_r_to_fortran(
         "named_vector_names": dict(_NAMED_VECTOR_NAMES),
         "return_array_fns": set(fn_return_array_kind.keys()),
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
+        "named_vector_name_exprs": collect_names_sources(stmts),
         "matrix_col_labels": collect_colname_labels(main_stmts),
         "matrix_colname_exprs": collect_colname_sources(stmts),
         "matrix_rowname_exprs": collect_rownames_sources(stmts),
@@ -18534,6 +18638,23 @@ def transpile_r_to_fortran(
                 m_alias_full = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)\s*$", rhs_alias)
                 if m_alias_full is not None:
                     base_alias, fld_alias = m_alias_full.group(1), m_alias_full.group(2)
+                    fld_alias_l = fld_alias.lower()
+                    if fld_alias_l in int_fields or fld_alias_l in real_fields:
+                        params.pop(st_alias.name, None)
+                        int_arrays.discard(st_alias.name)
+                        real_arrays.discard(st_alias.name)
+                        int_matrices.discard(st_alias.name)
+                        real_matrices.discard(st_alias.name)
+                        int_rank3_arrays.discard(st_alias.name)
+                        real_rank3_arrays.discard(st_alias.name)
+                        real_rank4_arrays.discard(st_alias.name)
+                        if fld_alias_l in int_fields:
+                            ints.add(st_alias.name)
+                            real_scalars.discard(st_alias.name)
+                        else:
+                            real_scalars.add(st_alias.name)
+                            ints.discard(st_alias.name)
+                        continue
                     spec_alias = _list_spec_from_type_name(list_vars.get(base_alias, ""))
                     expr_alias = spec_alias.root_fields.get(fld_alias) if spec_alias is not None else None
                     if isinstance(expr_alias, str):
