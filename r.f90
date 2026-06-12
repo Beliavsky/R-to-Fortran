@@ -3244,13 +3244,17 @@ split = out
 i = 2
 do while (i <= n - 2)
    j = i
-   do while (j < n .and. out(j + 1) == out(i))
+   do
+      if (j >= n) exit
+      if (out(j + 1) /= out(i)) exit
       j = j + 1
    end do
-   if (j == i + 1 .and. out(i - 1) /= out(i) .and. out(j + 1) /= out(i)) then
-      if ((out(i) > out(i - 1) .and. out(i) > out(j + 1)) .or. (out(i) < out(i - 1) .and. out(i) < out(j + 1))) then
-         split(i) = out(i - 1)
-         split(j) = out(j + 1)
+   if (j == i + 1) then
+      if (out(i - 1) /= out(i) .and. out(j + 1) /= out(i)) then
+         if ((out(i) > out(i - 1) .and. out(i) > out(j + 1)) .or. (out(i) < out(i - 1) .and. out(i) < out(j + 1))) then
+            split(i) = out(i - 1)
+            split(j) = out(j + 1)
+         end if
       end if
    end if
    i = j + 1
@@ -3818,7 +3822,9 @@ real(kind=dp) :: key
 do i = 2, size(x)
    key = x(i)
    j = i - 1
-   do while (j >= 1 .and. x(j) > key)
+   do
+      if (j < 1) exit
+      if (x(j) <= key) exit
       x(j + 1) = x(j)
       j = j - 1
    end do
@@ -3833,7 +3839,9 @@ integer :: i, j, key
 do i = 2, size(x)
    key = x(i)
    j = i - 1
-   do while (j >= 1 .and. x(j) > key)
+   do
+      if (j < 1) exit
+      if (x(j) <= key) exit
       x(j + 1) = x(j)
       j = j - 1
    end do
@@ -3901,12 +3909,16 @@ do i = 2, size(idx)
    t = idx(i)
    j = i - 1
    if (dec) then
-      do while (j >= 1 .and. x(idx(j)) < x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) >= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
    else
-      do while (j >= 1 .and. x(idx(j)) > x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) <= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
@@ -3932,12 +3944,16 @@ do i = 2, size(idx)
    t = idx(i)
    j = i - 1
    if (dec) then
-      do while (j >= 1 .and. x(idx(j)) < x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) >= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
    else
-      do while (j >= 1 .and. x(idx(j)) > x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) <= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
@@ -3963,12 +3979,16 @@ do i = 2, size(idx)
    t = idx(i)
    j = i - 1
    if (dec) then
-      do while (j >= 1 .and. x(idx(j)) < x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) >= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
    else
-      do while (j >= 1 .and. x(idx(j)) > x(t))
+      do
+         if (j < 1) exit
+         if (x(idx(j)) <= x(t)) exit
          idx(j + 1) = idx(j)
          j = j - 1
       end do
@@ -4034,7 +4054,9 @@ end do
 do i = 2, size(idx)
    t = idx(i)
    j = i - 1
-   do while (j >= 1 .and. x(idx(j)) > x(t))
+   do
+      if (j < 1) exit
+      if (x(idx(j)) <= x(t)) exit
       idx(j + 1) = idx(j)
       j = j - 1
    end do
@@ -4069,7 +4091,9 @@ ord = order_real(x)
 first = 1
 do while (first <= size(ord))
    last = first
-   do while (last < size(ord) .and. x(ord(last + 1)) == x(ord(first)))
+   do
+      if (last >= size(ord)) exit
+      if (x(ord(last + 1)) /= x(ord(first))) exit
       last = last + 1
    end do
    r = 0.5_dp * real(first + last, kind=dp)
