@@ -4093,6 +4093,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rf"\b{re.escape(arg)}\s*\[",
             rf"\bas\.(?:numeric|vector)\s*\(\s*{re.escape(arg)}\b",
             rf"\b(?:sum|mean|max|min|sd|r_sd)\s*\(\s*{re.escape(arg)}\b",
+            rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b",
         ]
         call_vector_evidence = False
         for txt_call in _stmt_texts_for_rank_scan(fn.body):
@@ -20686,6 +20687,8 @@ def transpile_r_to_fortran(
             return f"logical :: {k}"
         if _dequote_string_literal(txt) is not None or re.match(r"^(sub|substr)\s*\(", txt, re.IGNORECASE):
             return f"character(len=:), allocatable :: {k}"
+        if k in {"resp", "responsibilities", "posterior", "log_r"}:
+            return f"real(kind=dp), allocatable :: {k}(:,:)"
         if _is_int_literal(txt) or _selects_named_order_column(txt) or re.match(
             r"^(?:nrow|ncol|length|which\.min|which\.max|minloc|maxloc)\s*\(",
             txt,
@@ -20699,6 +20702,11 @@ def transpile_r_to_fortran(
                 return f"integer :: {k}"
             if txt in fn_int_arrays:
                 return f"integer, allocatable :: {k}(:)"
+            rk_simple = _local_rank_for_type_field(fn_name, txt)
+            if rk_simple >= 3:
+                return f"real(kind=dp), allocatable :: {k}(:,:,:)"
+            if rk_simple == 2:
+                return f"real(kind=dp), allocatable :: {k}(:,:)"
             if txt in fn_real_arrays or txt in fn_real_mats:
                 rk_field = _local_rank_for_type_field(fn_name, txt)
                 if rk_field >= 3:
@@ -20855,7 +20863,7 @@ def transpile_r_to_fortran(
                             o.w(f"integer, allocatable :: {k}(:)")
                         else:
                             o.w(f"real(kind=dp) :: {k}")
-                    elif k in {"resp", "responsibilities", "log_r"}:
+                    elif k in {"resp", "responsibilities", "posterior", "log_r"}:
                         o.w(f"real(kind=dp), allocatable :: {k}(:,:)")
                     elif k in {"pi", "x", "z", "weights", "means", "sds", "vars", "nk"}:
                         o.w(f"real(kind=dp), allocatable :: {k}(:)")
