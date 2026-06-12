@@ -4807,6 +4807,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "r_matmul",
                 "toeplitz",
                 "chol2inv",
+                "forwardsolve",
+                "backsolve",
                 "as.matrix",
                 "read.table",
                 "read.csv",
@@ -9500,6 +9502,8 @@ def emit_stmts(
             t in logical_matrix_vars or t.lower() in _KNOWN_LOGICAL_MATRIX_NAMES
         ):
             return 2
+        if re.fullmatch(r"[A-Za-z]\w*", t) and (t in int_matrix_vars or t in real_matrix_vars):
+            return 2
         c_tri_rank = parse_call_text(t)
         if c_tri_rank is not None and c_tri_rank[0].lower() in {"lower.tri", "upper.tri"}:
             return 2
@@ -9586,6 +9590,15 @@ def emit_stmts(
             if inner and ":" not in inner and _split_top_level_colon(inner) is None:
                 return 0
             return 1
+        c_sweep_rank_pre = parse_call_text(t)
+        if c_sweep_rank_pre is not None and c_sweep_rank_pre[0].lower() == "sweep":
+            x_arg_pre = (
+                c_sweep_rank_pre[1][0].strip()
+                if c_sweep_rank_pre[1]
+                else c_sweep_rank_pre[2].get("x", "").strip()
+            )
+            if x_arg_pre.lower() in _KNOWN_RANK3_NAMES:
+                return 3
         mm_t = _split_top_level_token(t, "%*%", from_right=True)
         if mm_t is not None:
             r1 = _expr_rank_for_print(mm_t[0])
@@ -9657,8 +9670,14 @@ def emit_stmts(
                     return 1
                 rr_ap = _expr_rank_for_print(src_ap) if src_ap else None
                 return rr_ap if rr_ap is not None else 1
-            if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz"}:
+            if nm_c in {"matrix", "array", "cbind", "cbind2", "rbind", "cov", "cor", "ccf_matrix", "crossprod", "tcrossprod", "t", "toeplitz", "chol2inv"}:
                 return 2
+            if nm_c in {"solve", "solve_real", "solve_real_mat"}:
+                b_arg = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", "").strip()
+                if not b_arg:
+                    return 2
+                rr_b = _expr_rank_for_print(b_arg)
+                return 2 if rr_b == 2 else 1
             if nm_c in {"forwardsolve", "backsolve"}:
                 rhs_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", c[2].get("x", "")).strip()
                 rr_rhs = _expr_rank_for_print(rhs_src) if rhs_src else None
@@ -11865,6 +11884,16 @@ def emit_stmts(
                                 o.pop()
                                 o.w("end block")
                             continue
+                    rank_for_matrix_print = _expr_rank_for_print(one)
+                    mentions_rank3_for_print = any(
+                        re.search(rf"\b{re.escape(nm)}\b", one, re.IGNORECASE)
+                        for nm in _KNOWN_RANK3_NAMES
+                    )
+                    if rank_for_matrix_print == 2 and has_r_mod and not mentions_rank3_for_print:
+                        one_for_matrix_print = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        _wstmt(f"call print_matrix({one_for_matrix_print})", st.comment)
+                        need_r_mod.add("print_matrix_rstyle")
+                        continue
                     m_sum = re.match(r"^summary\s*\((.*)\)\s*$", one, re.IGNORECASE)
                     m_coef_summary_lm = re.match(r"^coef\s*\(\s*summary\s*\(\s*(lm\s*\(.*\))\s*\)\s*\)\s*$", one, re.IGNORECASE)
                     if m_coef_summary_lm is not None:
@@ -15275,6 +15304,23 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 out.add(st.name)
             if low.startswith("chol("):
                 out.add(st.name)
+            if low.startswith("chol2inv("):
+                out.add(st.name)
+            m_rhs_slice = re.match(r"^\s*[A-Za-z]\w*(?:\$[A-Za-z]\w*)?\s*\[([^\]]+)\]\s*$", rhs)
+            if m_rhs_slice is not None:
+                rhs_slice_dims = _split_index_dims(m_rhs_slice.group(1))
+                rhs_slice_scalar_dims = [
+                    d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None
+                    for d in rhs_slice_dims
+                ]
+                if len(rhs_slice_dims) >= 2 and not any(rhs_slice_scalar_dims):
+                    out.add(st.name)
+            if low.startswith("forwardsolve(") or low.startswith("backsolve("):
+                c_tri_m = parse_call_text(rhs)
+                if c_tri_m is not None:
+                    b_src_m = c_tri_m[1][1] if len(c_tri_m[1]) >= 2 else c_tri_m[2].get("b", "")
+                    if b_src_m and _infer_assignment_rank_hint(b_src_m.strip(), {n.lower(): 2 for n in (out | known_int_matrices)}) >= 2:
+                        out.add(st.name)
             if low.startswith("scale("):
                 out.add(st.name)
             if low.startswith("diag(") and _infer_assignment_rank_hint(rhs, {n.lower(): 2 for n in out}) >= 2:
@@ -16873,6 +16919,36 @@ def transpile_r_to_fortran(
                 real_rank3_arrays.add(st_r3.name)
                 changed_rank3 = True
     _KNOWN_RANK3_NAMES.update(nm.lower() for nm in set(real_rank3_arrays) | set(int_rank3_arrays))
+    for st_mat_slice_vec in main_stmts:
+        if not isinstance(st_mat_slice_vec, Assign):
+            continue
+        rhs_slice_vec = st_mat_slice_vec.expr.strip()
+        m_slice_vec = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs_slice_vec)
+        if m_slice_vec is None:
+            continue
+        base_slice_vec = m_slice_vec.group(1)
+        dims_slice_vec = _split_index_dims(m_slice_vec.group(2))
+        if len(dims_slice_vec) < 2:
+            continue
+        scalar_dims_slice_vec = [
+            d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None
+            for d in dims_slice_vec
+        ]
+        if not any(scalar_dims_slice_vec) or all(scalar_dims_slice_vec):
+            continue
+        if base_slice_vec in int_matrices:
+            int_arrays.add(st_mat_slice_vec.name)
+            real_arrays.discard(st_mat_slice_vec.name)
+        elif base_slice_vec in real_matrices:
+            real_arrays.add(st_mat_slice_vec.name)
+            int_arrays.discard(st_mat_slice_vec.name)
+        else:
+            continue
+        ints.discard(st_mat_slice_vec.name)
+        real_scalars.discard(st_mat_slice_vec.name)
+        int_matrices.discard(st_mat_slice_vec.name)
+        real_matrices.discard(st_mat_slice_vec.name)
+        params.pop(st_mat_slice_vec.name, None)
     logical_arrays = infer_main_logical_arrays(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
@@ -17769,9 +17845,21 @@ def transpile_r_to_fortran(
         for st_scalar_alias in ss_scalar_alias:
             if isinstance(st_scalar_alias, Assign):
                 rhs_scalar_alias = st_scalar_alias.expr.strip()
-                m_scalar_alias = re.match(r"^([A-Za-z]\w*)\s*\[\s*[^,\]]+\s*,\s*[^,\]]+\s*\]$", rhs_scalar_alias)
+                m_scalar_alias = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]$", rhs_scalar_alias)
                 if m_scalar_alias is not None:
                     base_scalar_alias = m_scalar_alias.group(1)
+                    dims_scalar_alias = _split_index_dims(m_scalar_alias.group(2))
+                    is_scalar_ix_alias = (
+                        len(dims_scalar_alias) == 2
+                        and all(
+                            d.strip() != ""
+                            and ":" not in d
+                            and not re.match(r"^[-+]?\d+\s*:\s*[-+]?\d+$", d.strip())
+                            for d in dims_scalar_alias
+                        )
+                    )
+                    if not is_scalar_ix_alias:
+                        continue
                     if base_scalar_alias in int_matrices:
                         ints.add(st_scalar_alias.name)
                         int_arrays.discard(st_scalar_alias.name)
@@ -17795,6 +17883,12 @@ def transpile_r_to_fortran(
                 _force_scalar_matrix_element_aliases(st_scalar_alias.body)
 
     _force_scalar_matrix_element_aliases(main_stmts)
+    for nm in set(real_matrices) | set(int_matrices) | set(real_rank3_arrays) | set(int_rank3_arrays) | set(real_rank4_arrays):
+        real_scalars.discard(nm)
+        ints.discard(nm)
+        real_arrays.discard(nm)
+        int_arrays.discard(nm)
+        params.pop(nm, None)
 
     if char_arrays:
         ints.add("i_ew")
@@ -19423,6 +19517,7 @@ def transpile_r_to_fortran(
         "sort",
         "sort_list",
         "polyroot",
+        "chol2inv",
         "nchar",
         "is_na",
         "which",
@@ -19439,6 +19534,7 @@ def transpile_r_to_fortran(
         "kappa_real",
         "eigen_sym_values",
         "mahalanobis",
+        "isSymmetric",
         "decompose",
         "decompose_result_t",
         "ecdf_eval",
@@ -20188,6 +20284,27 @@ def _round_float_token(token: str, digits: int) -> str:
 def _round_output_text(text: str, digits: int) -> str:
     s = text.replace("\r\n", "\n").replace("\r", "\n")
     return _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _round_float_token(m.group(1), digits), s)
+
+
+def _trim_zero_decimal_token(token: str) -> str:
+    mant, exp = _split_pretty_float_token(token)
+    if exp:
+        return token
+    if mant in {"-0", "+0"}:
+        return "0"
+    if "." not in mant:
+        return token
+    head, frac = mant.split(".", 1)
+    if frac and set(frac) == {"0"}:
+        if head in {"-0", "+0"}:
+            return "0"
+        return head
+    return token
+
+
+def _trim_zero_decimals_output_text(text: str) -> str:
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _trim_zero_decimal_token(m.group(1)), s)
 
 
 def _wrap_output_text(text: str, width: int) -> str:
@@ -20971,6 +21088,7 @@ def _print_captured(
     pretty: bool = False,
     strip_r_indices: bool = False,
     round_digits: int | None = None,
+    trim_zero_decimals: bool = False,
     wrap_out: int | None = None,
 ) -> None:
     out = cp.stdout or ""
@@ -20984,6 +21102,9 @@ def _print_captured(
     if round_digits is not None:
         out = _round_output_text(out, round_digits)
         err = _round_output_text(err, round_digits)
+    if trim_zero_decimals:
+        out = _trim_zero_decimals_output_text(out)
+        err = _trim_zero_decimals_output_text(err)
     if wrap_out is not None:
         out = _wrap_output_text(out, wrap_out)
         err = _wrap_output_text(err, wrap_out)
@@ -21719,6 +21840,13 @@ def main() -> int:
         help="wrap displayed captured runtime output lines at N columns",
     )
     ap.add_argument(
+        "--trim-zero-decimals",
+        "--trim-zd",
+        action="store_true",
+        dest="trim_zero_decimals",
+        help="trim trailing .000... from integer-valued numeric tokens in displayed Fortran runtime output",
+    )
+    ap.add_argument(
         "--disp-real",
         action="store_true",
         help="disable integer-like printing of real matrices (always print reals)",
@@ -21795,6 +21923,8 @@ def main() -> int:
         args.via_python = True
         args.tee_both = True
     if args.run_diff:
+        args.run_both = True
+    if args.round_both is not None:
         args.run_both = True
     if args.run_both:
         args.run = True
@@ -22284,6 +22414,7 @@ def main() -> int:
                             normalize_num_output=args.normalize_num_output,
                             pretty=args.pretty,
                             round_digits=fortran_round_digits,
+                            trim_zero_decimals=args.trim_zero_decimals,
                             wrap_out=args.wrap_out,
                         )
                         return frun.returncode
@@ -22293,6 +22424,7 @@ def main() -> int:
                         normalize_num_output=args.normalize_num_output,
                         pretty=args.pretty,
                         round_digits=fortran_round_digits,
+                        trim_zero_decimals=args.trim_zero_decimals,
                         wrap_out=args.wrap_out,
                     )
                 if args.time:
@@ -22338,6 +22470,7 @@ def main() -> int:
                     normalize_num_output=args.normalize_num_output,
                     pretty=args.pretty,
                     round_digits=fortran_round_digits,
+                    trim_zero_decimals=args.trim_zero_decimals,
                     wrap_out=args.wrap_out,
                 )
                 return frun.returncode
@@ -22347,6 +22480,7 @@ def main() -> int:
                 normalize_num_output=args.normalize_num_output,
                 pretty=args.pretty,
                 round_digits=fortran_round_digits,
+                trim_zero_decimals=args.trim_zero_decimals,
                 wrap_out=args.wrap_out,
             )
 
@@ -22366,6 +22500,8 @@ def main() -> int:
                     f_blob = _pretty_output_text(f_blob)
                 if fortran_round_digits is not None:
                     f_blob = _round_output_text(f_blob, fortran_round_digits)
+                if args.trim_zero_decimals:
+                    f_blob = _trim_zero_decimals_output_text(f_blob)
                 if args.wrap_out is not None:
                     f_blob = _wrap_output_text(f_blob, args.wrap_out)
                 f_lines = _norm_output(f_blob)
