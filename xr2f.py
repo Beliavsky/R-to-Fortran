@@ -17792,7 +17792,7 @@ def transpile_r_to_fortran(
                 idx_vec_subset.startswith("-")
                 or ":" in idx_vec_subset
                 or re.match(r"^(?:seq|seq_len|seq_along|which)\s*\(", idx_vec_subset, re.IGNORECASE)
-                or idx_vec_subset.lower() in {n.lower() for n in set(int_arrays) | set(real_arrays) | set(logical_arrays)}
+                or idx_vec_subset.lower() in {n.lower() for n in set(int_arrays) | set(real_arrays) | _KNOWN_LOGICAL_VECTOR_NAMES}
             )
             if not vectorish_subset:
                 continue
