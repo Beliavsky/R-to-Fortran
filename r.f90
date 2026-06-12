@@ -12,19 +12,19 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
    & pmax, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
-   & read_real_vector, read_table_real_matrix, read_csv_real_matrix, &
-   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, &
+   & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
+   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
    & dt, pt, qt, df, pf, qf, dlogis, plogis, qlogis, dlnorm, plnorm, qlnorm, dweibull, pweibull, qweibull, &
    & dcauchy, pcauchy, qcauchy, dbinom, pbinom, qbinom, dpois, dgeom, pgeom, qgeom, dnbinom, pnbinom, qnbinom, &
-   & dhyper, phyper, qhyper, dwilcox, pwilcox, qwilcox, dsignrank, psignrank, qsignrank, cov, cor, scale, all_equal, r_log, r_seq_int, r_seq_len, &
+   & dhyper, phyper, qhyper, dwilcox, pwilcox, qwilcox, dsignrank, psignrank, qsignrank, cov, cor, mahalanobis, isSymmetric, scale, all_equal, r_log, r_seq_int, r_seq_len, &
    & glm_binomial_fit, glm_poisson_fit, glm_predict_response, glm_pearson_resid, print_glm_summary, &
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
-   & r_rep_real, r_rep_char, r_rep_int, r_head, r_array_real, r_array_int, r_array_char, matrix, &
+   & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_head, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
    & print_real_vector, print_char_vector, &
@@ -32,16 +32,16 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, &
-   & cumsum, cumprod, diff, diag, toeplitz, chol, forwardsolve, backsolve, sort, sort_list, polyroot, &
-   & nchar, is_na, which, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
-   & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, print_qr, &
+   & cumsum, cumprod, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
+   & nchar, char_join, list_files, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
    & r_factorial, r_lfactorial, t_test_result_t, t_test, t_test_p_value, print_t_test, &
    & chisq_test_result_t, chisq_test, print_chisq_test, prop_test_result_t, &
    & prop_test, print_prop_test, cor_test_result_t, cor_test, print_cor_test, &
    & fisher_test_result_t, fisher_test, print_fisher_test, wilcox_test_result_t, &
-   & wilcox_test, print_wilcox_test, kruskal_test_result_t, kruskal_test, &
+   & wilcox_test, print_wilcox_test, kruskal_test_result_t, kruskal_test, ks_test, print_ks_test, print_factanal, &
    & r_filter_linear, smooth_xy_t, loess_fit_t, smooth_spline_fit_t, smooth, &
    & runmed, ksmooth, lowess, loess_fit, predict_loess, smooth_spline, &
    & predict_smooth_spline, dist, hclust_result_t, hclust, cutree, &
@@ -184,6 +184,30 @@ type :: optim_result_t
    integer :: convergence
 end type optim_result_t
 
+type :: nlm_result_t
+   real(kind=dp) :: minimum = 0.0_dp
+   real(kind=dp), allocatable :: estimate(:), gradient(:), hessian(:,:)
+   integer :: code = 1
+   integer :: iterations = 0
+end type nlm_result_t
+
+abstract interface
+   function nlm_objective_scalar(x) result(v)
+      import :: dp
+      real(kind=dp), intent(in) :: x
+      real(kind=dp) :: v
+   end function nlm_objective_scalar
+   function nlm_objective_vec(p) result(v)
+      import :: dp
+      real(kind=dp), intent(in) :: p(:)
+      real(kind=dp) :: v
+   end function nlm_objective_vec
+end interface
+
+type :: decompose_result_t
+   real(kind=dp), allocatable :: trend(:), seasonal(:), random(:), figure(:)
+end type decompose_result_t
+
 type :: t_test_result_t
    real(kind=dp) :: statistic = 0.0_dp
    real(kind=dp) :: parameter = 0.0_dp
@@ -240,6 +264,12 @@ type :: kruskal_test_result_t
    real(kind=dp) :: p_value = 1.0_dp
 end type kruskal_test_result_t
 
+type :: ks_test_result_t
+   real(kind=dp) :: statistic = 0.0_dp
+   real(kind=dp) :: p_value = 1.0_dp
+   integer :: n = 0
+end type ks_test_result_t
+
 interface cov
    module procedure cov_vec
    module procedure cov_mat
@@ -250,13 +280,24 @@ interface var
    module procedure var_mat
 end interface var
 
+interface sd
+   module procedure sd_vec
+   module procedure sd_mat
+end interface sd
+
 interface cor
    module procedure cor_vec
    module procedure cor_mat
    module procedure cor_mat_pair
 end interface cor
 
+interface isSymmetric
+   module procedure isSymmetric_real
+   module procedure isSymmetric_int
+end interface isSymmetric
+
 interface scale
+   module procedure scale_vec
    module procedure scale_mat
 end interface scale
 
@@ -267,6 +308,8 @@ interface all_equal
    module procedure all_equal_int_scalar
    module procedure all_equal_int_vec
    module procedure all_equal_int_mat
+   module procedure all_equal_logical_vec
+   module procedure all_equal_logical_mat
 end interface all_equal
 
 interface r_log
@@ -357,6 +400,12 @@ interface pchisq
    module procedure pchisq_scalar
    module procedure pchisq_vec
 end interface pchisq
+
+interface qchisq
+   module procedure qchisq_scalar
+   module procedure qchisq_scalar_i
+   module procedure qchisq_vec
+end interface qchisq
 
 interface glm_binomial_fit
    module procedure glm_binomial_fit_real
@@ -456,6 +505,7 @@ end interface print_table2
 interface match
    module procedure match_int
    module procedure match_real
+   module procedure match_char
 end interface match
 
 interface r_in
@@ -463,9 +513,23 @@ interface r_in
    module procedure r_in_real
    module procedure r_in_int_real
    module procedure r_in_real_int
+   module procedure r_in_int_scalar
+   module procedure r_in_real_scalar
+   module procedure r_in_int_scalar_real
+   module procedure r_in_real_scalar_int
    module procedure r_in_char
    module procedure r_in_logical
 end interface r_in
+
+interface r_drop_index
+   module procedure r_drop_index_real
+   module procedure r_drop_index_int
+end interface r_drop_index
+
+interface r_drop_indices
+   module procedure r_drop_indices_real
+   module procedure r_drop_indices_int
+end interface r_drop_indices
 
 interface unique
    module procedure unique_int
@@ -515,11 +579,13 @@ end interface setequal
 interface print_matrix
    module procedure print_matrix_real
    module procedure print_matrix_int
+   module procedure print_matrix_logical
 end interface print_matrix
 
 interface print_matrix_rstyle
    module procedure print_matrix_rstyle_real
    module procedure print_matrix_rstyle_int
+   module procedure print_matrix_rstyle_logical
 end interface print_matrix_rstyle
 
 interface print_matrix_rstyle_named
@@ -560,6 +626,7 @@ end interface eigen
 interface sort
    module procedure sort_real
    module procedure sort_int
+   module procedure sort_char
 end interface sort
 
 interface sort_list
@@ -573,6 +640,7 @@ interface solve_real
    module procedure solve_real_vec_i_r
    module procedure solve_real_vec_i_i
    module procedure solve_real_mat
+   module procedure solve_real_mat_r_i
    module procedure solve_real_mat_i_r
    module procedure solve_real_mat_i_i
    module procedure solve_real_vec_r_c
@@ -614,11 +682,17 @@ interface chol
    module procedure chol_int
 end interface chol
 
+interface chol2inv
+   module procedure chol2inv_real
+   module procedure chol2inv_int
+end interface chol2inv
+
 interface forwardsolve
    module procedure forwardsolve_vec
    module procedure forwardsolve_vec_i_r
    module procedure forwardsolve_vec_i_i
    module procedure forwardsolve_mat
+   module procedure forwardsolve_mat_r_i
    module procedure forwardsolve_mat_i_r
    module procedure forwardsolve_mat_i_i
 end interface forwardsolve
@@ -628,6 +702,7 @@ interface backsolve
    module procedure backsolve_vec_i_r
    module procedure backsolve_vec_i_i
    module procedure backsolve_mat
+   module procedure backsolve_mat_r_i
    module procedure backsolve_mat_i_r
    module procedure backsolve_mat_i_i
 end interface backsolve
@@ -636,6 +711,26 @@ interface qr_coef
    module procedure qr_coef_vec
    module procedure qr_coef_mat
 end interface qr_coef
+
+interface qr_fitted
+   module procedure qr_fitted_vec
+   module procedure qr_fitted_mat
+end interface qr_fitted
+
+interface qr_resid
+   module procedure qr_resid_vec
+   module procedure qr_resid_mat
+end interface qr_resid
+
+interface qr_qty
+   module procedure qr_qty_vec
+   module procedure qr_qty_mat
+end interface qr_qty
+
+interface qr_qy
+   module procedure qr_qy_vec
+   module procedure qr_qy_mat
+end interface qr_qy
 
 interface hclust
    module procedure hclust_complete
@@ -728,12 +823,16 @@ end interface print_rle
 interface r_typeof
    module procedure r_typeof_real_scalar
    module procedure r_typeof_real_vec
+   module procedure r_typeof_real_mat
    module procedure r_typeof_int_scalar
    module procedure r_typeof_int_vec
+   module procedure r_typeof_int_mat
    module procedure r_typeof_char_scalar
    module procedure r_typeof_char_vec
+   module procedure r_typeof_char_mat
    module procedure r_typeof_logical_scalar
    module procedure r_typeof_logical_vec
+   module procedure r_typeof_logical_mat
 end interface r_typeof
 
 contains
@@ -744,6 +843,86 @@ integer, intent(in) :: n
 character(len=:), allocatable :: out(:)
 allocate(character(len=0) :: out(max(0, n)))
 end function r_character
+
+pure function r_drop_index_real(x, k) result(out)
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: k
+real(kind=dp), allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: n, m
+n = size(x)
+if (n <= 0) then
+   allocate(out(0))
+   return
+end if
+allocate(keep(n))
+keep = .true.
+if (k >= 1 .and. k <= n) keep(k) = .false.
+m = count(keep)
+allocate(out(m))
+if (m > 0) out = pack(x, keep)
+end function r_drop_index_real
+
+pure function r_drop_index_int(x, k) result(out)
+integer, intent(in) :: x(:)
+integer, intent(in) :: k
+integer, allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: n, m
+n = size(x)
+if (n <= 0) then
+   allocate(out(0))
+   return
+end if
+allocate(keep(n))
+keep = .true.
+if (k >= 1 .and. k <= n) keep(k) = .false.
+m = count(keep)
+allocate(out(m))
+if (m > 0) out = pack(x, keep)
+end function r_drop_index_int
+
+pure function r_drop_indices_real(x, drop) result(out)
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: drop(:)
+real(kind=dp), allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i, n, m
+n = size(x)
+if (n <= 0) then
+   allocate(out(0))
+   return
+end if
+allocate(keep(n))
+keep = .true.
+do i = 1, size(drop)
+   if (drop(i) >= 1 .and. drop(i) <= n) keep(drop(i)) = .false.
+end do
+m = count(keep)
+allocate(out(m))
+if (m > 0) out = pack(x, keep)
+end function r_drop_indices_real
+
+pure function r_drop_indices_int(x, drop) result(out)
+integer, intent(in) :: x(:)
+integer, intent(in) :: drop(:)
+integer, allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i, n, m
+n = size(x)
+if (n <= 0) then
+   allocate(out(0))
+   return
+end if
+allocate(keep(n))
+keep = .true.
+do i = 1, size(drop)
+   if (drop(i) >= 1 .and. drop(i) <= n) keep(drop(i)) = .false.
+end do
+m = count(keep)
+allocate(out(m))
+if (m > 0) out = pack(x, keep)
+end function r_drop_indices_int
 
 
 subroutine set_print_int_like(flag)
@@ -1508,6 +1687,23 @@ do i = 1, size(x)
 end do
 end function match_real
 
+pure function match_char(x, table) result(out)
+! Return first 1-based match positions, or a sentinel for NA.
+character(len=*), intent(in) :: x(:), table(:)
+integer, allocatable :: out(:)
+integer :: i, j
+allocate(out(size(x)))
+out = -huge(0)
+do i = 1, size(x)
+   do j = 1, size(table)
+      if (trim(x(i)) == trim(table(j))) then
+         out(i) = j
+         exit
+      end if
+   end do
+end do
+end function match_char
+
 pure function r_in_int(x, table) result(out)
 integer, intent(in) :: x(:), table(:)
 logical, allocatable :: out(:)
@@ -1549,6 +1745,34 @@ do i = 1, size(x)
    out(i) = has_int_value(table, size(table), nint(x(i))) .and. x(i) == real(nint(x(i)), kind=dp)
 end do
 end function r_in_real_int
+
+pure function r_in_int_scalar(x, table) result(out)
+integer, intent(in) :: x
+integer, intent(in) :: table(:)
+logical :: out
+out = has_int_value(table, size(table), x)
+end function r_in_int_scalar
+
+pure function r_in_real_scalar(x, table) result(out)
+real(kind=dp), intent(in) :: x
+real(kind=dp), intent(in) :: table(:)
+logical :: out
+out = has_real_value(table, size(table), x)
+end function r_in_real_scalar
+
+pure function r_in_int_scalar_real(x, table) result(out)
+integer, intent(in) :: x
+real(kind=dp), intent(in) :: table(:)
+logical :: out
+out = has_real_value(table, size(table), real(x, kind=dp))
+end function r_in_int_scalar_real
+
+pure function r_in_real_scalar_int(x, table) result(out)
+real(kind=dp), intent(in) :: x
+integer, intent(in) :: table(:)
+logical :: out
+out = has_int_value(table, size(table), nint(x)) .and. x == real(nint(x), kind=dp)
+end function r_in_real_scalar_int
 
 pure function r_in_char(x, table) result(out)
 character(len=*), intent(in) :: x(:), table(:)
@@ -2222,6 +2446,207 @@ character(len=*), intent(in) :: names(:)
 call print_char_vector(names)
 call print_real_vector(x)
 end subroutine print_named_real_vector
+
+function nlm_stub(p, hessian) result(out)
+real(kind=dp), intent(in) :: p(:)
+logical, intent(in), optional :: hessian
+type(nlm_result_t) :: out
+integer :: n
+n = size(p)
+allocate(out%estimate(n))
+allocate(out%gradient(n))
+allocate(out%hessian(n, n))
+out%estimate = p
+out%gradient = 0.0_dp
+out%hessian = 0.0_dp
+out%minimum = 0.0_dp
+out%code = 1
+out%iterations = 0
+end function nlm_stub
+
+function nlm_optimize_scalar(fn, p, hessian, stepmax) result(out)
+procedure(nlm_objective_scalar) :: fn
+real(kind=dp), intent(in) :: p
+logical, intent(in), optional :: hessian
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+real(kind=dp), allocatable :: pv(:)
+allocate(pv(1))
+pv(1) = p
+out = nlm_optimize_scalar_impl(fn, pv, hessian, stepmax)
+end function nlm_optimize_scalar
+
+function nlm_optimize_vec(fn, p, hessian, stepmax) result(out)
+procedure(nlm_objective_vec) :: fn
+real(kind=dp), intent(in) :: p(:)
+logical, intent(in), optional :: hessian
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+integer :: n, iter, i
+real(kind=dp), allocatable :: x(:), g(:), trial(:)
+real(kind=dp) :: f, f_trial, gnorm, alpha, max_step, step_norm, tol
+n = size(p)
+allocate(x(n), g(n), trial(n))
+x = p
+tol = 1.0e-7_dp
+max_step = 100.0_dp
+if (present(stepmax)) max_step = max(stepmax, 1.0e-12_dp)
+f = fn(x)
+do iter = 1, 500
+   call nlm_fd_grad_vec(fn, x, g)
+   gnorm = sqrt(sum(g*g))
+   if (gnorm <= tol * max(1.0_dp, sqrt(sum(x*x)))) exit
+   alpha = 1.0_dp
+   do
+      trial = x - alpha * g
+      step_norm = sqrt(sum((trial - x) * (trial - x)))
+      if (step_norm > max_step) trial = x + (trial - x) * (max_step / step_norm)
+      f_trial = fn(trial)
+      if (ieee_is_finite(f_trial) .and. f_trial <= f - 1.0e-4_dp * alpha * gnorm * gnorm) exit
+      alpha = alpha * 0.5_dp
+      if (alpha < 1.0e-10_dp) exit
+   end do
+   if (.not. ieee_is_finite(f_trial) .or. f_trial >= f) exit
+   if (maxval(abs(trial - x)) <= tol * max(1.0_dp, maxval(abs(x)))) then
+      x = trial
+      f = f_trial
+      exit
+   end if
+   x = trial
+   f = f_trial
+end do
+allocate(out%estimate(n), out%gradient(n), out%hessian(n, n))
+out%estimate = x
+out%minimum = f
+call nlm_fd_grad_vec(fn, x, out%gradient)
+out%hessian = 0.0_dp
+if (present(hessian)) then
+   if (hessian) call nlm_fd_hessian_vec(fn, x, out%hessian)
+end if
+out%iterations = min(iter, 500)
+out%code = merge(1, 4, sqrt(sum(out%gradient*out%gradient)) <= 1.0e-4_dp)
+end function nlm_optimize_vec
+
+function nlm_optimize_scalar_impl(fn, p, hessian, stepmax) result(out)
+procedure(nlm_objective_scalar) :: fn
+real(kind=dp), intent(in) :: p(:)
+logical, intent(in), optional :: hessian
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+integer :: iter
+real(kind=dp) :: x, g, f, f_trial, trial, alpha, max_step, tol, h
+x = p(1)
+tol = 1.0e-7_dp
+max_step = 100.0_dp
+if (present(stepmax)) max_step = max(stepmax, 1.0e-12_dp)
+f = fn(x)
+do iter = 1, 500
+   g = nlm_fd_grad_scalar(fn, x)
+   if (abs(g) <= tol * max(1.0_dp, abs(x))) exit
+   alpha = 1.0_dp
+   do
+      trial = x - alpha * g
+      if (abs(trial - x) > max_step) trial = x - sign(max_step, g)
+      f_trial = fn(trial)
+      if (ieee_is_finite(f_trial) .and. f_trial <= f - 1.0e-4_dp * alpha * g * g) exit
+      alpha = alpha * 0.5_dp
+      if (alpha < 1.0e-10_dp) exit
+   end do
+   if (.not. ieee_is_finite(f_trial) .or. f_trial >= f) exit
+   if (abs(trial - x) <= tol * max(1.0_dp, abs(x))) then
+      x = trial
+      f = f_trial
+      exit
+   end if
+   x = trial
+   f = f_trial
+end do
+allocate(out%estimate(1), out%gradient(1), out%hessian(1, 1))
+out%estimate(1) = x
+out%minimum = f
+out%gradient(1) = nlm_fd_grad_scalar(fn, x)
+out%hessian = 0.0_dp
+if (present(hessian)) then
+   if (hessian) then
+      h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x))
+      out%hessian(1, 1) = (fn(x + h) - 2.0_dp * fn(x) + fn(x - h)) / (h * h)
+   end if
+end if
+out%iterations = min(iter, 500)
+out%code = merge(1, 4, abs(out%gradient(1)) <= 1.0e-4_dp)
+end function nlm_optimize_scalar_impl
+
+function nlm_fd_grad_scalar(fn, x) result(g)
+procedure(nlm_objective_scalar) :: fn
+real(kind=dp), intent(in) :: x
+real(kind=dp) :: g, h
+h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x))
+g = (fn(x + h) - fn(x - h)) / (2.0_dp * h)
+end function nlm_fd_grad_scalar
+
+subroutine nlm_fd_grad_vec(fn, x, g)
+procedure(nlm_objective_vec) :: fn
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(out) :: g(:)
+real(kind=dp), allocatable :: xp(:), xm(:)
+integer :: i
+real(kind=dp) :: h
+allocate(xp(size(x)), xm(size(x)))
+do i = 1, size(x)
+   xp = x
+   xm = x
+   h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x(i)))
+   xp(i) = xp(i) + h
+   xm(i) = xm(i) - h
+   g(i) = (fn(xp) - fn(xm)) / (2.0_dp * h)
+end do
+end subroutine nlm_fd_grad_vec
+
+subroutine nlm_fd_hessian_vec(fn, x, hess)
+procedure(nlm_objective_vec) :: fn
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(out) :: hess(:,:)
+real(kind=dp), allocatable :: xpp(:), xpm(:), xmp(:), xmm(:)
+integer :: i, j, n
+real(kind=dp) :: hi, hj
+n = size(x)
+allocate(xpp(n), xpm(n), xmp(n), xmm(n))
+do i = 1, n
+   do j = 1, n
+      xpp = x
+      xpm = x
+      xmp = x
+      xmm = x
+      hi = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x(i)))
+      hj = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x(j)))
+      xpp(i) = xpp(i) + hi; xpp(j) = xpp(j) + hj
+      xpm(i) = xpm(i) + hi; xpm(j) = xpm(j) - hj
+      xmp(i) = xmp(i) - hi; xmp(j) = xmp(j) + hj
+      xmm(i) = xmm(i) - hi; xmm(j) = xmm(j) - hj
+      hess(i,j) = (fn(xpp) - fn(xpm) - fn(xmp) + fn(xmm)) / (4.0_dp * hi * hj)
+   end do
+end do
+end subroutine nlm_fd_hessian_vec
+
+subroutine print_nlm_result(fit)
+type(nlm_result_t), intent(in) :: fit
+write(*,"(a)")
+write(*,"(a)", advance="no") "$minimum"
+write(*,*)
+call print_real_scalar(fit%minimum)
+write(*,"(a)", advance="no") "$estimate"
+write(*,*)
+call print_real_vector(fit%estimate)
+write(*,"(a)", advance="no") "$gradient"
+write(*,*)
+call print_real_vector(fit%gradient)
+write(*,"(a)", advance="no") "$code"
+write(*,*)
+write(*,"(i0)") fit%code
+write(*,"(a)", advance="no") "$iterations"
+write(*,*)
+write(*,"(i0)") fit%iterations
+end subroutine print_nlm_result
 
 subroutine print_table1(x, names)
 integer, intent(in) :: x(:)
@@ -2991,16 +3416,93 @@ pure function predict_loess(fit, xnew) result(yhat)
 type(loess_fit_t), intent(in) :: fit
 real(kind=dp), intent(in) :: xnew(:)
 real(kind=dp), allocatable :: yhat(:)
-real(kind=dp) :: bw
-integer :: i
+real(kind=dp), allocatable :: dist(:), dist_sorted(:)
+real(kind=dp) :: h, d, w, z, sw, sy, sx, sxx, sxy, sx3, sx4, sx2y
+real(kind=dp) :: den, alpha, beta, gamma, det, b0, b1, b2
+real(kind=dp) :: m00, m01, m02, m11, m12, m22
+integer :: i, j, n, ns, deg
 allocate(yhat(size(xnew)))
-if (size(fit%x) > 1) then
-   bw = fit%span * (maxval(fit%x) - minval(fit%x))
-else
-   bw = 1.0_dp
-end if
+n = min(size(fit%x), size(fit%y))
+if (n <= 0) return
+ns = max(2, min(n, int(fit%span * real(n, kind=dp))))
+deg = max(0, min(2, fit%degree))
+allocate(dist(n), dist_sorted(n))
 do i = 1, size(xnew)
-   yhat(i) = smooth_kernel_eval(fit%x, fit%y, xnew(i), max(bw, sqrt(tiny(1.0_dp))), "normal")
+   do j = 1, n
+      dist(j) = abs(fit%x(j) - xnew(i))
+   end do
+   dist_sorted = sort(dist)
+   h = dist_sorted(ns)
+   if (h <= sqrt(tiny(1.0_dp))) h = maxval(dist_sorted)
+   sw = 0.0_dp
+   sy = 0.0_dp
+   sx = 0.0_dp
+   sxx = 0.0_dp
+   sxy = 0.0_dp
+   sx3 = 0.0_dp
+   sx4 = 0.0_dp
+   sx2y = 0.0_dp
+   do j = 1, n
+      z = fit%x(j) - xnew(i)
+      if (h <= sqrt(tiny(1.0_dp))) then
+         w = merge(1.0_dp, 0.0_dp, abs(z) <= sqrt(tiny(1.0_dp)))
+      else if (abs(z) <= h) then
+         d = abs(z) / h
+         w = (1.0_dp - d**3)**3
+      else
+         w = 0.0_dp
+      end if
+      sw = sw + w
+      sy = sy + w * fit%y(j)
+      sx = sx + w * z
+      sxx = sxx + w * z * z
+      sxy = sxy + w * z * fit%y(j)
+      if (deg >= 2) then
+         sx3 = sx3 + w * z**3
+         sx4 = sx4 + w * z**4
+         sx2y = sx2y + w * z * z * fit%y(j)
+      end if
+   end do
+   if (sw <= sqrt(tiny(1.0_dp))) then
+      yhat(i) = fit%y(min(max(1, minloc(dist, dim=1)), n))
+   else if (deg <= 0) then
+      yhat(i) = sy / sw
+   else if (deg == 1) then
+      den = sw * sxx - sx * sx
+      if (abs(den) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(sw * sxx), abs(sx * sx))) then
+         yhat(i) = sy / sw
+      else
+         beta = (sw * sxy - sx * sy) / den
+         alpha = (sy - beta * sx) / sw
+         yhat(i) = alpha
+      end if
+   else
+      m00 = sw
+      m01 = sx
+      m02 = sxx
+      m11 = sxx
+      m12 = sx3
+      m22 = sx4
+      det = m00 * (m11 * m22 - m12 * m12) - m01 * (m01 * m22 - m12 * m02) + m02 * (m01 * m12 - m11 * m02)
+      if (abs(det) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(m00*m11*m22))) then
+         den = sw * sxx - sx * sx
+         if (abs(den) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(sw * sxx), abs(sx * sx))) then
+            yhat(i) = sy / sw
+         else
+            beta = (sw * sxy - sx * sy) / den
+            alpha = (sy - beta * sx) / sw
+            yhat(i) = alpha
+         end if
+      else
+         b0 = sy
+         b1 = sxy
+         b2 = sx2y
+         gamma = (m00 * (m11 * b2 - b1 * m12) - m01 * (m01 * b2 - b1 * m02) + b0 * (m01 * m12 - m11 * m02)) / det
+         beta = (m00 * (b1 * m22 - m12 * b2) - b0 * (m01 * m22 - m12 * m02) + m02 * (m01 * b2 - b1 * m02)) / det
+         alpha = (b0 * (m11 * m22 - m12 * m12) - m01 * (b1 * m22 - m12 * b2) + m02 * (b1 * m12 - m11 * b2)) / det
+         yhat(i) = alpha
+      end if
+   end if
 end do
 end function predict_loess
 
@@ -3008,20 +3510,31 @@ pure function smooth_spline(x, y, df, spar) result(out)
 real(kind=dp), intent(in) :: x(:), y(:)
 real(kind=dp), intent(in), optional :: df, spar
 type(smooth_spline_fit_t) :: out
-real(kind=dp) :: frac, bw
-type(smooth_xy_t) :: sm
-out%x = x
-out%df = real(max(1, size(x)), kind=dp)
-if (present(df)) out%df = df
-frac = 0.25_dp
-if (present(spar)) frac = max(0.05_dp, min(1.0_dp, spar))
-if (size(x) > 1) then
-   bw = frac * (maxval(x) - minval(x))
-else
-   bw = 1.0_dp
+type(loess_fit_t) :: lf
+real(kind=dp) :: span_eff, df_eff, spar_eff
+integer :: n
+n = min(size(x), size(y))
+out%x = x(1:n)
+if (n <= 0) then
+   out%df = 0.0_dp
+   return
 end if
-sm = ksmooth(x, y, kernel="normal", bandwidth=max(bw, sqrt(tiny(1.0_dp))), x_points=x)
-out%y = sm%y
+if ((.not. present(df) .or. df <= 0.0_dp) .and. (.not. present(spar) .or. spar < 0.0_dp)) then
+   out%df = real(n, kind=dp)
+   out%y = y(1:n)
+   return
+end if
+if (present(df) .and. df > 0.0_dp) then
+   df_eff = max(2.0_dp, min(real(n, kind=dp), df))
+   out%df = df_eff
+   span_eff = min(1.0_dp, max(0.08_dp, 1.78_dp / sqrt(df_eff)))
+else
+   spar_eff = max(0.0_dp, min(1.5_dp, spar))
+   out%df = max(2.0_dp, real(n, kind=dp) * exp(-2.836_dp * spar_eff**1.32_dp))
+   span_eff = min(1.0_dp, max(0.08_dp, 0.18_dp + 0.82_dp * spar_eff))
+end if
+lf = loess_fit(out%x, y(1:n), span=span_eff, degree=2)
+out%y = predict_loess(lf, out%x)
 end function smooth_spline
 
 pure function predict_smooth_spline(fit, xnew) result(out)
@@ -3359,6 +3872,17 @@ if (present(decreasing)) then
    end if
 end if
 end function sort_int
+
+pure function sort_char(x, decreasing) result(out)
+! Return a sorted copy of a character vector.
+character(len=*), intent(in) :: x(:)
+logical, intent(in), optional :: decreasing
+character(len=:), allocatable :: out(:)
+integer, allocatable :: idx(:)
+idx = sort_list_char(x, decreasing)
+allocate(character(len=len(x)) :: out(size(x)))
+out = x(idx)
+end function sort_char
 
 pure function sort_list_real(x, decreasing) result(idx)
 ! Return 1-based indices that sort a real vector.
@@ -4677,11 +5201,62 @@ real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(real(a, kind=dp), b)
 end function solve_real_mat_i_r
 
+pure function solve_real_mat_r_i(a, b) result(x)
+real(kind=dp), intent(in) :: a(:,:)
+integer, intent(in) :: b(:,:)
+real(kind=dp), allocatable :: x(:,:)
+x = solve_real_mat(a, real(b, kind=dp))
+end function solve_real_mat_r_i
+
 pure function solve_real_mat_i_i(a, b) result(x)
 integer, intent(in) :: a(:,:), b(:,:)
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(real(a, kind=dp), real(b, kind=dp))
 end function solve_real_mat_i_i
+
+pure function mahalanobis(x, center, cov) result(out)
+real(kind=dp), intent(in) :: x(:,:), center(:), cov(:,:)
+real(kind=dp), allocatable :: out(:), z(:,:), sol(:,:)
+integer :: i, n, p
+n = size(x, 1)
+p = size(x, 2)
+allocate(out(n))
+out = 0.0_dp
+if (size(center) /= p .or. size(cov, 1) /= p .or. size(cov, 2) /= p) return
+allocate(z(n, p))
+do i = 1, n
+   z(i, :) = x(i, :) - center
+end do
+sol = solve_real_mat(cov, transpose(z))
+do i = 1, n
+   out(i) = sum(z(i, :) * sol(:, i))
+end do
+end function mahalanobis
+
+pure function isSymmetric_real(x, tol) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in), optional :: tol
+logical :: out
+real(kind=dp) :: eps
+if (size(x, 1) /= size(x, 2)) then
+   out = .false.
+   return
+end if
+eps = 100.0_dp * epsilon(1.0_dp)
+if (present(tol)) eps = tol
+out = all(abs(x - transpose(x)) <= eps)
+end function isSymmetric_real
+
+pure function isSymmetric_int(x, tol) result(out)
+integer, intent(in) :: x(:,:)
+real(kind=dp), intent(in), optional :: tol
+logical :: out
+if (present(tol)) then
+   out = isSymmetric_real(real(x, kind=dp), tol)
+else
+   out = isSymmetric_real(real(x, kind=dp))
+end if
+end function isSymmetric_int
 
 pure function solve_real_vec_r_c(a, b) result(x)
 real(kind=dp), intent(in) :: a(:,:)
@@ -4995,6 +5570,29 @@ real(kind=dp), allocatable :: r(:,:)
 r = chol_real(real(a, kind=dp))
 end function chol_int
 
+pure function chol2inv_real(r, size) result(out)
+real(kind=dp), intent(in) :: r(:,:)
+integer, intent(in), optional :: size
+real(kind=dp), allocatable :: out(:,:), a(:,:)
+integer :: n
+n = min(ubound(r, 1), ubound(r, 2))
+if (present(size)) n = min(n, size)
+allocate(a(n, n))
+a = matmul(transpose(r(1:n, 1:n)), r(1:n, 1:n))
+out = solve_real_mat(a, real(diag(n), kind=dp))
+end function chol2inv_real
+
+pure function chol2inv_int(r, size) result(out)
+integer, intent(in) :: r(:,:)
+integer, intent(in), optional :: size
+real(kind=dp), allocatable :: out(:,:)
+if (present(size)) then
+   out = chol2inv_real(real(r, kind=dp), size)
+else
+   out = chol2inv_real(real(r, kind=dp))
+end if
+end function chol2inv_int
+
 pure function forwardsolve_mat(l, b, transpose) result(x)
 ! Solve L x = b for lower-triangular L; transpose=.true. solves L^T x = b.
 real(kind=dp), intent(in) :: l(:,:), b(:,:)
@@ -5078,6 +5676,18 @@ else
    x = forwardsolve_mat(real(l, kind=dp), b)
 end if
 end function forwardsolve_mat_i_r
+
+pure function forwardsolve_mat_r_i(l, b, transpose) result(x)
+real(kind=dp), intent(in) :: l(:,:)
+integer, intent(in) :: b(:,:)
+logical, intent(in), optional :: transpose
+real(kind=dp), allocatable :: x(:,:)
+if (present(transpose)) then
+   x = forwardsolve_mat(l, real(b, kind=dp), transpose=transpose)
+else
+   x = forwardsolve_mat(l, real(b, kind=dp))
+end if
+end function forwardsolve_mat_r_i
 
 pure function forwardsolve_mat_i_i(l, b, transpose) result(x)
 integer, intent(in) :: l(:,:), b(:,:)
@@ -5174,6 +5784,18 @@ else
 end if
 end function backsolve_mat_i_r
 
+pure function backsolve_mat_r_i(r, b, transpose) result(x)
+real(kind=dp), intent(in) :: r(:,:)
+integer, intent(in) :: b(:,:)
+logical, intent(in), optional :: transpose
+real(kind=dp), allocatable :: x(:,:)
+if (present(transpose)) then
+   x = backsolve_mat(r, real(b, kind=dp), transpose=transpose)
+else
+   x = backsolve_mat(r, real(b, kind=dp))
+end if
+end function backsolve_mat_r_i
+
 pure function backsolve_mat_i_i(r, b, transpose) result(x)
 integer, intent(in) :: r(:,:), b(:,:)
 logical, intent(in), optional :: transpose
@@ -5190,6 +5812,378 @@ pure integer function nchar(s) result(out)
 character(len=*), intent(in) :: s
 out = len_trim(s)
 end function nchar
+
+pure function char_join(x, sep) result(out)
+character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: sep
+character(len=:), allocatable :: out
+integer :: i, total
+total = 0
+do i = 1, size(x)
+   total = total + len_trim(x(i))
+end do
+if (size(x) > 1) total = total + (size(x) - 1) * len(sep)
+allocate(character(len=max(0, total)) :: out)
+out = ""
+do i = 1, size(x)
+   if (i > 1) out = out // sep
+   out = out // trim(x(i))
+end do
+end function char_join
+
+function list_files(path, pattern, full_names, recursive) result(out)
+character(len=*), intent(in), optional :: path, pattern
+logical, intent(in), optional :: full_names, recursive
+character(len=:), allocatable :: out(:)
+character(len=:), allocatable :: p, pat, tmp, cmd, line, base
+character(len=4096) :: buf
+logical :: fnames, recur, keep
+integer :: unit, ios, stat, n, maxlen, i, slash
+p = "."
+if (present(path)) p = trim(path)
+pat = ""
+if (present(pattern)) pat = trim(pattern)
+fnames = .false.
+if (present(full_names)) fnames = full_names
+recur = .false.
+if (present(recursive)) recur = recursive
+call random_seed()
+call random_number_list_files_tmp(tmp)
+if (is_windows_path_env()) then
+   if (recur) then
+      cmd = 'cmd /c dir /b /s /a-d "' // p // '" > "' // tmp // '" 2>nul'
+   else
+      cmd = 'cmd /c dir /b /a-d "' // p // '" > "' // tmp // '" 2>nul'
+   end if
+else
+   if (recur) then
+      cmd = 'find "' // p // '" -type f > "' // tmp // '" 2>/dev/null'
+   else
+      cmd = 'find "' // p // '" -maxdepth 1 -type f > "' // tmp // '" 2>/dev/null'
+   end if
+end if
+call execute_command_line(cmd, wait=.true., exitstat=stat)
+n = 0
+maxlen = 1
+open(newunit=unit, file=tmp, status="old", action="read", iostat=ios)
+if (ios /= 0) then
+   allocate(character(len=1) :: out(0))
+   return
+end if
+do
+   read(unit, "(a)", iostat=ios) buf
+   if (ios /= 0) exit
+   line = trim(buf)
+   base = list_files_basename(line)
+   keep = pat == "" .or. list_files_pattern_match(base, pat)
+   if (keep) then
+      n = n + 1
+      if (fnames) then
+         maxlen = max(maxlen, len_trim(line))
+      else
+         maxlen = max(maxlen, len_trim(base))
+      end if
+   end if
+end do
+rewind(unit)
+allocate(character(len=maxlen) :: out(n))
+i = 0
+do
+   read(unit, "(a)", iostat=ios) buf
+   if (ios /= 0) exit
+   line = trim(buf)
+   base = list_files_basename(line)
+   keep = pat == "" .or. list_files_pattern_match(base, pat)
+   if (keep) then
+      i = i + 1
+      out(i) = ""
+      if (fnames) then
+         out(i) = trim(line)
+      else if (recur .and. .not. is_windows_path_env()) then
+         if (len_trim(p) > 0 .and. index(line, trim(p) // "/") == 1) then
+            out(i) = line(len_trim(p) + 2:)
+         else
+            out(i) = trim(base)
+         end if
+      else if (recur .and. is_windows_path_env()) then
+         slash = len_trim(p)
+         if (slash > 0 .and. index(line, trim(p) // "\") == 1) then
+            out(i) = line(slash + 2:)
+         else
+            out(i) = trim(base)
+         end if
+      else
+         out(i) = trim(base)
+      end if
+   end if
+end do
+close(unit, status="delete")
+end function list_files
+
+subroutine random_number_list_files_tmp(tmp)
+character(len=:), allocatable, intent(out) :: tmp
+real(kind=dp) :: u
+integer :: k
+call random_number(u)
+k = max(1, int(u * 1000000000.0_dp))
+tmp = "xr2f_list_files_" // int_to_string(k) // ".tmp"
+end subroutine random_number_list_files_tmp
+
+pure function int_to_string(i) result(out)
+integer, intent(in) :: i
+character(len=:), allocatable :: out
+character(len=32) :: buf
+write(buf, "(i0)") i
+out = trim(buf)
+end function int_to_string
+
+function ar_coef_names(nacf) result(out)
+integer, intent(in) :: nacf
+character(len=:), allocatable :: out(:)
+integer :: i, n
+n = max(0, nacf)
+allocate(character(len=32) :: out(n + 5))
+out(1) = "order"
+out(2) = "intercept"
+do i = 1, n
+   out(i + 2) = "phi" // int_to_string(i)
+end do
+out(n + 3) = "sigma2"
+out(n + 4) = "aic"
+out(n + 5) = "bic"
+end function ar_coef_names
+
+function lag_names(nlag) result(out)
+integer, intent(in) :: nlag
+character(len=:), allocatable :: out(:)
+integer :: i, n
+n = max(0, nlag)
+allocate(character(len=32) :: out(n))
+do i = 1, n
+   out(i) = "lag" // int_to_string(i)
+end do
+end function lag_names
+
+function is_windows_path_env() result(out)
+logical :: out
+character(len=16) :: os
+integer :: stat, n
+call get_environment_variable("OS", os, length=n, status=stat)
+out = stat == 0 .and. index(os(1:max(1,n)), "Windows") > 0
+end function is_windows_path_env
+
+pure function list_files_basename(s) result(out)
+character(len=*), intent(in) :: s
+character(len=:), allocatable :: out
+integer :: i, last
+last = 0
+do i = 1, len_trim(s)
+   if (s(i:i) == "/" .or. s(i:i) == "\") last = i
+end do
+out = s(last + 1:len_trim(s))
+end function list_files_basename
+
+pure function list_files_pattern_match(name, pattern) result(out)
+character(len=*), intent(in) :: name, pattern
+logical :: out
+character(len=:), allocatable :: pat
+pat = trim(pattern)
+if (pat == "") then
+   out = .true.
+else if (len_trim(pat) > 2 .and. pat(1:2) == ".*") then
+   out = index(name, pat(3:len_trim(pat))) > 0
+else if (len_trim(pat) == 2 .and. pat(1:2) == ".*") then
+   out = .true.
+else if (len_trim(pat) > 1 .and. pat(1:1) == "*") then
+   out = index(name, pat(2:len_trim(pat))) > 0
+else if (pat(1:1) == "*") then
+   out = .true.
+else if (pat(len_trim(pat):len_trim(pat)) == "*") then
+   out = index(name, pat(1:len_trim(pat)-1)) == 1
+else
+   out = index(name, pat) > 0
+end if
+end function list_files_pattern_match
+
+pure function strsplit_fixed(s, delim) result(out)
+character(len=*), intent(in) :: s, delim
+character(len=:), allocatable :: out(:)
+integer :: i, start, pos, n, dlen, maxlen
+dlen = max(1, len(delim))
+n = 1
+start = 1
+do
+   pos = index(s(start:), delim)
+   if (pos <= 0) exit
+   n = n + 1
+   start = start + pos + dlen - 1
+   if (start > len(s) + 1) exit
+end do
+maxlen = max(1, len(s))
+allocate(character(len=maxlen) :: out(n))
+start = 1
+do i = 1, n
+   pos = index(s(start:), delim)
+   if (pos <= 0) then
+      out(i) = s(start:)
+   else
+      out(i) = s(start:start + pos - 2)
+      start = start + pos + dlen - 1
+   end if
+end do
+end function strsplit_fixed
+
+pure function toupper(s) result(out)
+character(len=*), intent(in) :: s
+character(len=len(s)) :: out
+integer :: i, c
+out = s
+do i = 1, len(s)
+   c = iachar(out(i:i))
+   if (c >= iachar("a") .and. c <= iachar("z")) out(i:i) = achar(c - 32)
+end do
+end function toupper
+
+pure function tolower(s) result(out)
+character(len=*), intent(in) :: s
+character(len=len(s)) :: out
+integer :: i, c
+out = s
+do i = 1, len(s)
+   c = iachar(out(i:i))
+   if (c >= iachar("A") .and. c <= iachar("Z")) out(i:i) = achar(c + 32)
+end do
+end function tolower
+
+pure function casefold(s, upper) result(out)
+character(len=*), intent(in) :: s
+logical, intent(in), optional :: upper
+character(len=len(s)) :: out
+logical :: up
+up = .false.
+if (present(upper)) up = upper
+if (up) then
+   out = toupper(s)
+else
+   out = tolower(s)
+end if
+end function casefold
+
+pure function trimws(s, which) result(out)
+character(len=*), intent(in) :: s
+character(len=*), intent(in), optional :: which
+character(len=:), allocatable :: out
+character(len=16) :: w
+w = "both"
+if (present(which)) w = which
+select case (trim(w))
+case ("left")
+   out = adjustl(s)
+case ("right")
+   out = trim(s)
+case default
+   out = trim(adjustl(s))
+end select
+end function trimws
+
+pure function replace_first_fixed(s, old, new) result(out)
+character(len=*), intent(in) :: s, old, new
+character(len=:), allocatable :: out
+integer :: pos
+pos = index(s, old)
+if (pos <= 0) then
+   out = s
+else
+   out = s(1:pos - 1) // new // s(pos + len(old):)
+end if
+end function replace_first_fixed
+
+pure function replace_all_fixed(s, old, new) result(out)
+character(len=*), intent(in) :: s, old, new
+character(len=:), allocatable :: out
+character(len=:), allocatable :: rest
+integer :: pos
+out = ""
+rest = s
+do
+   pos = index(rest, old)
+   if (pos <= 0) exit
+   out = out // rest(1:pos - 1) // new
+   rest = rest(pos + len(old):)
+end do
+out = out // rest
+end function replace_all_fixed
+
+pure function chartr(old, new, s) result(out)
+character(len=*), intent(in) :: old, new, s
+character(len=len(s)) :: out
+integer :: i, p
+out = s
+do i = 1, len(s)
+   p = index(old, s(i:i))
+   if (p > 0 .and. p <= len(new)) out(i:i) = new(p:p)
+end do
+end function chartr
+
+pure function lower_tri(x, diag) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+logical, intent(in), optional :: diag
+logical, allocatable :: out(:,:)
+integer :: i, j
+logical :: include_diag
+include_diag = .false.
+if (present(diag)) include_diag = diag
+allocate(out(size(x,1), size(x,2)))
+do j = 1, size(x,2)
+   do i = 1, size(x,1)
+      if (include_diag) then
+         out(i,j) = i >= j
+      else
+         out(i,j) = i > j
+      end if
+   end do
+end do
+end function lower_tri
+
+pure function upper_tri(x, diag) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+logical, intent(in), optional :: diag
+logical, allocatable :: out(:,:)
+integer :: i, j
+logical :: include_diag
+include_diag = .false.
+if (present(diag)) include_diag = diag
+allocate(out(size(x,1), size(x,2)))
+do j = 1, size(x,2)
+   do i = 1, size(x,1)
+      if (include_diag) then
+         out(i,j) = i <= j
+      else
+         out(i,j) = i < j
+      end if
+   end do
+end do
+end function upper_tri
+
+pure function row_index_mat(x) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+integer, allocatable :: out(:,:)
+integer :: i
+allocate(out(size(x,1), size(x,2)))
+do i = 1, size(x,1)
+   out(i, :) = i
+end do
+end function row_index_mat
+
+pure function col_index_mat(x) result(out)
+real(kind=dp), intent(in) :: x(:,:)
+integer, allocatable :: out(:,:)
+integer :: j
+allocate(out(size(x,1), size(x,2)))
+do j = 1, size(x,2)
+   out(:, j) = j
+end do
+end function col_index_mat
 
 pure elemental logical function is_na_real_scalar(x) result(out)
 ! True when real scalar is NA/NaN in this subset.
@@ -5250,6 +6244,24 @@ do i = 1, size(x)
    end if
 end do
 end function which_logical
+
+pure function which_arr_ind(x) result(out)
+logical, intent(in) :: x(:,:)
+integer, allocatable :: out(:,:)
+integer :: i, j, k, n
+n = count(x)
+allocate(out(n, 2))
+k = 0
+do j = 1, size(x, 2)
+   do i = 1, size(x, 1)
+      if (x(i, j)) then
+         k = k + 1
+         out(k, 1) = i
+         out(k, 2) = j
+      end if
+   end do
+end do
+end function which_arr_ind
 
 pure function replace_real_idx_scalar(x, idx, values) result(out)
 real(kind=dp), intent(in) :: x(:), values
@@ -5651,6 +6663,13 @@ character(len=:), allocatable :: out
 out = "double"
 end function r_typeof_real_vec
 
+pure function r_typeof_real_mat(x) result(out)
+! Return R-like type label for real matrix.
+real(kind=dp), intent(in) :: x(:,:)
+character(len=:), allocatable :: out
+out = "double"
+end function r_typeof_real_mat
+
 pure function r_typeof_int_scalar(x) result(out)
 ! Return R-like type label for integer scalar.
 integer, intent(in) :: x
@@ -5664,6 +6683,13 @@ integer, intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "integer"
 end function r_typeof_int_vec
+
+pure function r_typeof_int_mat(x) result(out)
+! Return R-like type label for integer matrix.
+integer, intent(in) :: x(:,:)
+character(len=:), allocatable :: out
+out = "integer"
+end function r_typeof_int_mat
 
 pure function r_typeof_char_scalar(x) result(out)
 ! Return R-like type label for character scalar.
@@ -5679,6 +6705,13 @@ character(len=:), allocatable :: out
 out = "character"
 end function r_typeof_char_vec
 
+pure function r_typeof_char_mat(x) result(out)
+! Return R-like type label for character matrix.
+character(len=*), intent(in) :: x(:,:)
+character(len=:), allocatable :: out
+out = "character"
+end function r_typeof_char_mat
+
 pure function r_typeof_logical_scalar(x) result(out)
 ! Return R-like type label for logical scalar.
 logical, intent(in) :: x
@@ -5692,6 +6725,13 @@ logical, intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "logical"
 end function r_typeof_logical_vec
+
+pure function r_typeof_logical_mat(x) result(out)
+! Return R-like type label for logical matrix.
+logical, intent(in) :: x(:,:)
+character(len=:), allocatable :: out
+out = "logical"
+end function r_typeof_logical_mat
 
 pure function quantile(x, probs, names, type) result(out)
 ! Compute Type-7 quantiles for a numeric vector.
@@ -6387,7 +7427,7 @@ real(kind=dp) :: out
 out = max(a, b)
 end function pmax
 
-pure function sd(x) result(out)
+pure function sd_vec(x) result(out)
 ! Sample standard deviation (n-1 denominator).
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp) :: out, m
@@ -6399,7 +7439,14 @@ if (n <= 1) then
 end if
 m = sum(x) / real(n, kind=dp)
 out = sqrt(sum((x - m)**2) / real(n - 1, kind=dp))
-end function sd
+end function sd_vec
+
+pure function sd_mat(x) result(out)
+! R sd(matrix) treats the matrix as a vector.
+real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp) :: out
+out = sd_vec(pack(x, .true.))
+end function sd_mat
 
 pure function var_vec(x) result(out)
 ! Sample variance (n-1 denominator).
@@ -6579,6 +7626,19 @@ xc = x - spread(mu, dim=1, ncopies=n)
 out = matmul(transpose(xc), xc) / real(n - 1, kind=dp)
 end function cov_mat
 
+pure function scale_vec(x, center, scale) result(out)
+! R scale() on a vector returns an n-by-1 matrix.
+real(kind=dp), intent(in) :: x(:)
+logical, intent(in), optional :: center, scale
+real(kind=dp), allocatable :: out(:,:)
+real(kind=dp), allocatable :: xmat(:,:)
+integer :: n
+n = size(x)
+allocate(xmat(n, 1))
+if (n > 0) xmat(:, 1) = x
+out = scale_mat(xmat, center=center, scale=scale)
+end function scale_vec
+
 pure function scale_mat(x, center, scale) result(out)
 ! Column-center and optionally column-scale a matrix, matching common R scale() use.
 real(kind=dp), intent(in) :: x(:,:)
@@ -6677,6 +7737,22 @@ real(kind=dp), intent(in), optional :: tolerance
 logical :: out
 out = all_equal_real_mat(real(a, kind=dp), real(b, kind=dp), tolerance=tolerance)
 end function all_equal_int_mat
+
+pure function all_equal_logical_vec(a, b, tolerance) result(out)
+logical, intent(in) :: a(:), b(:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+out = size(a) == size(b)
+if (out) out = all(a .eqv. b)
+end function all_equal_logical_vec
+
+pure function all_equal_logical_mat(a, b, tolerance) result(out)
+logical, intent(in) :: a(:,:), b(:,:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+out = all(shape(a) == shape(b))
+if (out) out = all(a .eqv. b)
+end function all_equal_logical_mat
 
 elemental function r_log_scalar(x) result(out)
 real(kind=dp), intent(in) :: x
@@ -6924,6 +8000,46 @@ end do
 close(fp)
 end subroutine read_csv_real_matrix
 
+function read_csv_header_names(file_path) result(names)
+! Read the first CSV row as a character vector of header names.
+character(len=*), intent(in) :: file_path
+character(len=:), allocatable :: names(:)
+character(len=4096) :: line
+integer :: fp, ios, ncol, i, start, pos
+open(newunit=fp, file=file_path, status="old", action="read")
+read(fp, "(A)", iostat=ios) line
+close(fp)
+if (ios /= 0 .or. len_trim(line) == 0) then
+   allocate(character(len=1) :: names(0))
+   return
+end if
+ncol = 1
+do i = 1, len_trim(line)
+   if (line(i:i) == ",") ncol = ncol + 1
+end do
+allocate(character(len=128) :: names(ncol))
+start = 1
+pos = 1
+do i = 1, len_trim(line) + 1
+   if (i > len_trim(line) .or. line(i:i) == ",") then
+      if (i > start) then
+         names(pos) = adjustl(line(start:i-1))
+         names(pos) = trim(names(pos))
+         if (len_trim(names(pos)) >= 2) then
+            if ((names(pos)(1:1) == '"' .and. names(pos)(len_trim(names(pos)):len_trim(names(pos))) == '"') .or. &
+                (names(pos)(1:1) == "'" .and. names(pos)(len_trim(names(pos)):len_trim(names(pos))) == "'")) then
+               names(pos) = names(pos)(2:len_trim(names(pos))-1)
+            end if
+         end if
+      else
+         names(pos) = ""
+      end if
+      pos = pos + 1
+      start = i + 1
+   end if
+end do
+end function read_csv_header_names
+
 subroutine write_table_real_matrix(file_path, x, names)
 ! Write a numeric matrix as a whitespace-delimited table.
 character(len=*), intent(in) :: file_path
@@ -7078,6 +8194,23 @@ do i = 1, size(x, 1)
 end do
 end subroutine print_matrix_int
 
+subroutine print_matrix_logical(x)
+! Print a logical matrix row-by-row.
+logical, intent(in) :: x(:,:)
+integer :: i, j
+do i = 1, size(x, 1)
+   do j = 1, size(x, 2)
+      if (x(i, j)) then
+         write(*,'(a)', advance='no') 'T'
+      else
+         write(*,'(a)', advance='no') 'F'
+      end if
+      if (j < size(x, 2)) write(*,'(a)', advance='no') ' '
+   end do
+   write(*,*)
+end do
+end subroutine print_matrix_logical
+
 subroutine print_matrix_rstyle_int(x)
 ! Print an integer matrix with R-like column and row labels.
 integer, intent(in) :: x(:,:)
@@ -7092,6 +8225,12 @@ do i = 1, size(x, 1)
    write(*,'(*(i12,1x))') x(i, :)
 end do
 end subroutine print_matrix_rstyle_int
+
+subroutine print_matrix_rstyle_logical(x)
+! Print a logical matrix with R-like column and row labels.
+logical, intent(in) :: x(:,:)
+call print_matrix_logical(x)
+end subroutine print_matrix_rstyle_logical
 
 pure function lm_predict_general(fit, xpred) result(yhat)
 ! Predict responses for a fitted linear model.
@@ -7337,6 +8476,19 @@ do i = 1, min(nr, n)
 end do
 end function qr_R
 
+pure function qr_rank(fit) result(out)
+type(qr_fit_t), intent(in) :: fit
+integer :: out
+out = fit%rank
+end function qr_rank
+
+pure function qr_pivot(fit) result(out)
+type(qr_fit_t), intent(in) :: fit
+integer, allocatable :: out(:)
+allocate(out(size(fit%pivot)))
+out = fit%pivot
+end function qr_pivot
+
 pure function qr_coef_vec(fit, y) result(coef)
 type(qr_fit_t), intent(in) :: fit
 real(kind=dp), intent(in) :: y(:)
@@ -7370,6 +8522,90 @@ r = qr_R(fit)
 qty = matmul(transpose(q(:, 1:k)), y)
 coef = backsolve_mat(r(1:k, 1:k), qty(1:k, :))
 end function qr_coef_mat
+
+pure function qr_fitted_vec(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:)
+real(kind=dp), allocatable :: out(:)
+real(kind=dp), allocatable :: q(:,:), qty(:)
+integer :: k
+k = max(0, fit%rank)
+allocate(out(size(y)))
+if (k <= 0) then
+   out = 0.0_dp
+   return
+end if
+q = qr_Q(fit)
+qty = matmul(transpose(q(:, 1:k)), y)
+out = matmul(q(:, 1:k), qty(1:k))
+end function qr_fitted_vec
+
+pure function qr_fitted_mat(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:,:)
+real(kind=dp), allocatable :: out(:,:)
+real(kind=dp), allocatable :: q(:,:), qty(:,:)
+integer :: k
+k = max(0, fit%rank)
+allocate(out(size(y, 1), size(y, 2)))
+if (k <= 0) then
+   out = 0.0_dp
+   return
+end if
+q = qr_Q(fit)
+qty = matmul(transpose(q(:, 1:k)), y)
+out = matmul(q(:, 1:k), qty(1:k, :))
+end function qr_fitted_mat
+
+pure function qr_resid_vec(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:)
+real(kind=dp), allocatable :: out(:)
+out = y - qr_fitted(fit, y)
+end function qr_resid_vec
+
+pure function qr_resid_mat(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:,:)
+real(kind=dp), allocatable :: out(:,:)
+out = y - qr_fitted(fit, y)
+end function qr_resid_mat
+
+pure function qr_qty_vec(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:)
+real(kind=dp), allocatable :: out(:)
+real(kind=dp), allocatable :: q(:,:)
+q = qr_Q(fit, complete=.true.)
+out = matmul(transpose(q), y)
+end function qr_qty_vec
+
+pure function qr_qty_mat(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:,:)
+real(kind=dp), allocatable :: out(:,:)
+real(kind=dp), allocatable :: q(:,:)
+q = qr_Q(fit, complete=.true.)
+out = matmul(transpose(q), y)
+end function qr_qty_mat
+
+pure function qr_qy_vec(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:)
+real(kind=dp), allocatable :: out(:)
+real(kind=dp), allocatable :: q(:,:)
+q = qr_Q(fit, complete=.true.)
+out = matmul(q, y)
+end function qr_qy_vec
+
+pure function qr_qy_mat(fit, y) result(out)
+type(qr_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: y(:,:)
+real(kind=dp), allocatable :: out(:,:)
+real(kind=dp), allocatable :: q(:,:)
+q = qr_Q(fit, complete=.true.)
+out = matmul(q, y)
+end function qr_qy_mat
 
 subroutine print_qr(fit)
 type(qr_fit_t), intent(in) :: fit
@@ -7530,6 +8766,92 @@ fit%df = n - k
 fit%sigma = sqrt(sse / dof)
 fit%adj_r_squared = 1.0_dp - (1.0_dp - fit%r_squared) * (n - 1) / dof
 end function lm_fit_general
+
+function step_lm(lower, upper, k) result(best_fit)
+! Stepwise add/drop search over upper%xpred columns using an AIC-like score.
+type(lm_fit_t), intent(in) :: lower, upper
+real(kind=dp), intent(in), optional :: k
+type(lm_fit_t) :: best_fit, cand_fit
+logical, allocatable :: selected(:), cand_selected(:)
+real(kind=dp), allocatable :: xsel(:,:), xcand(:,:)
+real(kind=dp) :: kval, best_score, cand_score
+integer :: p, j, nsel, iter
+logical :: improved
+kval = 2.0_dp
+if (present(k)) kval = k
+p = size(upper%xpred, 2)
+allocate(selected(p), cand_selected(p))
+selected = .false.
+if (allocated(lower%xpred)) then
+   do j = 1, min(size(lower%xpred, 2), p)
+      selected(j) = .true.
+   end do
+end if
+call build_lm_design(upper%xpred, selected, xsel)
+best_fit = lm_fit_general(upper%y, xsel)
+best_score = lm_aic_score(best_fit, kval)
+do iter = 1, max(1, 2 * p + 2)
+   improved = .false.
+   cand_selected = selected
+   do j = 1, p
+      if (.not. selected(j)) then
+         cand_selected = selected
+         cand_selected(j) = .true.
+         call build_lm_design(upper%xpred, cand_selected, xcand)
+         cand_fit = lm_fit_general(upper%y, xcand)
+         cand_score = lm_aic_score(cand_fit, kval)
+         if (cand_score < best_score - 1.0e-8_dp) then
+            best_score = cand_score
+            best_fit = cand_fit
+            selected = cand_selected
+            improved = .true.
+         end if
+      end if
+   end do
+   do j = 1, p
+      if (selected(j) .and. count(selected) > 0) then
+         cand_selected = selected
+         cand_selected(j) = .false.
+         call build_lm_design(upper%xpred, cand_selected, xcand)
+         cand_fit = lm_fit_general(upper%y, xcand)
+         cand_score = lm_aic_score(cand_fit, kval)
+         if (cand_score < best_score - 1.0e-8_dp) then
+            best_score = cand_score
+            best_fit = cand_fit
+            selected = cand_selected
+            improved = .true.
+         end if
+      end if
+   end do
+   if (.not. improved) exit
+end do
+end function step_lm
+
+function lm_aic_score(fit, k) result(score)
+type(lm_fit_t), intent(in) :: fit
+real(kind=dp), intent(in) :: k
+real(kind=dp) :: score, rss, n
+n = real(size(fit%y), kind=dp)
+rss = max(tiny(1.0_dp), sum(fit%resid**2))
+score = n * log(rss / max(1.0_dp, n)) + k * real(size(fit%coef), kind=dp)
+end function lm_aic_score
+
+subroutine build_lm_design(x, selected, out)
+real(kind=dp), intent(in) :: x(:,:)
+logical, intent(in) :: selected(:)
+real(kind=dp), allocatable, intent(out) :: out(:,:)
+integer :: j, jj, n, p
+n = size(x, 1)
+p = count(selected)
+allocate(out(n, p))
+jj = 0
+do j = 1, min(size(x, 2), size(selected))
+   if (selected(j)) then
+      jj = jj + 1
+      out(:, jj) = x(:, j)
+   end if
+end do
+end subroutine build_lm_design
 
 function lm_coef(y, xpred) result(coef)
 ! Fit linear model and return only coefficient vector.
@@ -8296,14 +9618,21 @@ where (out > 1.0_dp) out = 1.0_dp
 out = lo + out * (hi - lo)
 end function qunif
 
-pure function dexp(x, rate) result(out)
+pure function dexp(x, rate, log_) result(out)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), intent(in), optional :: rate
+logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: r
+logical :: l
 r = 1.0_dp; if (present(rate)) r = rate
+l = .false.; if (present(log_)) l = log_
 allocate(out(size(x)))
-out = merge(r * exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
+if (l) then
+   out = merge(log(r) - r * x, -huge(1.0_dp), x >= 0.0_dp .and. r > 0.0_dp)
+else
+   out = merge(r * exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
+end if
 end function dexp
 
 pure function pexp(x, rate) result(out)
@@ -8428,11 +9757,26 @@ real(kind=dp), allocatable :: out(:)
 out = pgamma(x, 0.5_dp * df, rate=0.5_dp)
 end function pchisq_vec
 
-pure function qchisq(p, df) result(out)
+pure function qchisq_vec(p, df) result(out)
 real(kind=dp), intent(in) :: p(:), df
 real(kind=dp), allocatable :: out(:)
 out = qgamma(p, 0.5_dp * df, rate=0.5_dp)
-end function qchisq
+end function qchisq_vec
+
+pure function qchisq_scalar(p, df) result(out)
+real(kind=dp), intent(in) :: p, df
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qchisq_vec([p], df)
+out = tmp(1)
+end function qchisq_scalar
+
+pure function qchisq_scalar_i(p, df) result(out)
+real(kind=dp), intent(in) :: p
+integer, intent(in) :: df
+real(kind=dp) :: out
+out = qchisq_scalar(p, real(df, kind=dp))
+end function qchisq_scalar_i
 
 pure function dt(x, df) result(out)
 real(kind=dp), intent(in) :: x(:), df
@@ -9572,5 +10916,100 @@ write(*,'(a)') "Kruskal-Wallis rank sum test"
 write(*,'(a,g0,a,i0,a,g0)') "Kruskal-Wallis chi-squared = ", fit%statistic, &
    & ", df = ", fit%parameter, ", p-value = ", fit%p_value
 end subroutine print_kruskal_test
+
+pure function ks_test(x, mean, sd) result(out)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: mean, sd
+type(ks_test_result_t) :: out
+real(kind=dp), allocatable :: xs(:)
+real(kind=dp) :: mu, sig, fi, dplus, dminus, z
+integer :: i, n
+mu = 0.0_dp
+sig = 1.0_dp
+if (present(mean)) mu = mean
+if (present(sd)) sig = sd
+n = size(x)
+out%n = n
+if (n <= 0 .or. sig <= 0.0_dp) return
+xs = sort(x)
+do i = 1, n
+   fi = normal_cdf((xs(i) - mu) / sig)
+   dplus = real(i, kind=dp) / real(n, kind=dp) - fi
+   dminus = fi - real(i - 1, kind=dp) / real(n, kind=dp)
+   out%statistic = max(out%statistic, max(dplus, dminus))
+end do
+z = (sqrt(real(n, kind=dp)) + 0.12_dp + 0.11_dp / sqrt(real(n, kind=dp))) * out%statistic
+out%p_value = max(0.0_dp, min(1.0_dp, 2.0_dp * exp(-2.0_dp * z * z)))
+end function ks_test
+
+subroutine print_ks_test(fit)
+type(ks_test_result_t), intent(in) :: fit
+write(*,'(a)') "One-sample Kolmogorov-Smirnov test"
+write(*,'(a,g0,a,g0)') "D = ", fit%statistic, ", p-value = ", fit%p_value
+end subroutine print_ks_test
+
+subroutine print_factanal(x, factors)
+real(kind=dp), intent(in) :: x(:,:)
+integer, intent(in) :: factors
+type(eigen_result_t) :: eg
+real(kind=dp), allocatable :: loadings(:,:)
+integer :: j, nf
+nf = max(1, min(factors, size(x, 2)))
+eg = eigen(cor(x))
+allocate(loadings(size(x, 2), nf))
+do j = 1, nf
+   loadings(:, j) = eg%vectors(:, j) * sqrt(max(0.0_dp, eg%values(j)))
+end do
+write(*,'(a)') "Factor Analysis (principal-factor approximation)"
+write(*,'(a)') "Loadings:"
+call print_matrix_rstyle(loadings)
+write(*,'(a)') "Uniquenesses:"
+call print_real_vector(max(0.0_dp, 1.0_dp - sum(loadings**2, dim=2)))
+end subroutine print_factanal
+
+pure function decompose(x, type, frequency) result(out)
+real(kind=dp), intent(in) :: x(:)
+character(len=*), intent(in), optional :: type
+integer, intent(in), optional :: frequency
+type(decompose_result_t) :: out
+integer :: n, f, i, j, lo, hi, cnt
+real(kind=dp), allocatable :: detr(:)
+n = size(x)
+f = 1
+if (present(frequency)) f = max(1, frequency)
+allocate(out%trend(n), out%seasonal(n), out%random(n), out%figure(f), detr(n))
+out%trend = 0.0_dp
+do i = 1, n
+   lo = max(1, i - f/2)
+   hi = min(n, i + f/2)
+   out%trend(i) = sum(x(lo:hi)) / real(hi - lo + 1, kind=dp)
+end do
+detr = x - out%trend
+out%figure = 0.0_dp
+do j = 1, f
+   cnt = 0
+   do i = j, n, f
+      out%figure(j) = out%figure(j) + detr(i)
+      cnt = cnt + 1
+   end do
+   if (cnt > 0) out%figure(j) = out%figure(j) / real(cnt, kind=dp)
+end do
+out%figure = out%figure - sum(out%figure) / real(f, kind=dp)
+do i = 1, n
+   j = mod(i - 1, f) + 1
+   out%seasonal(i) = out%figure(j)
+end do
+out%random = x - out%trend - out%seasonal
+end function decompose
+
+pure function ecdf_eval(x, q) result(out)
+real(kind=dp), intent(in) :: x(:), q(:)
+real(kind=dp), allocatable :: out(:)
+integer :: i
+allocate(out(size(q)))
+do i = 1, size(q)
+   out(i) = real(count(x <= q(i)), kind=dp) / real(size(x), kind=dp)
+end do
+end function ecdf_eval
 
 end module r_mod
