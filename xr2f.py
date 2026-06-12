@@ -60,6 +60,9 @@ _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
+_NLM_OBJECTIVE_NAMES: set[str] = set()
+_NLM_CLOSURE_WRAPPERS: dict[str, dict[str, object]] = {}
+_FORCED_FUNC_ARG_RANKS: dict[str, dict[str, int]] = {}
 _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "strsplit": {"name": "strsplit", "category": "subset_semantics", "reason": "partial fixed-delimiter support; vector input/list semantics are not fully preserved"},
     "list.files": {"name": "list.files", "category": "subset_semantics", "reason": "platform command backed subset; pattern handling is substring/glob-like rather than full R regex"},
@@ -80,6 +83,7 @@ _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "hclust": {"name": "hclust", "category": "approximate_algorithm", "reason": "subset implementation; linkage/tie behavior may differ"},
     "cutree": {"name": "cutree", "category": "subset_semantics", "reason": "subset implementation"},
     "optim": {"name": "optim", "category": "approximate_algorithm", "reason": "subset/approximate optimizer behavior"},
+    "nlm": {"name": "nlm", "category": "approximate_algorithm", "reason": "placeholder/subset optimizer result; not R's stats::nlm algorithm"},
     "t.test": {"name": "t.test", "category": "subset_semantics", "reason": "subset implementation; edge cases may differ from R"},
     "chisq.test": {"name": "chisq.test", "category": "subset_semantics", "reason": "subset implementation"},
     "prop.test": {"name": "prop.test", "category": "subset_semantics", "reason": "subset implementation"},
@@ -3942,6 +3946,9 @@ def classify_vars(
 
 
 def infer_arg_rank(fn: FuncDef, arg: str) -> int:
+    forced_rank = _FORCED_FUNC_ARG_RANKS.get(fn.name.lower(), {}).get(arg.lower())
+    if forced_rank is not None:
+        return forced_rank
     if fn.name.lower() == "print_mat" and arg == "x":
         return 2
     if fn.name.lower() == "print_vec" and arg == "x":
@@ -3964,6 +3971,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\blength\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bsize\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bsum\s*\(\s*{re.escape(arg)}\b"),
+        re.compile(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bmean\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bmax\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bmin\s*\(\s*{re.escape(arg)}\s*\)"),
@@ -5187,11 +5195,12 @@ def rename_conflicting_reused_vars(
                 st = Assign(name=name, expr=st.expr, comment=st.comment)
                 out.append(st)
             elif isinstance(st, FuncDef):
+                fn_rename_map = {k: v for k, v in rename_map.items() if k not in set(st.args)}
                 body, child_ranks, child_map, child_kinds = walk_block(
                     st.body,
                     {k: v for k, v in var_ranks.items()},
                     {k: v for k, v in var_kinds.items()},
-                    rename_map,
+                    fn_rename_map,
                     used_names.copy(),
                     local_only=False,
                 )
@@ -5932,6 +5941,55 @@ def _list_field_aliases_from_specs(specs: dict[str, ListReturnSpec]) -> dict[str
     return aliases
 
 
+def _register_nlm_closure(expr: str) -> str | None:
+    s = expr.strip()
+    c = parse_call_text(s)
+    if c is None or c[0].lower() != "nlm":
+        return None
+    _nm, pos, kw = c
+    fn_src = pos[0].strip() if pos else kw.get("f", "").strip()
+    if re.fullmatch(r"[A-Za-z]\w*", fn_src) is None:
+        return None
+    ignored = {"f", "p", "hessian", "stepmax"}
+    idx = _USER_FUNC_ARG_INDEX.get(fn_src.lower(), {})
+    inv_idx = {v: k for k, v in idx.items()}
+    captures: list[tuple[str, str]] = []
+    for i, actual in enumerate(pos[2:], start=2):
+        formal = inv_idx.get(i)
+        if formal:
+            captures.append((formal, actual.strip()))
+    used_capture_formals = {formal.lower() for formal, _actual in captures}
+    for k, v in kw.items():
+        kn = _sanitize_fortran_kwarg_name(k).lower()
+        if kn in ignored:
+            continue
+        if kn not in idx:
+            for j in range(1, max(inv_idx.keys(), default=0) + 1):
+                cand = inv_idx.get(j)
+                if cand is not None and cand.lower() not in used_capture_formals:
+                    kn = cand.lower()
+                    break
+        captures.append((kn, v.strip()))
+        used_capture_formals.add(kn.lower())
+    if not captures:
+        return None
+    captures = sorted(captures, key=lambda kv: idx.get(kv[0].lower(), 1000))
+    if s not in _NLM_CLOSURE_WRAPPERS:
+        base = re.sub(r"[^A-Za-z0-9_]", "_", fn_src)
+        name = f"xr2f_nlm_{base}_{len(_NLM_CLOSURE_WRAPPERS) + 1}"
+        first_rank = 1
+        first_arg = inv_idx.get(0)
+        if first_arg is not None:
+            first_rank = int(_USER_FUNC_ARG_RANK.get(fn_src.lower(), {}).get(first_arg, 1))
+        _NLM_CLOSURE_WRAPPERS[s] = {
+            "name": name,
+            "fn": fn_src,
+            "captures": captures,
+            "first_rank": first_rank,
+        }
+    return str(_NLM_CLOSURE_WRAPPERS[s]["name"])
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
@@ -5960,6 +6018,66 @@ def r_expr_to_fortran(expr: str) -> str:
         diag_src = kw_tri.get("diag", "FALSE")
         fn_tri = "lower_tri" if c_tri0[0].lower() == "lower.tri" else "upper_tri"
         return f"{fn_tri}(real({r_expr_to_fortran(x_src)}, kind=dp), diag={r_expr_to_fortran(diag_src)})"
+    c_nlm0 = parse_call_text(s)
+    if c_nlm0 is not None and c_nlm0[0].lower() == "nlm":
+        _nm_nlm, pos_nlm, kw_nlm = c_nlm0
+        fn_src = pos_nlm[0].strip() if pos_nlm else kw_nlm.get("f", "").strip()
+        p_src = kw_nlm.get("p", pos_nlm[1] if len(pos_nlm) >= 2 else "0.0")
+        extra_kw = {
+            _sanitize_fortran_kwarg_name(k).lower()
+            for k in kw_nlm
+            if _sanitize_fortran_kwarg_name(k).lower() not in {"f", "p", "hessian", "stepmax"}
+        }
+        fn_key = fn_src.lower()
+        arg_ranks = _USER_FUNC_ARG_RANK.get(fn_key, {})
+        can_direct = bool(fn_src) and re.fullmatch(r"[A-Za-z]\w*", fn_src) is not None and not extra_kw
+        wrapper_name = _register_nlm_closure(s) if not can_direct else None
+        hess_src = kw_nlm.get("hessian")
+        stepmax_src = kw_nlm.get("stepmax")
+        first_rank = 1
+        if can_direct and arg_ranks:
+            first_arg = next(iter(arg_ranks))
+            first_rank = int(arg_ranks.get(first_arg, 1))
+        if wrapper_name is not None:
+            wrap_info = _NLM_CLOSURE_WRAPPERS.get(s, {})
+            p_wrap_f = r_expr_to_fortran(p_src)
+            if int(wrap_info.get("first_rank", 1)) == 0:
+                args_wrap = [wrapper_name, f"real({p_wrap_f}, kind=dp)"]
+                fn_wrap = "nlm_optimize_scalar"
+            else:
+                if not p_wrap_f.strip().startswith("["):
+                    p_wrap_f = f"[real({p_wrap_f}, kind=dp)]"
+                args_wrap = [wrapper_name, p_wrap_f]
+                fn_wrap = "nlm_optimize_vec"
+            if hess_src is not None:
+                args_wrap.append(f"hessian={r_expr_to_fortran(hess_src)}")
+            if stepmax_src is not None:
+                args_wrap.append(f"stepmax=real({r_expr_to_fortran(stepmax_src)}, kind=dp)")
+            return f"{fn_wrap}({', '.join(args_wrap)})"
+        if can_direct and first_rank == 0:
+            args_scalar = [fn_src, f"real({r_expr_to_fortran(p_src)}, kind=dp)"]
+            if hess_src is not None:
+                args_scalar.append(f"hessian={r_expr_to_fortran(hess_src)}")
+            if stepmax_src is not None:
+                args_scalar.append(f"stepmax=real({r_expr_to_fortran(stepmax_src)}, kind=dp)")
+            return f"nlm_optimize_scalar({', '.join(args_scalar)})"
+        if can_direct:
+            p_vec_f = r_expr_to_fortran(p_src)
+            if not p_vec_f.strip().startswith("["):
+                p_vec_f = f"[real({p_vec_f}, kind=dp)]"
+            args_vec = [fn_src, p_vec_f]
+            if hess_src is not None:
+                args_vec.append(f"hessian={r_expr_to_fortran(hess_src)}")
+            if stepmax_src is not None:
+                args_vec.append(f"stepmax=real({r_expr_to_fortran(stepmax_src)}, kind=dp)")
+            return f"nlm_optimize_vec({', '.join(args_vec)})"
+        p_f = r_expr_to_fortran(p_src)
+        if not p_f.strip().startswith("["):
+            p_f = f"[real({p_f}, kind=dp)]"
+        args_nlm = [p_f]
+        if hess_src is not None:
+            args_nlm.append(f"hessian={r_expr_to_fortran(hess_src)}")
+        return f"nlm_stub({', '.join(args_nlm)})"
     s = _replace_dotted_var_refs(s)
     s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
     s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
@@ -9211,6 +9329,7 @@ def emit_stmts(
     arima_vars_ctx: set[str] = set()
     arima_pred_vars_ctx: set[str] = set()
     acf_vars_ctx: set[str] = set()
+    nlm_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
@@ -9312,6 +9431,9 @@ def emit_stmts(
         acfv = helper_ctx.get("acf_vars")
         if isinstance(acfv, set):
             acf_vars_ctx = {str(x) for x in acfv}
+        nlv = helper_ctx.get("nlm_vars")
+        if isinstance(nlv, set):
+            nlm_vars_ctx = {str(x) for x in nlv}
         rlv = helper_ctx.get("rle_vars")
         if isinstance(rlv, dict):
             rle_vars_ctx = {str(k): str(v) for k, v in rlv.items()}
@@ -9338,8 +9460,6 @@ def emit_stmts(
             or name in logical_vector_vars
             or name in real_matrix_vars
             or name in int_matrix_vars
-            or name in real_arrays
-            or name in int_arrays
         ):
             o.w(f"if (allocated({name})) deallocate({name})")
         o.w(f"allocate({name}({extent}))")
@@ -9649,6 +9769,12 @@ def emit_stmts(
             return 1
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:pred|se)\b", t):
             return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:estimate|gradient)\b", t):
+            return 1
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*hessian\b", t):
+            return 2
+        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:minimum|code|iterations)\b", t):
+            return 0
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:ar|aic)\b", t):
             return 1
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*var\.pred\b", t):
@@ -11327,6 +11453,10 @@ def emit_stmts(
                         _wstmt(f"call print_ks_test({one_f_early})", st.comment)
                         need_r_mod.update({"print_ks_test", "ks_test", "ks_test_result_t"})
                         continue
+                    if re.match(r"^nlm_(?:stub|optimize_scalar|optimize_vec)\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_nlm_result({one_f_early})", st.comment)
+                        need_r_mod.update({"print_nlm_result", "nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -11378,6 +11508,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in acf_vars_ctx:
                         _wstmt(f"call print_acf({one})", st.comment)
                         need_r_mod.update({"print_acf", "acf_fit_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in nlm_vars_ctx:
+                        _wstmt(f"call print_nlm_result({one})", st.comment)
+                        need_r_mod.update({"print_nlm_result", "nlm_result_t"})
                         continue
                     if c_one is not None and c_one[0].lower() == "acf":
                         _wstmt(f"call print_acf({r_expr_to_fortran(one)})", st.comment)
@@ -12552,6 +12686,8 @@ def emit_stmts(
         elif isinstance(st, ExprStmt):
             if re.match(r"^\s*(?:colnames|rownames|names|storage\.mode)\s*\(", st.expr, re.IGNORECASE):
                 continue
+            if re.match(r"^\s*attr\s*\(.*\)\s*(?:<-|=)\s*.+$", st.expr.strip(), re.IGNORECASE):
+                continue
             m_diag_expr_lhs = re.match(
                 r"^\s*diag\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:<-|=)\s*(.+)$",
                 st.expr.strip(),
@@ -13378,11 +13514,19 @@ def emit_function(
         o.w(f"end function {fn.name}")
         return False
     can_be_pure = not _stmt_tree_has_side_effect_ops(body_stmts)
-    if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
+    purity_texts = _collect_stmt_expr_texts(body_stmts) + ([last.expr] if isinstance(last, ExprStmt) else [])
+    if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
-    if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in _collect_stmt_expr_texts(body_stmts)):
+    if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
-    for txt_pure in _collect_stmt_expr_texts(body_stmts):
+    for txt_pure in purity_texts:
+        try:
+            lowered_pure = r_expr_to_fortran(txt_pure)
+        except Exception:
+            lowered_pure = txt_pure
+        if re.search(r"\br_(?:add|sub|mul|div)\s*\(", lowered_pure):
+            can_be_pure = False
+            break
         for call_nm in re.findall(r"\b([A-Za-z]\w*)\s*\(", txt_pure):
             key_call = call_nm.lower()
             if key_call in _USER_FUNC_ARG_KIND and key_call not in _USER_FUNC_ELEMENTAL:
@@ -13552,25 +13696,27 @@ def emit_function(
         return False
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
-        for a in fn.args:
-            if arg_rank.get(a, 0) < 1:
-                continue
-            if (
-                re.fullmatch(rf"{re.escape(a)}", ex_last)
-                or re.search(rf"\b{re.escape(a)}\b\s*[\+\-\*/\^]", ex_last)
-                or re.search(rf"[\+\-\*/\^]\s*\b{re.escape(a)}\b", ex_last)
-            ):
-                ret_rank = 1
-                if "integer" in rdecl:
-                    rdecl = "integer, allocatable"
-                else:
-                    rdecl = "real(kind=dp), allocatable"
-                break
+        if not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE):
+            for a in fn.args:
+                if arg_rank.get(a, 0) < 1:
+                    continue
+                if (
+                    re.fullmatch(rf"{re.escape(a)}", ex_last)
+                    or re.search(rf"\b{re.escape(a)}\b\s*[\+\-\*/\^]", ex_last)
+                    or re.search(rf"[\+\-\*/\^]\s*\b{re.escape(a)}\b", ex_last)
+                ):
+                    ret_rank = 1
+                    if "integer" in rdecl:
+                        rdecl = "integer, allocatable"
+                    else:
+                        rdecl = "real(kind=dp), allocatable"
+                    break
     is_elemental = (
         can_be_pure
         and list_spec is None
         and ret_rank == 0
         and all(arg_rank.get(a, 0) == 0 for a in fn.args)
+        and fn.name.lower() not in _NLM_OBJECTIVE_NAMES
     )
     pref = "pure elemental " if is_elemental else ("pure " if can_be_pure else "")
     for cmt in fn.leading_comments:
@@ -14011,6 +14157,12 @@ def emit_function(
                             local_list_types[lhs_nm] = "optim_result_t"
                             if has_r_mod:
                                 need_r_mod.add("optim_result_t")
+                            continue
+                        if callee.lower() == "nlm":
+                            local_list_types[lhs_nm] = "nlm_result_t"
+                            if has_r_mod:
+                                need_r_mod.add("nlm_result_t")
+                                need_r_mod.add("nlm_stub")
                             continue
                         if callee.lower() == "max_col" and has_r_mod:
                             need_r_mod.add("max_col")
@@ -16393,6 +16545,31 @@ def _collect_func_open_lines(src: str) -> dict[str, int]:
     return out
 
 
+def _rename_duplicate_function_defs(stmts: list[object]) -> list[object]:
+    """Rename repeated top-level function definitions and bind later uses to the latest definition."""
+    counts: dict[str, int] = {}
+    active: dict[str, str] = {}
+    out: list[object] = []
+    for st in stmts:
+        if isinstance(st, FuncDef):
+            raw = st.name
+            counts[raw] = counts.get(raw, 0) + 1
+            new_name = raw if counts[raw] == 1 else f"{raw}_{counts[raw]}"
+            body = [_rename_stmt_obj(b, active) for b in st.body] if active else list(st.body)
+            defaults = {k: _replace_idents(v, active) for k, v in st.defaults.items()} if active else dict(st.defaults)
+            out.append(FuncDef(
+                name=new_name,
+                args=list(st.args),
+                defaults=defaults,
+                body=body,
+                leading_comments=st.leading_comments,
+            ))
+            active[raw] = new_name
+        else:
+            out.append(_rename_stmt_obj(st, active) if active else st)
+    return out
+
+
 def _balanced_parens(txt: str) -> bool:
     depth = 0
     in_single = False
@@ -16460,6 +16637,7 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
         raise NotImplementedError("could not parse full source for R annotation")
     stmts = _lower_dim_assignments(stmts)
     stmts = attach_function_adjacent_comments(stmts)
+    stmts = _rename_duplicate_function_defs(stmts)
     stmts = rename_conflicting_loop_vars(stmts)
     stmts = rename_conflicting_reused_vars(stmts)
     stmts = rename_case_conflicting_names(stmts)
@@ -16536,7 +16714,7 @@ def transpile_r_to_fortran(
     recycle_warn: bool = False,
     recycle_stop: bool = False,
 ) -> str:
-    global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
+    global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -16568,6 +16746,7 @@ def transpile_r_to_fortran(
     stmts = _lower_dim_assignments(stmts)
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
+    stmts = _rename_duplicate_function_defs(stmts)
     stmts = attach_function_adjacent_comments(stmts)
     loop_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
@@ -16753,6 +16932,8 @@ def transpile_r_to_fortran(
         else:
             ret_nm_rank = m_rank_ret.group(1)
             rr = _infer_local_array_rank(f_rank_ret.body, ret_nm_rank)
+        if re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ret_expr_rank, re.IGNORECASE):
+            rr = 0
         if rr > 0:
             _USER_FUNC_RETURN_RANK[f_rank_ret.name.lower()] = rr
     fn_real_matrix_names = {f.name: infer_function_real_matrix_names(f) for f in funcs}
@@ -16791,6 +16972,45 @@ def transpile_r_to_fortran(
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ARG_RANK = {}
     _USER_FUNC_ELEMENTAL = set()
+    _NLM_OBJECTIVE_NAMES = set()
+    _NLM_CLOSURE_WRAPPERS = {}
+    _FORCED_FUNC_ARG_RANKS = {}
+    def _collect_nlm_objectives(ss_nlm: list[object]) -> None:
+        for st_nlm in ss_nlm:
+            expr_nlm = ""
+            if isinstance(st_nlm, Assign):
+                expr_nlm = st_nlm.expr.strip()
+            elif isinstance(st_nlm, ExprStmt):
+                asn_nlm = split_top_level_assignment(st_nlm.expr.strip())
+                expr_nlm = (asn_nlm[1] if asn_nlm is not None else st_nlm.expr).strip()
+            elif isinstance(st_nlm, PrintStmt):
+                for a_nlm in st_nlm.args:
+                    c_pr_nlm = parse_call_text(a_nlm.strip())
+                    if c_pr_nlm is not None and c_pr_nlm[0].lower() == "nlm":
+                        fn_obj = c_pr_nlm[1][0].strip() if c_pr_nlm[1] else c_pr_nlm[2].get("f", "").strip()
+                        if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                            _NLM_OBJECTIVE_NAMES.add(fn_obj.lower())
+                continue
+            elif isinstance(st_nlm, IfStmt):
+                _collect_nlm_objectives(st_nlm.then_body)
+                _collect_nlm_objectives(st_nlm.else_body)
+                continue
+            elif isinstance(st_nlm, ForStmt):
+                _collect_nlm_objectives(st_nlm.body)
+                continue
+            elif isinstance(st_nlm, WhileStmt):
+                _collect_nlm_objectives(st_nlm.body)
+                continue
+            elif isinstance(st_nlm, RepeatStmt):
+                _collect_nlm_objectives(st_nlm.body)
+                continue
+            c_nlm_obj = parse_call_text(expr_nlm)
+            if c_nlm_obj is not None and c_nlm_obj[0].lower() == "nlm":
+                fn_obj = c_nlm_obj[1][0].strip() if c_nlm_obj[1] else c_nlm_obj[2].get("f", "").strip()
+                if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                    _NLM_OBJECTIVE_NAMES.add(fn_obj.lower())
+
+    _collect_nlm_objectives(stmts)
     for f in funcs:
         _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
     _USER_FUNC_ARG_RANK = {
@@ -16841,6 +17061,35 @@ def transpile_r_to_fortran(
                 else "real"
             )
         _USER_FUNC_ARG_KIND[f.name.lower()] = kinds
+    def _walk_register_nlm_closures(ss_nlm_reg: list[object]) -> None:
+        for st_nlm_reg in ss_nlm_reg:
+            expr_nlm_reg = ""
+            if isinstance(st_nlm_reg, Assign):
+                expr_nlm_reg = st_nlm_reg.expr.strip()
+            elif isinstance(st_nlm_reg, ExprStmt):
+                asn_nlm_reg = split_top_level_assignment(st_nlm_reg.expr.strip())
+                expr_nlm_reg = (asn_nlm_reg[1] if asn_nlm_reg is not None else st_nlm_reg.expr).strip()
+            elif isinstance(st_nlm_reg, PrintStmt):
+                for a_nlm_reg in st_nlm_reg.args:
+                    _register_nlm_closure(a_nlm_reg.strip())
+                continue
+            elif isinstance(st_nlm_reg, IfStmt):
+                _walk_register_nlm_closures(st_nlm_reg.then_body)
+                _walk_register_nlm_closures(st_nlm_reg.else_body)
+                continue
+            elif isinstance(st_nlm_reg, ForStmt):
+                _walk_register_nlm_closures(st_nlm_reg.body)
+                continue
+            elif isinstance(st_nlm_reg, WhileStmt):
+                _walk_register_nlm_closures(st_nlm_reg.body)
+                continue
+            elif isinstance(st_nlm_reg, RepeatStmt):
+                _walk_register_nlm_closures(st_nlm_reg.body)
+                continue
+            if expr_nlm_reg:
+                _register_nlm_closure(expr_nlm_reg)
+
+    _walk_register_nlm_closures(stmts)
     helper_modules = set(m.lower() for m in (helper_modules or set()))
     _HAS_R_MOD = ("r_mod" in helper_modules)
     _NO_RECYCLE = bool(no_recycle)
@@ -17102,6 +17351,19 @@ def transpile_r_to_fortran(
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_LOGICAL_MATRIX_NAMES = {n.lower() for n in logical_matrices}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
+    for info_force in _NLM_CLOSURE_WRAPPERS.values():
+        fn_force = str(info_force.get("fn", "")).lower()
+        caps_force = info_force.get("captures", [])
+        if not fn_force or not isinstance(caps_force, list):
+            continue
+        for formal_force, actual_force in caps_force:
+            if not isinstance(actual_force, str):
+                continue
+            actual_l = actual_force.strip().lower()
+            if actual_l in _KNOWN_MATRIX_NAMES:
+                _FORCED_FUNC_ARG_RANKS.setdefault(fn_force, {})[str(formal_force).lower()] = 2
+            elif actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+                _FORCED_FUNC_ARG_RANKS.setdefault(fn_force, {})[str(formal_force).lower()] = 1
     rle_vars: dict[str, str] = {}
     for st_rle in main_stmts:
         if not isinstance(st_rle, Assign):
@@ -17143,6 +17405,16 @@ def transpile_r_to_fortran(
         for nm_l in free_names_l:
             if nm_l in main_name_map:
                 promoted_l.add(nm_l)
+    for info_cl in _NLM_CLOSURE_WRAPPERS.values():
+        caps_cl = info_cl.get("captures", [])
+        if not isinstance(caps_cl, list):
+            continue
+        for _formal_cl, actual_cl in caps_cl:
+            if not isinstance(actual_cl, str):
+                continue
+            m_actual_cl = re.fullmatch(r"[A-Za-z]\w*", actual_cl.strip())
+            if m_actual_cl is not None and m_actual_cl.group(0).lower() in main_name_map:
+                promoted_l.add(m_actual_cl.group(0).lower())
     promoted_names: set[str] = {main_name_map[nm_l] for nm_l in promoted_l}
     promoted_params: dict[str, str] = {}
     promoted_array_params: dict[str, tuple[str, int, str]] = {}
@@ -17266,6 +17538,7 @@ def transpile_r_to_fortran(
     arima_pred_vars: set[str] = set()
     acf_vars: set[str] = set()
     qr_vars: set[str] = set()
+    nlm_vars: set[str] = set()
     t_test_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
@@ -17355,6 +17628,9 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "qr":
                 qr_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "nlm":
+                nlm_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t", "print_nlm_result"})
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -17879,6 +18155,17 @@ def transpile_r_to_fortran(
             real_rank3_arrays.discard(nm)
             real_rank4_arrays.discard(nm)
             params.pop(nm, None)
+    for nm in nlm_vars:
+        ints.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        real_scalars.discard(nm)
+        int_matrices.discard(nm)
+        real_matrices.discard(nm)
+        int_rank3_arrays.discard(nm)
+        real_rank3_arrays.discard(nm)
+        real_rank4_arrays.discard(nm)
+        params.pop(nm, None)
 
     scalar_element_assigns: dict[str, list[str]] = {}
 
@@ -18083,6 +18370,9 @@ def transpile_r_to_fortran(
     if qr_vars:
         for nm in sorted(qr_vars):
             pbody.w(f"type(qr_fit_t) :: {nm}")
+    if nlm_vars:
+        for nm in sorted(nlm_vars):
+            pbody.w(f"type(nlm_result_t) :: {nm}")
     if rle_vars:
         for nm, tn in sorted(rle_vars.items()):
             pbody.w(f"type({tn}) :: {nm}")
@@ -18103,6 +18393,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["arima_pred_vars"] = set(arima_pred_vars)
     if acf_vars:
         helper_ctx_main["acf_vars"] = set(acf_vars)
+    if nlm_vars:
+        helper_ctx_main["nlm_vars"] = set(nlm_vars)
     if rle_vars:
         helper_ctx_main["rle_vars"] = dict(rle_vars)
     pbody.w("")
@@ -18128,6 +18420,27 @@ def transpile_r_to_fortran(
     fn_needs_rnorm = False
     for fn in funcs:
         fn_needs_rnorm = emit_function(mprocs, fn, list_specs, helper_ctx=helper_ctx_mod) or fn_needs_rnorm
+        mprocs.w("")
+    for info_wrap in _NLM_CLOSURE_WRAPPERS.values():
+        name_wrap = str(info_wrap.get("name", ""))
+        fn_wrap = str(info_wrap.get("fn", ""))
+        caps_wrap = info_wrap.get("captures", [])
+        first_rank_wrap = int(info_wrap.get("first_rank", 1))
+        if not name_wrap or not fn_wrap or not isinstance(caps_wrap, list):
+            continue
+        arg_name_wrap = "par" if first_rank_wrap >= 1 else "x"
+        mprocs.w(f"function {name_wrap}({arg_name_wrap}) result({name_wrap}_result)")
+        if first_rank_wrap >= 1:
+            mprocs.w(f"real(kind=dp), intent(in) :: {arg_name_wrap}(:)")
+        else:
+            mprocs.w(f"real(kind=dp), intent(in) :: {arg_name_wrap}")
+        mprocs.w(f"real(kind=dp) :: {name_wrap}_result")
+        actuals_wrap = [arg_name_wrap] + [
+            f"{_sanitize_fortran_kwarg_name(str(formal))}=real({r_expr_to_fortran(str(actual))}, kind=dp)"
+            for formal, actual in caps_wrap
+        ]
+        mprocs.w(f"{name_wrap}_result = {fn_wrap}({', '.join(actuals_wrap)})")
+        mprocs.w(f"end function {name_wrap}")
         mprocs.w("")
     has_r_mod_main = bool(helper_ctx_main.get("has_r_mod"))
     emit_local_rnorm = (need_rnorm_main["used"] or fn_needs_rnorm) and (not has_r_mod_main)
@@ -19787,6 +20100,11 @@ def transpile_r_to_fortran(
         "rle_char_t",
         "rle_logical_t",
         "optim_result_t",
+        "nlm_result_t",
+        "nlm_stub",
+        "nlm_optimize_scalar",
+        "nlm_optimize_vec",
+        "print_nlm_result",
         "t_test_result_t",
         "t_test",
         "t_test_p_value",
@@ -19911,6 +20229,10 @@ def transpile_r_to_fortran(
         mod_needed.add("optim_result_t")
     if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("optim_result_t")
+    if re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("nlm_result_t")
+    if re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("nlm_result_t")
     if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("hclust_result_t")
     if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", main_text_now, re.IGNORECASE):
@@ -20018,6 +20340,20 @@ def transpile_r_to_fortran(
         o.w("integer :: convergence")
         o.pop()
         o.w("end type optim_result_t")
+        o.w("")
+    need_nlm_result = bool(
+        re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", mod_text_now + "\n" + main_text_now, re.IGNORECASE)
+    )
+    if need_nlm_result and ("r_mod" not in helper_modules):
+        o.w("")
+        o.w("type :: nlm_result_t")
+        o.push()
+        o.w("real(kind=dp) :: minimum = 0.0_dp")
+        o.w("real(kind=dp), allocatable :: estimate(:), gradient(:), hessian(:,:)")
+        o.w("integer :: code = 1")
+        o.w("integer :: iterations = 0")
+        o.pop()
+        o.w("end type nlm_result_t")
         o.w("")
     need_hclust_result = bool(
         re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now + "\n" + main_text_now, re.IGNORECASE)
