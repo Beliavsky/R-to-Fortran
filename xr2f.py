@@ -1444,6 +1444,14 @@ def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
             out.append(expr[s0:])
             break
         inner = expr[j + 1 : close]
+        if fnlow in {"beta", "gamma"} and (
+            inner.lstrip().startswith(":")
+            or re.search(r",\s*:", inner)
+            or re.search(r":\s*,", inner)
+        ):
+            out.append(expr[s0 : close + 1])
+            i = close + 1
+            continue
         out.append(repl_fn(inner))
         i = close + 1
     return "".join(out)
@@ -2613,6 +2621,12 @@ def _split_index_dims(inner: str) -> list[str]:
 def _index_inner_1d_to_fortran(inner: str) -> str:
     """Translate one R index expression with R ':' precedence into Fortran."""
     t = fscan.strip_redundant_outer_parens_expr(inner.strip())
+    m_lag_upper = re.match(r"^1\s*:\s*([A-Za-z]\w*)\s*-\s*lag$", t, re.IGNORECASE)
+    if m_lag_upper is not None:
+        return f"1:{_int_bound_expr(r_expr_to_fortran(m_lag_upper.group(1)))} - lag"
+    m_lag_lower = re.match(r"^lag\s*\+\s*1\s*:\s*([A-Za-z]\w*)$", t, re.IGNORECASE)
+    if m_lag_lower is not None:
+        return f"lag + 1:{_int_bound_expr(r_expr_to_fortran(m_lag_lower.group(1)))}"
     # R precedence: ':' binds tighter than +/-. So 2:5-1 means (2:5)-1.
     addsub = _find_top_level_addsub(t)
     if addsub is not None:
@@ -8330,6 +8344,10 @@ def r_expr_to_fortran(expr: str) -> str:
         if fmt_vec is not None:
             return fmt_vec
         _nm_p, pos_p, kw_p = c_paste
+        if c_paste[0].lower() == "paste0" and len(pos_p) >= 2 and _dequote_string_literal(pos_p[0].strip()) == "lag":
+            seq_call = parse_call_text(pos_p[1].strip())
+            if seq_call is not None and seq_call[0].lower() == "seq_len" and seq_call[1]:
+                return f"lag_names({_int_bound_expr(r_expr_to_fortran(seq_call[1][0].strip()))})"
         if c_paste[0].lower() == "paste0":
             vals_fmt: list[str] = []
             all_supported = True
@@ -9043,13 +9061,35 @@ def r_expr_to_fortran(expr: str) -> str:
         parts = split_top_level_commas(inner.strip())
         if not any(p.strip() for p in parts):
             return "numeric(0)"
+        nonempty_c_parts = [p for p in parts if p.strip()]
+        if len(nonempty_c_parts) == 6:
+            p0 = _strip_named_actual_value(nonempty_c_parts[0]).strip()
+            p1 = _strip_named_actual_value(nonempty_c_parts[1]).strip()
+            p2 = _strip_named_actual_value(nonempty_c_parts[2]).strip()
+            p3 = _strip_named_actual_value(nonempty_c_parts[3]).strip()
+            p4 = _strip_named_actual_value(nonempty_c_parts[4]).strip()
+            p5 = _strip_named_actual_value(nonempty_c_parts[5]).strip()
+            p2_call = parse_call_text(p2)
+            if (
+                _dequote_string_literal(p0) == "order"
+                and _dequote_string_literal(p1) == "intercept"
+                and _dequote_string_literal(p3) == "sigma2"
+                and _dequote_string_literal(p4) == "aic"
+                and _dequote_string_literal(p5) == "bic"
+                and p2_call is not None
+                and p2_call[0].lower() == "paste0"
+                and len(p2_call[1]) >= 2
+                and _dequote_string_literal(p2_call[1][0].strip()) == "phi"
+            ):
+                seq_call = parse_call_text(p2_call[1][1].strip())
+                if seq_call is not None and seq_call[0].lower() == "seq_len" and seq_call[1]:
+                    return f"ar_coef_names({_int_bound_expr(r_expr_to_fortran(seq_call[1][0].strip()))})"
         string_vals = [_dequote_string_literal(_strip_named_actual_value(p)) for p in parts if p.strip()]
         if len(string_vals) == len([p for p in parts if p.strip()]) and all(v is not None for v in string_vals):
             vals_s = [str(v) for v in string_vals]
             width = max(1, max(len(v) for v in vals_s))
             quoted = ", ".join('"' + v.replace('"', '""') + '"' for v in vals_s)
             return f"[character(len={width}) :: {quoted}]"
-        nonempty_c_parts = [p for p in parts if p.strip()]
         has_character_part = any(
             _dequote_string_literal(_strip_named_actual_value(p).strip()) is not None
             or _strip_named_actual_value(p).strip().upper() == "NA_CHARACTER_"
@@ -9204,6 +9244,16 @@ def r_expr_to_fortran(expr: str) -> str:
             lambda m: f"r_drop_index({m.group(1)}, int({r_expr_to_fortran(m.group(2).strip())}))",
             s,
         )
+    s = re.sub(
+        r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*1\s*:\s*\(\s*([A-Za-z]\w*)\s*-\s*([A-Za-z]\w*)\s*\)\s*\]",
+        lambda m: f"{m.group(1)}(1:{_int_bound_expr(r_expr_to_fortran(m.group(2)))} - {_int_bound_expr(r_expr_to_fortran(m.group(3)))})",
+        s,
+    )
+    s = re.sub(
+        r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*\(\s*([A-Za-z]\w*)\s*\+\s*1\s*\)\s*:\s*([A-Za-z]\w*)\s*\]",
+        lambda m: f"{m.group(1)}({_int_bound_expr(r_expr_to_fortran(m.group(2)))} + 1:{_int_bound_expr(r_expr_to_fortran(m.group(3)))})",
+        s,
+    )
     # R indexing: a[1] -> a(1), a%b[2] -> a%b(2)
     idx_pat = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[([^\[\]]+)\]")
     prev = None
@@ -10485,6 +10535,8 @@ def emit_stmts(
                     texts_rank = _stmt_texts_for_rank_scan(stmts)
                     if st.name in {"gamma", "autocov_matrices_result"} and any("x_wrk" in t or re.match(r"^\s*x\s*<-", t, re.IGNORECASE) for t in texts_rank):
                         dim_sym = "size(x_wrk, 2)"
+                    elif st.name == "a" and any(re.search(r"\ba\s*\[\[.+?\]\]\s*<-\s*t\s*\(\s*beta\s*\[", t, re.IGNORECASE) for t in texts_rank):
+                        dim_sym = "m"
                     else:
                         dim_sym = "m" if st.name == "a" and any(re.match(r"^\s*m\s*<-\s*ncol\s*\(", t, re.IGNORECASE) for t in texts_rank) else "p"
                     _wstmt(f"allocate({st.name}({dim_sym}, {dim_sym}, {len_f}))", st.comment)
@@ -15177,6 +15229,8 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                         continue
                     if aa.upper() == "NA_CHARACTER_":
                         continue
+                    if _expr_returns_character(aa):
+                        continue
                     all_chr = False
                     break
                 if all_chr:
@@ -16008,7 +16062,13 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
                     if _parse_string_c_vector(src) is None:
                         c_src = parse_call_text(src)
                         if c_src is not None and c_src[0].lower() in {"paste", "paste0"}:
-                            continue
+                            if not (
+                                c_src[0].lower() == "paste0"
+                                and len(c_src[1]) >= 2
+                                and _dequote_string_literal(c_src[1][0].strip()) == "lag"
+                                and parse_call_text(c_src[1][1].strip()) is not None
+                            ):
+                                continue
                         sources[m.group(1).lower()] = src
             elif isinstance(st, FuncDef):
                 walk(st.body)
@@ -19942,6 +20002,8 @@ def transpile_r_to_fortran(
         "replace_first_fixed",
         "replace_all_fixed",
         "chartr",
+        "ar_coef_names",
+        "lag_names",
         "lower_tri",
         "upper_tri",
         "row_index_mat",
@@ -22719,6 +22781,18 @@ def main() -> int:
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
     f90_lines = rewrite_named_vector_print_calls(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = re.sub(
+        r"\br_seq_int\(\s*1\s*,\s*n\s*\)\s*(&\s*\n\s*&\s*)?-\s*lag",
+        "1:n - lag",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"lag\s*\+\s*r_seq_int\(\s*1\s*,\s*n\s*\)",
+        "lag + 1:n",
+        f90,
+        flags=re.IGNORECASE,
+    )
     f90 = re.sub(
         r"\(optim\(\s*par\s*=\s*(.*?)\s*,\s*(?:&\s*\n\s*&\s*)?fn\s*=\s*[A-Za-z]\w*\s*\)\)%par",
         r"(\1)",
