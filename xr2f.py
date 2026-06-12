@@ -4166,6 +4166,15 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
     # Rank-2 triggers on matrix-like assignment or 2D indexing use.
     texts = _stmt_texts_for_rank_scan(stmts)
     nm = re.escape(name)
+    rank1_names: set[str] = set()
+    for t_rank1 in texts:
+        m_rank1 = re.match(
+            r"^\s*([A-Za-z]\w*)\s*<-\s*(?:colSums|rowSums|apply|numeric|double|r_rep_real|r_rep_int|seq|seq_len|seq_along)\s*\(",
+            t_rank1,
+            re.IGNORECASE,
+        )
+        if m_rank1 is not None:
+            rank1_names.add(m_rank1.group(1))
     pat_mat_rhs = re.compile(
         rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|data\.frame)\s*\(",
         re.IGNORECASE,
@@ -4235,12 +4244,14 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         m_scalar_formula_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
         if m_scalar_formula_rhs is not None:
             rhs_scalar = m_scalar_formula_rhs.group(1).strip()
+            rhs_names = set(re.findall(r"\b[A-Za-z]\w*\b", rhs_scalar))
             if (
                 not rhs_scalar.lstrip().startswith(("c(", "["))
                 and
                 re.search(r"\b(?:nrow|ncol|length|sum|mean|min|max|det|logdet_spd|sd|r_sd|log)\s*\(", rhs_scalar, re.IGNORECASE)
                 and "%*%" not in rhs_scalar
                 and not re.match(r"\s*(?:matrix|array|cbind|cbind2|rbind|crossprod|tcrossprod|sweep|t)\s*\(", rhs_scalar, re.IGNORECASE)
+                and not (rhs_names & rank1_names)
             ):
                 return 0
         if re.match(rf"^\s*{nm}\s*<-\s*apply\s*\(", t, re.IGNORECASE):
@@ -4313,6 +4324,8 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         m_arith_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
         if m_arith_rhs is not None:
             rhs_arith = fscan.strip_redundant_outer_parens_expr(m_arith_rhs.group(1).strip())
+            if set(re.findall(r"\b[A-Za-z]\w*\b", rhs_arith)) & rank1_names:
+                return 1
             for op in ["+", "-", "*", "/"]:
                 mm = _split_top_level_token(rhs_arith, op, from_right=True)
                 if mm is None:
@@ -17389,6 +17402,40 @@ def transpile_r_to_fortran(
         int_matrices.discard(st_mat_slice_vec.name)
         real_matrices.discard(st_mat_slice_vec.name)
         params.pop(st_mat_slice_vec.name, None)
+    for st_vec_subset in main_stmts:
+        if not isinstance(st_vec_subset, Assign):
+            continue
+        rhs_vec_subset = st_vec_subset.expr.strip()
+        m_vec_subset = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\],]+)\]\s*$", rhs_vec_subset)
+        c_vec_subset = parse_call_text(rhs_vec_subset)
+        if m_vec_subset is not None:
+            base_vec_subset = m_vec_subset.group(1)
+            idx_vec_subset = m_vec_subset.group(2).strip()
+            vectorish_subset = (
+                idx_vec_subset.startswith("-")
+                or ":" in idx_vec_subset
+                or re.match(r"^(?:seq|seq_len|seq_along|which)\s*\(", idx_vec_subset, re.IGNORECASE)
+                or idx_vec_subset.lower() in {n.lower() for n in set(int_arrays) | set(real_arrays) | set(logical_arrays)}
+            )
+            if not vectorish_subset:
+                continue
+        elif c_vec_subset is not None and c_vec_subset[0].lower() in {"r_drop_index", "r_drop_indices"} and c_vec_subset[1]:
+            base_vec_subset = c_vec_subset[1][0].strip()
+        else:
+            continue
+        if base_vec_subset in int_arrays:
+            int_arrays.add(st_vec_subset.name)
+            real_arrays.discard(st_vec_subset.name)
+        elif base_vec_subset in real_arrays:
+            real_arrays.add(st_vec_subset.name)
+            int_arrays.discard(st_vec_subset.name)
+        else:
+            continue
+        ints.discard(st_vec_subset.name)
+        real_scalars.discard(st_vec_subset.name)
+        int_matrices.discard(st_vec_subset.name)
+        real_matrices.discard(st_vec_subset.name)
+        params.pop(st_vec_subset.name, None)
     logical_arrays = infer_main_logical_arrays(
         main_stmts,
         set(int_arrays) | set(real_arrays) | set(array_params.keys()) | set(int_matrices) | set(real_matrices),
@@ -19829,100 +19876,6 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.w("end function solve_real")
         mprocs.w("")
-    if emit_local_drop:
-        mprocs.w("pure function r_drop_index_real(x, k) result(out)")
-        mprocs.w("real(kind=dp), intent(in) :: x(:)")
-        mprocs.w("integer, intent(in) :: k")
-        mprocs.w("real(kind=dp), allocatable :: out(:)")
-        mprocs.w("logical, allocatable :: keep(:)")
-        mprocs.w("integer :: n, m")
-        mprocs.w("n = size(x)")
-        mprocs.w("if (n <= 0) then")
-        mprocs.push()
-        mprocs.w("allocate(out(0))")
-        mprocs.w("return")
-        mprocs.pop()
-        mprocs.w("end if")
-        mprocs.w("allocate(keep(n))")
-        mprocs.w("keep = .true.")
-        mprocs.w("if (k >= 1 .and. k <= n) keep(k) = .false.")
-        mprocs.w("m = count(keep)")
-        mprocs.w("allocate(out(m))")
-        mprocs.w("if (m > 0) out = pack(x, keep)")
-        mprocs.w("end function r_drop_index_real")
-        mprocs.w("")
-        mprocs.w("pure function r_drop_index_int(x, k) result(out)")
-        mprocs.w("integer, intent(in) :: x(:)")
-        mprocs.w("integer, intent(in) :: k")
-        mprocs.w("integer, allocatable :: out(:)")
-        mprocs.w("logical, allocatable :: keep(:)")
-        mprocs.w("integer :: n, m")
-        mprocs.w("n = size(x)")
-        mprocs.w("if (n <= 0) then")
-        mprocs.push()
-        mprocs.w("allocate(out(0))")
-        mprocs.w("return")
-        mprocs.pop()
-        mprocs.w("end if")
-        mprocs.w("allocate(keep(n))")
-        mprocs.w("keep = .true.")
-        mprocs.w("if (k >= 1 .and. k <= n) keep(k) = .false.")
-        mprocs.w("m = count(keep)")
-        mprocs.w("allocate(out(m))")
-        mprocs.w("if (m > 0) out = pack(x, keep)")
-        mprocs.w("end function r_drop_index_int")
-        mprocs.w("")
-        mprocs.w("pure function r_drop_indices_real(x, drop) result(out)")
-        mprocs.w("real(kind=dp), intent(in) :: x(:)")
-        mprocs.w("integer, intent(in) :: drop(:)")
-        mprocs.w("real(kind=dp), allocatable :: out(:)")
-        mprocs.w("logical, allocatable :: keep(:)")
-        mprocs.w("integer :: i, n, m")
-        mprocs.w("n = size(x)")
-        mprocs.w("if (n <= 0) then")
-        mprocs.push()
-        mprocs.w("allocate(out(0))")
-        mprocs.w("return")
-        mprocs.pop()
-        mprocs.w("end if")
-        mprocs.w("allocate(keep(n))")
-        mprocs.w("keep = .true.")
-        mprocs.w("do i = 1, size(drop)")
-        mprocs.push()
-        mprocs.w("if (drop(i) >= 1 .and. drop(i) <= n) keep(drop(i)) = .false.")
-        mprocs.pop()
-        mprocs.w("end do")
-        mprocs.w("m = count(keep)")
-        mprocs.w("allocate(out(m))")
-        mprocs.w("if (m > 0) out = pack(x, keep)")
-        mprocs.w("end function r_drop_indices_real")
-        mprocs.w("")
-        mprocs.w("pure function r_drop_indices_int(x, drop) result(out)")
-        mprocs.w("integer, intent(in) :: x(:)")
-        mprocs.w("integer, intent(in) :: drop(:)")
-        mprocs.w("integer, allocatable :: out(:)")
-        mprocs.w("logical, allocatable :: keep(:)")
-        mprocs.w("integer :: i, n, m")
-        mprocs.w("n = size(x)")
-        mprocs.w("if (n <= 0) then")
-        mprocs.push()
-        mprocs.w("allocate(out(0))")
-        mprocs.w("return")
-        mprocs.pop()
-        mprocs.w("end if")
-        mprocs.w("allocate(keep(n))")
-        mprocs.w("keep = .true.")
-        mprocs.w("do i = 1, size(drop)")
-        mprocs.push()
-        mprocs.w("if (drop(i) >= 1 .and. drop(i) <= n) keep(drop(i)) = .false.")
-        mprocs.pop()
-        mprocs.w("end do")
-        mprocs.w("m = count(keep)")
-        mprocs.w("allocate(out(m))")
-        mprocs.w("if (m > 0) out = pack(x, keep)")
-        mprocs.w("end function r_drop_indices_int")
-        mprocs.w("")
-
     helper_names = {
         "runif1",
         "runif_vec",
@@ -19977,6 +19930,8 @@ def transpile_r_to_fortran(
         "r_rep_real",
         "r_rep_char",
         "r_rep_int",
+        "r_drop_index",
+        "r_drop_indices",
         "char_join",
         "list_files",
         "strsplit_fixed",
@@ -20325,18 +20280,6 @@ def transpile_r_to_fortran(
                 "end interface r_typeof",
             ]
         )
-    if emit_local_drop:
-        module_iface_lines.extend(
-            [
-                "interface r_drop_index",
-                "   module procedure r_drop_index_real, r_drop_index_int",
-                "end interface r_drop_index",
-                "interface r_drop_indices",
-                "   module procedure r_drop_indices_real, r_drop_indices_int",
-                "end interface r_drop_indices",
-            ]
-        )
-
     o = FEmit()
     o.w(f"module {module_name}")
     iso_imports_mod = "dp => real64"
@@ -21068,6 +21011,30 @@ def hoist_repeated_numeric_array_literals(lines: list[str]) -> list[str]:
     return out
 
 
+def promote_drop_index_result_declarations(lines: list[str]) -> list[str]:
+    assigned: set[str] = set()
+    for ln in lines:
+        m = re.match(r"\s*([A-Za-z]\w*)\s*=\s*r_drop_(?:index|indices)\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            assigned.add(m.group(1))
+    if not assigned:
+        return lines
+    out: list[str] = []
+    for ln in lines:
+        m_decl = re.match(r"^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*)(.+)$", ln, re.IGNORECASE)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        names = [x.strip() for x in m_decl.group(2).split(",")]
+        promote = [x for x in names if x in assigned]
+        keep = [x for x in names if x not in assigned]
+        if keep:
+            out.append(m_decl.group(1) + ", ".join(keep))
+        for nm in promote:
+            out.append(re.sub(r"::\s*$", ", allocatable :: ", m_decl.group(1)) + f"{nm}(:)")
+    return out
+
+
 def rewrite_selected_orders_dataframe_print(lines: list[str]) -> list[str]:
     """Lower the small selected-orders data.frame print used by mixture examples."""
     out: list[str] = []
@@ -21077,7 +21044,9 @@ def rewrite_selected_orders_dataframe_print(lines: list[str]) -> list[str]:
         if (
             "write" in ln
             and "data.frame" in ln
-            and 'criterion = ["AIC", "BIC"]' in ln
+            and "criterion" in ln
+            and '"AIC"' in ln
+            and '"BIC"' in ln
             and i + 1 < len(lines)
             and "selected_ncomp" in lines[i + 1]
         ):
@@ -22724,6 +22693,7 @@ def main() -> int:
     # Keep component declarations in derived types intact; generic coalescing can
     # collapse mixed-rank fields onto one line and change semantics.
     f90_lines = fscan.coalesce_simple_declarations(f90_lines, max_len=80)
+    f90_lines = promote_drop_index_result_declarations(f90_lines)
     f90_lines = fscan.wrap_long_declaration_lines(f90_lines, max_len=80)
     f90_lines = fscan.ensure_space_before_inline_comments(f90_lines)
     f90_lines = split_long_inline_comments(f90_lines, max_len=80)
