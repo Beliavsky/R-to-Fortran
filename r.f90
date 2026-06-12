@@ -1361,7 +1361,7 @@ logical, allocatable :: alive(:)
 real(kind=dp), allocatable :: cdist(:,:)
 integer, allocatable :: cluster_rep(:)
 integer :: n, step, i, j, k
-integer :: a, b, node_count, root_a, root_b, new_node
+integer :: node_count, new_node
 real(kind=dp) :: best_d, cand_d
 integer :: best_a, best_b
 character(len=16) :: meth
@@ -1637,6 +1637,7 @@ integer, intent(in) :: x(:) ! input vector
 integer, intent(in), optional :: margin
 real(kind=dp), allocatable :: out(:)
 integer :: s
+if (present(margin)) continue
 allocate(out(size(x)))
 s = sum(x)
 if (s > 0) then
@@ -2548,6 +2549,7 @@ real(kind=dp), intent(in) :: p(:) ! dimension count
 logical, intent(in), optional :: hessian
 type(nlm_result_t) :: out
 integer :: n
+if (present(hessian)) continue
 n = size(p)
 allocate(out%estimate(n))
 allocate(out%gradient(n))
@@ -2580,7 +2582,7 @@ real(kind=dp), intent(in) :: p(:) ! dimension count
 logical, intent(in), optional :: hessian ! logical flag
 real(kind=dp), intent(in), optional :: stepmax
 type(nlm_result_t) :: out
-integer :: n, iter, i
+integer :: n, iter
 real(kind=dp), allocatable :: x(:), g(:), trial(:)
 real(kind=dp) :: f, f_trial, gnorm, alpha, max_step, step_norm, tol
 n = size(p)
@@ -3219,7 +3221,9 @@ function runif_vec(n) result(x)
 ! Return a length-n vector of U(0,1) variates.
 integer, intent(in) :: n
 real(kind=dp), allocatable :: x(:)
+#ifdef XR2F_USE_R_RNG
 integer :: i
+#endif
 allocate(x(n))
 #ifdef XR2F_USE_R_RNG
 do i = 1, n
@@ -4808,6 +4812,8 @@ type(ar_fit_t) :: fit
 integer :: pmax, p, n, i, j, k
 real(kind=dp), allocatable :: xt(:), rhs(:), mat(:,:), coef(:)
 real(kind=dp) :: mu, sse
+if (present(aic)) continue
+if (present(method)) continue
 n = size(x)
 pmax = 1
 if (present(order_max)) pmax = max(0, order_max)
@@ -5331,7 +5337,8 @@ end function besselK_vec_r
 
 pure function solve_real_vec(a, b) result(x)
 ! Return the solution of a square linear system a %*% x = b.
-real(kind=dp), intent(in) :: a(:,:), b(:)
+real(kind=dp), intent(in) :: a(:,:) ! square coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: aa(:,:), bb(:)
 integer :: i, j, k, n, p
@@ -5377,22 +5384,24 @@ end function solve_real_vec
 
 pure function solve_real_vec_i_r(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:) ! input matrix
-real(kind=dp), intent(in) :: b(:)
+integer, intent(in) :: a(:,:) ! coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
 real(kind=dp), allocatable :: x(:)
 x = solve_real_vec(real(a, kind=dp), b)
 end function solve_real_vec_i_r
 
 pure function solve_real_vec_i_i(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:), b(:)
+integer, intent(in) :: a(:,:) ! coefficient matrix
+integer, intent(in) :: b(:) ! right-hand side vector
 real(kind=dp), allocatable :: x(:)
 x = solve_real_vec(real(a, kind=dp), real(b, kind=dp))
 end function solve_real_vec_i_i
 
 pure function solve_real_mat(a, b) result(x)
 ! Return the solution of a square linear system a %*% x = b for matrix b.
-real(kind=dp), intent(in) :: a(:,:), b(:,:)
+real(kind=dp), intent(in) :: a(:,:) ! square coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
 real(kind=dp), allocatable :: x(:,:)
 integer :: j, n, m
 n = size(a, 1)
@@ -5407,30 +5416,33 @@ end function solve_real_mat
 
 pure function solve_real_mat_i_r(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:) ! input matrix
-real(kind=dp), intent(in) :: b(:,:)
+integer, intent(in) :: a(:,:) ! coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(real(a, kind=dp), b)
 end function solve_real_mat_i_r
 
 pure function solve_real_mat_r_i(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: a(:,:) ! input matrix
-integer, intent(in) :: b(:,:)
+real(kind=dp), intent(in) :: a(:,:) ! coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(a, real(b, kind=dp))
 end function solve_real_mat_r_i
 
 pure function solve_real_mat_i_i(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:), b(:,:)
+integer, intent(in) :: a(:,:) ! coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(real(a, kind=dp), real(b, kind=dp))
 end function solve_real_mat_i_i
 
 pure function mahalanobis(x, center, cov) result(out)
 ! Runtime helper for R-compatible mahalanobis.
-real(kind=dp), intent(in) :: x(:,:), center(:), cov(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! observations by rows
+real(kind=dp), intent(in) :: center(:) ! center vector to subtract
+real(kind=dp), intent(in) :: cov(:,:) ! covariance matrix
 real(kind=dp), allocatable :: out(:), z(:,:), sol(:,:)
 integer :: i, n, p
 n = size(x, 1)
@@ -5450,8 +5462,9 @@ end function mahalanobis
 
 pure function isSymmetric_real(x, tol) result(out)
 ! Test the R-like predicate isSymmetric_real.
-real(kind=dp), intent(in) :: x(:,:) ! input matrix
-real(kind=dp), intent(in), optional :: tol
+! If tol is absent, use 100*epsilon(1.0_dp).
+real(kind=dp), intent(in) :: x(:,:) ! matrix to test for symmetry
+real(kind=dp), intent(in), optional :: tol ! absolute symmetry tolerance
 logical :: out
 real(kind=dp) :: eps
 if (size(x, 1) /= size(x, 2)) then
@@ -5465,8 +5478,9 @@ end function isSymmetric_real
 
 pure function isSymmetric_int(x, tol) result(out)
 ! Test the R-like predicate isSymmetric_int.
-integer, intent(in) :: x(:,:) ! input matrix
-real(kind=dp), intent(in), optional :: tol
+! If tol is absent, use 100*epsilon(1.0_dp).
+integer, intent(in) :: x(:,:) ! matrix to test for symmetry
+real(kind=dp), intent(in), optional :: tol ! absolute symmetry tolerance
 logical :: out
 if (present(tol)) then
    out = isSymmetric_real(real(x, kind=dp), tol)
@@ -5477,23 +5491,24 @@ end function isSymmetric_int
 
 pure function solve_real_vec_r_c(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: a(:,:) ! input matrix
-complex(kind=dp), intent(in) :: b(:)
+real(kind=dp), intent(in) :: a(:,:) ! coefficient matrix
+complex(kind=dp), intent(in) :: b(:) ! right-hand side vector
 complex(kind=dp), allocatable :: x(:)
 x = solve_complex_vec(cmplx(a, 0.0_dp, kind=dp), b)
 end function solve_real_vec_r_c
 
 pure function solve_real_vec_i_c(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:) ! input matrix
-complex(kind=dp), intent(in) :: b(:)
+integer, intent(in) :: a(:,:) ! coefficient matrix
+complex(kind=dp), intent(in) :: b(:) ! right-hand side vector
 complex(kind=dp), allocatable :: x(:)
 x = solve_complex_vec(cmplx(real(a, kind=dp), 0.0_dp, kind=dp), b)
 end function solve_real_vec_i_c
 
 pure function solve_complex_vec(a, b) result(x)
 ! Return the solution of a square complex linear system a %*% x = b.
-complex(kind=dp), intent(in) :: a(:,:), b(:)
+complex(kind=dp), intent(in) :: a(:,:) ! square coefficient matrix
+complex(kind=dp), intent(in) :: b(:) ! right-hand side vector
 complex(kind=dp), allocatable :: x(:)
 complex(kind=dp), allocatable :: aa(:,:), bb(:)
 integer :: i, j, k, n, p
@@ -5540,7 +5555,8 @@ end function solve_complex_vec
 
 pure function solve_complex_mat(a, b) result(x)
 ! Return the solution of a square complex linear system a %*% x = b for matrix b.
-complex(kind=dp), intent(in) :: a(:,:), b(:,:)
+complex(kind=dp), intent(in) :: a(:,:) ! square coefficient matrix
+complex(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
 complex(kind=dp), allocatable :: x(:,:)
 integer :: j, n, m
 n = size(a, 1)
@@ -5555,7 +5571,7 @@ end function solve_complex_mat
 
 pure function cumsum_real(x) result(out)
 ! Return cumulative sums of a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -5568,7 +5584,7 @@ end function cumsum_real
 
 pure function cumsum_int(x) result(out)
 ! Return cumulative sums of an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -5581,7 +5597,7 @@ end function cumsum_int
 
 pure function apply_col_cumsum(x) result(out)
 ! Return apply(x, 2, cumsum) for a real matrix.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), allocatable :: out(:,:)
 integer :: j
 allocate(out(size(x, 1), size(x, 2)))
@@ -5592,7 +5608,7 @@ end function apply_col_cumsum
 
 pure function apply_col_sd(x) result(out)
 ! Return apply(x, 2, sd) for a real matrix.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), allocatable :: out(:)
 integer :: j
 allocate(out(size(x, 2)))
@@ -5603,7 +5619,8 @@ end function apply_col_sd
 
 pure function findInterval(x, vec) result(out)
 ! Return R-style interval counts for each x against sorted breakpoints vec.
-real(kind=dp), intent(in) :: x(:), vec(:)
+real(kind=dp), intent(in) :: x(:) ! query values
+real(kind=dp), intent(in) :: vec(:) ! sorted breakpoints
 integer, allocatable :: out(:)
 integer :: i, j
 allocate(out(size(x)))
@@ -5617,7 +5634,7 @@ end function findInterval
 
 pure function cumprod_real(x) result(out)
 ! Return cumulative products of a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -5630,7 +5647,7 @@ end function cumprod_real
 
 pure function cumprod_int(x) result(out)
 ! Return cumulative products of an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -5643,7 +5660,7 @@ end function cumprod_int
 
 pure function diff_real(x) result(out)
 ! First differences of a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), allocatable :: out(:)
 integer :: n
 n = size(x)
@@ -5653,7 +5670,7 @@ end function diff_real
 
 pure function diff_mat_real(x) result(out)
 ! First row differences of a real matrix, matching R diff() on matrices.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), allocatable :: out(:,:)
 integer :: n, p
 n = size(x, 1)
@@ -5664,7 +5681,7 @@ end function diff_mat_real
 
 pure function diff_int(x) result(out)
 ! First differences of an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, allocatable :: out(:)
 integer :: n
 n = size(x)
@@ -5766,7 +5783,7 @@ pure function chol_real(a) result(r)
 real(kind=dp), intent(in) :: a(:,:)
 real(kind=dp), allocatable :: r(:,:)
 real(kind=dp) :: s
-integer :: i, j, k, n
+integer :: j, k, n
 n = size(a, 1)
 allocate(r(n, n))
 r = 0.0_dp
@@ -5804,8 +5821,8 @@ end function chol2inv_real
 
 pure function chol2inv_int(r, size) result(out)
 ! Runtime helper for R-compatible chol2inv int.
-integer, intent(in) :: r(:,:) ! input matrix
-integer, intent(in), optional :: size
+integer, intent(in) :: r(:,:) ! Cholesky factor
+integer, intent(in), optional :: size ! leading dimension to invert
 real(kind=dp), allocatable :: out(:,:)
 if (present(size)) then
    out = chol2inv_real(real(r, kind=dp), size)
@@ -5816,9 +5833,9 @@ end function chol2inv_int
 
 pure function forwardsolve_mat(l, b, transpose) result(x)
 ! Solve L x = b for lower-triangular L; transpose=.true. solves L^T x = b.
-real(kind=dp), intent(in) :: l(:,:) ! input matrix
-real(kind=dp), intent(in) :: b(:,:) ! input matrix
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 logical :: tr
 integer :: i, j, n, m
@@ -5850,9 +5867,9 @@ end function forwardsolve_mat
 
 pure function forwardsolve_vec(l, b, transpose) result(x)
 ! Solve L x = b for a vector RHS.
-real(kind=dp), intent(in) :: l(:,:) ! input matrix
-real(kind=dp), intent(in) :: b(:) ! input vector
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: bm(:,:), xm(:,:)
 allocate(bm(size(b), 1))
@@ -5867,9 +5884,9 @@ end function forwardsolve_vec
 
 pure function forwardsolve_vec_i_r(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-integer, intent(in) :: l(:,:) ! input matrix
-real(kind=dp), intent(in) :: b(:) ! input vector
-logical, intent(in), optional :: transpose
+integer, intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 if (present(transpose)) then
    x = forwardsolve_vec(real(l, kind=dp), b, transpose=transpose)
@@ -5880,8 +5897,9 @@ end function forwardsolve_vec_i_r
 
 pure function forwardsolve_vec_i_i(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-integer, intent(in) :: l(:,:), b(:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+integer, intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 if (present(transpose)) then
    x = forwardsolve_vec(real(l, kind=dp), real(b, kind=dp), transpose=transpose)
@@ -5892,9 +5910,9 @@ end function forwardsolve_vec_i_i
 
 pure function forwardsolve_mat_i_r(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-integer, intent(in) :: l(:,:)
-real(kind=dp), intent(in) :: b(:,:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = forwardsolve_mat(real(l, kind=dp), b, transpose=transpose)
@@ -5905,9 +5923,9 @@ end function forwardsolve_mat_i_r
 
 pure function forwardsolve_mat_r_i(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: l(:,:)
-integer, intent(in) :: b(:,:)
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = forwardsolve_mat(l, real(b, kind=dp), transpose=transpose)
@@ -5918,8 +5936,9 @@ end function forwardsolve_mat_r_i
 
 pure function forwardsolve_mat_i_i(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-integer, intent(in) :: l(:,:), b(:,:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: l(:,:) ! lower-triangular coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = forwardsolve_mat(real(l, kind=dp), real(b, kind=dp), transpose=transpose)
@@ -5930,8 +5949,9 @@ end function forwardsolve_mat_i_i
 
 pure function backsolve_mat(r, b, transpose) result(x)
 ! Solve R x = b for upper-triangular R; transpose=.true. solves R^T x = b.
-real(kind=dp), intent(in) :: r(:,:), b(:,:)
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 logical :: tr
 integer :: i, j, n, m
@@ -5963,8 +5983,9 @@ end function backsolve_mat
 
 pure function backsolve_vec(r, b, transpose) result(x)
 ! Solve R x = b for a vector RHS.
-real(kind=dp), intent(in) :: r(:,:), b(:)
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: bm(:,:), xm(:,:)
 allocate(bm(size(b), 1))
@@ -5979,9 +6000,9 @@ end function backsolve_vec
 
 pure function backsolve_vec_i_r(r, b, transpose) result(x)
 ! Solve an upper-triangular system with mixed numeric input kinds.
-integer, intent(in) :: r(:,:)
-real(kind=dp), intent(in) :: b(:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 if (present(transpose)) then
    x = backsolve_vec(real(r, kind=dp), b, transpose=transpose)
@@ -5992,8 +6013,9 @@ end function backsolve_vec_i_r
 
 pure function backsolve_vec_i_i(r, b, transpose) result(x)
 ! Solve an upper-triangular system with mixed numeric input kinds.
-integer, intent(in) :: r(:,:), b(:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+integer, intent(in) :: b(:) ! right-hand side vector
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:)
 if (present(transpose)) then
    x = backsolve_vec(real(r, kind=dp), real(b, kind=dp), transpose=transpose)
@@ -6004,9 +6026,9 @@ end function backsolve_vec_i_i
 
 pure function backsolve_mat_i_r(r, b, transpose) result(x)
 ! Solve an upper-triangular system with mixed numeric input kinds.
-integer, intent(in) :: r(:,:)
-real(kind=dp), intent(in) :: b(:,:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+real(kind=dp), intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = backsolve_mat(real(r, kind=dp), b, transpose=transpose)
@@ -6017,9 +6039,9 @@ end function backsolve_mat_i_r
 
 pure function backsolve_mat_r_i(r, b, transpose) result(x)
 ! Solve an upper-triangular system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: r(:,:)
-integer, intent(in) :: b(:,:)
-logical, intent(in), optional :: transpose
+real(kind=dp), intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = backsolve_mat(r, real(b, kind=dp), transpose=transpose)
@@ -6030,8 +6052,9 @@ end function backsolve_mat_r_i
 
 pure function backsolve_mat_i_i(r, b, transpose) result(x)
 ! Solve an upper-triangular system with mixed numeric input kinds.
-integer, intent(in) :: r(:,:), b(:,:)
-logical, intent(in), optional :: transpose
+integer, intent(in) :: r(:,:) ! upper-triangular coefficient matrix
+integer, intent(in) :: b(:,:) ! right-hand side matrix
+logical, intent(in), optional :: transpose ! solve transposed system flag
 real(kind=dp), allocatable :: x(:,:)
 if (present(transpose)) then
    x = backsolve_mat(real(r, kind=dp), real(b, kind=dp), transpose=transpose)
@@ -6937,6 +6960,7 @@ pure function r_typeof_real_scalar(x) result(out)
 real(kind=dp), intent(in) :: x
 character(len=:), allocatable :: out
 out = "double"
+if (storage_size(x) < 0) out = ""
 end function r_typeof_real_scalar
 
 pure function r_typeof_real_vec(x) result(out)
@@ -6944,6 +6968,7 @@ pure function r_typeof_real_vec(x) result(out)
 real(kind=dp), intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "double"
+if (size(x) < 0) out = ""
 end function r_typeof_real_vec
 
 pure function r_typeof_real_mat(x) result(out)
@@ -6951,6 +6976,7 @@ pure function r_typeof_real_mat(x) result(out)
 real(kind=dp), intent(in) :: x(:,:)
 character(len=:), allocatable :: out
 out = "double"
+if (size(x) < 0) out = ""
 end function r_typeof_real_mat
 
 pure function r_typeof_int_scalar(x) result(out)
@@ -6958,6 +6984,7 @@ pure function r_typeof_int_scalar(x) result(out)
 integer, intent(in) :: x
 character(len=:), allocatable :: out
 out = "integer"
+if (storage_size(x) < 0) out = ""
 end function r_typeof_int_scalar
 
 pure function r_typeof_int_vec(x) result(out)
@@ -6965,6 +6992,7 @@ pure function r_typeof_int_vec(x) result(out)
 integer, intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "integer"
+if (size(x) < 0) out = ""
 end function r_typeof_int_vec
 
 pure function r_typeof_int_mat(x) result(out)
@@ -6972,6 +7000,7 @@ pure function r_typeof_int_mat(x) result(out)
 integer, intent(in) :: x(:,:)
 character(len=:), allocatable :: out
 out = "integer"
+if (size(x) < 0) out = ""
 end function r_typeof_int_mat
 
 pure function r_typeof_char_scalar(x) result(out)
@@ -6979,6 +7008,7 @@ pure function r_typeof_char_scalar(x) result(out)
 character(len=*), intent(in) :: x
 character(len=:), allocatable :: out
 out = "character"
+if (len(x) < 0) out = ""
 end function r_typeof_char_scalar
 
 pure function r_typeof_char_vec(x) result(out)
@@ -6986,6 +7016,7 @@ pure function r_typeof_char_vec(x) result(out)
 character(len=*), intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "character"
+if (size(x) < 0) out = ""
 end function r_typeof_char_vec
 
 pure function r_typeof_char_mat(x) result(out)
@@ -6993,6 +7024,7 @@ pure function r_typeof_char_mat(x) result(out)
 character(len=*), intent(in) :: x(:,:)
 character(len=:), allocatable :: out
 out = "character"
+if (size(x) < 0) out = ""
 end function r_typeof_char_mat
 
 pure function r_typeof_logical_scalar(x) result(out)
@@ -7000,6 +7032,7 @@ pure function r_typeof_logical_scalar(x) result(out)
 logical, intent(in) :: x
 character(len=:), allocatable :: out
 out = "logical"
+if (merge(0, 0, x) < 0) out = ""
 end function r_typeof_logical_scalar
 
 pure function r_typeof_logical_vec(x) result(out)
@@ -7007,6 +7040,7 @@ pure function r_typeof_logical_vec(x) result(out)
 logical, intent(in) :: x(:)
 character(len=:), allocatable :: out
 out = "logical"
+if (size(x) < 0) out = ""
 end function r_typeof_logical_vec
 
 pure function r_typeof_logical_mat(x) result(out)
@@ -7014,6 +7048,7 @@ pure function r_typeof_logical_mat(x) result(out)
 logical, intent(in) :: x(:,:)
 character(len=:), allocatable :: out
 out = "logical"
+if (size(x) < 0) out = ""
 end function r_typeof_logical_mat
 
 pure function quantile(x, probs, names, type) result(out)
@@ -8032,6 +8067,7 @@ pure function all_equal_logical_vec(a, b, tolerance) result(out)
 logical, intent(in) :: a(:), b(:)
 real(kind=dp), intent(in), optional :: tolerance
 logical :: out
+if (present(tolerance)) continue
 out = size(a) == size(b)
 if (out) out = all(a .eqv. b)
 end function all_equal_logical_vec
@@ -8041,6 +8077,7 @@ pure function all_equal_logical_mat(a, b, tolerance) result(out)
 logical, intent(in) :: a(:,:), b(:,:)
 real(kind=dp), intent(in), optional :: tolerance
 logical :: out
+if (present(tolerance)) continue
 out = all(shape(a) == shape(b))
 if (out) out = all(a .eqv. b)
 end function all_equal_logical_mat
@@ -8583,6 +8620,7 @@ real(kind=dp), intent(in), optional :: level
 real(kind=dp), allocatable :: out(:,:)
 real(kind=dp) :: crit, se
 integer :: j, p
+if (present(level)) continue
 p = size(fit%coef)
 allocate(out(p, 2))
 if (p <= 0) return
@@ -9083,7 +9121,7 @@ type(lm_fit_t) :: best_fit, cand_fit
 logical, allocatable :: selected(:), cand_selected(:)
 real(kind=dp), allocatable :: xsel(:,:), xcand(:,:)
 real(kind=dp) :: kval, best_score, cand_score
-integer :: p, j, nsel, iter
+integer :: p, j, iter
 logical :: improved
 kval = 2.0_dp
 if (present(k)) kval = k
@@ -11379,6 +11417,7 @@ integer, intent(in), optional :: frequency
 type(decompose_result_t) :: out
 integer :: n, f, i, j, lo, hi, cnt
 real(kind=dp), allocatable :: detr(:)
+if (present(type)) continue
 n = size(x)
 f = 1
 if (present(frequency)) f = max(1, frequency)
