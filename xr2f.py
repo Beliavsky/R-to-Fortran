@@ -15674,13 +15674,6 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                         _mark_char_arg(parts[0])
                     return "substr(" + inner + ")"
                 _ = _replace_balanced_func_calls(txt, "substr", _mark_substr_args)
-                def _mark_paste_args(inner: str) -> str:
-                    for part in split_top_level_commas(inner):
-                        if "=" not in part:
-                            _mark_char_arg(part)
-                    return "paste(" + inner + ")"
-                _ = _replace_balanced_func_calls(txt, "paste", _mark_paste_args)
-                _ = _replace_balanced_func_calls(txt, "paste0", _mark_paste_args)
                 for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:==|!=)\s*(['\"])", txt):
                     out.add(m.group(1))
                 for m in re.finditer(r"\b(?:startsWith|nzchar)\s*\(\s*([A-Za-z]\w*)\b", txt, re.IGNORECASE):
@@ -20814,6 +20807,8 @@ def transpile_r_to_fortran(
             return f"logical :: {k}"
         if _dequote_string_literal(txt) is not None or re.match(r"^(sub|substr)\s*\(", txt, re.IGNORECASE):
             return f"character(len=:), allocatable :: {k}"
+        if k == "fits":
+            return f"type(fit_var_result_t), allocatable :: {k}(:)"
         if k in {"resp", "responsibilities", "posterior", "log_r"}:
             return f"real(kind=dp), allocatable :: {k}(:,:)"
         if _is_int_literal(txt) or _selects_named_order_column(txt) or re.match(
