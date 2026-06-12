@@ -3829,6 +3829,63 @@ def classify_vars(
                     return True
         return False
 
+    def scalar_index_assignment_kind(target: str, ss: list[object]) -> str | None:
+        kind: str | None = None
+        seen = False
+        for st in ss:
+            if isinstance(st, Assign):
+                if st.name != target:
+                    continue
+                seen = True
+                m_idx = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", st.expr.strip())
+                if m_idx is None:
+                    return None
+                base_idx = m_idx.group(1)
+                idx_rhs = m_idx.group(2).strip()
+                if "," in idx_rhs or ":" in idx_rhs or _split_top_level_colon(idx_rhs) is not None:
+                    return None
+                cur = "integer" if base_idx in int_arrays else "real" if (base_idx in real_arrays or base_idx in known_arrays) else None
+                if cur is None:
+                    return None
+                if kind is None:
+                    kind = cur
+                elif kind != cur:
+                    return None
+            elif isinstance(st, ForStmt):
+                sub = scalar_index_assignment_kind(target, st.body)
+                if sub is not None:
+                    seen = True
+                    if kind is None:
+                        kind = sub
+                    elif kind != sub:
+                        return None
+            elif isinstance(st, IfStmt):
+                for sub_body in (st.then_body, st.else_body):
+                    sub = scalar_index_assignment_kind(target, sub_body)
+                    if sub is not None:
+                        seen = True
+                        if kind is None:
+                            kind = sub
+                        elif kind != sub:
+                            return None
+            elif isinstance(st, WhileStmt):
+                sub = scalar_index_assignment_kind(target, st.body)
+                if sub is not None:
+                    seen = True
+                    if kind is None:
+                        kind = sub
+                    elif kind != sub:
+                        return None
+            elif isinstance(st, RepeatStmt):
+                sub = scalar_index_assignment_kind(target, st.body)
+                if sub is not None:
+                    seen = True
+                    if kind is None:
+                        kind = sub
+                    elif kind != sub:
+                        return None
+        return kind if seen else None
+
     for nm in list(integer_context_names):
         if nm in int_arrays and assigned_from_scalar_int_index(nm, stmts):
             int_arrays.discard(nm)
@@ -3840,6 +3897,20 @@ def classify_vars(
             continue
         ints.add(nm)
         real_scalars.discard(nm)
+        known_arrays.discard(nm)
+        params.pop(nm, None)
+    for nm in set(assign_counts):
+        scalar_kind = scalar_index_assignment_kind(nm, stmts)
+        if scalar_kind == "integer":
+            ints.add(nm)
+            real_scalars.discard(nm)
+        elif scalar_kind == "real":
+            real_scalars.add(nm)
+            ints.discard(nm)
+        else:
+            continue
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
         known_arrays.discard(nm)
         params.pop(nm, None)
     for nm in collect_int_vector_assignments(stmts):
@@ -4731,6 +4802,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 2
     if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)values", expr_l):
         return 1
+    if re.match(r"^uniroot\s*\(.*\)\s*(?:\$|%)\s*root\s*$", expr_l, re.IGNORECASE):
+        return 0
     if _split_top_level_token(expr, "%in%", from_right=True) is not None:
         return 1
     expr_f = r_expr_to_fortran(expr)
@@ -4853,6 +4926,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
             if fn_name in {"acf", "pacf", "ccf"}:
+                return 0
+            if fn_name == "uniroot":
                 return 0
             if fn_name in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
