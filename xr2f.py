@@ -3740,7 +3740,7 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
-                elif st.name in {"i", "j", "k", "it", "iter", "i0", "i1", "i2", "row1", "row2", "col1", "col2", "nfit", "max_order", "max_dot_assets", "max_dot_returns", "aic_dot_comp", "bic_dot_comp", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
+                elif st.name in {"i", "j", "k", "it", "iter", "i0", "i1", "i2", "row", "row1", "row2", "col1", "col2", "nfit", "nmodels", "max_order", "max_dot_assets", "max_dot_returns", "aic_dot_comp", "bic_dot_comp", "aic_row", "bic_row", "aic_p", "aic_q", "bic_p", "bic_q", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
                     ints.add(st.name)
                     params.pop(st.name, None)
                     known_arrays.discard(st.name)
@@ -5053,6 +5053,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "scale":
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
+            if fn_name == "diff":
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 1
             if fn_name == "solve":
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
                 if b_src is None:
@@ -5134,6 +5137,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             p0 = p.strip()
             if not p0:
                 continue
+            if re.match(r"^(?:drop|exact)\s*=", p0, re.IGNORECASE):
+                continue
             if _split_top_level_colon(p0) is None:
                 fixed += 1
         if base_rank > 0:
@@ -5150,7 +5155,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 3
     if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*lag$", expr_l):
         return 1
-    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:ar|aic)$", expr_l):
+    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*ar$", expr_l):
         return 1
     if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:order|var\.pred)$", expr_l):
         return 0
@@ -5294,6 +5299,17 @@ def rename_conflicting_reused_vars(
                     var_ranks[st.name] = max(var_ranks.get(st.name, 0), 2)
                     out.append(st)
                     continue
+                m_self_matrix_subset = re.match(
+                    rf"^\s*{re.escape(st.name)}\s*\[(.*)\]\s*$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_self_matrix_subset is not None:
+                    parts_self_subset = _split_index_dims(m_self_matrix_subset.group(1).strip())
+                    if len(parts_self_subset) >= 2 and any(not p.strip() for p in parts_self_subset[:2]):
+                        var_ranks[st.name] = max(var_ranks.get(st.name, 0), 2)
+                        out.append(st)
+                        continue
                 rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
                 if re.match(r"^\s*as\.numeric\s*\(", st.expr, re.IGNORECASE) and "%*%" in st.expr:
                     rhs_rank = 1
@@ -15199,7 +15215,7 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
     ints: set[str] = set()
     for a in fn.args:
         dflt = fn.defaults.get(a, "").strip()
-        if a in {"n", "p", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
+        if a in {"n", "p", "q", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
             ints.add(a)
     body_no_ret = fn.body if fn.body else []
     if body_no_ret:
@@ -17685,6 +17701,9 @@ def transpile_r_to_fortran(
         "lm_anova_dfs_by_fit": {},
         "aov_fits": set(),
         "return_array_fns": set(fn_return_array_kind.keys()),
+        "named_vector_name_exprs": collect_names_sources(stmts),
+        "matrix_colname_exprs": collect_colname_sources(stmts),
+        "matrix_rowname_exprs": collect_rownames_sources(stmts),
     }
     helper_ctx_main: dict[str, object] = {
         "has_r_mod": ("r_mod" in helper_modules),
