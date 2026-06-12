@@ -60,6 +60,8 @@ _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _CSV_HEADER_SOURCES: dict[str, str] = {}
+_SCALE_SOURCE_BY_RESULT: dict[str, str] = {}
+_SCALE_ATTRS_BY_RESULT: dict[str, tuple[str | None, str | None]] = {}
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
 _NLM_OBJECTIVE_NAMES: set[str] = set()
 _NLM_CLOSURE_WRAPPERS: dict[str, dict[str, object]] = {}
@@ -648,7 +650,7 @@ def _looks_matrix_expr(expr: str) -> bool:
     c = parse_call_text(t)
     if c is None:
         return False
-    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol"}:
+    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol", "scale"}:
         return True
     if c[0].lower() in {"forwardsolve", "backsolve"}:
         rhs_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", c[2].get("x", "")).strip()
@@ -7048,12 +7050,57 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"apply_col_cumsum({r_expr_to_fortran(x_src)})"
         if margin_txt in {"2", "2L"} and fun_name in {"sd", "r_sd"}:
             return f"apply_col_sd(real({r_expr_to_fortran(x_src)}, kind=dp))"
+    if c_usr is not None and c_usr[0].lower() == "attr":
+        _nm_attr, pos_attr, kw_attr = c_usr
+        obj_src = pos_attr[0].strip() if pos_attr else kw_attr.get("x", "").strip()
+        which_src = pos_attr[1].strip() if len(pos_attr) >= 2 else kw_attr.get("which", "").strip()
+        which_lit = _dequote_string_literal(which_src)
+        src_scale = _SCALE_SOURCE_BY_RESULT.get(obj_src.lower())
+        if src_scale is not None and which_lit in {"scaled:center", "scaled:scale"}:
+            src_f = r_expr_to_fortran(src_scale)
+            src_real = f"real({src_f}, kind=dp)"
+            if which_lit == "scaled:center":
+                if _looks_matrix_expr(src_scale):
+                    return f"sum({src_real}, dim=1) / real(size({src_f}, 1), kind=dp)"
+                return f"[(sum({src_real}) / real(size({src_f}), kind=dp))]"
+            if _looks_matrix_expr(src_scale):
+                return f"apply_col_sd({src_real})"
+            return f"[sd({src_real})]"
     if c_usr is not None and c_usr[0].lower() == "scale":
         _nm_sc, pos_sc, kw_sc = c_usr
         x_src = pos_sc[0] if pos_sc else kw_sc.get("x", "")
         if not x_src:
             raise NotImplementedError("scale requires x argument")
-        return f"scale(real({r_expr_to_fortran(x_src)}, kind=dp))"
+        x_f = r_expr_to_fortran(x_src)
+        center_src = kw_sc.get("center")
+        scale_src = kw_sc.get("scale")
+        if center_src is None and len(pos_sc) >= 2:
+            center_src = pos_sc[1]
+        if scale_src is None and len(pos_sc) >= 3:
+            scale_src = pos_sc[2]
+        args_sc = [f"real({x_f}, kind=dp)"]
+        if center_src is not None and scale_src is not None:
+            center_txt = center_src.strip()
+            scale_txt = scale_src.strip()
+            center_bool = center_txt.upper() in {"TRUE", "FALSE"}
+            scale_bool = scale_txt.upper() in {"TRUE", "FALSE"}
+            if center_bool and scale_bool:
+                args_sc.append(f"center={r_expr_to_fortran(center_txt)}")
+                args_sc.append(f"scale={r_expr_to_fortran(scale_txt)}")
+                return f"scale({', '.join(args_sc)})"
+            center_f = r_expr_to_fortran(center_txt)
+            scale_f = r_expr_to_fortran(scale_txt)
+            if _looks_matrix_expr(x_src):
+                return (
+                    f"(real({x_f}, kind=dp) - spread(real({center_f}, kind=dp), dim=1, "
+                    f"ncopies=size({x_f},1))) / spread(real({scale_f}, kind=dp), dim=1, "
+                    f"ncopies=size({x_f},1))"
+                )
+        if center_src is not None:
+            args_sc.append(f"center={r_expr_to_fortran(center_src.strip())}")
+        if scale_src is not None:
+            args_sc.append(f"scale={r_expr_to_fortran(scale_src.strip())}")
+        return f"scale({', '.join(args_sc)})"
     if c_usr is not None and c_usr[0].lower() == "sort":
         _nm_sort, pos_sort, kw_sort = c_usr
         x_src = pos_sort[0] if pos_sort else kw_sort.get("x", "")
@@ -7812,6 +7859,11 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is not None and m_src is not None and st_src is not None:
             x_f = r_expr_to_fortran(x_src)
             st_f = r_expr_to_fortran(st_src)
+            def _paren_sweep_operand(v: str) -> str:
+                vv = v.strip()
+                if any(_split_top_level_token(vv, op, from_right=True) is not None for op in ["+", "-", "*", "/"]):
+                    return f"({vv})"
+                return vv
             m_t = m_src.strip()
             fn_t = fn_src.strip().strip("\"'") if fn_src is not None else "+"
             is_rank3_sweep = x_src.strip().lower() in _KNOWN_RANK3_NAMES
@@ -7834,9 +7886,9 @@ def r_expr_to_fortran(expr: str) -> str:
             if fn_t == "-":
                 return f"{x_f} - {rhs}"
             if fn_t == "*":
-                return f"{x_f} * {rhs}"
+                return f"{_paren_sweep_operand(x_f)} * {_paren_sweep_operand(rhs)}"
             if fn_t == "/":
-                return f"{x_f} / {rhs}"
+                return f"{_paren_sweep_operand(x_f)} / {_paren_sweep_operand(rhs)}"
             return f"{r_expr_to_fortran(fn_t)}(real({x_f}, kind=dp), real({rhs}, kind=dp))"
     c_back = parse_call_text(s)
     if c_back is not None and c_back[0].lower() == "backsolve":
@@ -8665,6 +8717,9 @@ def r_expr_to_fortran(expr: str) -> str:
             return ".true."
         return ".true." if re.match(r"^[A-Za-z]\w*$", txt) and txt.lower() in _KNOWN_CHAR_VECTOR_NAMES else ".false."
     s = _replace_balanced_func_calls(s, "is.character", _is_character_to_fortran)
+    def _is_matrix_to_fortran(inner: str) -> str:
+        return ".true." if _looks_matrix_expr(inner.strip()) else ".false."
+    s = _replace_balanced_func_calls(s, "is.matrix", _is_matrix_to_fortran)
     s = _replace_balanced_func_calls(
         s,
         "complete.cases",
@@ -10477,11 +10532,80 @@ def emit_stmts(
         _wstmt(f'write(*,"({scalar_fmt})") ({expr_f},{var}={lo},{hi})', ss[0].comment)
         return True
 
+    def _scale_print_attr_exprs(expr_src: str) -> tuple[str | None, str | None, str | None] | None:
+        raw = fscan.strip_redundant_outer_parens_expr(expr_src.strip())
+        c_scale = parse_call_text(raw)
+        if c_scale is not None and c_scale[0].lower() == "scale":
+            x_src = c_scale[1][0].strip() if c_scale[1] else c_scale[2].get("x", "").strip()
+            center_src = c_scale[2].get("center")
+            scale_src = c_scale[2].get("scale")
+            if center_src is None and len(c_scale[1]) >= 2:
+                center_src = c_scale[1][1].strip()
+            if scale_src is None and len(c_scale[1]) >= 3:
+                scale_src = c_scale[1][2].strip()
+            return (x_src or None, center_src, scale_src)
+        if re.fullmatch(r"[A-Za-z]\w*", raw):
+            src = _SCALE_SOURCE_BY_RESULT.get(raw.lower())
+            if src is not None:
+                center_src, scale_src = _SCALE_ATTRS_BY_RESULT.get(raw.lower(), (None, None))
+                return (src, center_src, scale_src)
+        return None
+
+    def _emit_scale_print_attrs(expr_src: str, comment: str) -> None:
+        info = _scale_print_attr_exprs(expr_src)
+        if info is None:
+            return
+        x_src, center_src, scale_src = info
+        if not x_src:
+            return
+        x_f = r_expr_to_fortran(x_src)
+        x_real = f"real({x_f}, kind=dp)"
+
+        def _attr_vec(src_opt: str | None, attr_name: str) -> str | None:
+            txt = (src_opt or "TRUE").strip()
+            if txt.upper() == "FALSE":
+                return None
+            if txt.upper() == "TRUE":
+                if attr_name == "scaled:center":
+                    if _looks_matrix_expr(x_src):
+                        return f"sum({x_real}, dim=1) / real(size({x_f}, 1), kind=dp)"
+                    return f"[(sum({x_real}) / real(size({x_f}), kind=dp))]"
+                if _looks_matrix_expr(x_src):
+                    return f"apply_col_sd({x_real})"
+                return f"[sd({x_real})]"
+            return f"real({r_expr_to_fortran(txt)}, kind=dp)"
+
+        center_f = _attr_vec(center_src, "scaled:center")
+        scale_f = _attr_vec(scale_src, "scaled:scale")
+        if center_f is not None:
+            _wstmt("write(*,'(a)') 'attr(,\"scaled:center\")'", comment)
+            _wstmt(f"call print_real_vector({center_f})", "")
+            need_r_mod.add("print_real_vector")
+        if scale_f is not None:
+            _wstmt("write(*,'(a)') 'attr(,\"scaled:scale\")'", comment)
+            _wstmt(f"call print_real_vector({scale_f})", "")
+            need_r_mod.add("print_real_vector")
+
     for st in stmts:
         if isinstance(st, CommentStmt):
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
+            c_scale_track = parse_call_text(st.expr.strip())
+            if c_scale_track is not None and c_scale_track[0].lower() == "scale":
+                x_scale_src = c_scale_track[1][0].strip() if c_scale_track[1] else c_scale_track[2].get("x", "").strip()
+                if x_scale_src:
+                    _SCALE_SOURCE_BY_RESULT[st.name.lower()] = x_scale_src
+                    center_scale_src = c_scale_track[2].get("center")
+                    scale_scale_src = c_scale_track[2].get("scale")
+                    if center_scale_src is None and len(c_scale_track[1]) >= 2:
+                        center_scale_src = c_scale_track[1][1].strip()
+                    if scale_scale_src is None and len(c_scale_track[1]) >= 3:
+                        scale_scale_src = c_scale_track[1][2].strip()
+                    _SCALE_ATTRS_BY_RESULT[st.name.lower()] = (center_scale_src, scale_scale_src)
+            else:
+                _SCALE_SOURCE_BY_RESULT.pop(st.name.lower(), None)
+                _SCALE_ATTRS_BY_RESULT.pop(st.name.lower(), None)
             m_diag_lhs = re.match(r"^diag\s*\(\s*([A-Za-z]\w*)\s*\)$", st.name.strip(), re.IGNORECASE)
             if m_diag_lhs is not None:
                 mat_nm = r_expr_to_fortran(m_diag_lhs.group(1))
@@ -11632,6 +11756,7 @@ def emit_stmts(
                             o.w("end associate")
                             o.pop()
                             o.w("end block")
+                        _emit_scale_print_attrs(one, st.comment)
                         continue
                     one_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", one, flags=re.IGNORECASE)
                     c_one = parse_call_text(one_call_src)
@@ -17052,13 +17177,15 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
-    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES
+    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
     _EXPANDED_DATA_FRAME_ALIASES = {}
     _CSV_HEADER_SOURCES = {}
+    _SCALE_SOURCE_BY_RESULT = {}
+    _SCALE_ATTRS_BY_RESULT = {}
     _LIST_FIELD_NAME_ALIASES = {}
     _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
