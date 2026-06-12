@@ -1411,6 +1411,13 @@ def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
             break
         s0 = i + m.start()
         e0 = i + m.end()
+        if (
+            (s0 > 0 and (expr[s0 - 1].isalnum() or expr[s0 - 1] == "_"))
+            or (e0 < n and (expr[e0].isalnum() or expr[e0] == "_"))
+        ):
+            out.append(expr[i:e0])
+            i = e0
+            continue
         if s0 > 0 and expr[s0 - 1] == ".":
             out.append(expr[i:e0])
             i = e0
@@ -8625,7 +8632,7 @@ def r_expr_to_fortran(expr: str) -> str:
     def _length_repl(inner: str) -> str:
         txt = inner.strip()
         ft = r_expr_to_fortran(txt)
-        if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(:,:,:,", ft):
+        if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(\s*:\s*,\s*:\s*,\s*:\s*,", ft):
             return f"nested_matrix_list_len({ft})"
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?$", ft) and ft.split("%")[-1].lower() == "a_list":
             return f"size({ft}, 4)"
@@ -8909,13 +8916,23 @@ def r_expr_to_fortran(expr: str) -> str:
         )
 
     def _sum_to_fortran(inner: str) -> str:
-        x_src, na_rm = _split_reduction_args(inner)
+        parts_sum = split_top_level_commas(inner)
+        dim_src = None
+        kept_sum: list[str] = []
+        for part_sum in parts_sum:
+            m_dim_sum = re.match(r"^\s*dim\s*=\s*(.+)$", part_sum.strip(), re.IGNORECASE)
+            if m_dim_sum is not None:
+                dim_src = m_dim_sum.group(1).strip()
+            else:
+                kept_sum.append(part_sum)
+        x_src, na_rm = _split_reduction_args(", ".join(kept_sum))
         inner_f = r_expr_to_fortran(x_src)
+        dim_suffix = f", dim={_int_bound_expr(r_expr_to_fortran(dim_src))}" if dim_src is not None else ""
         if _is_logical_reduction_arg(x_src, inner_f):
-            return f"sum(merge(1, 0, {inner_f}))"
+            return f"sum(merge(1, 0, {inner_f}){dim_suffix})"
         if na_rm:
-            return f"sum({_non_na_pack_expr(inner_f)})"
-        return f"sum({inner_f})"
+            return f"sum({_non_na_pack_expr(inner_f)}{dim_suffix})"
+        return f"sum({inner_f}{dim_suffix})"
 
     s = _replace_balanced_func_calls(
         s,
@@ -9990,7 +10007,11 @@ def emit_stmts(
             return 1
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*var\.pred\b", t):
             return 0
-        if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*order\b", t):
+        m_order_field_rank = re.match(r"^([A-Za-z]\w*)\s*(?:\$|%)\s*order\b", t)
+        if m_order_field_rank is not None:
+            root_order_rank = m_order_field_rank.group(1)
+            if object_list_vars.get(root_order_rank) == "simulate_ms_varp_result_t":
+                return 1
             return 0
         if m_field_print is not None and m_field_print.group(1).lower() == "rank":
             return 0
@@ -18871,8 +18892,16 @@ def transpile_r_to_fortran(
             pbody.w(f"type({tn}) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
+    if list_vars:
+        existing_object_vars = helper_ctx_main.get("object_list_vars")
+        merged_object_vars = dict(existing_object_vars) if isinstance(existing_object_vars, dict) else {}
+        merged_object_vars.update(list_vars)
+        helper_ctx_main["object_list_vars"] = merged_object_vars
     if main_object_list_vars:
-        helper_ctx_main["object_list_vars"] = dict(main_object_list_vars)
+        existing_object_vars = helper_ctx_main.get("object_list_vars")
+        merged_object_vars = dict(existing_object_vars) if isinstance(existing_object_vars, dict) else {}
+        merged_object_vars.update(main_object_list_vars)
+        helper_ctx_main["object_list_vars"] = merged_object_vars
         _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in main_object_list_vars)
     if t_test_vars:
         helper_ctx_main["t_test_vars"] = set(t_test_vars)
