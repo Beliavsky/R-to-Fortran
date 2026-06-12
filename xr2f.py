@@ -54,6 +54,7 @@ _FIT_TERM_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
 _ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
+_LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
@@ -5845,6 +5846,17 @@ def _list_return_specs(funcs: list[FuncDef]) -> dict[str, ListReturnSpec]:
     return specs
 
 
+def _list_field_aliases_from_specs(specs: dict[str, ListReturnSpec]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for spec in specs.values():
+        fields = {_sanitize_fortran_kwarg_name(str(k)) for k in spec.root_fields}
+        for field in fields:
+            m = re.match(r"^(.+)_\d+$", field)
+            if m is not None and m.group(1) not in fields:
+                aliases.setdefault(m.group(1), field)
+    return aliases
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
@@ -8911,6 +8923,13 @@ def r_expr_to_fortran(expr: str) -> str:
             return m.group(0)
 
         s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)\b", _repl_expanded_df_field, s)
+    if _LIST_FIELD_NAME_ALIASES:
+        def _repl_list_field_alias(m: re.Match[str]) -> str:
+            obj = m.group(1)
+            field = _sanitize_fortran_kwarg_name(m.group(2))
+            return f"{obj}${_LIST_FIELD_NAME_ALIASES.get(field, field)}"
+
+        s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)\b", _repl_list_field_alias, s)
     s = s.replace("$", "%")
     s = s.replace("@", "%")
     s = re.sub(
@@ -13510,8 +13529,10 @@ def emit_function(
                 used_fields.add(_sanitize_fortran_kwarg_name(m.group(1)))
         if not used_fields:
             return None
+        used_fields_resolved = {_LIST_FIELD_NAME_ALIASES.get(f, f) for f in used_fields}
         for spec_name, spec in list_specs.items():
-            if used_fields <= set(spec.root_fields.keys()):
+            spec_fields = {_sanitize_fortran_kwarg_name(str(k)) for k in spec.root_fields}
+            if used_fields <= spec_fields or used_fields_resolved <= spec_fields:
                 return _type_name_for_path(spec_name, ())
         return None
 
@@ -16443,7 +16464,7 @@ def transpile_r_to_fortran(
     global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
-    global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS
+    global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
@@ -16451,6 +16472,7 @@ def transpile_r_to_fortran(
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
     _EXPANDED_DATA_FRAME_ALIASES = {}
+    _LIST_FIELD_NAME_ALIASES = {}
     _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
     _TABLE_LABELS = {}
@@ -16598,6 +16620,7 @@ def transpile_r_to_fortran(
                 _ARRAY_DIM_LABELS[st_adl.name.lower()] = new_labs
                 changed_dimlabs = True
     list_specs = _list_return_specs(funcs)
+    _LIST_FIELD_NAME_ALIASES = _list_field_aliases_from_specs(list_specs)
     fn_matrix_col_labels = {f.name: collect_colname_labels(f.body) for f in funcs}
     fn_alias_return_type: dict[str, str] = {}
     for f_alias in funcs:
