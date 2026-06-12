@@ -61,6 +61,7 @@ _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
 _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "strsplit": {"name": "strsplit", "category": "subset_semantics", "reason": "partial fixed-delimiter support; vector input/list semantics are not fully preserved"},
+    "list.files": {"name": "list.files", "category": "subset_semantics", "reason": "platform command backed subset; pattern handling is substring/glob-like rather than full R regex"},
     "arima": {"name": "arima", "category": "approximate_algorithm", "reason": "approximate fitter/predictor; does not reproduce stats::arima exactly"},
     "armaacf": {"name": "ARMAacf", "category": "approximate_algorithm", "reason": "subset implementation; output and edge-case behavior may differ from R"},
     "acf": {"name": "acf", "category": "subset_semantics", "reason": "subset implementation; output/lag handling may differ from R"},
@@ -6475,6 +6476,23 @@ def r_expr_to_fortran(expr: str) -> str:
         if lam_src is None and len(pos_rp0) >= 2:
             lam_src = pos_rp0[1]
         return f"rpois({_int_bound_expr(r_expr_to_fortran(n_src))}, {r_expr_to_fortran(lam_src or '1.0')})"
+    c_list_files0 = parse_call_text(s)
+    if c_list_files0 is not None and c_list_files0[0].lower() in {"list.files", "list_files"}:
+        _nm_lf0, pos_lf0, kw_lf0 = c_list_files0
+        args_lf0: list[str] = []
+        path_src = pos_lf0[0] if pos_lf0 else kw_lf0.get("path")
+        pattern_src = kw_lf0.get("pattern")
+        full_names_src = kw_lf0.get("full.names", kw_lf0.get("full_names"))
+        recursive_src = kw_lf0.get("recursive")
+        if path_src is not None:
+            args_lf0.append(f"path={r_expr_to_fortran(path_src)}")
+        if pattern_src is not None:
+            args_lf0.append(f"pattern={r_expr_to_fortran(pattern_src)}")
+        if full_names_src is not None:
+            args_lf0.append(f"full_names={r_expr_to_fortran(full_names_src)}")
+        if recursive_src is not None:
+            args_lf0.append(f"recursive={r_expr_to_fortran(recursive_src)}")
+        return f"list_files({', '.join(args_lf0)})"
     # Preserve operator precedence: parse top-level scalar +/- before scalar division.
     # Example: m4 / sd**4 - 3.0 must map to (m4 / sd**4) - 3.0, not m4 / (sd**4 - 3.0).
     addsub = _find_top_level_addsub(s)
@@ -14811,6 +14829,9 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if low.startswith("strsplit("):
                     out.add(st.name)
                     continue
+                if low.startswith("list.files(") or low.startswith("list_files("):
+                    out.add(st.name)
+                    continue
                 c_rhs = parse_call_text(rhs)
                 if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
                     out.add(st.name)
@@ -19474,6 +19495,7 @@ def transpile_r_to_fortran(
         "r_rep_char",
         "r_rep_int",
         "char_join",
+        "list_files",
         "strsplit_fixed",
         "toupper",
         "tolower",
