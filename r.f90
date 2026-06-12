@@ -873,15 +873,15 @@ contains
 
 function r_character(n) result(out)
 ! Allocate an R-like character vector initialized to empty strings.
-integer, intent(in) :: n
+integer, intent(in) :: n ! requested vector length
 character(len=:), allocatable :: out(:)
 allocate(character(len=0) :: out(max(0, n)))
 end function r_character
 
 pure function r_drop_index_real(x, k) result(out)
 ! Return a vector with one or more positions removed.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: k
+real(kind=dp), intent(in) :: x(:) ! source vector
+integer, intent(in) :: k ! position to remove
 real(kind=dp), allocatable :: out(:)
 logical, allocatable :: keep(:)
 integer :: n, m
@@ -900,8 +900,8 @@ end function r_drop_index_real
 
 pure function r_drop_index_int(x, k) result(out)
 ! Return a vector with one or more positions removed.
-integer, intent(in) :: x(:)
-integer, intent(in) :: k
+integer, intent(in) :: x(:) ! source vector
+integer, intent(in) :: k ! position to remove
 integer, allocatable :: out(:)
 logical, allocatable :: keep(:)
 integer :: n, m
@@ -920,8 +920,8 @@ end function r_drop_index_int
 
 pure function r_drop_indices_real(x, drop) result(out)
 ! Return a vector with one or more positions removed.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: drop(:)
+real(kind=dp), intent(in) :: x(:) ! source vector
+integer, intent(in) :: drop(:) ! positions to remove
 real(kind=dp), allocatable :: out(:)
 logical, allocatable :: keep(:)
 integer :: i, n, m
@@ -942,7 +942,7 @@ end function r_drop_indices_real
 
 pure function r_drop_indices_int(x, drop) result(out)
 ! Return a vector with one or more positions removed.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input values
 integer, intent(in) :: drop(:)
 integer, allocatable :: out(:)
 logical, allocatable :: keep(:)
@@ -965,31 +965,31 @@ end function r_drop_indices_int
 
 subroutine set_print_int_like(flag)
 ! Enable/disable integer-like rendering for real matrix printing.
-logical, intent(in) :: flag
+logical, intent(in) :: flag ! logical flag
 print_int_like_default = flag
 end subroutine set_print_int_like
 
 subroutine set_print_int_like_tol(tol)
 ! Set tolerance used for integer-like real rendering.
-real(kind=dp), intent(in) :: tol
+real(kind=dp), intent(in) :: tol ! convergence tolerance
 if (tol > 0.0_dp) print_int_like_tol = tol
 end subroutine set_print_int_like_tol
 
 subroutine set_recycle_warn(flag)
 ! Enable/disable warnings for non-multiple recycling lengths.
-logical, intent(in) :: flag
+logical, intent(in) :: flag ! logical flag
 recycle_warn_default = flag
 end subroutine set_recycle_warn
 
 subroutine set_recycle_stop(flag)
 ! Enable/disable error stop for non-multiple recycling lengths.
-logical, intent(in) :: flag
+logical, intent(in) :: flag ! logical flag
 recycle_stop_default = flag
 end subroutine set_recycle_stop
 
 subroutine set_seed_int(seed)
 ! Set Fortran RNG seed deterministically from a single integer.
-integer, intent(in) :: seed
+integer, intent(in) :: seed ! random seed
 #ifdef XR2F_USE_R_RNG
 call xr2f_r_set_seed(int(seed, kind=c_int))
 #else
@@ -1011,8 +1011,8 @@ end subroutine set_seed_int
 
 function kmeans_vec(x, centers, nstart) result(out)
 ! Minimal 1D k-means helper: returns centers and 1-based cluster ids.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: centers
+real(kind=dp), intent(in) :: x(:) ! input values
+integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:), c_new(:), sums(:), best_withinss(:), withinss(:), best_centers(:)
@@ -1161,8 +1161,8 @@ end function kmeans_vec
 
 function kmeans_mat(x, centers, nstart) result(out)
 ! Minimal row-wise k-means helper for matrix observations.
-real(kind=dp), intent(in) :: x(:,:)
-integer, intent(in) :: centers
+real(kind=dp), intent(in) :: x(:,:) ! input data matrix
+integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:,:), c_new(:,:), sums(:,:), best_centers(:,:), best_withinss(:), withinss(:)
@@ -1300,8 +1300,9 @@ end function kmeans_mat
 
 pure function dist_mat(x, method) result(out)
 ! Compute pairwise distance matrix for observations in rows.
-real(kind=dp), intent(in) :: x(:,:)
-character(len=*), intent(in), optional :: method
+! Valid method values: "euclidean" (default), "manhattan", "maximum", "canberra".
+real(kind=dp), intent(in) :: x(:,:) ! observations by rows, variables by columns
+character(len=*), intent(in), optional :: method ! distance metric name
 real(kind=dp), allocatable :: out(:,:)
 integer :: i, j, k, n, p
 real(kind=dp) :: acc
@@ -1352,8 +1353,9 @@ end function dist_mat
 
 function hclust_complete(d, method) result(out)
 ! Minimal hierarchical clustering helper using complete linkage on a distance matrix.
-real(kind=dp), intent(in) :: d(:,:)
-character(len=*), intent(in), optional :: method
+! Valid method value: "complete" (default); other values are treated as "complete".
+real(kind=dp), intent(in) :: d(:,:) ! square distance matrix
+character(len=*), intent(in), optional :: method ! linkage method name
 type(hclust_result_t) :: out
 logical, allocatable :: alive(:)
 real(kind=dp), allocatable :: cdist(:,:)
@@ -1457,8 +1459,9 @@ end function hclust_complete
 
 function cutree_f90(fit, k) result(group)
 ! Cut dendrogram at a target number of groups.
-type(hclust_result_t), intent(in) :: fit
-integer, intent(in), optional :: k
+! If k is absent, return one group; provided k is clamped to the range 1:n.
+type(hclust_result_t), intent(in) :: fit ! hierarchical clustering result
+integer, intent(in), optional :: k ! requested number of groups
 integer, allocatable :: group(:)
 integer, allocatable :: rep_map(:), parent(:), merge_rep(:)
 integer :: n, nmerge, target_groups, nmerge_apply
@@ -1553,7 +1556,7 @@ end function cutree_f90
 
 pure function max_col(x, ties_method) result(idx)
 ! Return 1-based column index of row-wise maxima (ties -> first).
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 character(len=*), intent(in), optional :: ties_method
 integer, allocatable :: idx(:)
 integer :: i, j, n, k, jbest
@@ -1583,7 +1586,7 @@ end function max_col
 
 function tabulate_int(x, nbins) result(out)
 ! Count occurrences of integer labels 1..nbins.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, intent(in) :: nbins
 integer, allocatable :: out(:)
 integer :: i, b
@@ -1597,7 +1600,7 @@ end function tabulate_int
 
 function tabulate_real(x, nbins) result(out)
 ! Count occurrences after integer-coding real labels.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nbins
 integer, allocatable :: out(:)
 integer :: i, b
@@ -1611,7 +1614,8 @@ end function tabulate_real
 
 function table2_int(x, y, nx, ny) result(out)
 ! Count paired integer labels into an nx-by-ny contingency table.
-integer, intent(in) :: x(:), y(:)
+integer, intent(in) :: x(:) ! input vector
+integer, intent(in) :: y(:) ! response values
 integer, intent(in) :: nx, ny
 integer, allocatable :: out(:,:)
 integer :: i, a, b, n
@@ -1629,7 +1633,7 @@ end function table2_int
 
 function prop_table_int_vec(x, margin) result(out)
 ! Convert integer counts to proportions.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, intent(in), optional :: margin
 real(kind=dp), allocatable :: out(:)
 integer :: s
@@ -1644,7 +1648,7 @@ end function prop_table_int_vec
 
 function prop_table_int_mat(x, margin) result(out)
 ! Convert integer contingency tables to overall, row, or column proportions.
-integer, intent(in) :: x(:,:)
+integer, intent(in) :: x(:,:) ! input matrix
 integer, intent(in), optional :: margin
 real(kind=dp), allocatable :: out(:,:)
 integer :: i, j, s
@@ -1693,7 +1697,8 @@ end function nested_matrix_list_len
 
 pure function match_int(x, table) result(out)
 ! Return first 1-based match positions, or a sentinel for NA.
-integer, intent(in) :: x(:), table(:)
+integer, intent(in) :: x(:) ! values to match
+integer, intent(in) :: table(:) ! lookup table
 integer, allocatable :: out(:)
 integer :: i, j
 allocate(out(size(x)))
@@ -1710,7 +1715,8 @@ end function match_int
 
 pure function match_real(x, table) result(out)
 ! Return first 1-based match positions, or a sentinel for NA.
-real(kind=dp), intent(in) :: x(:), table(:)
+real(kind=dp), intent(in) :: x(:) ! values to match
+real(kind=dp), intent(in) :: table(:) ! lookup table
 integer, allocatable :: out(:)
 integer :: i, j
 allocate(out(size(x)))
@@ -1727,7 +1733,8 @@ end function match_real
 
 pure function match_char(x, table) result(out)
 ! Return first 1-based match positions, or a sentinel for NA.
-character(len=*), intent(in) :: x(:), table(:)
+character(len=*), intent(in) :: x(:) ! strings to match
+character(len=*), intent(in) :: table(:) ! lookup table
 integer, allocatable :: out(:)
 integer :: i, j
 allocate(out(size(x)))
@@ -1744,7 +1751,8 @@ end function match_char
 
 pure function r_in_int(x, table) result(out)
 ! Test membership for int values.
-integer, intent(in) :: x(:), table(:)
+integer, intent(in) :: x(:) ! values to test
+integer, intent(in) :: table(:) ! candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1755,7 +1763,8 @@ end function r_in_int
 
 pure function r_in_real(x, table) result(out)
 ! Test membership for real values.
-real(kind=dp), intent(in) :: x(:), table(:)
+real(kind=dp), intent(in) :: x(:) ! values to test
+real(kind=dp), intent(in) :: table(:) ! candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1766,8 +1775,8 @@ end function r_in_real
 
 pure function r_in_int_real(x, table) result(out)
 ! Test membership for int real values.
-integer, intent(in) :: x(:)
-real(kind=dp), intent(in) :: table(:)
+integer, intent(in) :: x(:) ! integer values to test
+real(kind=dp), intent(in) :: table(:) ! real candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1778,8 +1787,8 @@ end function r_in_int_real
 
 pure function r_in_real_int(x, table) result(out)
 ! Test membership for real int values.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: table(:)
+real(kind=dp), intent(in) :: x(:) ! real values to test
+integer, intent(in) :: table(:) ! integer candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1790,39 +1799,40 @@ end function r_in_real_int
 
 pure function r_in_int_scalar(x, table) result(out)
 ! Test membership for int scalar values.
-integer, intent(in) :: x
-integer, intent(in) :: table(:)
+integer, intent(in) :: x ! value to test
+integer, intent(in) :: table(:) ! candidate set
 logical :: out
 out = has_int_value(table, size(table), x)
 end function r_in_int_scalar
 
 pure function r_in_real_scalar(x, table) result(out)
 ! Test membership for real scalar values.
-real(kind=dp), intent(in) :: x
-real(kind=dp), intent(in) :: table(:)
+real(kind=dp), intent(in) :: x ! value to test
+real(kind=dp), intent(in) :: table(:) ! candidate set
 logical :: out
 out = has_real_value(table, size(table), x)
 end function r_in_real_scalar
 
 pure function r_in_int_scalar_real(x, table) result(out)
 ! Test membership for int scalar real values.
-integer, intent(in) :: x
-real(kind=dp), intent(in) :: table(:)
+integer, intent(in) :: x ! integer value to test
+real(kind=dp), intent(in) :: table(:) ! real candidate set
 logical :: out
 out = has_real_value(table, size(table), real(x, kind=dp))
 end function r_in_int_scalar_real
 
 pure function r_in_real_scalar_int(x, table) result(out)
 ! Test membership for real scalar int values.
-real(kind=dp), intent(in) :: x
-integer, intent(in) :: table(:)
+real(kind=dp), intent(in) :: x ! real value to test
+integer, intent(in) :: table(:) ! integer candidate set
 logical :: out
 out = has_int_value(table, size(table), nint(x)) .and. x == real(nint(x), kind=dp)
 end function r_in_real_scalar_int
 
 pure function r_in_char(x, table) result(out)
 ! Test membership for char values.
-character(len=*), intent(in) :: x(:), table(:)
+character(len=*), intent(in) :: x(:) ! strings to test
+character(len=*), intent(in) :: table(:) ! candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1833,7 +1843,8 @@ end function r_in_char
 
 pure function r_in_logical(x, table) result(out)
 ! Test membership for logical values.
-logical, intent(in) :: x(:), table(:)
+logical, intent(in) :: x(:) ! values to test
+logical, intent(in) :: table(:) ! candidate set
 logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
@@ -1844,7 +1855,9 @@ end function r_in_logical
 
 pure logical function has_int_value(x, n, value) result(out)
 ! Test whether a vector contains the requested int value.
-integer, intent(in) :: x(:), n, value
+integer, intent(in) :: x(:) ! candidate values
+integer, intent(in) :: n ! active candidate count
+integer, intent(in) :: value ! value to find
 integer :: i
 out = .false.
 do i = 1, min(n, size(x))
@@ -1857,8 +1870,9 @@ end function has_int_value
 
 pure logical function has_real_value(x, n, value) result(out)
 ! Test whether a vector contains the requested real value.
-real(kind=dp), intent(in) :: x(:), value
-integer, intent(in) :: n
+real(kind=dp), intent(in) :: x(:) ! candidate values
+integer, intent(in) :: n ! active candidate count
+real(kind=dp), intent(in) :: value ! value to find
 integer :: i
 out = .false.
 do i = 1, min(n, size(x))
@@ -1871,8 +1885,9 @@ end function has_real_value
 
 pure logical function has_char_value(x, n, value) result(out)
 ! Test whether a vector contains the requested char value.
-character(len=*), intent(in) :: x(:), value
-integer, intent(in) :: n
+character(len=*), intent(in) :: x(:) ! candidate strings
+integer, intent(in) :: n ! active candidate count
+character(len=*), intent(in) :: value ! string to find
 integer :: i
 out = .false.
 do i = 1, min(n, size(x))
@@ -1885,8 +1900,9 @@ end function has_char_value
 
 pure logical function has_logical_value(x, n, value) result(out)
 ! Test whether a vector contains the requested logical value.
-logical, intent(in) :: x(:), value
-integer, intent(in) :: n
+logical, intent(in) :: x(:) ! candidate values
+integer, intent(in) :: n ! active candidate count
+logical, intent(in) :: value ! value to find
 integer :: i
 out = .false.
 do i = 1, min(n, size(x))
@@ -1980,7 +1996,7 @@ end function unique_logical
 
 pure function duplicated_int(x, fromLast) result(out)
 ! Return duplicate flags for int values.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 logical, allocatable :: out(:)
 integer, allocatable :: seen(:)
@@ -2012,7 +2028,7 @@ end function duplicated_int
 
 pure function duplicated_real(x, fromLast) result(out)
 ! Return duplicate flags for real values.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 logical, allocatable :: out(:)
 real(kind=dp), allocatable :: seen(:)
@@ -2063,7 +2079,7 @@ end function duplicated_real
 
 pure function duplicated_char(x, fromLast) result(out)
 ! Return duplicate flags for char values.
-character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 logical, allocatable :: out(:)
 character(len=:), allocatable :: seen(:)
@@ -2097,7 +2113,7 @@ end function duplicated_char
 
 pure function duplicated_logical(x, fromLast) result(out)
 ! Return duplicate flags for logical values.
-logical, intent(in) :: x(:)
+logical, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 logical, allocatable :: out(:)
 logical, allocatable :: seen(:)
@@ -2129,7 +2145,7 @@ end function duplicated_logical
 
 pure function anyDuplicated_int(x, fromLast) result(out)
 ! Return the first duplicated position for int values.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 integer :: out, i
 logical, allocatable :: dup(:)
@@ -2145,7 +2161,7 @@ end function anyDuplicated_int
 
 pure function anyDuplicated_real(x, fromLast) result(out)
 ! Return the first duplicated position for real values.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 integer :: out, i
 logical, allocatable :: dup(:)
@@ -2161,7 +2177,7 @@ end function anyDuplicated_real
 
 pure function anyDuplicated_char(x, fromLast) result(out)
 ! Return the first duplicated position for char values.
-character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 integer :: out, i
 logical, allocatable :: dup(:)
@@ -2177,7 +2193,7 @@ end function anyDuplicated_char
 
 pure function anyDuplicated_logical(x, fromLast) result(out)
 ! Return the first duplicated position for logical values.
-logical, intent(in) :: x(:)
+logical, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: fromLast
 integer :: out, i
 logical, allocatable :: dup(:)
@@ -2397,8 +2413,8 @@ end function setequal_char
 
 function r_format_vec(x, digits, sep) result(out)
 ! Format a real vector like paste(sprintf("%.<digits>f", x), collapse=sep).
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: digits
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in) :: digits ! number of digits
 character(len=*), intent(in), optional :: sep
 character(len=:), allocatable :: out
 character(len=64) :: fmt, buf
@@ -2421,8 +2437,9 @@ end function r_format_vec
 
 subroutine maybe_warn_recycle(op, na, nb)
 ! Warn/stop when any vector recycling occurs (lengths differ).
-character(len=*), intent(in) :: op
-integer, intent(in) :: na, nb
+character(len=*), intent(in) :: op ! input string
+integer, intent(in) :: na ! integer argument
+integer, intent(in) :: nb ! integer argument
 integer :: nmax, nmin
 if ((.not. recycle_warn_default) .and. (.not. recycle_stop_default)) return
 nmax = max(na, nb)
@@ -2441,8 +2458,8 @@ end subroutine maybe_warn_recycle
 
 subroutine print_real_scalar(x, int_like)
 ! Print one real value using integer format when integer-like.
-real(kind=dp), intent(in) :: x
-logical, intent(in), optional :: int_like
+real(kind=dp), intent(in) :: x ! value to print
+logical, intent(in), optional :: int_like ! force integer-like formatting
 logical :: use_int_like, as_int
 integer(kind=int64) :: k
 real(kind=dp) :: tol
@@ -2465,8 +2482,8 @@ end subroutine print_real_scalar
 
 subroutine print_real_vector(x, int_like)
 ! Print one real vector; use integer format when all values are integer-like.
-real(kind=dp), intent(in) :: x(:)
-logical, intent(in), optional :: int_like
+real(kind=dp), intent(in) :: x(:) ! values to print
+logical, intent(in), optional :: int_like ! force integer-like formatting
 logical :: use_int_like, all_int
 integer :: i
 integer(kind=int64) :: k
@@ -2508,7 +2525,7 @@ end subroutine print_real_vector
 
 subroutine print_char_vector(x)
 ! Print char vector values in an R-like format.
-character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: x(:) ! input vector
 integer :: i
 do i = 1, size(x)
    write(*,"(a)", advance="no") trim(x(i))
@@ -2519,15 +2536,15 @@ end subroutine print_char_vector
 
 subroutine print_named_real_vector(x, names)
 ! Print named real vector values in an R-like format.
-real(kind=dp), intent(in) :: x(:)
-character(len=*), intent(in) :: names(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
+character(len=*), intent(in) :: names(:) ! display names
 call print_char_vector(names)
 call print_real_vector(x)
 end subroutine print_named_real_vector
 
 function nlm_stub(p, hessian) result(out)
 ! Support nlm-style optimization for stub.
-real(kind=dp), intent(in) :: p(:)
+real(kind=dp), intent(in) :: p(:) ! dimension count
 logical, intent(in), optional :: hessian
 type(nlm_result_t) :: out
 integer :: n
@@ -2545,9 +2562,9 @@ end function nlm_stub
 
 function nlm_optimize_scalar(fn, p, hessian, stepmax) result(out)
 ! Support nlm-style optimization for optimize scalar.
-procedure(nlm_objective_scalar) :: fn
-real(kind=dp), intent(in) :: p
-logical, intent(in), optional :: hessian
+procedure(nlm_objective_scalar) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p ! dimension count
+logical, intent(in), optional :: hessian ! logical flag
 real(kind=dp), intent(in), optional :: stepmax
 type(nlm_result_t) :: out
 real(kind=dp), allocatable :: pv(:)
@@ -2558,9 +2575,9 @@ end function nlm_optimize_scalar
 
 function nlm_optimize_vec(fn, p, hessian, stepmax) result(out)
 ! Support nlm-style optimization for optimize vec.
-procedure(nlm_objective_vec) :: fn
-real(kind=dp), intent(in) :: p(:)
-logical, intent(in), optional :: hessian
+procedure(nlm_objective_vec) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p(:) ! dimension count
+logical, intent(in), optional :: hessian ! logical flag
 real(kind=dp), intent(in), optional :: stepmax
 type(nlm_result_t) :: out
 integer :: n, iter, i
@@ -2610,9 +2627,9 @@ end function nlm_optimize_vec
 
 function nlm_optimize_scalar_impl(fn, p, hessian, stepmax) result(out)
 ! Support nlm-style optimization for optimize scalar impl.
-procedure(nlm_objective_scalar) :: fn
-real(kind=dp), intent(in) :: p(:)
-logical, intent(in), optional :: hessian
+procedure(nlm_objective_scalar) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p(:) ! dimension count
+logical, intent(in), optional :: hessian ! logical flag
 real(kind=dp), intent(in), optional :: stepmax
 type(nlm_result_t) :: out
 integer :: iter
@@ -2660,8 +2677,8 @@ end function nlm_optimize_scalar_impl
 
 function nlm_fd_grad_scalar(fn, x) result(g)
 ! Support nlm-style optimization for fd grad scalar.
-procedure(nlm_objective_scalar) :: fn
-real(kind=dp), intent(in) :: x
+procedure(nlm_objective_scalar) :: fn ! objective function
+real(kind=dp), intent(in) :: x ! evaluation point
 real(kind=dp) :: g, h
 h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x))
 g = (fn(x + h) - fn(x - h)) / (2.0_dp * h)
@@ -2669,9 +2686,9 @@ end function nlm_fd_grad_scalar
 
 subroutine nlm_fd_grad_vec(fn, x, g)
 ! Support nlm-style optimization for fd grad vec.
-procedure(nlm_objective_vec) :: fn
-real(kind=dp), intent(in) :: x(:)
-real(kind=dp), intent(out) :: g(:)
+procedure(nlm_objective_vec) :: fn ! objective function
+real(kind=dp), intent(in) :: x(:) ! evaluation point
+real(kind=dp), intent(out) :: g(:) ! gradient values
 real(kind=dp), allocatable :: xp(:), xm(:)
 integer :: i
 real(kind=dp) :: h
@@ -2688,9 +2705,9 @@ end subroutine nlm_fd_grad_vec
 
 subroutine nlm_fd_hessian_vec(fn, x, hess)
 ! Support nlm-style optimization for fd hessian vec.
-procedure(nlm_objective_vec) :: fn
-real(kind=dp), intent(in) :: x(:)
-real(kind=dp), intent(out) :: hess(:,:)
+procedure(nlm_objective_vec) :: fn ! objective function
+real(kind=dp), intent(in) :: x(:) ! evaluation point
+real(kind=dp), intent(out) :: hess(:,:) ! Hessian matrix
 real(kind=dp), allocatable :: xpp(:), xpm(:), xmp(:), xmm(:)
 integer :: i, j, n
 real(kind=dp) :: hi, hj
@@ -2715,7 +2732,7 @@ end subroutine nlm_fd_hessian_vec
 
 subroutine print_nlm_result(fit)
 ! Print nlm result values in an R-like format.
-type(nlm_result_t), intent(in) :: fit
+type(nlm_result_t), intent(in) :: fit ! input value
 write(*,"(a)")
 write(*,"(a)", advance="no") "$minimum"
 write(*,*)
@@ -2736,8 +2753,8 @@ end subroutine print_nlm_result
 
 subroutine print_table1(x, names)
 ! Print table1 values in an R-like format.
-integer, intent(in) :: x(:)
-character(len=*), intent(in) :: names(:)
+integer, intent(in) :: x(:) ! input vector
+character(len=*), intent(in) :: names(:) ! display names
 integer :: i
 do i = 1, min(size(x), size(names))
    write(*,'(a,1x)', advance='no') trim(names(i))
@@ -2751,8 +2768,9 @@ end subroutine print_table1
 
 subroutine print_table2_int(x, row_names, col_names)
 ! Print table2 int values in an R-like format.
-integer, intent(in) :: x(:,:)
-character(len=*), intent(in) :: row_names(:), col_names(:)
+integer, intent(in) :: x(:,:) ! input matrix
+character(len=*), intent(in) :: row_names(:) ! display names
+character(len=*), intent(in) :: col_names(:) ! display names
 integer :: i, j
 write(*,'(12x)', advance='no')
 do j = 1, size(x, 2)
@@ -2778,8 +2796,9 @@ end subroutine print_table2_int
 
 subroutine print_table2_real(x, row_names, col_names)
 ! Print table2 real values in an R-like format.
-real(kind=dp), intent(in) :: x(:,:)
-character(len=*), intent(in) :: row_names(:), col_names(:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
+character(len=*), intent(in) :: row_names(:) ! display names
+character(len=*), intent(in) :: col_names(:) ! display names
 integer :: i, j
 write(*,'(12x)', advance='no')
 do j = 1, size(x, 2)
@@ -2805,7 +2824,7 @@ end subroutine print_table2_real
 
 subroutine print_summary_vec(x)
 ! Print an R-like summary for a numeric vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), allocatable :: s(:)
 s = summary_vec(x)
 write(*,'(a,1x,g0)') "   Min.:", s(1)
@@ -2818,7 +2837,7 @@ end subroutine print_summary_vec
 
 subroutine print_summary_mat(x)
 ! Print R-like per-column summaries for a numeric matrix.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), allocatable :: s(:,:)
 character(len=*), parameter :: labels(6) = [character(len=8) :: "Min.   :", "1st Qu.:", "Median :", "Mean   :", "3rd Qu.:", "Max.   :"]
 integer :: j
@@ -2929,7 +2948,8 @@ end function r_seq_real_by
 
 pure function r_seq_real_length(a, b, n) result(out)
 ! Return n real values linearly spaced from a to b.
-real(kind=dp), intent(in) :: a, b
+real(kind=dp), intent(in) :: a ! input values
+real(kind=dp), intent(in) :: b ! input values
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -2951,8 +2971,10 @@ end function r_seq_real_length
 
 pure function r_rep_real(x, times, each, len_out, times_vec) result(out)
 ! Repeat elements/blocks of a real vector (R-like rep subset).
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in), optional :: times, each, len_out
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: times ! integer argument
+integer, intent(in), optional :: each ! integer argument
+integer, intent(in), optional :: len_out ! integer argument
 integer, intent(in), optional :: times_vec(:)
 real(kind=dp), allocatable :: out(:)
 real(kind=dp), allocatable :: y(:), z(:)
@@ -3027,8 +3049,10 @@ end function r_rep_real
 
 pure function r_rep_char(x, times, each, len_out, times_vec) result(out)
 ! Repeat elements/blocks of a character vector (R-like rep subset).
-character(len=*), intent(in) :: x(:)
-integer, intent(in), optional :: times, each, len_out
+character(len=*), intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: times ! integer argument
+integer, intent(in), optional :: each ! integer argument
+integer, intent(in), optional :: len_out ! integer argument
 integer, intent(in), optional :: times_vec(:)
 character(len=:), allocatable :: out(:)
 character(len=:), allocatable :: y(:), z(:)
@@ -3105,8 +3129,10 @@ end function r_rep_char
 
 pure function r_rep_int(x, times, each, len_out, times_vec) result(out)
 ! Repeat elements/blocks of an integer vector (R-like rep subset).
-integer, intent(in) :: x(:)
-integer, intent(in), optional :: times, each, len_out
+integer, intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: times ! integer argument
+integer, intent(in), optional :: each ! integer argument
+integer, intent(in), optional :: len_out ! integer argument
 integer, intent(in), optional :: times_vec(:)
 integer, allocatable :: out(:)
 integer, allocatable :: y(:), z(:)
@@ -3257,7 +3283,8 @@ end function rnorm_mat
 
 pure function r_filter_linear(x, filt, sides) result(out)
 ! Minimal stats::filter-style linear convolution for numeric vectors.
-real(kind=dp), intent(in) :: x(:), filt(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: filt(:) ! input vector
 integer, intent(in), optional :: sides
 real(kind=dp), allocatable :: out(:)
 integer :: n, nf, i, j, idx, side, before, after
@@ -3290,7 +3317,7 @@ end function r_filter_linear
 
 pure function runmed(x, k) result(out)
 ! Compute R-like runmed smoothing output.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: k
 real(kind=dp), allocatable :: out(:), tmp(:)
 integer :: i, n, kk, h
@@ -3313,7 +3340,7 @@ end function runmed
 
 pure function smooth(x, kind) result(out)
 ! Compute R-like smooth smoothing output.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 character(len=*), intent(in), optional :: kind
 real(kind=dp), allocatable :: out(:), prev(:), split(:)
 integer :: i, j, n, iter
@@ -3355,7 +3382,10 @@ end function smooth
 
 pure function smooth_kernel_eval(x, y, x0, bandwidth, kernel) result(v)
 ! Compute R-like smooth kernel eval smoothing output.
-real(kind=dp), intent(in) :: x(:), y(:), x0, bandwidth
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
+real(kind=dp), intent(in) :: x0 ! input value
+real(kind=dp), intent(in) :: bandwidth ! input value
 character(len=*), intent(in) :: kernel
 real(kind=dp) :: v
 real(kind=dp) :: bw, z, w, sw, sy, scale
@@ -3393,9 +3423,10 @@ end function smooth_kernel_eval
 
 pure function ksmooth(x, y, kernel, bandwidth, x_points) result(out)
 ! Compute R-like ksmooth smoothing output.
-real(kind=dp), intent(in) :: x(:), y(:)
-character(len=*), intent(in), optional :: kernel
-real(kind=dp), intent(in), optional :: bandwidth
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
+character(len=*), intent(in), optional :: kernel ! input string
+real(kind=dp), intent(in), optional :: bandwidth ! input value
 real(kind=dp), intent(in), optional :: x_points(:)
 type(smooth_xy_t) :: out
 character(len=:), allocatable :: kern
@@ -3419,8 +3450,9 @@ end function ksmooth
 
 pure function lowess(x, y, f, iter) result(out)
 ! Compute R-like lowess smoothing output.
-real(kind=dp), intent(in) :: x(:), y(:)
-real(kind=dp), intent(in), optional :: f
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
+real(kind=dp), intent(in), optional :: f ! callback procedure
 integer, intent(in), optional :: iter
 type(smooth_xy_t) :: out
 real(kind=dp), allocatable :: robust(:), fitted(:), resid(:), abs_resid(:), dist(:), dist_sorted(:)
@@ -3499,8 +3531,9 @@ end function lowess
 
 pure function loess_fit(x, y, span, degree) result(out)
 ! Runtime helper for R-compatible loess fit.
-real(kind=dp), intent(in) :: x(:), y(:)
-real(kind=dp), intent(in), optional :: span
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
+real(kind=dp), intent(in), optional :: span ! input value
 integer, intent(in), optional :: degree
 type(loess_fit_t) :: out
 out%x = x
@@ -3513,7 +3546,7 @@ end function loess_fit
 
 pure function predict_loess(fit, xnew) result(yhat)
 ! Evaluate distribution helper predict_loess.
-type(loess_fit_t), intent(in) :: fit
+type(loess_fit_t), intent(in) :: fit ! input value
 real(kind=dp), intent(in) :: xnew(:)
 real(kind=dp), allocatable :: yhat(:)
 real(kind=dp), allocatable :: dist(:), dist_sorted(:)
@@ -3608,7 +3641,8 @@ end function predict_loess
 
 pure function smooth_spline(x, y, df, spar) result(out)
 ! Compute R-like smooth spline smoothing output.
-real(kind=dp), intent(in) :: x(:), y(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
 real(kind=dp), intent(in), optional :: df, spar
 type(smooth_spline_fit_t) :: out
 type(loess_fit_t) :: lf
@@ -3640,7 +3674,7 @@ end function smooth_spline
 
 pure function predict_smooth_spline(fit, xnew) result(out)
 ! Evaluate distribution helper predict_smooth_spline.
-type(smooth_spline_fit_t), intent(in) :: fit
+type(smooth_spline_fit_t), intent(in) :: fit ! input value
 real(kind=dp), intent(in) :: xnew(:)
 type(smooth_xy_t) :: out
 integer :: i, j
@@ -3670,7 +3704,8 @@ end function predict_smooth_spline
 
 function rbinom_scalar(n, size_, prob) result(x)
 ! Return n binomial(size, prob) variates.
-integer, intent(in) :: n, size_
+integer, intent(in) :: n ! item count
+integer, intent(in) :: size_ ! integer argument
 real(kind=dp), intent(in) :: prob
 integer, allocatable :: x(:)
 integer :: i, j, s
@@ -3689,7 +3724,8 @@ end function rbinom_scalar
 
 function rbinom_vector_prob(n, size_, prob) result(x)
 ! Return n binomial(size, prob(i)) variates.
-integer, intent(in) :: n, size_
+integer, intent(in) :: n ! item count
+integer, intent(in) :: size_ ! integer argument
 real(kind=dp), intent(in) :: prob(:)
 integer, allocatable :: x(:)
 integer :: i, j, s
@@ -3712,7 +3748,7 @@ end function rbinom_vector_prob
 
 function rpois_scalar(n, lambda) result(x)
 ! Return n Poisson(lambda) variates.
-integer, intent(in) :: n
+integer, intent(in) :: n ! item count
 real(kind=dp), intent(in) :: lambda
 integer, allocatable :: x(:)
 integer :: i
@@ -3724,7 +3760,7 @@ end function rpois_scalar
 
 function rpois_vector(n, lambda) result(x)
 ! Return n Poisson(lambda(i)) variates.
-integer, intent(in) :: n
+integer, intent(in) :: n ! item count
 real(kind=dp), intent(in) :: lambda(:)
 integer, allocatable :: x(:)
 integer :: i
@@ -3765,7 +3801,7 @@ end function rpois_one
 
 function random_choice2_prob(n, p1) result(z)
 ! Sample n labels in {1,2} with P(label=1)=p1.
-integer, intent(in) :: n
+integer, intent(in) :: n ! item count
 real(kind=dp), intent(in) :: p1
 integer, allocatable :: z(:)
 integer :: i
@@ -3798,9 +3834,9 @@ end function randint_range
 
 function sample_int(n, size_, replace, prob) result(out)
 ! R-like sample.int with optional replacement and probabilities.
-integer, intent(in) :: n
-integer, intent(in), optional :: size_
-logical, intent(in), optional :: replace
+integer, intent(in) :: n ! item count
+integer, intent(in), optional :: size_ ! integer argument
+logical, intent(in), optional :: replace ! logical flag
 real(kind=dp), intent(in), optional :: prob(:)
 integer, allocatable :: out(:), pool(:)
 real(kind=dp), allocatable :: w(:), cdf(:)
@@ -3895,8 +3931,8 @@ end function sample_int
 
 function sample_int1(n, replace, prob) result(out)
 ! Scalar wrapper for sample_int(..., size_=1).
-integer, intent(in) :: n
-logical, intent(in), optional :: replace
+integer, intent(in) :: n ! item count
+logical, intent(in), optional :: replace ! logical flag
 real(kind=dp), intent(in), optional :: prob(:)
 integer :: out
 integer, allocatable :: tmp(:)
@@ -3914,7 +3950,7 @@ end function sample_int1
 
 pure subroutine sort_increasing(x)
 ! Sort a real vector in increasing order (insertion sort).
-real(kind=dp), intent(inout) :: x(:)
+real(kind=dp), intent(inout) :: x(:) ! input vector
 integer :: i, j
 real(kind=dp) :: key
 do i = 2, size(x)
@@ -3932,7 +3968,7 @@ end subroutine sort_increasing
 
 pure subroutine sort_increasing_int(x)
 ! Sort an integer vector in increasing order (insertion sort).
-integer, intent(inout) :: x(:)
+integer, intent(inout) :: x(:) ! input vector
 integer :: i, j, key
 do i = 2, size(x)
    key = x(i)
@@ -3949,7 +3985,7 @@ end subroutine sort_increasing_int
 
 pure function sort_real(x, decreasing) result(out)
 ! Return a sorted copy of a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 real(kind=dp), allocatable :: out(:)
 integer :: i, n
@@ -3965,7 +4001,7 @@ end function sort_real
 
 pure function sort_int(x, decreasing) result(out)
 ! Return a sorted copy of an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 integer, allocatable :: out(:)
 integer :: i, n
@@ -3981,7 +4017,7 @@ end function sort_int
 
 pure function sort_char(x, decreasing) result(out)
 ! Return a sorted copy of a character vector.
-character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 character(len=:), allocatable :: out(:)
 integer, allocatable :: idx(:)
@@ -3992,7 +4028,7 @@ end function sort_char
 
 pure function sort_list_real(x, decreasing) result(idx)
 ! Return 1-based indices that sort a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 integer, allocatable :: idx(:)
 integer :: i, j, t
@@ -4027,7 +4063,7 @@ end function sort_list_real
 
 pure function sort_list_int(x, decreasing) result(idx)
 ! Return 1-based indices that sort an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 integer, allocatable :: idx(:)
 integer :: i, j, t
@@ -4062,7 +4098,7 @@ end function sort_list_int
 
 pure function sort_list_char(x, decreasing) result(idx)
 ! Return 1-based indices that sort a character vector.
-character(len=*), intent(in) :: x(:)
+character(len=*), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 integer, allocatable :: idx(:)
 integer :: i, j, t
@@ -4097,7 +4133,7 @@ end function sort_list_char
 
 pure function r_head_real(x, n) result(out)
 ! Return the first n elements of a real vector.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:)
 integer :: m
@@ -4108,7 +4144,7 @@ end function r_head_real
 
 pure function r_head_int(x, n) result(out)
 ! Return the first n elements of an integer vector.
-integer, intent(in) :: x(:)
+integer, intent(in) :: x(:) ! input vector
 integer, intent(in) :: n
 integer, allocatable :: out(:)
 integer :: m
@@ -4119,7 +4155,7 @@ end function r_head_int
 
 pure function r_head_real_mat(x, n) result(out)
 ! Return the first n rows of a real matrix.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:,:)
 integer :: m
@@ -4130,7 +4166,7 @@ end function r_head_real_mat
 
 pure function r_head_int_mat(x, n) result(out)
 ! Return the first n rows of an integer matrix.
-integer, intent(in) :: x(:,:)
+integer, intent(in) :: x(:,:) ! input matrix
 integer, intent(in) :: n
 integer, allocatable :: out(:,:)
 integer :: m
@@ -4328,7 +4364,7 @@ end function eigen_sym_values
 
 function eigen_int(x, symmetric, only_values) result(fit)
 ! Runtime helper for R-compatible eigen int.
-integer, intent(in) :: x(:,:)
+integer, intent(in) :: x(:,:) ! input matrix
 logical, intent(in), optional :: symmetric, only_values
 type(eigen_result_t) :: fit
 if (present(symmetric) .and. present(only_values)) then
@@ -4344,7 +4380,7 @@ end function eigen_int
 
 function eigen_real(x, symmetric, only_values) result(fit)
 ! Small real eigen decomposition helper for R eigen() examples.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 logical, intent(in), optional :: symmetric, only_values
 type(eigen_result_t) :: fit
 real(kind=dp), allocatable :: a(:,:), vecs(:,:), tmpv(:)
@@ -4469,7 +4505,7 @@ end function eigen_real
 
 subroutine print_eigen(fit)
 ! Print eigen values in an R-like format.
-type(eigen_result_t), intent(in) :: fit
+type(eigen_result_t), intent(in) :: fit ! input value
 write(*,'(a)') "$values"
 call print_real_vector(fit%values)
 write(*,*)
@@ -4483,7 +4519,7 @@ end subroutine print_eigen
 
 function prcomp(x, center, scale_) result(fit)
 ! Principal components for a numeric matrix using a symmetric Jacobi eigensolver.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 logical, intent(in), optional :: center, scale_
 type(prcomp_fit_t) :: fit
 real(kind=dp), allocatable :: z(:,:), covm(:,:), vals(:), vecs(:,:), tmpv(:)
@@ -4591,7 +4627,7 @@ end function prcomp
 
 subroutine print_prcomp_summary(fit)
 ! Print prcomp summary values in an R-like format.
-type(prcomp_fit_t), intent(in) :: fit
+type(prcomp_fit_t), intent(in) :: fit ! input value
 real(kind=dp), allocatable :: var(:), prop(:), cum(:)
 integer :: j, p
 p = size(fit%sdev)
@@ -4635,7 +4671,8 @@ end subroutine print_prcomp_summary
 
 function arima_sim_scalar(ar, ma, n) result(x)
 ! Compute R-like time-series helper arima_sim_scalar.
-real(kind=dp), intent(in) :: ar, ma
+real(kind=dp), intent(in) :: ar ! input value
+real(kind=dp), intent(in) :: ma ! input value
 integer, intent(in) :: n
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: z(:)
@@ -4651,7 +4688,8 @@ end function arima_sim_scalar
 
 function arima_sim_vector(ar, ma, n) result(x)
 ! Compute R-like time-series helper arima_sim_vector.
-real(kind=dp), intent(in) :: ar(:), ma
+real(kind=dp), intent(in) :: ar(:) ! input vector
+real(kind=dp), intent(in) :: ma ! input value
 integer, intent(in) :: n
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: z(:)
@@ -4671,8 +4709,8 @@ end function arima_sim_vector
 
 function arima_fit(x, order, include_mean) result(fit)
 ! Compute R-like time-series helper arima_fit.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: order(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in) :: order(:) ! input vector
 logical, intent(in), optional :: include_mean
 type(arima_fit_t) :: fit
 real(kind=dp) :: resid(size(x)), best_resid(size(x))
@@ -4730,7 +4768,7 @@ end function arima_fit
 
 function arima_predict(fit, n_ahead) result(pred)
 ! Compute R-like time-series helper arima_predict.
-type(arima_fit_t), intent(in) :: fit
+type(arima_fit_t), intent(in) :: fit ! input value
 integer, intent(in) :: n_ahead
 real(kind=dp), allocatable :: pred(:)
 integer :: i
@@ -4752,7 +4790,7 @@ end function arima_predict
 
 function arima_predict_result(fit, n_ahead) result(out)
 ! Compute R-like time-series helper arima_predict_result.
-type(arima_fit_t), intent(in) :: fit
+type(arima_fit_t), intent(in) :: fit ! input value
 integer, intent(in) :: n_ahead
 type(arima_predict_result_t) :: out
 out%pred = arima_predict(fit, n_ahead)
@@ -4761,10 +4799,11 @@ end function arima_predict_result
 
 function ar_fit(x, order_max, aic, method) result(fit)
 ! Compute R-like time-series helper ar_fit.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in), optional :: order_max
-logical, intent(in), optional :: aic
-character(len=*), intent(in), optional :: method
+! The method argument is accepted for R compatibility but is currently ignored.
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: order_max ! maximum AR order to consider
+logical, intent(in), optional :: aic ! select order by AIC flag
+character(len=*), intent(in), optional :: method ! accepted for compatibility; ignored
 type(ar_fit_t) :: fit
 integer :: pmax, p, n, i, j, k
 real(kind=dp), allocatable :: xt(:), rhs(:), mat(:,:), coef(:)
@@ -4806,7 +4845,7 @@ end function ar_fit
 
 subroutine print_arima_fit(fit)
 ! Print arima fit values in an R-like format.
-type(arima_fit_t), intent(in) :: fit
+type(arima_fit_t), intent(in) :: fit ! input value
 write(*,*) "Call:"
 write(*,*) "arima(x = x, order = c(", fit%p, ",", fit%d, ",", fit%q, "))"
 write(*,*)
@@ -4818,10 +4857,11 @@ end subroutine print_arima_fit
 
 function acf_vec(x, lag_max, type, plot) result(fit)
 ! Compute R-like time-series helper acf_vec.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in), optional :: lag_max
-character(len=*), intent(in), optional :: type
-logical, intent(in), optional :: plot
+! Valid type values: "correlation" (default behavior), "covariance".
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: lag_max ! maximum lag to return
+character(len=*), intent(in), optional :: type ! autocorrelation output type
+logical, intent(in), optional :: plot ! request plot warning flag
 type(acf_fit_t) :: fit
 real(kind=dp), allocatable :: xm(:,:)
 allocate(xm(size(x), 1))
@@ -4831,10 +4871,11 @@ end function acf_vec
 
 function acf_mat(x, lag_max, type, plot) result(fit)
 ! Compute R-like time-series helper acf_mat.
-real(kind=dp), intent(in) :: x(:,:)
-integer, intent(in), optional :: lag_max
-character(len=*), intent(in), optional :: type
-logical, intent(in), optional :: plot
+! Valid type values: "correlation" (default behavior), "covariance".
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
+integer, intent(in), optional :: lag_max ! maximum lag to return
+character(len=*), intent(in), optional :: type ! autocorrelation output type
+logical, intent(in), optional :: plot ! request plot warning flag
 type(acf_fit_t) :: fit
 integer :: n, p, lag_n, h, i, j, k, cnt
 real(kind=dp), allocatable :: mu(:), var0(:)
@@ -4906,10 +4947,11 @@ end function acf_mat
 
 function acf_values_vec(x, lag_max, type, plot) result(vals)
 ! Compute R-like time-series helper acf_values_vec.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in), optional :: lag_max
-character(len=*), intent(in), optional :: type
-logical, intent(in), optional :: plot
+! Valid type values: "correlation" (default behavior), "covariance".
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in), optional :: lag_max ! maximum lag to return
+character(len=*), intent(in), optional :: type ! autocorrelation output type
+logical, intent(in), optional :: plot ! request plot warning flag
 real(kind=dp), allocatable :: vals(:)
 type(acf_fit_t) :: fit
 fit = acf_vec(x, lag_max=lag_max, type=type, plot=plot)
@@ -4918,10 +4960,11 @@ end function acf_values_vec
 
 function acf_values_mat(x, lag_max, type, plot) result(vals)
 ! Compute R-like time-series helper acf_values_mat.
-real(kind=dp), intent(in) :: x(:,:)
-integer, intent(in), optional :: lag_max
-character(len=*), intent(in), optional :: type
-logical, intent(in), optional :: plot
+! Valid type values: "correlation" (default behavior), "covariance".
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
+integer, intent(in), optional :: lag_max ! maximum lag to return
+character(len=*), intent(in), optional :: type ! autocorrelation output type
+logical, intent(in), optional :: plot ! request plot warning flag
 real(kind=dp), allocatable :: vals(:)
 type(acf_fit_t) :: fit
 fit = acf_mat(x, lag_max=lag_max, type=type, plot=plot)
@@ -4930,8 +4973,8 @@ end function acf_values_mat
 
 function ARMAacf(ar, ma, lag_max) result(vals)
 ! Compute R-like time-series helper ARMAacf.
-real(kind=dp), intent(in), optional :: ar(:)
-real(kind=dp), intent(in), optional :: ma
+real(kind=dp), intent(in), optional :: ar(:) ! input vector
+real(kind=dp), intent(in), optional :: ma ! input value
 integer, intent(in), optional :: lag_max
 real(kind=dp), allocatable :: vals(:)
 integer :: lag_n, h, p
@@ -4957,10 +5000,12 @@ end function ARMAacf
 
 function ccf_vec(x, y, lag_max, type, plot) result(fit)
 ! Runtime helper for R-compatible ccf vec.
-real(kind=dp), intent(in) :: x(:), y(:)
-integer, intent(in), optional :: lag_max
-character(len=*), intent(in), optional :: type
-logical, intent(in), optional :: plot
+! Valid type values: "correlation" (default behavior), "covariance".
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: y(:) ! response values
+integer, intent(in), optional :: lag_max ! maximum lag to return
+character(len=*), intent(in), optional :: type ! cross-correlation output type
+logical, intent(in), optional :: plot ! request plot warning flag
 type(acf_fit_t) :: fit
 integer :: n, lag_n, h, ii, idx, cnt
 real(kind=dp) :: mux, muy, vx, vy, s
@@ -5008,7 +5053,7 @@ end function ccf_vec
 
 subroutine print_acf(fit)
 ! Print acf values in an R-like format.
-type(acf_fit_t), intent(in) :: fit
+type(acf_fit_t), intent(in) :: fit ! input value
 write(*,*) "Autocorrelations of series"
 call print_real_vector(reshape(fit%acf, [size(fit%acf)]))
 end subroutine print_acf
@@ -5049,7 +5094,8 @@ end function besselJ_core
 
 pure function besselI_core(x, nu, scaled) result(out)
 ! Evaluate the besselI core Bessel helper.
-real(kind=dp), intent(in) :: x, nu
+real(kind=dp), intent(in) :: x ! input values
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in) :: scaled
 real(kind=dp) :: out, term, ax
 integer :: k
@@ -5099,7 +5145,8 @@ end function besselY_core
 
 pure function besselK_core(x, nu, scaled) result(out)
 ! Evaluate the besselK core Bessel helper.
-real(kind=dp), intent(in) :: x, nu
+real(kind=dp), intent(in) :: x ! input values
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in) :: scaled
 real(kind=dp) :: out, nuf, s
 if (x <= 0.0_dp) then
@@ -5118,7 +5165,7 @@ end function besselK_core
 
 pure function besselJ_scalar_i(x, nu) result(out)
 ! Evaluate the besselJ scalar i Bessel helper.
-real(kind=dp), intent(in) :: x
+real(kind=dp), intent(in) :: x ! input values
 integer, intent(in) :: nu
 real(kind=dp) :: out
 out = besselJ_core(x, real(nu, kind=dp))
@@ -5133,7 +5180,7 @@ end function besselJ_scalar_r
 
 pure function besselJ_vec_i(x, nu) result(out)
 ! Evaluate the besselJ vec i Bessel helper.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nu
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5145,7 +5192,7 @@ end function besselJ_vec_i
 
 pure function besselJ_vec_r(x, nu) result(out)
 ! Evaluate the besselJ vec r Bessel helper.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: nu
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5157,7 +5204,7 @@ end function besselJ_vec_r
 
 pure function besselY_scalar_i(x, nu) result(out)
 ! Evaluate the besselY scalar i Bessel helper.
-real(kind=dp), intent(in) :: x
+real(kind=dp), intent(in) :: x ! input values
 integer, intent(in) :: nu
 real(kind=dp) :: out
 out = besselY_core(x, real(nu, kind=dp))
@@ -5172,7 +5219,7 @@ end function besselY_scalar_r
 
 pure function besselY_vec_i(x, nu) result(out)
 ! Evaluate the besselY vec i Bessel helper.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nu
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5184,7 +5231,7 @@ end function besselY_vec_i
 
 pure function besselY_vec_r(x, nu) result(out)
 ! Evaluate the besselY vec r Bessel helper.
-real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: nu
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5196,8 +5243,8 @@ end function besselY_vec_r
 
 pure function besselI_scalar_i(x, nu, expon_scaled) result(out)
 ! Evaluate the besselI scalar i Bessel helper.
-real(kind=dp), intent(in) :: x
-integer, intent(in) :: nu
+real(kind=dp), intent(in) :: x ! input values
+integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
 out = besselI_core(x, real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
@@ -5205,7 +5252,8 @@ end function besselI_scalar_i
 
 pure function besselI_scalar_r(x, nu, expon_scaled) result(out)
 ! Evaluate the besselI scalar r Bessel helper.
-real(kind=dp), intent(in) :: x, nu
+real(kind=dp), intent(in) :: x ! input values
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
 out = besselI_core(x, nu, present(expon_scaled) .and. expon_scaled)
@@ -5213,8 +5261,8 @@ end function besselI_scalar_r
 
 pure function besselI_vec_i(x, nu, expon_scaled) result(out)
 ! Evaluate the besselI vec i Bessel helper.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: nu
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5226,8 +5274,8 @@ end function besselI_vec_i
 
 pure function besselI_vec_r(x, nu, expon_scaled) result(out)
 ! Evaluate the besselI vec r Bessel helper.
-real(kind=dp), intent(in) :: x(:)
-real(kind=dp), intent(in) :: nu
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5239,8 +5287,8 @@ end function besselI_vec_r
 
 pure function besselK_scalar_i(x, nu, expon_scaled) result(out)
 ! Evaluate the besselK scalar i Bessel helper.
-real(kind=dp), intent(in) :: x
-integer, intent(in) :: nu
+real(kind=dp), intent(in) :: x ! input values
+integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
 out = besselK_core(x, real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
@@ -5248,7 +5296,8 @@ end function besselK_scalar_i
 
 pure function besselK_scalar_r(x, nu, expon_scaled) result(out)
 ! Evaluate the besselK scalar r Bessel helper.
-real(kind=dp), intent(in) :: x, nu
+real(kind=dp), intent(in) :: x ! input values
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
 out = besselK_core(x, nu, present(expon_scaled) .and. expon_scaled)
@@ -5256,8 +5305,8 @@ end function besselK_scalar_r
 
 pure function besselK_vec_i(x, nu, expon_scaled) result(out)
 ! Evaluate the besselK vec i Bessel helper.
-real(kind=dp), intent(in) :: x(:)
-integer, intent(in) :: nu
+real(kind=dp), intent(in) :: x(:) ! input vector
+integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5269,8 +5318,8 @@ end function besselK_vec_i
 
 pure function besselK_vec_r(x, nu, expon_scaled) result(out)
 ! Evaluate the besselK vec r Bessel helper.
-real(kind=dp), intent(in) :: x(:)
-real(kind=dp), intent(in) :: nu
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
@@ -5328,7 +5377,7 @@ end function solve_real_vec
 
 pure function solve_real_vec_i_r(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:)
+integer, intent(in) :: a(:,:) ! input matrix
 real(kind=dp), intent(in) :: b(:)
 real(kind=dp), allocatable :: x(:)
 x = solve_real_vec(real(a, kind=dp), b)
@@ -5358,7 +5407,7 @@ end function solve_real_mat
 
 pure function solve_real_mat_i_r(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:)
+integer, intent(in) :: a(:,:) ! input matrix
 real(kind=dp), intent(in) :: b(:,:)
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(real(a, kind=dp), b)
@@ -5366,7 +5415,7 @@ end function solve_real_mat_i_r
 
 pure function solve_real_mat_r_i(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: a(:,:)
+real(kind=dp), intent(in) :: a(:,:) ! input matrix
 integer, intent(in) :: b(:,:)
 real(kind=dp), allocatable :: x(:,:)
 x = solve_real_mat(a, real(b, kind=dp))
@@ -5401,7 +5450,7 @@ end function mahalanobis
 
 pure function isSymmetric_real(x, tol) result(out)
 ! Test the R-like predicate isSymmetric_real.
-real(kind=dp), intent(in) :: x(:,:)
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), intent(in), optional :: tol
 logical :: out
 real(kind=dp) :: eps
@@ -5416,7 +5465,7 @@ end function isSymmetric_real
 
 pure function isSymmetric_int(x, tol) result(out)
 ! Test the R-like predicate isSymmetric_int.
-integer, intent(in) :: x(:,:)
+integer, intent(in) :: x(:,:) ! input matrix
 real(kind=dp), intent(in), optional :: tol
 logical :: out
 if (present(tol)) then
@@ -5428,7 +5477,7 @@ end function isSymmetric_int
 
 pure function solve_real_vec_r_c(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-real(kind=dp), intent(in) :: a(:,:)
+real(kind=dp), intent(in) :: a(:,:) ! input matrix
 complex(kind=dp), intent(in) :: b(:)
 complex(kind=dp), allocatable :: x(:)
 x = solve_complex_vec(cmplx(a, 0.0_dp, kind=dp), b)
@@ -5436,7 +5485,7 @@ end function solve_real_vec_r_c
 
 pure function solve_real_vec_i_c(a, b) result(x)
 ! Solve a real linear system with mixed numeric input kinds.
-integer, intent(in) :: a(:,:)
+integer, intent(in) :: a(:,:) ! input matrix
 complex(kind=dp), intent(in) :: b(:)
 complex(kind=dp), allocatable :: x(:)
 x = solve_complex_vec(cmplx(real(a, kind=dp), 0.0_dp, kind=dp), b)
@@ -5687,7 +5736,7 @@ end function diag_scalar_int
 
 pure function diag_scalar_real_n(x, n) result(out)
 ! Create an n by n real diagonal matrix with scalar value x.
-real(kind=dp), intent(in) :: x
+real(kind=dp), intent(in) :: x ! input values
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:,:)
 integer :: i
@@ -5742,7 +5791,7 @@ end function chol_int
 
 pure function chol2inv_real(r, size) result(out)
 ! Runtime helper for R-compatible chol2inv real.
-real(kind=dp), intent(in) :: r(:,:)
+real(kind=dp), intent(in) :: r(:,:) ! input matrix
 integer, intent(in), optional :: size
 real(kind=dp), allocatable :: out(:,:), a(:,:)
 integer :: n
@@ -5755,7 +5804,7 @@ end function chol2inv_real
 
 pure function chol2inv_int(r, size) result(out)
 ! Runtime helper for R-compatible chol2inv int.
-integer, intent(in) :: r(:,:)
+integer, intent(in) :: r(:,:) ! input matrix
 integer, intent(in), optional :: size
 real(kind=dp), allocatable :: out(:,:)
 if (present(size)) then
@@ -5767,7 +5816,8 @@ end function chol2inv_int
 
 pure function forwardsolve_mat(l, b, transpose) result(x)
 ! Solve L x = b for lower-triangular L; transpose=.true. solves L^T x = b.
-real(kind=dp), intent(in) :: l(:,:), b(:,:)
+real(kind=dp), intent(in) :: l(:,:) ! input matrix
+real(kind=dp), intent(in) :: b(:,:) ! input matrix
 logical, intent(in), optional :: transpose
 real(kind=dp), allocatable :: x(:,:)
 logical :: tr
@@ -5800,7 +5850,8 @@ end function forwardsolve_mat
 
 pure function forwardsolve_vec(l, b, transpose) result(x)
 ! Solve L x = b for a vector RHS.
-real(kind=dp), intent(in) :: l(:,:), b(:)
+real(kind=dp), intent(in) :: l(:,:) ! input matrix
+real(kind=dp), intent(in) :: b(:) ! input vector
 logical, intent(in), optional :: transpose
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: bm(:,:), xm(:,:)
@@ -5816,8 +5867,8 @@ end function forwardsolve_vec
 
 pure function forwardsolve_vec_i_r(l, b, transpose) result(x)
 ! Solve a lower-triangular system with mixed numeric input kinds.
-integer, intent(in) :: l(:,:)
-real(kind=dp), intent(in) :: b(:)
+integer, intent(in) :: l(:,:) ! input matrix
+real(kind=dp), intent(in) :: b(:) ! input vector
 logical, intent(in), optional :: transpose
 real(kind=dp), allocatable :: x(:)
 if (present(transpose)) then
