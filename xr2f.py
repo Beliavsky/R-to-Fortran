@@ -6078,10 +6078,28 @@ def r_expr_to_fortran(expr: str) -> str:
         if hess_src is not None:
             args_nlm.append(f"hessian={r_expr_to_fortran(hess_src)}")
         return f"nlm_stub({', '.join(args_nlm)})"
+    m_qr_field0 = re.match(r"^qr\s*\((.*)\)\s*(?:\$|%)\s*(rank|pivot)\s*$", s, re.IGNORECASE)
+    if m_qr_field0 is not None:
+        inner_qr = m_qr_field0.group(1).strip()
+        field_qr = m_qr_field0.group(2).lower()
+        fn_qr_field = "qr_rank" if field_qr == "rank" else "qr_pivot"
+        return f"{fn_qr_field}({r_expr_to_fortran('qr(' + inner_qr + ')')})"
     s = _replace_dotted_var_refs(s)
     s = re.sub(r"(?i)\bqr\.Q\s*\(", "qr_Q(", s)
     s = re.sub(r"(?i)\bqr\.R\s*\(", "qr_R(", s)
     s = re.sub(r"(?i)\bqr\.coef\s*\(", "qr_coef(", s)
+    s = re.sub(r"(?i)\bqr\.fitted\s*\(", "qr_fitted(", s)
+    s = re.sub(r"(?i)\bqr\.resid\s*\(", "qr_resid(", s)
+    s = re.sub(r"(?i)\bqr\.qty\s*\(", "qr_qty(", s)
+    s = re.sub(r"(?i)\bqr\.qy\s*\(", "qr_qy(", s)
+    s = re.sub(r"(?i)\bqr\.solve\s*\(", "qr_solve(", s)
+    c_qr_helper0 = parse_call_text(s)
+    if c_qr_helper0 is not None and c_qr_helper0[0].lower() in {"qr_coef", "qr_fitted", "qr_resid", "qr_qty", "qr_qy"}:
+        nm_qh, pos_qh, kw_qh = c_qr_helper0
+        fit_src_qh = pos_qh[0] if pos_qh else kw_qh.get("qr", kw_qh.get("fit", ""))
+        y_src_qh = pos_qh[1] if len(pos_qh) >= 2 else kw_qh.get("y", "")
+        if fit_src_qh and y_src_qh:
+            return f"{nm_qh}({r_expr_to_fortran(fit_src_qh)}, real({r_expr_to_fortran(y_src_qh)}, kind=dp))"
     m_lmfit_coef_early = re.match(r"^(lm\.fit\s*\(.*\))\s*\$\s*coefficients\s*$", s, re.IGNORECASE)
     if m_lmfit_coef_early is not None:
         c_lmfit_e = parse_call_text(m_lmfit_coef_early.group(1))
@@ -9869,7 +9887,7 @@ def emit_stmts(
                 return 2
             if nm_c in {"qr.r", "qr_r", "qr.q", "qr_q"}:
                 return 2
-            if nm_c in {"qr.coef", "qr_coef"}:
+            if nm_c in {"qr.coef", "qr_coef", "qr.fitted", "qr_fitted", "qr.resid", "qr_resid", "qr.qty", "qr_qty", "qr.qy", "qr_qy", "qr.solve", "qr_solve"}:
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
@@ -10093,8 +10111,35 @@ def emit_stmts(
         cinfo = parse_call_text(t)
         if cinfo is not None and cinfo[0].lower() == "unname":
             return None
+        m_lmfit_coef = re.match(r"^(lm\.fit\s*\(.*\))\s*(?:\$|%)\s*coefficients\s*$", t, re.IGNORECASE)
+        if m_lmfit_coef is not None:
+            c_lmfit = parse_call_text(m_lmfit_coef.group(1))
+            if c_lmfit is not None and c_lmfit[0].lower() == "lm.fit":
+                x_src = c_lmfit[1][0].strip() if c_lmfit[1] else c_lmfit[2].get("x", "").strip()
+                matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
+                if isinstance(matrix_labels_map, dict):
+                    labs = matrix_labels_map.get(x_src.lower())
+                    if isinstance(labs, list) and labs:
+                        return r_expr_to_fortran(t), _char_array_literal([str(x) for x in labs]), False
+        c_qrcoef_named = parse_call_text(t)
+        if c_qrcoef_named is not None and c_qrcoef_named[0].lower() == "qr_coef" and c_qrcoef_named[1]:
+            fit_src_qc = c_qrcoef_named[1][0].strip()
+            m_qr_src = re.match(r"^qr\s*\(\s*(?:real\s*\(\s*)?([A-Za-z]\w*)\b", fit_src_qc, re.IGNORECASE)
+            if m_qr_src is not None:
+                matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
+                if isinstance(matrix_labels_map, dict):
+                    labs = matrix_labels_map.get(m_qr_src.group(1).lower())
+                    if isinstance(labs, list) and labs:
+                        return r_expr_to_fortran(t), _char_array_literal([str(x) for x in labs]), False
         if re.match(r"^[A-Za-z]\w*$", t) and t.lower() in _NAMED_VECTOR_NAMES:
             return r_expr_to_fortran(t), _NAMED_VECTOR_NAMES[t.lower()], False
+        if re.match(r"^[A-Za-z]\w*$", t):
+            labels_map = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
+            if not isinstance(labels_map, dict) or not labels_map:
+                labels_map = _NAMED_VECTOR_LABELS
+            labs_var = labels_map.get(t.lower()) if isinstance(labels_map, dict) else None
+            if isinstance(labs_var, list) and labs_var:
+                return r_expr_to_fortran(t), _char_array_literal([str(x) for x in labs_var]), False
         m_ix = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\]]+)\]$", t)
         if m_ix and m_ix.group(1).lower() in _NAMED_VECTOR_NAMES:
             base = m_ix.group(1)
@@ -11996,6 +12041,21 @@ def emit_stmts(
                                 )
                                 if src_print_aperm.lower() in _KNOWN_RANK3_NAMES:
                                     one_f = f"reshape({one_f}, [size({one_f})])"
+                            named_parts_rank1 = _named_vector_print_parts(one)
+                            if named_parts_rank1 is not None:
+                                val_expr_nv, name_expr_nv, scalar_nv = named_parts_rank1
+                                if scalar_nv:
+                                    _wstmt(
+                                        f"call print_named_real_vector([real({val_expr_nv}, kind=dp)], {name_expr_nv})",
+                                        st.comment,
+                                    )
+                                else:
+                                    _wstmt(
+                                        f"call print_named_real_vector(real({val_expr_nv}, kind=dp), {name_expr_nv})",
+                                        st.comment,
+                                    )
+                                need_r_mod.add("print_named_real_vector")
+                                continue
                             if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in real_vector_vars:
                                 _wstmt(f"call print_real_vector({one_f})", st.comment)
                             else:
@@ -15876,8 +15936,20 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
                             continue
                         cbind_labs.append(f"V{idx}")
                         ok = False
+                    for key in cinfo[2]:
+                        cbind_labs.append(_sanitize_fortran_kwarg_name(key))
                     if cbind_labs and ok:
                         labels[st.name.lower()] = cbind_labs
+                if cinfo is not None and cinfo[0].lower() == "qr":
+                    src = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("x", "").strip()
+                    src_labs = labels.get(src.lower())
+                    if isinstance(src_labs, list) and src_labs:
+                        labels[st.name.lower()] = [str(x) for x in src_labs]
+                if cinfo is not None and cinfo[0].lower() in {"qr.coef", "qr_coef"}:
+                    fit_src = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("qr", "").strip()
+                    fit_labs = labels.get(fit_src.lower())
+                    if isinstance(fit_labs, list) and fit_labs:
+                        labels[st.name.lower()] = [str(x) for x in fit_labs]
             elif isinstance(st, ExprStmt):
                 m = re.match(
                     r"^\s*colnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
@@ -20075,6 +20147,12 @@ def transpile_r_to_fortran(
         "qr_Q",
         "qr_R",
         "qr_coef",
+        "qr_rank",
+        "qr_pivot",
+        "qr_fitted",
+        "qr_resid",
+        "qr_qty",
+        "qr_qy",
         "print_qr",
         "lm_predict_interval",
         "lm_cooks_distance",
