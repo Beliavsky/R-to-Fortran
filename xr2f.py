@@ -59,6 +59,7 @@ _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
+_CSV_HEADER_SOURCES: dict[str, str] = {}
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
 _NLM_OBJECTIVE_NAMES: set[str] = set()
 _NLM_CLOSURE_WRAPPERS: dict[str, dict[str, object]] = {}
@@ -2645,6 +2646,11 @@ def _index_inner_1d_to_fortran(inner: str) -> str:
         a, b = seq
         a_f = _int_bound_expr(r_expr_to_fortran(a))
         b_f = _int_bound_expr(r_expr_to_fortran(b))
+        m_a_dec = re.fullmatch(r"([A-Za-z]\w*)\s*-\s*(\d+)", a.strip())
+        m_b_dec = re.fullmatch(r"([A-Za-z]\w*)\s*-\s*(\d+)", b.strip())
+        if m_a_dec is not None and m_b_dec is not None and m_a_dec.group(1) == m_b_dec.group(1):
+            if int(m_a_dec.group(2)) < int(m_b_dec.group(2)):
+                return f"{a_f}:{b_f}:-1"
         return f"{a_f}:{b_f}"
     m_which = re.match(r"^which\.(min|max)\s*\((.*)\)$", t, re.IGNORECASE)
     if m_which is not None:
@@ -2666,8 +2672,12 @@ def _index_dim_to_fortran(base: str, dimno: int, d: str) -> str:
             return str(dim_labels[dimno - 1].index(lab_dt) + 1)
         except ValueError:
             pass
-    if dimno == 2 and dt == "price_names":
+    if dimno == 2 and dt == "price_names" and dt.lower() not in _KNOWN_CHAR_VECTOR_NAMES:
         return "price_names + 1"
+    if dimno == 2 and re.fullmatch(r"[A-Za-z]\w*", dt) and dt.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+        csv_src = _CSV_HEADER_SOURCES.get(base.lower())
+        if csv_src is not None:
+            return f"match({dt}, read_csv_header_names({r_expr_to_fortran(csv_src)}))"
     if dimno == 2 and base == "coef_mat":
         lab_dt = _dequote_string_literal(dt)
         coef_idx = {
@@ -4031,13 +4041,13 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 rank = max(rank, 3)
             if re.search(rf"\$(?:sigma|fitted|resid|coef|design|y)\b.*\b{re.escape(arg)}\b|\b{re.escape(arg)}\b.*\$(?:sigma|fitted|resid|coef|design|y)\b", txt):
                 rank = max(rank, 2)
-            if re.search(rf"\$(?:mu|intercept|pi|weights|means|sds|vars|nk)\b.*\b{re.escape(arg)}\b|\b{re.escape(arg)}\b.*\$(?:mu|intercept|pi|weights|means|sds|vars|nk)\b", txt):
+            if re.search(rf"\$(?:pi|weights|means|sds|vars|nk)\b.*\b{re.escape(arg)}\b|\b{re.escape(arg)}\b.*\$(?:pi|weights|means|sds|vars|nk)\b", txt):
                 rank = max(rank, 1)
             if re.search(rf"\blist\s*\(.*\ba\s*=\s*{re.escape(arg)}\b", txt, re.IGNORECASE):
                 rank = max(rank, 3)
             if re.search(rf"\blist\s*\(.*\b(?:sigma|fitted|resid|coef|design|y)\s*=\s*{re.escape(arg)}\b", txt, re.IGNORECASE):
                 rank = max(rank, 2)
-            if re.search(rf"\blist\s*\(.*\b(?:mu|intercept|pi|weights|means|sds|vars|nk)\s*=\s*{re.escape(arg)}\b", txt, re.IGNORECASE):
+            if re.search(rf"\blist\s*\(.*\b(?:pi|weights|means|sds|vars|nk)\s*=\s*{re.escape(arg)}\b", txt, re.IGNORECASE):
                 rank = max(rank, 1)
             elif any(p.search(txt) for p in pats_rank1):
                 rank = max(rank, 1)
@@ -4076,6 +4086,64 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rank_out = min(rank_out, 1)
     if fn.name.lower().endswith("negloglik") and arg in {"x", "ret"}:
         rank_out = max(rank_out, 1)
+    if rank_out == 1:
+        vector_evidence = [
+            rf"\blength\s*\(\s*{re.escape(arg)}\b",
+            rf"\bsize\s*\(\s*{re.escape(arg)}\b",
+            rf"\b{re.escape(arg)}\s*\[",
+            rf"\bas\.(?:numeric|vector)\s*\(\s*{re.escape(arg)}\b",
+            rf"\b(?:sum|mean|max|min|sd|r_sd)\s*\(\s*{re.escape(arg)}\b",
+        ]
+        call_vector_evidence = False
+        for txt_call in _stmt_texts_for_rank_scan(fn.body):
+            for callee_l_direct, ranks_direct in _USER_FUNC_ARG_RANK.items():
+                if not any(v >= 1 for v in ranks_direct.values()):
+                    continue
+                idx_direct = _USER_FUNC_ARG_INDEX.get(callee_l_direct, {})
+                for m_direct in re.finditer(rf"\b{re.escape(callee_l_direct)}\s*\(([^)]*)\)", txt_call, re.IGNORECASE):
+                    args_direct = split_top_level_commas(m_direct.group(1))
+                    for pos_direct, actual_direct in enumerate(args_direct):
+                        if not re.fullmatch(re.escape(arg), actual_direct.strip()):
+                            continue
+                        for formal_l_direct, idx_l_direct in idx_direct.items():
+                            if idx_l_direct == pos_direct and ranks_direct.get(formal_l_direct, 0) >= 1:
+                                call_vector_evidence = True
+                                break
+                        if call_vector_evidence:
+                            break
+                    if call_vector_evidence:
+                        break
+                if call_vector_evidence:
+                    break
+            if call_vector_evidence:
+                break
+            c_call_ev = parse_call_text(txt_call.strip())
+            if c_call_ev is None:
+                continue
+            callee_l_ev = c_call_ev[0].lower()
+            callee_ranks_ev = _USER_FUNC_ARG_RANK.get(callee_l_ev, {})
+            if not callee_ranks_ev:
+                continue
+            callee_idx_ev = _USER_FUNC_ARG_INDEX.get(callee_l_ev, {})
+            for pos_ev, actual_ev in enumerate(c_call_ev[1]):
+                actual_s_ev = actual_ev.strip()
+                arg_pos_ev = pos_ev
+                m_named_ev = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", actual_s_ev)
+                if m_named_ev is not None:
+                    arg_pos_ev = callee_idx_ev.get(m_named_ev.group(1).lower(), pos_ev)
+                    actual_s_ev = m_named_ev.group(2).strip()
+                if not re.fullmatch(re.escape(arg), actual_s_ev):
+                    continue
+                for formal_l_ev, idx_ev in callee_idx_ev.items():
+                    if idx_ev == arg_pos_ev and callee_ranks_ev.get(formal_l_ev, 0) >= 1:
+                        call_vector_evidence = True
+                        break
+                if call_vector_evidence:
+                    break
+            if call_vector_evidence:
+                break
+        if (not call_vector_evidence) and not any(re.search(pat, body_text, re.IGNORECASE) for pat in vector_evidence):
+            rank_out = 0
     return rank_out
 
 
@@ -6310,6 +6378,9 @@ def r_expr_to_fortran(expr: str) -> str:
         m_names_sd = re.match(r"^names\s*\(\s*([A-Za-z]\w*)\s*\)$", first_sd, re.IGNORECASE)
         if m_names_sd is not None and (second_sd or "").lower() == "date":
             base_sd = m_names_sd.group(1)
+            csv_src = _CSV_HEADER_SOURCES.get(base_sd.lower())
+            if csv_src is not None:
+                return f"setdiff(read_csv_header_names({r_expr_to_fortran(csv_src)}), [character(len=4) :: \"Date\"])"
             return f"r_seq_int(1, size({base_sd}, 2) - 1)"
     # Drop namespace qualifiers (e.g., stats::sd -> sd) in this subset.
     s = re.sub(r"\b[A-Za-z]\w*::", "", s)
@@ -6344,6 +6415,9 @@ def r_expr_to_fortran(expr: str) -> str:
         if nm_pre == "names":
             names_src = pos_pre[0].strip() if pos_pre else ""
             names_src_l = names_src.lower()
+            csv_src = _CSV_HEADER_SOURCES.get(names_src_l)
+            if csv_src is not None:
+                return f"read_csv_header_names({r_expr_to_fortran(csv_src)})"
             if (
                 re.match(r"^loess_fit\s*\(", names_src_l)
                 or re.match(r"^loess\s*\(", names_src_l)
@@ -10274,6 +10348,24 @@ def emit_stmts(
                 return r_expr_to_fortran(src.strip())
         return None
 
+    def _matrix_row_label_expr_for_print(expr_txt: str) -> str | None:
+        expr_map = helper_ctx.get("matrix_rowname_exprs") if helper_ctx is not None else None
+        if not isinstance(expr_map, dict):
+            return None
+        t = expr_txt.strip()
+        c_round = parse_call_text(t)
+        if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
+            t = c_round[1][0].strip()
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        for cand in reversed(candidates):
+            src = expr_map.get(cand)
+            if isinstance(src, str) and src.strip():
+                return r_expr_to_fortran(src.strip())
+        cinfo = parse_call_text(t)
+        if cinfo is not None and cinfo[0].lower() in {"cor", "ccf_matrix"} and cinfo[1]:
+            return _matrix_col_label_expr_for_print(cinfo[1][0].strip())
+        return None
+
     def _int_col_mask_literal(labels: list[str]) -> str | None:
         int_names = {
             "nobs",
@@ -10505,6 +10597,7 @@ def emit_stmts(
             c_read_csv = parse_call_text(rhs)
             if c_read_csv is not None and c_read_csv[0].lower() == "read.csv":
                 path_src = c_read_csv[1][0] if c_read_csv[1] else c_read_csv[2].get("file", '""')
+                _CSV_HEADER_SOURCES[st.name.lower()] = path_src
                 path_f = r_expr_to_fortran(path_src)
                 if has_r_mod:
                     need_r_mod.add("read_csv_real_matrix")
@@ -11490,10 +11583,17 @@ def emit_stmts(
                     if _looks_matrix_expr(one):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
+                            row_label_expr = _matrix_row_label_expr_for_print(one)
                             labels = _matrix_col_labels_for_print(one)
                             if labels is not None:
                                 int_cols = _int_col_mask_literal(labels)
-                                if int_cols is not None:
+                                if row_label_expr is not None:
+                                    _wstmt(
+                                        f"call print_table2({one_f}, {row_label_expr}, {_char_array_literal(labels)})",
+                                        st.comment,
+                                    )
+                                    need_r_mod.add("print_table2")
+                                elif int_cols is not None:
                                     _wstmt(
                                         f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)}, int_cols={int_cols})",
                                         st.comment,
@@ -11507,8 +11607,12 @@ def emit_stmts(
                             else:
                                 label_expr = _matrix_col_label_expr_for_print(one)
                                 if label_expr is not None:
-                                    _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
-                                    need_r_mod.add("print_matrix_rstyle_named")
+                                    if row_label_expr is not None:
+                                        _wstmt(f"call print_table2({one_f}, {row_label_expr}, {label_expr})", st.comment)
+                                        need_r_mod.add("print_table2")
+                                    else:
+                                        _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
+                                        need_r_mod.add("print_matrix_rstyle_named")
                                 else:
                                     _wstmt(f"call print_matrix({one_f})", st.comment)
                                     need_r_mod.add("print_matrix_rstyle")
@@ -11909,10 +12013,17 @@ def emit_stmts(
                     if rank_one == 2:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
+                            row_label_expr = _matrix_row_label_expr_for_print(one)
                             labels = _matrix_col_labels_for_print(one)
                             if labels is not None:
                                 int_cols = _int_col_mask_literal(labels)
-                                if int_cols is not None:
+                                if row_label_expr is not None:
+                                    _wstmt(
+                                        f"call print_table2({one_f}, {row_label_expr}, {_char_array_literal(labels)})",
+                                        st.comment,
+                                    )
+                                    need_r_mod.add("print_table2")
+                                elif int_cols is not None:
                                     _wstmt(
                                         f"call print_matrix_rstyle_named({one_f}, {_char_array_literal(labels)}, "
                                         f"int_cols={int_cols})",
@@ -11924,7 +12035,10 @@ def emit_stmts(
                             else:
                                 label_expr = _matrix_col_label_expr_for_print(one)
                                 if label_expr is not None:
-                                    if re.fullmatch(r"arma_mat", one_f.strip(), re.IGNORECASE):
+                                    if row_label_expr is not None:
+                                        _wstmt(f"call print_table2({one_f}, {row_label_expr}, {label_expr})", st.comment)
+                                        need_r_mod.add("print_table2")
+                                    elif re.fullmatch(r"arma_mat", one_f.strip(), re.IGNORECASE):
                                         _wstmt(
                                             f"call print_matrix_rstyle_named({one_f}, {label_expr}, "
                                             f"int_cols=[.true., .true., spread(.false., dim=1, "
@@ -15165,12 +15279,25 @@ def _collect_pi_trig_array_args(stmts: list[object]) -> set[str]:
 def infer_main_character_scalars(stmts: list[object]) -> set[str]:
     """Find scalar vars assigned from quoted string literals in main statements."""
     out: set[str] = set()
+    char_arrays_seen = infer_main_character_arrays(stmts)
     def walk(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, Assign):
                 rhs = st.expr.strip()
                 if _dequote_string_literal(rhs) is not None:
                     out.add(st.name)
+                    continue
+                m_char_scalar_subset = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs)
+                if m_char_scalar_subset is not None:
+                    base = m_char_scalar_subset.group(1)
+                    idx = m_char_scalar_subset.group(2).strip()
+                    vectorish = (
+                        ":" in idx
+                        or "," in idx
+                        or idx.lower().startswith(("seq", "which", "c("))
+                    )
+                    if (not vectorish) and base.lower() in {x.lower() for x in char_arrays_seen}:
+                        out.add(st.name)
             elif isinstance(st, IfStmt):
                 walk(st.then_body)
                 walk(st.else_body)
@@ -15209,10 +15336,35 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
                     out.add(st.name)
                     continue
+                if c_rhs is not None and c_rhs[0].lower() in {"read_csv_header_names", "lag_names", "ar_coef_names"}:
+                    out.add(st.name)
+                    continue
+                if c_rhs is not None and c_rhs[0].lower() == "setdiff" and c_rhs[1]:
+                    src = c_rhs[1][0].strip()
+                    src_call = parse_call_text(src)
+                    if (
+                        src.lower() in {x.lower() for x in out}
+                        or src.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                        or (src_call is not None and src_call[0].lower() in {"names", "read_csv_header_names"})
+                    ):
+                        out.add(st.name)
+                    continue
                 if c_rhs is not None and c_rhs[0].lower() == "unique":
                     src = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
                     if src.lower() in {x.lower() for x in out} or src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                         out.add(st.name)
+                    continue
+                m_char_subset = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
+                if m_char_subset is not None and m_char_subset.group(1).lower() in {x.lower() for x in out}:
+                    idx_txt = rhs[rhs.find("[") + 1 : rhs.rfind("]")].strip()
+                    vectorish_subset = (
+                        ":" in idx_txt
+                        or "," in idx_txt
+                        or idx_txt.lower().startswith(("seq", "which", "c("))
+                    )
+                    if not vectorish_subset:
+                        continue
+                    out.add(st.name)
                     continue
                 if not low.startswith("c("):
                     continue
@@ -16086,6 +16238,35 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
     return sources
 
 
+def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
+    sources: dict[str, str] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, ExprStmt):
+                m = re.match(
+                    r"^\s*rownames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*(.+)$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m is not None:
+                    sources[m.group(1).lower()] = m.group(2).strip()
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return sources
+
+
 def infer_main_real_rank3_arrays(stmts: list[object]) -> set[str]:
     out: set[str] = set()
     for st in stmts:
@@ -16811,6 +16992,12 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
     array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
+    for nm_char_arr in set(char_arrays):
+        ints.discard(nm_char_arr)
+        int_arrays.discard(nm_char_arr)
+        real_arrays.discard(nm_char_arr)
+        real_scalars.discard(nm_char_arr)
+        params.pop(nm_char_arr, None)
     logical_scalars = infer_main_logical_scalars(main_stmts)
     main_kinds: dict[str, str] = {}
     for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
@@ -16864,12 +17051,13 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
-    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES
+    global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
     _EXPANDED_DATA_FRAME_ALIASES = {}
+    _CSV_HEADER_SOURCES = {}
     _LIST_FIELD_NAME_ALIASES = {}
     _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
@@ -17279,6 +17467,7 @@ def transpile_r_to_fortran(
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
         "matrix_col_labels": collect_colname_labels(main_stmts),
         "matrix_colname_exprs": collect_colname_sources(stmts),
+        "matrix_rowname_exprs": collect_rownames_sources(stmts),
     }
 
     assign_counts = infer_assigned_names(main_stmts)
@@ -17489,6 +17678,10 @@ def transpile_r_to_fortran(
         elif base_vec_subset in real_arrays:
             real_arrays.add(st_vec_subset.name)
             int_arrays.discard(st_vec_subset.name)
+        elif base_vec_subset in char_arrays or base_vec_subset.lower() in {x.lower() for x in char_arrays}:
+            char_arrays.add(st_vec_subset.name)
+            int_arrays.discard(st_vec_subset.name)
+            real_arrays.discard(st_vec_subset.name)
         else:
             continue
         ints.discard(st_vec_subset.name)
@@ -20136,6 +20329,7 @@ def transpile_r_to_fortran(
         "read_real_vector",
         "read_table_real_matrix",
         "read_csv_real_matrix",
+        "read_csv_header_names",
         "write_table_real_matrix",
         "lm_fit_general",
         "lm_r_squared_general",
@@ -22792,6 +22986,11 @@ def main() -> int:
         "lag + 1:n",
         f90,
         flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\s*-\s*(\d+)\s*:\s*\1\s*-\s*([A-Za-z]\w*)\b",
+        lambda m: f"{m.group(1)} - {m.group(2)}:{m.group(1)} - {m.group(3)}:-1",
+        f90,
     )
     f90 = re.sub(
         r"\(optim\(\s*par\s*=\s*(.*?)\s*,\s*(?:&\s*\n\s*&\s*)?fn\s*=\s*[A-Za-z]\w*\s*\)\)%par",
