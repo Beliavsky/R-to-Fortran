@@ -8529,6 +8529,13 @@ def r_expr_to_fortran(expr: str) -> str:
             if seq_call is not None and seq_call[0].lower() == "seq_len" and seq_call[1]:
                 return f"lag_names({_int_bound_expr(r_expr_to_fortran(seq_call[1][0].strip()))})"
         if c_paste[0].lower() == "paste0":
+            if len(pos_p) == 2:
+                prefix_lit = _dequote_string_literal(pos_p[0].strip())
+                if prefix_lit is not None:
+                    rhs_src = pos_p[1].strip()
+                    rhs_f = r_expr_to_fortran(rhs_src)
+                    if re.match(r"^[A-Za-z]\w*(?:\([^)]*\))?$", rhs_f.strip()):
+                        return f"r_paste0_real({r_expr_to_fortran(pos_p[0])}, real({rhs_f}, kind=dp))"
             vals_fmt: list[str] = []
             all_supported = True
             for p in pos_p:
@@ -12163,6 +12170,8 @@ def emit_stmts(
                     named_parts = _named_vector_print_parts(one)
                     if has_r_mod and named_parts is not None:
                         val_expr, name_expr, scalar_val = named_parts
+                        if "r_paste0_real(" in name_expr:
+                            need_r_mod.add("r_paste0_real")
                         if scalar_val:
                             _wstmt(
                                 f"call print_named_real_vector([real({val_expr}, kind=dp)], {name_expr})",
@@ -12470,6 +12479,8 @@ def emit_stmts(
                             named_parts_rank1 = _named_vector_print_parts(one)
                             if named_parts_rank1 is not None:
                                 val_expr_nv, name_expr_nv, scalar_nv = named_parts_rank1
+                                if "r_paste0_real(" in name_expr_nv:
+                                    need_r_mod.add("r_paste0_real")
                                 if scalar_nv:
                                     _wstmt(
                                         f"call print_named_real_vector([real({val_expr_nv}, kind=dp)], {name_expr_nv})",
@@ -15270,7 +15281,7 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
     ints: set[str] = set()
     for a in fn.args:
         dflt = fn.defaults.get(a, "").strip()
-        if a in {"n", "p", "q", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
+        if a in {"n", "p", "order", "start_order", "max_order", "maxlag", "lag", "nacf", "seed", "iter", "max_iter", "maxit", "it"} or _is_int_literal(dflt) or dflt.upper() == "NULL":
             ints.add(a)
     body_no_ret = fn.body if fn.body else []
     if body_no_ret:
