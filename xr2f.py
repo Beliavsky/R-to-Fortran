@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Partial R-to-Fortran transpiler (numeric subset).
 
 This is a pragmatic first pass analogous in workflow to xp2f.py:
@@ -10520,11 +10520,15 @@ def emit_stmts(
         t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
         src_direct = expr_map.get(t_key)
         if isinstance(src_direct, str) and src_direct.strip():
+            if re.search(r"\b(?:colnames|rownames)\s*\(", src_direct, re.IGNORECASE):
+                return None
             return r_expr_to_fortran(src_direct.strip())
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
             if isinstance(src, str) and src.strip():
+                if re.search(r"\b(?:colnames|rownames)\s*\(", src, re.IGNORECASE):
+                    return None
                 return r_expr_to_fortran(src.strip())
         return None
 
@@ -10539,11 +10543,15 @@ def emit_stmts(
         t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
         src_direct = expr_map.get(t_key)
         if isinstance(src_direct, str) and src_direct.strip():
+            if re.search(r"\b(?:colnames|rownames)\s*\(", src_direct, re.IGNORECASE):
+                return None
             return r_expr_to_fortran(src_direct.strip())
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
             if isinstance(src, str) and src.strip():
+                if re.search(r"\b(?:colnames|rownames)\s*\(", src, re.IGNORECASE):
+                    return None
                 return r_expr_to_fortran(src.strip())
         cinfo = parse_call_text(t)
         if cinfo is not None and cinfo[0].lower() in {"cor", "ccf_matrix"} and cinfo[1]:
@@ -23703,3 +23711,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
