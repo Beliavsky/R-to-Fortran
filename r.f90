@@ -24,6 +24,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
+   & r_paste0_real, r_paste0_int, &
    & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_head, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
@@ -6087,6 +6088,45 @@ do i = 1, size(x)
    out = out // trim(x(i))
 end do
 end function char_join
+
+function r_paste0_real(prefix, x) result(out)
+! Prefix each numeric value with a fixed string, matching paste0(prefix, x).
+character(len=*), intent(in) :: prefix ! prefix string
+real(kind=dp), intent(in) :: x(:) ! values to convert and prefix
+character(len=:), allocatable :: out(:)
+character(len=64) :: buf
+integer :: i, k
+real(kind=dp) :: tol
+allocate(character(len=max(1, len_trim(prefix) + 64)) :: out(size(x)))
+do i = 1, size(x)
+   if (ieee_is_finite(x(i)) .and. abs(x(i)) <= real(huge(0), kind=dp)) then
+      k = nint(x(i))
+      tol = 1000.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(x(i)))
+      if (abs(x(i) - real(k, kind=dp)) <= tol) then
+         write(buf, "(i0)") k
+      else
+         write(buf, "(g0)") x(i)
+      end if
+   else
+      write(buf, "(g0)") x(i)
+   end if
+   out(i) = trim(prefix) // trim(adjustl(buf))
+end do
+end function r_paste0_real
+
+function r_paste0_int(prefix, x) result(out)
+! Prefix each integer value with a fixed string, matching paste0(prefix, x).
+character(len=*), intent(in) :: prefix ! prefix string
+integer, intent(in) :: x(:) ! values to convert and prefix
+character(len=:), allocatable :: out(:)
+character(len=64) :: buf
+integer :: i
+allocate(character(len=max(1, len_trim(prefix) + 64)) :: out(size(x)))
+do i = 1, size(x)
+   write(buf, "(i0)") x(i)
+   out(i) = trim(prefix) // trim(adjustl(buf))
+end do
+end function r_paste0_int
 
 function list_files(path, pattern, full_names, recursive) result(out)
 ! Implement R-like character helper list_files.

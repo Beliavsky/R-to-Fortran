@@ -198,6 +198,39 @@ def simplify_norm2_patterns(lines: List[str]) -> List[str]:
     return out
 
 
+def fold_simple_integer_intrinsics(lines: List[str]) -> List[str]:
+    """Fold tiny integer-only intrinsic calls such as `max(0, 3)` -> `3`.
+
+    This intentionally handles only literal integer arguments so expressions
+    involving variables or array sizes keep their runtime checks.
+    """
+    out: List[str] = []
+    pat = re.compile(
+        r"\b(?P<fn>max|min)\s*\(\s*(?P<args>[+-]?\d+(?:\s*,\s*[+-]?\d+)+)\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _fold_code(code: str) -> str:
+        prev = None
+        cur = code
+        while prev != cur:
+            prev = cur
+
+            def _repl(m: re.Match[str]) -> str:
+                vals = [int(x.strip()) for x in m.group("args").split(",")]
+                fn = m.group("fn").lower()
+                return str(max(vals) if fn == "max" else min(vals))
+
+            cur = pat.sub(_repl, cur)
+        return cur
+
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_fold_code(code)}{comment}{eol}")
+    return out
+
+
 def rewrite_named_arguments(lines: List[str], *, max_positional: int = 3) -> List[str]:
     """Rewrite eligible positional call arguments into named arguments."""
     out, _nchg, _missing = fscan.rewrite_named_arguments_in_lines(

@@ -63,6 +63,34 @@ def test_xr2f_batch_reports_missing_at_file(tmp_path: Path) -> None:
     assert "@ file not found:" in proc.stdout
 
 
+def test_expand_inputs_skip_lines_can_skip_glob_matches(tmp_path: Path) -> None:
+    for name in ("01_a.r", "02_b.r", "03_c.r"):
+        (tmp_path / name).write_text("print(1)\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XR2F_BATCH_PATH),
+            str(tmp_path / "*.r"),
+            "--skip-lines",
+            "2",
+            "--self-contained",
+            "--tee",
+            str(tmp_path / "out.txt"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Totals: 1 files, 1 pass, 0 fail" in proc.stdout
+    assert "03_c.r" in proc.stdout
+    assert "01_a.r" not in proc.stdout
+    assert "02_b.r" not in proc.stdout
+
+
 def test_xr2f_batch_self_contained_limit_and_tee(tmp_path: Path) -> None:
     a_r = tmp_path / "a.r"
     b_r = tmp_path / "b.r"

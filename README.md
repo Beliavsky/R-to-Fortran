@@ -1,39 +1,39 @@
 # R-to-Fortran
 
-`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate simple numeric, array-oriented, and statistical R scripts into readable Fortran that can be compiled with `gfortran`.
+`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate numeric, array-oriented, and statistical R scripts into readable Fortran that can be compiled with `gfortran`.
 
-This is not a complete R implementation.  It is useful for numeric scripts that mostly use base R arrays, loops, scalar functions, vector operations, and selected statistical helpers.
+This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, and a growing subset of base R statistical algorithms.  The project now includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, and file I/O patterns used by the example corpus.
 
 ## Quick Start
 
 Translate an R script:
 
 ```bat
-python xr2f.py xhello.r
+python xr2f.py r_examples\xhello.r
 ```
 
 Compile the generated Fortran:
 
 ```bat
-python xr2f.py xhello.r --compile
+python xr2f.py r_examples\xhello.r --compile
 ```
 
 Compile and run the generated Fortran:
 
 ```bat
-python xr2f.py xhello.r --run
+python xr2f.py r_examples\xhello.r --run
 ```
 
 Run both the original R script and the generated Fortran:
 
 ```bat
-python xr2f.py xhello.r --run-both
+python xr2f.py r_examples\xhello.r --run-both
 ```
 
 Create a single self-contained Fortran file with the needed runtime support prepended:
 
 ```bat
-python xr2f.py xrunif.r --self-contained --compile
+python xr2f.py r_examples\xrunif.r --self-contained --compile
 ```
 
 ## Example
@@ -88,10 +88,11 @@ end program xr2f_smoke
 
 - `xr2f.py`: main R-to-Fortran transpiler.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
-- `r.f90`: Fortran runtime helper module.
+- `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, and file-I/O helpers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
 - `tests/`: pytest tests for the standalone command-line tools.
-- `x*.r`, `xr2f_smoke.R`: small R examples used by the pytest suite.
+- `r_examples/`: small R scripts used as examples and regression inputs.  These include both R syntax probes and statistical algorithm examples.
+- `r_stat_examples/`: numbered statistical examples, including data-reading examples and base-R statistical workflows.
 
 Generated files normally use the suffix `_r.f90`, for example `foo.r` becomes `foo_r.f90`.
 
@@ -109,8 +110,13 @@ The supported subset is intentionally focused on numerical scripts:
 - Matrix helpers such as `matrix`, `array`, `t`, `%*%`, `crossprod`, `tcrossprod`, `rowSums`, `colSums`, `det`, and `solve(a, b)` for selected cases.
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
 - Basic named vectors: construction with names, `names(v)`, `unname(v)`, named printing, positional indexing, literal-name indexing, and name-preserving printed arithmetic.
+- Selected data-frame and file-reading patterns such as `read.table(..., header = TRUE)` into numeric matrices.
+- Statistical distributions and tests such as normal/exponential/gamma/beta-related helpers, `t.test`, empirical CDF/KS-style helpers, and related summaries.
+- Linear-model helpers including selected `lm`, prediction, coefficients, summaries, confidence intervals, and simple stepwise model selection support.
+- Smoothing and time-series helpers such as moving filters, running medians, lowess/loess-style approximations, spline/decomposition helpers, `acf`/`pacf`-style routines, AR/ARMA/ARIMA-related subsets, and VAR/VARMA example support.
+- Clustering and multivariate helpers such as distance matrices, hierarchical clustering/cutting, `kmeans`, covariance/correlation helpers, Cholesky/QR helpers, and selected mixture-model routines.
 
-Unsupported or incomplete areas include general R objects, packages, data frames beyond narrow patterns, formulas beyond simple cases, S3/S4 dispatch, closures with general lexical scoping, environments, complex string processing, and arbitrary list manipulation.
+Unsupported or incomplete areas include general R objects, packages, data frames beyond narrow patterns, formulas beyond simple cases, S3/S4 dispatch, closures with general lexical scoping, environments, complex string processing, and arbitrary list manipulation.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
 
 ## Runtime Modes
 
@@ -138,48 +144,42 @@ python xr2f.py foo.r --run --recycle-stop
 Compile all `.R` files in a directory:
 
 ```bat
-python xr2f_batch.py examples\*.R --compile
+python xr2f_batch.py r_stat_examples\*.R --compile
 ```
 
 Compile with a limit:
 
 ```bat
-python xr2f_batch.py examples\*.R --compile --limit 20
+python xr2f_batch.py r_stat_examples\*.R --compile --limit 20
 ```
 
 Run multiple jobs in parallel:
 
 ```bat
-python xr2f_batch.py examples\*.R --compile --jobs 4
+python xr2f_batch.py r_stat_examples\*.R --compile --jobs 4
 ```
 
 Stop after the first failure and print useful failure detail:
 
 ```bat
-python xr2f_batch.py examples\*.R --compile --max-fail 1
+python xr2f_batch.py r_stat_examples\*.R --compile --max-fail 1
 ```
 
 Save batch output to a results file:
 
 ```bat
-python xr2f_batch.py examples\*.R --compile --tee
+python xr2f_batch.py r_stat_examples\*.R --compile --tee
 ```
 
 ## Tests
 
-The repository includes a focused pytest suite and small R fixture scripts:
+The repository includes a focused pytest suite and R fixture scripts:
 
 ```bat
 pytest -q
 ```
 
-At the time this README was updated, the suite collected 25 tests:
-
-```bat
-pytest --collect-only -q
-```
-
-The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.
+The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.  Many tests use scripts from `r_examples/` and generated one-off R programs in temporary directories.
 
 ## Comparing R and Fortran Output
 
@@ -199,7 +199,9 @@ Differences can be legitimate when the R script uses random numbers, platform-de
 
 ## Project Status
 
-This project is early-stage and test-driven.  The practical strategy is to add support for real scripts one feature at a time while checking that existing translated scripts still compile and run.
+This project is experimental and test-driven.  The practical strategy is to add support for real scripts one feature at a time while checking that existing translated scripts still compile and run.
+
+The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations used by the example corpus.  Coverage is still selective and pragmatic.  The translator favors real regression examples over full language completeness.
 
 Good bug reports include:
 
