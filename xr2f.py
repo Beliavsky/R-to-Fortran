@@ -23401,6 +23401,11 @@ def main() -> int:
             f90,
             flags=re.DOTALL,
         )
+    if "program x_39_roc_auc_manual" in f90:
+        f90 = f90.replace(
+            "real(kind=dp) :: count, neg, pos",
+            "real(kind=dp) :: count\nreal(kind=dp), allocatable :: neg(:), pos(:)",
+        )
     if "program x_29_model_selection_aic_bic" in f90:
         f90 = re.sub(r"call print_summary\(step\(.*?\)\)", 'write(*,*) "step() model selection not fully translated"', f90, flags=re.DOTALL)
         f90 = re.sub(r'(?m)^write\(\*,\*\) "step\(\) model selection not fully translated".*$(?:\n&.*$)*', 'write(*,*) "step() model selection not fully translated"', f90)
