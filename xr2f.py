@@ -22264,7 +22264,12 @@ def _cached_runtime_object(
             pass
         return obj, cache_dir, None
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cmd = cparts + ["-J", str(cache_dir), "-c", str(helper), "-o", str(obj)]
+    compiler_name = Path(cparts[0]).name.lower() if cparts else ""
+    if "ifx" in compiler_name:
+        module_flags = [f"/module:{cache_dir}"] if sys.platform.startswith("win") else ["-module", str(cache_dir)]
+    else:
+        module_flags = ["-J", str(cache_dir)]
+    cmd = cparts + module_flags + ["-c", str(helper), "-o", str(obj)]
     try:
         cp = _run_capture(cmd, cwd=cache_dir)
         if cp.returncode != 0:
@@ -22607,6 +22612,13 @@ def _with_fortran_cpp_flag(cparts: list[str]) -> list[str]:
     return out
 
 
+def _fortran_module_include_flags(cparts: list[str], inc_dir: Path) -> list[str]:
+    compiler_name = Path(cparts[0]).name.lower() if cparts else ""
+    if "ifx" in compiler_name and sys.platform.startswith("win"):
+        return [f"/I{inc_dir}"]
+    return ["-I", str(inc_dir)]
+
+
 def _with_r_rng_fortran_flags(cparts: list[str]) -> list[str]:
     out = _with_fortran_cpp_flag(cparts)
     if not any(p == "-DXR2F_USE_R_RNG" for p in out):
@@ -22754,6 +22766,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--compile")
     if getattr(args, "debug", False):
         cmd.append("--debug")
+    if getattr(args, "gfortran", False):
+        cmd.append("--gfortran")
     if getattr(args, "ifx", False):
         cmd.append("--ifx")
     if args.run:
@@ -22824,6 +22838,99 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.extend(["--rscript", args.rscript])
     cp = subprocess.run(cmd)
     return int(cp.returncode)
+
+
+def _argv_without_compiler_selectors(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in {"--gfortran", "--ifx"}:
+            continue
+        if arg == "--compiler":
+            skip_next = True
+            continue
+        if arg.startswith("--compiler="):
+            continue
+        out.append(arg)
+    return out
+
+
+def _run_selected_compilers(argv: list[str], selected: list[tuple[str, str]]) -> int:
+    base_args = _argv_without_compiler_selectors(argv)
+    timings: list[tuple[str, dict[str, float]]] = []
+    rc = 0
+    for label, compiler in selected:
+        print(f"=== Compiler: {label} ===", flush=True)
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *base_args,
+            "--compile",
+            "--compiler",
+            compiler,
+        ]
+        cp = subprocess.run(cmd, capture_output=True, text=True)
+        if cp.stdout:
+            print(cp.stdout, end="" if cp.stdout.endswith("\n") else "\n")
+        if cp.stderr:
+            print(cp.stderr, end="" if cp.stderr.endswith("\n") else "\n")
+        parsed = _parse_timing_summary(cp.stdout + "\n" + cp.stderr)
+        if parsed:
+            timings.append((label, parsed))
+        if cp.returncode != 0 and rc == 0:
+            rc = int(cp.returncode)
+    _print_combined_timing_summary(timings)
+    return rc
+
+
+def _parse_timing_summary(text: str) -> dict[str, float]:
+    rows: dict[str, float] = {}
+    in_table = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "Timing summary (seconds):":
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if not stripped:
+            if rows:
+                break
+            continue
+        if stripped.startswith("stage "):
+            continue
+        m = re.match(r"^(.+?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+(?:\S+)\s*$", stripped)
+        if m:
+            rows[m.group(1).strip()] = float(m.group(2))
+    return rows
+
+
+def _print_combined_timing_summary(timings: list[tuple[str, dict[str, float]]]) -> None:
+    if not timings:
+        return
+    preferred = ["r run", "transpile", "compile", "fortran run", "fortran total"]
+    stages = [stage for stage in preferred if any(stage in vals for _, vals in timings)]
+    for _, vals in timings:
+        for stage in vals:
+            if stage not in stages:
+                stages.append(stage)
+    headers = ["compiler", *stages]
+    body = [
+        [label, *[f"{vals[stage]:.6f}" if stage in vals else "" for stage in stages]]
+        for label, vals in timings
+    ]
+    widths = [
+        max(len(str(row[i])) for row in [headers, *body])
+        for i in range(len(headers))
+    ]
+    print()
+    print("Combined timing summary (seconds):")
+    print("  " + "  ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))))
+    for row in body:
+        print("  " + "  ".join(str(row[i]).ljust(widths[i]) for i in range(len(row))))
 
 
 def _maybe_adopt_positional_out(args: argparse.Namespace) -> None:
@@ -22967,6 +23074,11 @@ def main() -> int:
     )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
+    ap.add_argument(
+        "--gfortran",
+        action="store_true",
+        help="compile with the default gfortran command; implies --compile",
+    )
     ap.add_argument(
         "--debug",
         action="store_true",
@@ -23121,17 +23233,26 @@ def main() -> int:
         print("Options conflict: --recycle-warn and --recycle-stop cannot be used together.")
         return 1
 
+    compiler_selectors = []
+    if args.gfortran:
+        compiler_selectors.append(("gfortran", DEFAULT_COMPILER))
+    if args.ifx:
+        compiler_selectors.append(("ifx", IFX_COMPILER))
+    if compiler_explicit and compiler_selectors:
+        print("Options conflict: --compiler cannot be used with --gfortran or --ifx.")
+        return 1
+
     if args.debug:
+        if compiler_selectors:
+            print("Options conflict: --debug cannot be used with --gfortran or --ifx.")
+            return 1
         args.run = True
         args.compile = True
         if not compiler_explicit:
             args.compiler = DEBUG_COMPILER
-    if args.ifx:
-        if compiler_explicit:
-            print("Options conflict: --ifx and --compiler cannot be used together.")
-            return 1
+    if len(compiler_selectors) == 1:
         args.compile = True
-        args.compiler = IFX_COMPILER
+        args.compiler = compiler_selectors[0][1]
     if args.time_both:
         args.run_diff = True
     if args.run_all:
@@ -23156,6 +23277,9 @@ def main() -> int:
     if args.out_python and not args.via_python:
         print("Option --out-python requires --via-python (or --run-all/--tee-all).")
         return 1
+    if len(compiler_selectors) > 1:
+        args.compile = True
+        return _run_selected_compilers(sys.argv[1:], compiler_selectors)
 
     if _has_glob_chars(args.input_r):
         matches = sorted(glob.glob(args.input_r))
@@ -23550,8 +23674,13 @@ def main() -> int:
     if r_comments:
         migrated_block = "\n".join(f"! {c}" for c in r_comments) + "\n"
     f90 = f"! transpiled by xr2f.py from {in_path.name} on {stamp}\n" + migrated_block + f90
+    uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
+    compile_helper_paths = [
+        hp for hp in helper_paths
+        if hp.name.lower() != "r.f90" or uses_r_mod
+    ]
     if args.self_contained:
-        f90 = prepend_self_contained_runtime(f90, helper_paths)
+        f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
@@ -23602,8 +23731,9 @@ def main() -> int:
                 return shim_cp.returncode
             build_helpers.append(str(shim_obj))
         if not args.self_contained:
-            use_runtime_cache = bool(cparts) and "gfortran" in Path(cparts[0]).name.lower()
-            for hp in helper_paths:
+            compiler_name = Path(cparts[0]).name.lower() if cparts else ""
+            use_runtime_cache = bool(cparts) and ("gfortran" in compiler_name or "ifx" in compiler_name)
+            for hp in compile_helper_paths:
                 if use_runtime_cache and hp.name.lower() == "r.f90":
                     using_cached_runtime = True
                     obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts)
@@ -23613,7 +23743,7 @@ def main() -> int:
                         print(f"Build: FAIL (exit {helper_cp.returncode})")
                         _print_captured(helper_cp)
                         return helper_cp.returncode
-                    include_dirs.extend(["-J", str(inc_dir), "-I", str(inc_dir)])
+                    include_dirs.extend(_fortran_module_include_flags(cparts, inc_dir))
                     build_helpers.append(str(obj))
                 else:
                     build_helpers.append(str(hp.resolve()))
