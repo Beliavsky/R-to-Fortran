@@ -5239,6 +5239,9 @@ def rewrite_list_directed_print_reals(
             if real_lit_re.match(t):
                 fmts.append(real_fmt)
                 continue
+            if re.search(r"(?<![<>=/])(?:==|/=|<=|>=|<|>)(?![<>=/])|\.(?:and|or|not)\.", t, re.IGNORECASE):
+                fmts.append("l1")
+                continue
             base = base_identifier(t)
             if base is not None:
                 if base in int_names:
