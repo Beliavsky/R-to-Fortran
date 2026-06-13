@@ -280,7 +280,12 @@ def main() -> int:
     ap.add_argument("--no-format-print", action="store_true", help="Forward --no-format-print to xr2f.py.")
     ap.add_argument("--if-const-aggressive", action="store_true", help="Forward --if-const-aggressive to xr2f.py.")
     ap.add_argument("--limit", type=int, default=0, help="Process at most this many matched files (0 = no limit).")
-    ap.add_argument("--skip-lines", type=int, default=0, help="Skip this many initial lines in top-level @list files.")
+    ap.add_argument(
+        "--skip-lines",
+        type=int,
+        default=0,
+        help="Skip this many initial entries: lines for top-level @list files, or matched files for globs/direct inputs.",
+    )
     ap.add_argument("--max-fail", "--maxfail", dest="max_fail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
     ap.add_argument("--jobs", type=int, default=1, help="Run up to this many independent xr2f.py jobs concurrently.")
     ap.add_argument("--timeout", type=float, default=0.0, help="Per-file timeout in seconds (0 = no timeout).")
@@ -336,6 +341,8 @@ def main() -> int:
         for err in input_errors:
             print(err)
         return 1
+    if args.skip_lines > 0 and not any(item.startswith("@") for item in args.inputs):
+        r_files = r_files[args.skip_lines :]
     if not r_files:
         print("No R files matched the provided inputs.")
         return 1
@@ -501,6 +508,8 @@ def main() -> int:
         if not args.terse:
             tee.print(f"[{r.index}/{total}] {r.source}")
         if r.output:
+            if args.terse and not r.ok:
+                tee.print("")
             tee.print(r.output)
         if (not args.terse) and r.index < total:
             tee.print("")
