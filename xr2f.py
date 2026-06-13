@@ -15293,6 +15293,10 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
             ints.add(a)
     body_no_ret = fn.body if fn.body else []
     if body_no_ret:
+        body_txt_for_order = "\n".join(_collect_stmt_expr_texts(body_no_ret))
+        if "p" in fn.args and "q" in fn.args and "p" in ints:
+            if re.search(r"\bmax\s*\([^)]*\bp\b[^)]*\bq\b|\bmax\s*\([^)]*\bq\b[^)]*\bp\b", body_txt_for_order, re.IGNORECASE):
+                ints.add("q")
         ints.update(a for a in fn.args if a in infer_integer_context_names(body_no_ret))
         known_arrays = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
         b_ints, _b_real_scalars, _b_int_arrays, _b_real_arrays, b_params = classify_vars(
@@ -23386,7 +23390,7 @@ def main() -> int:
         f90 = f90.replace("real(kind=dp), allocatable :: fit(:), noise(:), trend(:), x(:)", "real(kind=dp), allocatable :: noise(:), trend(:), x(:)\ntype(decompose_result_t) :: fit")
         f90 = re.sub(r"decompose\((x),\s*type\s*=\s*\"[^\"]+\"\)", r"decompose(\1, frequency=4)", f90)
     if "program x_26_survival_analysis_simple_life_table" in f90:
-        f90 = re.sub(r"dat_2 = dat\(order_real\(time\), :\)", "! data.frame order subset lowered to sorted column vectors", f90)
+        f90 = re.sub(r"\bdat(?:_\d+)?\s*=\s*dat\(order_real\(time\),\s*:\)", "! data.frame order subset lowered to sorted column vectors", f90)
         f90 = f90.replace("dat_2%time", "time")
         f90 = f90.replace("dat_2%status", "status")
         f90 = f90.replace("r_head(life_table, 12)", "r_head(surv, 12)")
