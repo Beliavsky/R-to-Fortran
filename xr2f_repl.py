@@ -85,7 +85,7 @@ def parse_compiler_words(words: list[str], *, allow: bool = True) -> tuple[list[
     if not words:
         return [], ""
     if not allow:
-        return None, "compiler selectors are not valid for run-r"
+        return None, "compiler selectors are not valid for R-only commands"
     specs: list[tuple[str, list[str]]] = []
     current_name = ""
     current_options: list[str] = []
@@ -112,15 +112,39 @@ def parse_compiler_words(words: list[str], *, allow: bool = True) -> tuple[list[
     return out, ""
 
 
+def parse_repeat_verbose_and_compiler_words(words: list[str]) -> tuple[int | None, bool, list[str], str]:
+    verbose = False
+    if not words:
+        return 1, verbose, [], ""
+    if re.fullmatch(r"\d+", words[0]):
+        repeat = int(words[0])
+        if repeat < 1:
+            return None, verbose, [], "repeat count must be positive"
+        words = words[1:]
+    else:
+        repeat = 1
+    kept: list[str] = []
+    for word in words:
+        if word.lower() == "verbose":
+            verbose = True
+        else:
+            kept.append(word)
+    return repeat, verbose, kept, ""
+
+
 def build_xr2f_command(
     args: argparse.Namespace,
     source_path: Path,
     fortran_path: Path,
     mode: str,
     compiler_command: str | None = None,
+    repeat: int = 1,
+    verbose_runs: bool = False,
 ) -> list[str]:
     if mode == "time-both":
         run_flag = "--time-both"
+    elif mode == "time":
+        run_flag = "--time"
     elif mode == "run-both":
         run_flag = "--run-both"
     else:
@@ -133,6 +157,10 @@ def build_xr2f_command(
         str(fortran_path),
         run_flag,
     ]
+    if repeat != 1:
+        cmd.extend(["--run-repeat", str(repeat)])
+    if verbose_runs:
+        cmd.append("--verbose-runs")
     if compiler_command:
         cmd.extend(["--compiler", compiler_command])
     elif args.compiler:
@@ -168,6 +196,8 @@ def run_session(
     source_name: str = DEFAULT_SESSION_R,
     mode: str = "run",
     compilers: list[tuple[str, str]] | None = None,
+    repeat: int = 1,
+    verbose_runs: bool = False,
 ) -> SessionResult:
     source = repl_source(lines)
     with tempfile.TemporaryDirectory(prefix="xr2f_repl_") as tmp:
@@ -175,23 +205,38 @@ def run_session(
         source_path = tmpdir / source_name
         fortran_path = tmpdir / DEFAULT_SESSION_FORTRAN
         source_path.write_text(source, encoding="utf-8")
-        if mode != "run-r" and compilers:
-            return run_compiler_specs(source_path, fortran_path, args, mode, compilers)
+        if mode not in {"run-r", "time-r"} and compilers:
+            return run_compiler_specs(source_path, fortran_path, args, mode, compilers, repeat, verbose_runs)
         cmd = (
             build_rscript_command(args, source_path)
-            if mode == "run-r"
-            else build_xr2f_command(args, source_path, fortran_path, mode)
+            if mode in {"run-r", "time-r"}
+            else build_xr2f_command(args, source_path, fortran_path, mode, repeat=repeat, verbose_runs=verbose_runs)
         )
         t0 = time.perf_counter()
         try:
-            cp = subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout)
+            runs = [subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout) for _ in range(repeat if mode in {"run-r", "time-r"} else 1)]
         except subprocess.TimeoutExpired as exc:
             return SessionResult(False, message=f"{cmd[0]} timed out after {exc.timeout} seconds")
         seconds = time.perf_counter() - t0
+        cp = runs[0]
+        failed = next((rr for rr in runs if rr.returncode != 0), None)
+        if failed is not None:
+            cp = failed
         fortran = fortran_path.read_text(encoding="utf-8", errors="replace") if fortran_path.exists() else ""
-        if cp.returncode == 0:
+        if failed is None and cp.returncode == 0:
             stdout = cp.stdout
-            if mode == "run":
+            if mode in {"run-r", "time-r"} and repeat != 1:
+                if verbose_runs:
+                    stdout_parts: list[str] = [f"Run (r) repeat: {repeat} (showing all runs)\n"]
+                    for i_rep, rr in enumerate(runs, 1):
+                        stdout_parts.append(f"Run (r) output {i_rep}/{repeat}:\n")
+                        stdout_parts.append(rr.stdout)
+                        if rr.stdout and not rr.stdout.endswith("\n"):
+                            stdout_parts.append("\n")
+                    stdout = "".join(stdout_parts)
+                else:
+                    stdout = f"Run (r) repeat: {repeat} (showing first run output)\n" + stdout
+            if mode in {"run", "time"}:
                 stdout = _xr2f_run_output(stdout)
             return SessionResult(True, stdout=stdout, stderr=cp.stderr, fortran=fortran, seconds=seconds)
         message = "\n".join(part.rstrip() for part in (cp.stdout, cp.stderr) if part and part.strip())
@@ -204,6 +249,8 @@ def run_compiler_specs(
     args: argparse.Namespace,
     mode: str,
     compilers: list[tuple[str, str]],
+    repeat: int = 1,
+    verbose_runs: bool = False,
 ) -> SessionResult:
     t0 = time.perf_counter()
     stdout_parts: list[str] = []
@@ -213,7 +260,7 @@ def run_compiler_specs(
     last_fortran = ""
     for label, compiler_command in compilers:
         stdout_parts.append(f"=== Compiler: {label} ===\n")
-        cmd = build_xr2f_command(args, source_path, fortran_path, mode, compiler_command)
+        cmd = build_xr2f_command(args, source_path, fortran_path, mode, compiler_command, repeat, verbose_runs)
         try:
             cp = subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout)
         except subprocess.TimeoutExpired as exc:
@@ -275,7 +322,7 @@ def combined_timing_summary(timings: list[tuple[str, dict[str, float]]]) -> str:
                 stages.append(stage)
     headers = ["compiler", *stages]
     body = [
-        [label, *[f"{vals[stage]:.6f}" if stage in vals else "" for stage in stages]]
+        [label, *[f"{vals[stage]:.4f}" if stage in vals else "" for stage in stages]]
         for label, vals in timings
     ]
     widths = [max(len(str(row[i])) for row in [headers, *body]) for i in range(len(headers))]
@@ -287,14 +334,21 @@ def combined_timing_summary(timings: list[tuple[str, dict[str, float]]]) -> str:
 
 
 def print_timing(result: SessionResult) -> None:
-    print(f"xr2f_repl timing: {result.seconds:.6f} s ({'ok' if result.ok else 'failed'})")
+    print(f"xr2f_repl timing: {result.seconds:.4f} s ({'ok' if result.ok else 'failed'})")
 
 
 def run_file(args: argparse.Namespace) -> int:
     source_path = Path(args.source)
     source = source_path.read_text(encoding="utf-8-sig")
     lines = source.splitlines()
-    result = run_session(lines, args, source_name=source_path.name, mode=args.mode)
+    result = run_session(
+        lines,
+        args,
+        source_name=source_path.name,
+        mode=args.mode,
+        repeat=args.repeat,
+        verbose_runs=args.verbose_runs,
+    )
     if args.fortran:
         print(result.fortran, end="" if result.fortran.endswith("\n") else "\n")
     if args.time:
@@ -310,10 +364,14 @@ def run_file(args: argparse.Namespace) -> int:
     return 1
 
 
-def run_repl(args: argparse.Namespace) -> int:
+def run_repl(args: argparse.Namespace, initial_source: Path | None = None) -> int:
     print("xr2f interactive mode")
-    print("Commands: run, run-r, run-both, time-both, fortran, list, clear, quit")
+    print("Commands: run, time, run-r, time-r, run-both, time-both, fortran, list, clear, quit")
+    print("Run commands accept: [N] [verbose] [gfortran|ifx options...]")
     lines: list[str] = []
+    if initial_source is not None:
+        lines = initial_source.read_text(encoding="utf-8-sig").splitlines()
+        print(f"loaded {initial_source} ({len(lines)} lines)")
     last_fortran = ""
     while True:
         try:
@@ -339,14 +397,18 @@ def run_repl(args: argparse.Namespace) -> int:
                 print(last_fortran, end="" if last_fortran.endswith("\n") else "\n")
             continue
         words = raw_cmd.split()
-        if words and words[0].lower() in {"run", "run-r", "run-both", "time-both"}:
+        if words and words[0].lower() in {"run", "time", "run-r", "time-r", "run-both", "time-both"}:
             run_cmd = words[0].lower()
-            compilers, error = parse_compiler_words(words[1:], allow=(run_cmd != "run-r"))
+            repeat, verbose_runs, compiler_words, error = parse_repeat_verbose_and_compiler_words(words[1:])
+            if repeat is None:
+                print(f"xr2f_repl: {error}", file=sys.stderr)
+                continue
+            compilers, error = parse_compiler_words(compiler_words, allow=(run_cmd not in {"run-r", "time-r"}))
             if compilers is None:
                 print(f"xr2f_repl: {error}", file=sys.stderr)
                 continue
-            result = run_session(lines, args, mode=run_cmd, compilers=compilers)
-            if args.time:
+            result = run_session(lines, args, mode=run_cmd, compilers=compilers, repeat=repeat, verbose_runs=verbose_runs)
+            if args.time or run_cmd in {"time", "time-r"}:
                 print_timing(result)
             if result.ok:
                 if result.fortran:
@@ -393,13 +455,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--xr2f", default=str(DEFAULT_XR2F), help="path to xr2f.py")
     parser.add_argument(
         "--mode",
-        choices=["run", "run-r", "run-both", "time-both"],
+        choices=["run", "time", "run-r", "time-r", "run-both", "time-both"],
         default="run",
-        help="file mode execution backend",
+        help="batch execution backend",
     )
+    parser.add_argument("--batch", action="store_true", help="with a source file, run once and exit instead of loading the REPL")
     parser.add_argument("--compiler", default="", help="compiler command passed to xr2f.py")
     parser.add_argument("--rscript", default="rscript", help="Rscript executable")
     parser.add_argument("--timeout", type=float, default=60.0, help="xr2f.py timeout in seconds")
+    parser.add_argument("--repeat", type=int, default=1, help="run program this many times after one transpile/build")
+    parser.add_argument("--verbose-runs", action="store_true", help="with --repeat, print output from every repeated run")
     parser.add_argument("--fortran", action="store_true", help="print generated Fortran before output in file mode")
     parser.add_argument("--time", action="store_true", help="print elapsed time")
     parser.add_argument("--pretty", action="store_true", help="pass --pretty to xr2f.py")
@@ -413,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-fortran", default=DEFAULT_SESSION_FORTRAN, help="REPL session Fortran file written on exit")
     parser.add_argument("--no-save", action="store_true", help="in REPL mode, do not save session files on exit")
     args = parser.parse_args(argv)
+    if args.repeat < 1:
+        print("xr2f_repl: --repeat must be positive", file=sys.stderr)
+        return 2
 
     xr2f = Path(args.xr2f)
     if not xr2f.exists():
@@ -423,7 +491,9 @@ def main(argv: list[str] | None = None) -> int:
         if not source.exists():
             print(f"xr2f_repl: source file not found: {source}", file=sys.stderr)
             return 2
-        return run_file(args)
+        if args.batch:
+            return run_file(args)
+        return run_repl(args, initial_source=source)
     return run_repl(args)
 
 
