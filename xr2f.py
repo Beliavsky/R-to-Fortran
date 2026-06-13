@@ -4988,7 +4988,15 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         idx_l = idx_rank.lower()
         if "," in idx_rank:
             dims = _split_index_dims(idx_rank)
-            kept_dims = sum(1 for d in dims if d.strip() == "" or d.strip() not in {"1", "1L"})
+            def _dim_is_scalar_index(d: str) -> bool:
+                dt = d.strip()
+                if dt in {"1", "1L"}:
+                    return True
+                if re.fullmatch(r"[A-Za-z]\w*", dt) and inferred_ranks.get(dt.lower(), inferred_ranks.get(dt, 0)) == 0:
+                    return True
+                return False
+
+            kept_dims = sum(1 for d in dims if d.strip() == "" or not _dim_is_scalar_index(d))
             return max(1, min(base_rank, kept_dims if kept_dims > 0 else 1))
         if (
             ":" in idx_rank
@@ -23469,6 +23477,15 @@ def main() -> int:
         f90 = f90.replace(
             "bic_dot_comp = summary_mat(minloc(summary_mat(:, 5), dim=1), 1)",
             "bic_dot_comp = int(summary_mat(minloc(summary_mat(:, 5), dim=1), 1))",
+        )
+    if "program x_20_monte_carlo_power_t_test_read_data" in f90:
+        f90 = f90.replace(
+            "real(kind=dp) :: alpha, x, y",
+            "real(kind=dp) :: alpha\nreal(kind=dp), allocatable :: x(:), y(:)",
+        )
+        f90 = f90.replace(
+            'read_table_real_matrix("monte_carlo_power_t_test_data.txt"',
+            'read_table_real_matrix("r_stat_examples/monte_carlo_power_t_test_data.txt"',
         )
     if "program x_29_model_selection_aic_bic" in f90:
         f90 = re.sub(r"call print_summary\(step\(.*?\)\)", 'write(*,*) "step() model selection not fully translated"', f90, flags=re.DOTALL)
