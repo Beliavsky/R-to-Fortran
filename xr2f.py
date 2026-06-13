@@ -14,6 +14,7 @@ import argparse
 import difflib
 import glob
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,8 @@ import fortran_post as fpost
 import fortran_scan as fscan
 
 _HAS_R_MOD = False
+_FORTRAN_COMMENTS = True
+_RAW_FORTRAN_TAG = "xr2f_raw_fortran"
 _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
 _USER_FUNC_ARG_RANK: dict[str, dict[str, int]] = {}
@@ -187,6 +190,14 @@ class FuncDef:
     defaults: dict[str, str]
     body: list[object]
     leading_comments: tuple[str, ...] = ()
+
+
+def _fortran_comment_payload(text: str) -> str | None:
+    if not _FORTRAN_COMMENTS:
+        return None
+    t = text.lstrip()
+    m = re.match(r"^(?:f|fortran)\s+(.+)$", t, flags=re.IGNORECASE)
+    return m.group(1).rstrip() if m else None
 
 
 def _collect_stmt_expr_texts(stmts: list[object]) -> list[str]:
@@ -9837,6 +9848,10 @@ def emit_stmts(
             o.w(stmt_line)
 
     def _wcomment(text: str) -> None:
+        payload = _fortran_comment_payload(text)
+        if payload is not None:
+            o.w(f"{payload} ! {_RAW_FORTRAN_TAG}")
+            return
         t = text.strip()
         if t:
             o.w(f"! {t}")
@@ -17446,8 +17461,9 @@ def transpile_r_to_fortran(
     no_recycle: bool = False,
     recycle_warn: bool = False,
     recycle_stop: bool = False,
+    fortran_comments: bool = True,
 ) -> str:
-    global _HAS_R_MOD, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -17455,6 +17471,7 @@ def transpile_r_to_fortran(
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
+    _FORTRAN_COMMENTS = bool(fortran_comments)
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
     _EXPANDED_DATA_FRAME_ALIASES = {}
@@ -22780,6 +22797,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--time")
     if args.time_both:
         cmd.append("--time-both")
+    if getattr(args, "run_repeat", 1) != 1:
+        cmd.extend(["--run-repeat", str(args.run_repeat)])
+    if getattr(args, "verbose_runs", False):
+        cmd.append("--verbose-runs")
     if args.tee:
         cmd.append("--tee")
     if args.tee_both:
@@ -22816,6 +22837,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--no-recycle")
     if args.recycle_warn:
         cmd.append("--recycle-warn")
+    if getattr(args, "no_fortran_comments", False):
+        cmd.append("--no-fortran-comments")
     if args.recycle_stop:
         cmd.append("--recycle-stop")
     if args.warn_approx:
@@ -22919,7 +22942,7 @@ def _print_combined_timing_summary(timings: list[tuple[str, dict[str, float]]]) 
                 stages.append(stage)
     headers = ["compiler", *stages]
     body = [
-        [label, *[f"{vals[stage]:.6f}" if stage in vals else "" for stage in stages]]
+        [label, *[f"{vals[stage]:.4f}" if stage in vals else "" for stage in stages]]
         for label, vals in timings
     ]
     widths = [
@@ -22931,6 +22954,41 @@ def _print_combined_timing_summary(timings: list[tuple[str, dict[str, float]]]) 
     print("  " + "  ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))))
     for row in body:
         print("  " + "  ".join(str(row[i]).ljust(widths[i]) for i in range(len(row))))
+
+
+def _mean_sd(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    mean = sum(values) / float(len(values))
+    if len(values) < 2:
+        return mean, 0.0
+    var = sum((x - mean) ** 2 for x in values) / float(len(values) - 1)
+    return mean, math.sqrt(var)
+
+
+def _protect_raw_fortran_lines(lines: list[str]) -> tuple[list[str], dict[str, str]]:
+    protected: list[str] = []
+    restore: dict[str, str] = {}
+    for i, line in enumerate(lines):
+        if _RAW_FORTRAN_TAG in line:
+            key = f"__XR2F_RAW_FORTRAN_{i}__"
+            restore[key] = line
+            protected.append(key)
+        else:
+            protected.append(line)
+    return protected, restore
+
+
+def _restore_raw_fortran_lines(lines: list[str], restore: dict[str, str]) -> list[str]:
+    return [restore.get(line.strip(), line) for line in lines]
+
+
+def _strip_raw_fortran_tags(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    tag_re = re.compile(r"\s*!\s*" + re.escape(_RAW_FORTRAN_TAG) + r"\s*$")
+    for line in lines:
+        out.append(tag_re.sub("", line).rstrip())
+    return out
 
 
 def _maybe_adopt_positional_out(args: argparse.Namespace) -> None:
@@ -23092,6 +23150,8 @@ def main() -> int:
     ap.add_argument("--run-diff", action="store_true", help="run both and compare outputs")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original R and transpiled Fortran (implies --run-diff)")
+    ap.add_argument("--run-repeat", type=int, default=1, help="run R/Fortran programs this many times after one transpile/build")
+    ap.add_argument("--verbose-runs", action="store_true", help="with --run-repeat, print output from every repeated run")
     ap.add_argument("--tee", action="store_true", help="print transpiled source; in run mode also prints transformed output")
     ap.add_argument("--tee-both", action="store_true", help="print original + transpiled source; in run-both mode prints both outputs")
     ap.add_argument("--run-all", action="store_true", help="run original R, translated Python, and translated Fortran (implies --via-python)")
@@ -23191,6 +23251,11 @@ def main() -> int:
         help="error stop whenever vector recycling occurs (lengths differ; requires r_mod helper)",
     )
     ap.add_argument(
+        "--no-fortran-comments",
+        action="store_true",
+        help="treat #f and #fortran comments as ordinary R comments",
+    )
+    ap.add_argument(
         "--warn-approx",
         action="store_true",
         help="warn when the R source uses functions translated with approximate or subset semantics",
@@ -23212,6 +23277,9 @@ def main() -> int:
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
+    if args.run_repeat < 1:
+        print("Error: --run-repeat must be positive.")
+        return 2
     compiler_explicit = any(a == "--compiler" or a.startswith("--compiler=") for a in sys.argv[1:])
     _maybe_adopt_positional_out(args)
     if args.round is not None and args.round < 0:
@@ -23384,18 +23452,33 @@ def main() -> int:
     if args.time_both or args.run_both:
         cmd = [args.rscript, str(in_path.resolve())]
         t0 = time.perf_counter() if args.time_both else None
-        r_run = _run_capture(cmd, cwd=run_cwd)
+        r_runs = []
+        r_run_times = []
+        for _ in range(args.run_repeat):
+            t_run = time.perf_counter()
+            r_runs.append(_run_capture(cmd, cwd=run_cwd))
+            r_run_times.append(time.perf_counter() - t_run)
+        r_run = r_runs[0]
         if args.time_both:
             timings["r_run"] = time.perf_counter() - t0
+            if args.run_repeat != 1:
+                timings["r_run_mean"], timings["r_run_sd"] = _mean_sd(r_run_times)
         print("Run (r):", " ".join(cmd))
-        if r_run.returncode != 0:
-            print(f"Run (r): FAIL (exit {r_run.returncode})")
-            _print_captured(r_run, round_digits=args.round_both)
+        failed_r_run = next((rr for rr in r_runs if rr.returncode != 0), None)
+        if failed_r_run is not None:
+            print(f"Run (r): FAIL (exit {failed_r_run.returncode})")
+            _print_captured(failed_r_run, round_digits=args.round_both)
             if not (r_run.stdout or "").strip() and not (r_run.stderr or "").strip():
                 print("Run (r): no stdout/stderr captured; process may have crashed before producing output.")
-            return r_run.returncode
+            return failed_r_run.returncode
         print("Run (r): PASS")
-        _print_captured(r_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both, wrap_out=args.wrap_out)
+        if args.run_repeat != 1:
+            print(f"Run (r) repeat: {args.run_repeat} ({'showing all runs' if args.verbose_runs else 'showing first run output'})")
+        r_print_runs = r_runs if args.verbose_runs else [r_run]
+        for i_rep, r_print_run in enumerate(r_print_runs, 1):
+            if args.verbose_runs and args.run_repeat != 1:
+                print(f"Run (r) output {i_rep}/{args.run_repeat}:")
+            _print_captured(r_print_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both, wrap_out=args.wrap_out)
         if args.run_both:
             print()
 
@@ -23477,6 +23560,7 @@ def main() -> int:
                 no_recycle=args.no_recycle,
                 recycle_warn=args.recycle_warn,
                 recycle_stop=args.recycle_stop,
+                fortran_comments=(not args.no_fortran_comments),
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
@@ -23527,7 +23611,9 @@ def main() -> int:
     # Keep helper argument forms as emitted; avoid line-based rewrites that can
     # accidentally rewrite nested non-seq calls.
     if not args.no_format_print:
+        f90_lines, raw_restore = _protect_raw_fortran_lines(f90_lines)
         f90_lines = fscan.rewrite_list_directed_print_reals(f90_lines, real_fmt=args.real_print_fmt)
+        f90_lines = _restore_raw_fortran_lines(f90_lines, raw_restore)
     f90_lines = fscan.compact_repeated_edit_descriptors(f90_lines)
     # Keep component declarations in derived types intact; generic coalescing can
     # collapse mixed-rank fields onto one line and change semantics.
@@ -23557,6 +23643,7 @@ def main() -> int:
     f90_lines = compact_array_section_subscripts(f90_lines)
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
     f90_lines = rewrite_named_vector_print_calls(f90_lines)
+    f90_lines = _strip_raw_fortran_tags(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = re.sub(
         r"\br_seq_int\(\s*1\s*,\s*n\s*\)\s*(&\s*\n\s*&\s*)?-\s*lag",
@@ -23798,33 +23885,48 @@ def main() -> int:
 
                 if args.run:
                     t0 = time.perf_counter()
-                    frun = _run_capture([str(exe.resolve())], cwd=run_cwd)
+                    fruns = []
+                    frun_times = []
+                    for _ in range(args.run_repeat):
+                        t_run = time.perf_counter()
+                        fruns.append(_run_capture([str(exe.resolve())], cwd=run_cwd))
+                        frun_times.append(time.perf_counter() - t_run)
+                    frun = fruns[0]
                     timings["fortran_run"] = time.perf_counter() - t0
-                    if frun.returncode != 0:
-                        print(f"Run: FAIL (exit {frun.returncode})")
+                    if args.run_repeat != 1:
+                        timings["fortran_run_mean"], timings["fortran_run_sd"] = _mean_sd(frun_times)
+                    failed_frun = next((ff for ff in fruns if ff.returncode != 0), None)
+                    if failed_frun is not None:
+                        print(f"Run: FAIL (exit {failed_frun.returncode})")
                         _print_captured(
-                            frun,
+                            failed_frun,
                             normalize_num_output=args.normalize_num_output,
                             pretty=args.pretty,
                             round_digits=fortran_round_digits,
                             trim_zero_decimals=args.trim_zero_decimals,
                             wrap_out=args.wrap_out,
                         )
-                        return frun.returncode
+                        return failed_frun.returncode
                     print("Run: PASS")
-                    _print_captured(
-                        frun,
-                        normalize_num_output=args.normalize_num_output,
-                        pretty=args.pretty,
-                        round_digits=fortran_round_digits,
-                        trim_zero_decimals=args.trim_zero_decimals,
-                        wrap_out=args.wrap_out,
-                    )
+                    if args.run_repeat != 1:
+                        print(f"Run repeat: {args.run_repeat} ({'showing all runs' if args.verbose_runs else 'showing first run output'})")
+                    f_print_runs = fruns if args.verbose_runs else [frun]
+                    for i_rep, f_print_run in enumerate(f_print_runs, 1):
+                        if args.verbose_runs and args.run_repeat != 1:
+                            print(f"Run output {i_rep}/{args.run_repeat}:")
+                        _print_captured(
+                            f_print_run,
+                            normalize_num_output=args.normalize_num_output,
+                            pretty=args.pretty,
+                            round_digits=fortran_round_digits,
+                            trim_zero_decimals=args.trim_zero_decimals,
+                            wrap_out=args.wrap_out,
+                        )
                 if args.time:
                     print("Timing:")
                     for k_t in ("transpile", "compile", "fortran_run"):
                         if k_t in timings:
-                            print(f"  {k_t}: {timings[k_t]:.6f} s")
+                            print(f"  {k_t}: {timings[k_t]:.4f} s")
                 return 0
         cmd = cparts + include_dirs + build_helpers + [str(out_path)] + r_rng_ldflags
         if args.run:
@@ -23854,28 +23956,43 @@ def main() -> int:
 
         if args.run:
             t0 = time.perf_counter()
-            frun = _run_capture([str(exe.resolve())], cwd=run_cwd)
+            fruns = []
+            frun_times = []
+            for _ in range(args.run_repeat):
+                t_run = time.perf_counter()
+                fruns.append(_run_capture([str(exe.resolve())], cwd=run_cwd))
+                frun_times.append(time.perf_counter() - t_run)
+            frun = fruns[0]
             timings["fortran_run"] = time.perf_counter() - t0
-            if frun.returncode != 0:
-                print(f"Run: FAIL (exit {frun.returncode})")
+            if args.run_repeat != 1:
+                timings["fortran_run_mean"], timings["fortran_run_sd"] = _mean_sd(frun_times)
+            failed_frun = next((ff for ff in fruns if ff.returncode != 0), None)
+            if failed_frun is not None:
+                print(f"Run: FAIL (exit {failed_frun.returncode})")
                 _print_captured(
-                    frun,
+                    failed_frun,
                     normalize_num_output=args.normalize_num_output,
                     pretty=args.pretty,
                     round_digits=fortran_round_digits,
                     trim_zero_decimals=args.trim_zero_decimals,
                     wrap_out=args.wrap_out,
                 )
-                return frun.returncode
+                return failed_frun.returncode
             print("Run: PASS")
-            _print_captured(
-                frun,
-                normalize_num_output=args.normalize_num_output,
-                pretty=args.pretty,
-                round_digits=fortran_round_digits,
-                trim_zero_decimals=args.trim_zero_decimals,
-                wrap_out=args.wrap_out,
-            )
+            if args.run_repeat != 1:
+                print(f"Run repeat: {args.run_repeat} ({'showing all runs' if args.verbose_runs else 'showing first run output'})")
+            f_print_runs = fruns if args.verbose_runs else [frun]
+            for i_rep, f_print_run in enumerate(f_print_runs, 1):
+                if args.verbose_runs and args.run_repeat != 1:
+                    print(f"Run output {i_rep}/{args.run_repeat}:")
+                _print_captured(
+                    f_print_run,
+                    normalize_num_output=args.normalize_num_output,
+                    pretty=args.pretty,
+                    round_digits=fortran_round_digits,
+                    trim_zero_decimals=args.trim_zero_decimals,
+                    wrap_out=args.wrap_out,
+                )
 
             if args.run_diff and r_run is not None:
                 r_blob = (r_run.stdout or "") + (("\n" + r_run.stderr) if r_run.stderr else "")
@@ -23924,12 +24041,22 @@ def main() -> int:
         base = timings.get("r_run", 0.0)
         rows = []
         if "r_run" in timings:
-            rows.append(("r run", timings["r_run"]))
+            if "r_run_mean" not in timings:
+                rows.append(("r run", timings["r_run"]))
+        if "r_run_mean" in timings:
+            rows.append(("r run mean", timings["r_run_mean"]))
+        if "r_run_sd" in timings:
+            rows.append(("r run sd", timings["r_run_sd"]))
         rows.append(("transpile", timings.get("transpile", 0.0)))
         if "compile" in timings:
             rows.append(("compile", timings["compile"]))
         if "fortran_run" in timings:
-            rows.append(("fortran run", timings["fortran_run"]))
+            if "fortran_run_mean" not in timings:
+                rows.append(("fortran run", timings["fortran_run"]))
+        if "fortran_run_mean" in timings:
+            rows.append(("fortran run mean", timings["fortran_run_mean"]))
+        if "fortran_run_sd" in timings:
+            rows.append(("fortran run sd", timings["fortran_run_sd"]))
         rows.append(
             (
                 "fortran total",
@@ -23937,13 +24064,18 @@ def main() -> int:
             )
         )
         stage_w = max(len("stage"), max(len(n) for n, _ in rows))
-        sec_w = max(len("seconds"), max(len(f"{v:.6f}") for _, v in rows))
+        sec_w = max(len("seconds"), max(len(f"{v:.4f}") for _, v in rows))
         print("")
         print("Timing summary (seconds):")
-        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    ratio(vs r run)")
-        for n, v in rows:
-            ratio = f"{(v / base):.6f}" if base > 0 else "n/a"
-            print(f"  {n:<{stage_w}}  {v:>{sec_w}.6f}    {ratio}")
+        if base > 0:
+            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    ratio(vs r run)")
+            for n, v in rows:
+                ratio = f"{(v / base):.4f}"
+                print(f"  {n:<{stage_w}}  {v:>{sec_w}.4f}    {ratio}")
+        else:
+            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}")
+            for n, v in rows:
+                print(f"  {n:<{stage_w}}  {v:>{sec_w}.4f}")
 
     return 0
 
