@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shlex
 import subprocess
@@ -327,26 +328,75 @@ def helper_paths_for_fortran(fortran: str) -> list[Path]:
     return []
 
 
+def gfortran_options_for_mode(mode: str) -> list[str]:
+    if mode == "gfortran -O2":
+        return ["-O2"]
+    if mode == "gfortran -O3":
+        return ["-O3"]
+    return []
+
+
+def cached_r_helper_for_gfortran(mode: str, run_dir: Path, timeout: float | None) -> tuple[Path, Path, str, float]:
+    helper = DEFAULT_R_HELPER.resolve()
+    helper_bytes = helper.read_bytes()
+    options = [*gfortran_options_for_mode(mode), "-cpp"]
+    key_data = b"\0".join(
+        [
+            str(helper).encode("utf-8"),
+            mode.encode("utf-8"),
+            " ".join(options).encode("utf-8"),
+            sys.platform.encode("utf-8"),
+            helper_bytes,
+        ]
+    )
+    key = hashlib.sha256(key_data).hexdigest()[:24]
+    cache_dir = Path(tempfile.gettempdir()) / "xr2f_ide_runtime_cache" / key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    obj = cache_dir / "r.o"
+    mod = cache_dir / "r_mod.mod"
+    if obj.exists() and mod.exists():
+        return obj, cache_dir, "", 0.0
+    cmd = ["gfortran", *options, "-c", str(helper), "-J", str(cache_dir), "-I", str(cache_dir), "-o", str(obj)]
+    start = time.perf_counter()
+    cp = subprocess.run(cmd, cwd=run_dir, text=True, capture_output=True, timeout=timeout)
+    elapsed = time.perf_counter() - start
+    if cp.returncode != 0:
+        raise RuntimeError("\n".join(part.rstrip() for part in (cp.stdout, cp.stderr) if part and part.strip()))
+    return obj, cache_dir, "", elapsed
+
+
+def _uses_r_helper(sources: list[Path]) -> bool:
+    return any(src.name.lower() == "r.f90" for src in sources)
+
+
 def ifx_command(sources: list[Path], exe: Path, options: list[str]) -> list[str]:
+    options = list(options)
+    if _uses_r_helper(sources):
+        fpp = "/fpp" if sys.platform.startswith("win") else "-fpp"
+        if fpp not in options:
+            options.insert(0, fpp)
     if sys.platform.startswith("win"):
         return ["ifx", *options, *map(str, sources), f"/Fe:{exe}"]
     return ["ifx", *options, *map(str, sources), "-o", str(exe)]
 
 
-def compiler_command(mode: str, sources: list[Path], exe: Path) -> list[str]:
+def compiler_command(mode: str, sources: list[Path], exe: Path, *, include_dirs: list[Path] | None = None) -> list[str]:
+    include_dirs = include_dirs or []
+    include_flags = [flag for inc in include_dirs for flag in ("-I", str(inc))]
+    gfortran_cpp = ["-cpp"] if _uses_r_helper(sources) else []
     if mode == "gfortran":
-        return ["gfortran", *map(str, sources), "-o", str(exe)]
+        return ["gfortran", *gfortran_cpp, *include_flags, *map(str, sources), "-o", str(exe)]
     if mode == "gfortran -O2":
-        return ["gfortran", "-O2", *map(str, sources), "-o", str(exe)]
+        return ["gfortran", "-O2", *gfortran_cpp, *include_flags, *map(str, sources), "-o", str(exe)]
     if mode == "gfortran -O3":
-        return ["gfortran", "-O3", *map(str, sources), "-o", str(exe)]
+        return ["gfortran", "-O3", *gfortran_cpp, *include_flags, *map(str, sources), "-o", str(exe)]
     if mode == "ifx":
         return ifx_command(sources, exe, [])
     if mode == "ifx /O2":
         return ifx_command(sources, exe, ["/O2"] if sys.platform.startswith("win") else ["-O2"])
     if mode == "lfortran":
         return ["lfortran", *map(str, sources), "-o", str(exe)]
-    return ["gfortran", *map(str, sources), "-o", str(exe)]
+    return ["gfortran", *gfortran_cpp, *include_flags, *map(str, sources), "-o", str(exe)]
 
 
 def run_fortran_source(fortran: str, *, mode: str, run_dir: Path, timeout: float | None) -> RunResult:
@@ -356,8 +406,30 @@ def run_fortran_source(fortran: str, *, mode: str, run_dir: Path, timeout: float
         source = tmpdir / "xr2f_ide_session.f90"
         exe = tmpdir / ("xr2f_ide_session.exe" if sys.platform.startswith("win") else "xr2f_ide_session")
         source.write_text(fortran, encoding="utf-8")
-        sources = [*helper_paths_for_fortran(fortran), source]
-        compile_cmd = compiler_command(mode, sources, exe)
+        helper_paths = helper_paths_for_fortran(fortran)
+        include_dirs: list[Path] = []
+        helper_compile_elapsed = 0.0
+        if helper_paths and mode.startswith("gfortran"):
+            try:
+                r_obj, r_mod_dir, _diag, helper_compile_elapsed = cached_r_helper_for_gfortran(
+                    mode,
+                    run_dir,
+                    timeout,
+                )
+            except FileNotFoundError:
+                elapsed = time.perf_counter() - start
+                return RunResult(False, "", "gfortran was not found on PATH", elapsed, ["gfortran"], elapsed, None)
+            except subprocess.TimeoutExpired as exc:
+                elapsed = time.perf_counter() - start
+                return RunResult(False, exc.stdout or "", f"r.f90 compile timed out after {exc.timeout} seconds", elapsed, ["gfortran"], elapsed, None)
+            except RuntimeError as exc:
+                elapsed = time.perf_counter() - start
+                return RunResult(False, "", str(exc), elapsed, ["gfortran"], elapsed, None)
+            sources = [r_obj, source]
+            include_dirs = [r_mod_dir]
+        else:
+            sources = [*helper_paths, source]
+        compile_cmd = compiler_command(mode, sources, exe, include_dirs=include_dirs)
         compile_start = time.perf_counter()
         try:
             cp = subprocess.run(compile_cmd, cwd=run_dir, text=True, capture_output=True, timeout=timeout)
@@ -367,7 +439,7 @@ def run_fortran_source(fortran: str, *, mode: str, run_dir: Path, timeout: float
         except subprocess.TimeoutExpired as exc:
             elapsed = time.perf_counter() - start
             return RunResult(False, exc.stdout or "", f"{mode} compile timed out after {exc.timeout} seconds", elapsed, compile_cmd, elapsed, None)
-        compile_elapsed = time.perf_counter() - compile_start
+        compile_elapsed = helper_compile_elapsed + (time.perf_counter() - compile_start)
         if cp.returncode != 0:
             elapsed = time.perf_counter() - start
             return RunResult(False, cp.stdout or "", cp.stderr or "", elapsed, compile_cmd, compile_elapsed, None)
