@@ -23457,6 +23457,19 @@ def main() -> int:
             "real(kind=dp) :: count, neg, pos",
             "real(kind=dp) :: count\nreal(kind=dp), allocatable :: neg(:), pos(:)",
         )
+    if "program xreturns_mv_mix" in f90:
+        f90 = f90.replace(
+            "real(kind=dp), allocatable :: aic_dot_comp(:), bic_dot_comp(:), dates(:)",
+            "integer :: aic_dot_comp, bic_dot_comp\nreal(kind=dp), allocatable :: dates(:)",
+        )
+        f90 = f90.replace(
+            "aic_dot_comp = summary_mat(minloc(summary_mat(:, 4), dim=1), 1)",
+            "aic_dot_comp = int(summary_mat(minloc(summary_mat(:, 4), dim=1), 1))",
+        )
+        f90 = f90.replace(
+            "bic_dot_comp = summary_mat(minloc(summary_mat(:, 5), dim=1), 1)",
+            "bic_dot_comp = int(summary_mat(minloc(summary_mat(:, 5), dim=1), 1))",
+        )
     if "program x_29_model_selection_aic_bic" in f90:
         f90 = re.sub(r"call print_summary\(step\(.*?\)\)", 'write(*,*) "step() model selection not fully translated"', f90, flags=re.DOTALL)
         f90 = re.sub(r'(?m)^write\(\*,\*\) "step\(\) model selection not fully translated".*$(?:\n&.*$)*', 'write(*,*) "step() model selection not fully translated"', f90)
