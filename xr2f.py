@@ -3147,6 +3147,13 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^[A-Za-z]\w*\s*\[.*(?:==|!=|>=|<=|>|<|:|seq_len\s*\(|c\s*\().*\]\s*$", rhs, re.IGNORECASE):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif _factor_rep_string_info(rhs) is not None:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -3881,6 +3888,15 @@ def classify_vars(
                 idx_rhs = m_idx.group(2).strip()
                 if "," in idx_rhs or ":" in idx_rhs or _split_top_level_colon(idx_rhs) is not None:
                     return None
+                idx_rhs_l = idx_rhs.lower()
+                if (
+                    "c(" in idx_rhs_l
+                    or "seq_len(" in idx_rhs_l
+                    or "r_seq_len(" in idx_rhs_l
+                    or "r_seq_int(" in idx_rhs_l
+                    or any(op in idx_rhs for op in ["==", "!=", ">=", "<=", ">", "<"])
+                ):
+                    return None
                 cur = "integer" if base_idx in int_arrays else "real" if (base_idx in real_arrays or base_idx in known_arrays) else None
                 if cur is None:
                     return None
@@ -4589,6 +4605,19 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if t.startswith("c(") or (t.startswith("[") and t.endswith("]")):
         return False
+    m_subset = re.match(r"^[A-Za-z]\w*\s*\[(.+)\]$", t)
+    if m_subset is not None:
+        idx = m_subset.group(1).strip()
+        if (
+            ":" in idx
+            or "," in idx
+            or "c(" in idx.lower()
+            or "seq_len(" in idx.lower()
+            or "r_seq_len(" in idx.lower()
+            or "r_seq_int(" in idx.lower()
+            or any(op in idx for op in ["==", "!=", ">=", "<=", ">", "<"])
+        ):
+            return False
     if re.match(r"^(array|character|raw)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^t\s*\(", t, re.IGNORECASE):
@@ -4596,6 +4625,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
     if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
         return False
     if re.match(r"^outer\s*\(", t, re.IGNORECASE):
+        return False
+    if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^rle\s*\(", t, re.IGNORECASE):
         return False
@@ -4949,6 +4980,26 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     # Constructor vectors/matrices.
     if expr_l.startswith("c(") or expr_f.startswith("c("):
         return 1
+
+    m_subset_rank = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr)
+    if m_subset_rank is not None:
+        base_rank = inferred_ranks.get(m_subset_rank.group(1).lower(), inferred_ranks.get(m_subset_rank.group(1), 1))
+        idx_rank = m_subset_rank.group(2).strip()
+        idx_l = idx_rank.lower()
+        if "," in idx_rank:
+            dims = _split_index_dims(idx_rank)
+            kept_dims = sum(1 for d in dims if d.strip() == "" or d.strip() not in {"1", "1L"})
+            return max(1, min(base_rank, kept_dims if kept_dims > 0 else 1))
+        if (
+            ":" in idx_rank
+            or "c(" in idx_l
+            or "seq_len(" in idx_l
+            or "r_seq_len(" in idx_l
+            or "r_seq_int(" in idx_l
+            or any(op in idx_rank for op in ["==", "!=", ">=", "<=", ">", "<"])
+        ):
+            return 1
+        return 0
 
     if re.match(r"^[A-Za-z]\w*\(", expr_l):
         c_call = parse_call_text(expr)
