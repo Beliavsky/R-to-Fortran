@@ -99,6 +99,7 @@ _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
 DEFAULT_COMPILER = "gfortran -O3 -march=native -Wfatal-errors"
+IFX_COMPILER = "ifx /O2" if sys.platform.startswith("win") else "ifx -O2"
 DEBUG_COMPILER = "gfortran -g -O0 -Wall -Wextra -Wimplicit-interface -fcheck=all -fbacktrace"
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
@@ -22596,7 +22597,12 @@ def _ratio(a: int | None, b: int | None) -> str:
 
 def _with_fortran_cpp_flag(cparts: list[str]) -> list[str]:
     out = list(cparts)
-    if not any(p.lower() == "-cpp" for p in out):
+    compiler_name = Path(out[0]).name.lower() if out else ""
+    if "ifx" in compiler_name:
+        flag = "/fpp" if sys.platform.startswith("win") else "-fpp"
+        if not any(p.lower() == flag.lower() for p in out):
+            out.append(flag)
+    elif not any(p.lower() == "-cpp" for p in out):
         out.append("-cpp")
     return out
 
@@ -22748,6 +22754,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--compile")
     if getattr(args, "debug", False):
         cmd.append("--debug")
+    if getattr(args, "ifx", False):
+        cmd.append("--ifx")
     if args.run:
         cmd.append("--run")
     if args.run_both:
@@ -23001,6 +23009,11 @@ def main() -> int:
         help="do not rewrite list-directed `print *` to explicit `write` formats",
     )
     ap.add_argument("--compiler", default=DEFAULT_COMPILER, help='compiler command, e.g. "gfortran -O2 -Wall"')
+    ap.add_argument(
+        "--ifx",
+        action="store_true",
+        help="compile with Intel ifx; implies --compile",
+    )
     ap.add_argument("--rscript", default="rscript", help="command to run R scripts")
     ap.add_argument(
         "--r-rng",
@@ -23113,6 +23126,12 @@ def main() -> int:
         args.compile = True
         if not compiler_explicit:
             args.compiler = DEBUG_COMPILER
+    if args.ifx:
+        if compiler_explicit:
+            print("Options conflict: --ifx and --compiler cannot be used together.")
+            return 1
+        args.compile = True
+        args.compiler = IFX_COMPILER
     if args.time_both:
         args.run_diff = True
     if args.run_all:
