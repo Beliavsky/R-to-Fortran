@@ -1,6 +1,6 @@
 # R-to-Fortran
 
-`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate numeric, array-oriented, and statistical R scripts into readable Fortran that can be compiled with `gfortran`.
+`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate numeric, array-oriented, and statistical R scripts into readable Fortran that can be compiled with `gfortran` or `ifx`, or run interactively through the `ofort` Fortran interpreter from the REPL.
 
 This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, and a growing subset of base R statistical algorithms.  The project includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, random-number generation, and file I/O patterns used by the example corpus.
 
@@ -103,13 +103,14 @@ end program xr2f_smoke
 - Python 3.11 or newer is recommended.
 - `gfortran` is needed for `--compile`, `--run`, `--run-both`, and batch compile/run modes.
 - Intel `ifx` is optional and can be selected with `--ifx` or from the REPL.
+- `ofort` is optional and can be selected from `xr2f_repl.py` to run generated Fortran source directly without compiling an executable.
 - `Rscript` is needed for `--run-both`, `--run-diff`, and `--time-both`.
 - The helper runtime `r.f90` is used by default for R-like helper functions such as `rnorm_vec`, `sd`, `quantile`, matrix printing, and vector recycling.
 
 ## Files
 
 - `xr2f.py`: main R-to-Fortran transpiler.
-- `xr2f_repl.py`: interactive R-to-Fortran session runner.  It can load an R file, accept more R statements, run the generated Fortran, run R, compare both, and benchmark compiler choices.
+- `xr2f_repl.py`: interactive R-to-Fortran session runner.  It can load an R file, accept more R statements, run the generated Fortran, run R, compare both, benchmark compiler choices, and run generated Fortran through `ofort`.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
 - `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, and file-I/O helpers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
@@ -174,6 +175,12 @@ python xr2f.py foo.r --time-both --gfortran --ifx
 
 When both `--gfortran` and `--ifx` are supplied, `xr2f.py` runs the job once per compiler and prints a combined timing table.
 
+`ofort` is handled by `xr2f_repl.py`, because it interprets Fortran source directly rather than compiling and linking an executable:
+
+```bat
+python xr2f_repl.py foo.r --ofort
+```
+
 Use the R RNG shim when matching R random streams matters:
 
 ```bat
@@ -222,9 +229,13 @@ xr2f> time 10
 xr2f> time 10 verbose
 xr2f> time-both 5 gfortran -O2 gfortran -O3
 xr2f> time-both gfortran -O3 -march=native ifx /O2
+xr2f> time ofort
+xr2f> time 5 ofort gfortran -O3 ifx /O2
 ```
 
 For repeated timing runs, translation and compilation happen once.  The executable or R script is then run repeatedly.  Repeated timing reports mean and sample standard deviation for the run stage.
+
+For `ofort`, translation happens once and the generated Fortran source is run directly by `ofort`.  If the generated program uses `r_mod`, the REPL includes `r.f90` in the `ofort` command.
 
 Use `--batch` for the old run-and-exit file behavior:
 
