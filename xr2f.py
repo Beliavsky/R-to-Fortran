@@ -41,6 +41,8 @@ _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
 _SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
+_KNOWN_INT_NAMES: set[str] = set()
+_KNOWN_INT_VECTOR_NAMES: set[str] = set()
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
@@ -100,6 +102,7 @@ _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "wilcox.test": {"name": "wilcox.test", "category": "subset_semantics", "reason": "subset implementation"},
     "kruskal.test": {"name": "kruskal.test", "category": "subset_semantics", "reason": "subset implementation"},
 }
+_CALL_COERCION_WARNINGS: set[tuple[str, str, str]] = set()
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -661,6 +664,12 @@ def _looks_matrix_expr(expr: str) -> bool:
     t = fscan.strip_redundant_outer_parens_expr(expr.strip())
     if re.match(r"^[A-Za-z]\w*$", t) and t.lower() in _KNOWN_MATRIX_NAMES:
         return True
+    for tok in ("+", "-", "*", "/"):
+        split = _split_top_level_token(t, tok, from_right=True)
+        if split is not None:
+            lhs, rhs = split
+            if lhs.strip() and rhs.strip() and (_looks_matrix_expr(lhs) or _looks_matrix_expr(rhs)):
+                return True
     c = parse_call_text(t)
     if c is None:
         return False
@@ -3059,6 +3068,16 @@ def _function_returns_invisible(fn: FuncDef) -> bool:
     target = ret_arg if ret_arg is not None else expr
     c = parse_call_text((target or "").strip())
     return c is not None and c[0].lower() == "invisible"
+
+
+def _function_declared_double_args(fn: FuncDef) -> set[str]:
+    out: set[str] = set()
+    for txt in _collect_stmt_expr_texts(fn.body):
+        if "declare" not in txt.lower() or "double" not in txt.lower():
+            continue
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*=\s*double\s*\(", txt, re.IGNORECASE):
+            out.add(m.group(1))
+    return out
 
 
 def _factor_rep_string_info(expr: str) -> tuple[list[str], str] | None:
@@ -6355,6 +6374,34 @@ def _register_nlm_closure(expr: str) -> str | None:
     return str(_NLM_CLOSURE_WRAPPERS[s]["name"])
 
 
+def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src: str, actual_f: str, wanted_kind: str) -> str:
+    if wanted_kind != "real":
+        return actual_f
+    af = actual_f.strip()
+    actual_l = actual_src.strip().lower()
+    is_int_actual = (
+        _is_int_literal(af)
+        or actual_l in _KNOWN_INT_NAMES
+        or actual_l in _KNOWN_INT_VECTOR_NAMES
+        or af.lower() in _KNOWN_INT_NAMES
+        or af.lower() in _KNOWN_INT_VECTOR_NAMES
+    )
+    if _is_int_literal(af):
+        return f"{int(af)}.0_dp"
+    if is_int_actual:
+        key = (fn_name.lower(), formal.lower(), actual_src.strip())
+        if key not in _CALL_COERCION_WARNINGS:
+            print(
+                f"Warning: call {fn_name}(...): argument `{formal}` is declared double "
+                f"but actual `{actual_src.strip()}` is inferred integer; passing real(..., kind=dp)."
+            )
+            _CALL_COERCION_WARNINGS.add(key)
+        return f"real({actual_f}, kind=dp)"
+    if re.match(r"^price_names\s*\(", af, re.IGNORECASE):
+        return f"real({actual_f}, kind=dp)"
+    return actual_f
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
@@ -7475,16 +7522,15 @@ def r_expr_to_fortran(expr: str) -> str:
         kinds = _USER_FUNC_ARG_KIND.get(key_u)
         if kinds is not None:
             idx_map = _USER_FUNC_ARG_INDEX.get(key_u, {})
+            inv_idx_map = {v: k for k, v in idx_map.items()}
             pos_out: list[str] = []
             for i, a in enumerate(pos_u):
                 af = r_expr_to_fortran(a)
                 if key_u == "print_matrix" and i == 1 and _looks_vector_actual_for_matrix_arg(a, af):
                     af = f"reshape({af}, [size({af}), 1])"
                 if i < len(kinds) and kinds[i] == "real":
-                    if _is_int_literal(af.strip()):
-                        af = f"{int(af.strip())}.0_dp"
-                    elif re.match(r"^price_names\s*\(", af.strip(), re.IGNORECASE):
-                        af = f"real({af}, kind=dp)"
+                    formal_i = inv_idx_map.get(i, f"arg{i + 1}")
+                    af = _coerce_user_actual_for_declared_kind(nm_u, formal_i, a, af, "real")
                 pos_out.append(af)
             kw_out: list[str] = []
             for k, v in kw_u.items():
@@ -7493,10 +7539,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 if key_u == "print_matrix" and k.lower() == "x" and _looks_vector_actual_for_matrix_arg(v, vf):
                     vf = f"reshape({vf}, [size({vf}), 1])"
                 if idx_k >= 0 and idx_k < len(kinds) and kinds[idx_k] == "real":
-                    if _is_int_literal(vf.strip()):
-                        vf = f"{int(vf.strip())}.0_dp"
-                    elif re.match(r"^price_names\s*\(", vf.strip(), re.IGNORECASE):
-                        vf = f"real({vf}, kind=dp)"
+                    vf = _coerce_user_actual_for_declared_kind(nm_u, k, v, vf, "real")
                 kw_out.append(f"{_sanitize_fortran_kwarg_name(k)}={vf}")
             args_txt = ", ".join(pos_out + kw_out)
             return f"{nm_u}({args_txt})"
@@ -16433,6 +16476,8 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 out.add(st.name)
             if low.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs):
                 out.add(st.name)
+            if _looks_matrix_expr(rhs) and not (low.startswith("matrix(") and _matrix_has_integer_literal_data(rhs)):
+                out.add(st.name)
             if low.startswith("array("):
                 dim_parts_arr = _array_dim_parts(rhs)
                 if dim_parts_arr is not None and len(dim_parts_arr) == 2 and st.name not in known_int_matrices:
@@ -17692,13 +17737,14 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
+    global _CALL_COERCION_WARNINGS
     _FORTRAN_COMMENTS = bool(fortran_comments)
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
@@ -17719,6 +17765,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _MIXED_CHARACTER_COERCION_WARNINGS = set()
+    _CALL_COERCION_WARNINGS = set()
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -18019,6 +18066,7 @@ def transpile_r_to_fortran(
         kinds: list[str] = []
         fn_ints = fn_int_names.get(f.name, set())
         fn_int_arrs = fn_int_array_names.get(f.name, set())
+        fn_declared_double_args = _function_declared_double_args(f)
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
         fn_chars = fn_char_scalars.get(f.name, set())
@@ -18035,6 +18083,9 @@ def transpile_r_to_fortran(
             kinds.append(
                 "character"
                 if a in fn_chars or (a == "name" and f.name.lower().startswith("print_") and f.name.lower() != "print_matrix")
+                else
+                "real"
+                if a in fn_declared_double_args
                 else
                 "integer"
                 if (
@@ -18389,6 +18440,8 @@ def transpile_r_to_fortran(
             real_scalars.discard(nm_order)
             ints.discard(nm_order)
             params.pop(nm_order, None)
+    _KNOWN_INT_NAMES = {n.lower() for n in ints}
+    _KNOWN_INT_VECTOR_NAMES = {n.lower() for n in int_arrays}
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
@@ -19475,6 +19528,8 @@ def transpile_r_to_fortran(
 
     need_rnorm_main = {"used": False}
     params_for_emit = set(params.keys()) | set(array_params.keys()) | set(promoted_params.keys()) | set(promoted_array_params.keys())
+    _KNOWN_INT_NAMES = {n.lower() for n in ints}
+    _KNOWN_INT_VECTOR_NAMES = {n.lower() for n in int_arrays}
     emit_stmts(
         pbody,
         main_stmts,
@@ -21657,6 +21712,35 @@ def transpile_r_to_fortran(
     return o.text()
 
 
+def extract_fortran_module_text(f90: str, module_name: str | None = None) -> str:
+    """Return the first module block from generated Fortran text."""
+    if module_name:
+        pat = rf"(?ims)^\s*module\s+{re.escape(module_name)}\b.*?^\s*end\s+module\s+{re.escape(module_name)}\b"
+    else:
+        pat = r"(?ims)^\s*module\s+[A-Za-z]\w*\b.*?^\s*end\s+module\s+[A-Za-z]\w*\b"
+    m = re.search(pat, f90)
+    if m is None:
+        raise ValueError("generated Fortran does not contain a module")
+    return m.group(0).rstrip() + "\n"
+
+
+def transpile_r_functions_to_fortran_module(
+    function_src: str,
+    stem: str,
+    helper_modules: set[str] | None = None,
+    fortran_comments: bool = True,
+) -> str:
+    """Transpile R function definitions and return only the generated Fortran module."""
+    module_name = _module_name_from_stem(stem)
+    f90 = transpile_r_to_fortran(
+        function_src,
+        stem=stem,
+        helper_modules=helper_modules,
+        fortran_comments=fortran_comments,
+    )
+    return extract_fortran_module_text(f90, module_name=module_name)
+
+
 def _norm_output(s: str) -> list[str]:
     lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines = [" ".join(ln.split()) for ln in lines]
@@ -22162,6 +22246,36 @@ def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
             out.append(f"{m_call.group(1)}call print_real_vector({expr})")
         else:
             out.append(ln)
+    return out
+
+
+def rewrite_matrix_linear_indices(lines: list[str]) -> list[str]:
+    """Lower simple R-style linear indexing of matrices to Fortran row/column indexing."""
+    matrices: set[str] = set()
+    decl_re = re.compile(r"\b(?:real\s*\([^)]*\)|integer|logical)\s*,\s*allocatable\s*::\s*(.*)", re.IGNORECASE)
+    for ln in lines:
+        m = decl_re.search(ln)
+        if m is None:
+            continue
+        for nm in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)", m.group(1)):
+            matrices.add(nm)
+    if not matrices:
+        return lines
+    out: list[str] = []
+    for ln in lines:
+        if "::" in ln:
+            out.append(ln)
+            continue
+        new = ln
+        for nm in sorted(matrices, key=len, reverse=True):
+            pat = re.compile(rf"\b{re.escape(nm)}\s*\(\s*([A-Za-z]\w*|\d+)\s*\)")
+
+            def repl(m: re.Match[str]) -> str:
+                idx = m.group(1)
+                return f"{nm}(mod(({idx}) - 1, size({nm},1)) + 1, ((({idx}) - 1) / size({nm},1)) + 1)"
+
+            new = pat.sub(repl, new)
+        out.append(new)
     return out
 
 
@@ -23897,6 +24011,7 @@ def main() -> int:
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
+    f90_lines = rewrite_matrix_linear_indices(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = fscan.simplify_real_int_casts_in_mixed_expr(f90_lines)
     f90_lines = fscan.simplify_size_expressions(f90_lines)
@@ -23956,6 +24071,7 @@ def main() -> int:
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
+    f90_lines = rewrite_matrix_linear_indices(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = compact_array_section_subscripts(f90_lines)
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
