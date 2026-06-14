@@ -21,6 +21,7 @@ import xr2f
 
 
 DEFAULT_COMPILER = xr2f.DEFAULT_COMPILER
+IFX_COMPILER = xr2f.IFX_COMPILER
 
 
 @dataclass
@@ -302,7 +303,7 @@ def emit_fortran_wrappers(module_name: str, funcs: list[BridgeFunction]) -> str:
         parts.append("out")
         if bf.ret_rank >= 1:
             parts.append("n_out")
-        lines.append(f"subroutine {bridge_name}({', '.join(parts)})")
+        lines.append(f'subroutine {bridge_name}({", ".join(parts)}) bind(C, name="{bridge_name}")')
         lines.append("use, intrinsic :: iso_fortran_env, only: dp => real64")
         lines.append(f"use {module_name}, only: {bf.name}")
         lines.append("implicit none")
@@ -369,7 +370,7 @@ def emit_r_wrappers(dll_name: str, funcs: list[BridgeFunction]) -> str:
         dot_args.append("out=out")
         if bf.ret_rank >= 1:
             dot_args.append("n_out=as.integer(length(out))")
-        lines.append(f"  res <- .Fortran({', '.join(dot_args)})")
+        lines.append(f"  res <- .C({', '.join(dot_args)})")
         if bf.ret_rank == 2 and shape_from is not None:
             lines.append(f"  matrix(res$out, nrow = nrow({shape_from}), ncol = ncol({shape_from}))")
         else:
@@ -377,6 +378,10 @@ def emit_r_wrappers(dll_name: str, funcs: list[BridgeFunction]) -> str:
         lines.append("}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _bridge_export_names(f90_text: str) -> list[str]:
+    return re.findall(r'(?im)^\s*subroutine\s+([A-Za-z]\w*)\s*\(.*?\)\s*bind\s*\(\s*C\s*,\s*name\s*=\s*"\1"\s*\)', f90_text)
 
 
 def compile_shared(f90_path: Path, dll_path: Path, compiler: str) -> subprocess.CompletedProcess[str]:
@@ -388,6 +393,8 @@ def compile_shared(f90_path: Path, dll_path: Path, compiler: str) -> subprocess.
     f90_abs = f90_path.resolve()
     dll_abs = dll_path.resolve()
     f90_text = f90_path.read_text(encoding="utf-8", errors="replace")
+    export_names = _bridge_export_names(f90_text)
+    export_flags = (["/link"] + [f"/export:{nm}" for nm in export_names]) if export_names else []
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90_text) is not None
     extra_objs: list[str] = []
     include_flags: list[str] = []
@@ -401,10 +408,17 @@ def compile_shared(f90_path: Path, dll_path: Path, compiler: str) -> subprocess.
             include_flags.extend([f"/module:{mod_dir}"] if sys.platform.startswith("win") else ["-module", str(mod_dir)])
         else:
             include_flags.extend(["-I", str(mod_dir)])
-    cmd = parts + ["-shared", "-fPIC", *include_flags, *extra_objs, str(f90_abs), "-o", str(dll_abs)]
-    if sys.platform.startswith("win"):
+    compiler_name = Path(parts[0]).name.lower() if parts else ""
+    if sys.platform.startswith("win") and "ifx" in compiler_name:
+        cmd = parts + ["/dll", *include_flags, *extra_objs, str(f90_abs), f"/Fe:{dll_abs}", *export_flags]
+    elif sys.platform.startswith("win"):
         cmd = parts + ["-shared", *include_flags, *extra_objs, str(f90_abs), "-o", str(dll_abs)]
-    return subprocess.run(cmd, cwd=root, capture_output=True, text=True, check=False)
+    else:
+        cmd = parts + ["-shared", "-fPIC", *include_flags, *extra_objs, str(f90_abs), "-o", str(dll_abs)]
+    try:
+        return subprocess.run(cmd, cwd=root, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", f"{exc}\n")
 
 
 def emit_runner_r(wrapper_path: Path, original_src_without_functions: str) -> str:
@@ -426,8 +440,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runner-out", help="R runner path for --run (default: <input>_bridge_run.R)")
     ap.add_argument("--rscript", default="rscript", help="command used to run R scripts")
     ap.add_argument("--compiler", default=DEFAULT_COMPILER, help='compiler command, e.g. "gfortran -O3"')
+    ap.add_argument("--ifx", action="store_true", help="compile generated bridge Fortran with Intel ifx")
     ap.add_argument("--only-selected", action="store_true", help="only compile selected function definitions, not all top-level functions")
     args = ap.parse_args(argv)
+    if args.ifx:
+        args.compiler = IFX_COMPILER
     if args.time or args.time_both:
         args.run = True
 
