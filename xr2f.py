@@ -45,6 +45,8 @@ _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
+_KNOWN_DATE_NAMES: set[str] = set()
+_KNOWN_DATE_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_MATRIX_NAMES: set[str] = set()
 _KNOWN_COMPLEX_SCALAR_NAMES: set[str] = set()
@@ -3324,6 +3326,22 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif (c_diff_date := parse_call_text(rhs)) is not None and c_diff_date[0].lower() == "diff":
+                    diff_arg = c_diff_date[1][0].strip() if c_diff_date[1] else c_diff_date[2].get("x", "").strip()
+                    if diff_arg.lower() in _KNOWN_DATE_VECTOR_NAMES:
+                        int_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        real_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
+                    else:
+                        real_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
                 elif rhs_l.startswith("as.numeric(") or rhs_l.startswith("as.double("):
                     c_asn = parse_call_text(rhs)
                     arg0 = c_asn[1][0].strip() if c_asn is not None and c_asn[1] else ""
@@ -5844,6 +5862,135 @@ def _is_complex_expr_source(expr: str) -> bool:
     )
 
 
+def _is_date_scalar_source(expr: str) -> bool:
+    t = expr.strip()
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        return t.lower() in _KNOWN_DATE_NAMES
+    c = parse_call_text(t)
+    if c is not None and c[0].lower() in {"min", "max"}:
+        arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+        return _is_date_vector_source(arg)
+    if c is not None and c[0].lower() in {"as.date", "date_from_iso"}:
+        arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+        return not (parse_call_text(arg) is not None and parse_call_text(arg)[0].lower() == "c")
+    m = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", t)
+    if m is not None and m.group(1).lower() in _KNOWN_DATE_VECTOR_NAMES:
+        idx_txt = m.group(2).strip()
+        vectorish = (
+            ":" in idx_txt
+            or "," in idx_txt
+            or idx_txt.lower().startswith(("seq", "which", "c("))
+            or any(op in idx_txt for op in ["==", "!=", "<=", ">=", "<", ">"])
+        )
+        return not vectorish
+    return False
+
+
+def _is_date_vector_source(expr: str) -> bool:
+    t = expr.strip()
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        return t.lower() in _KNOWN_DATE_VECTOR_NAMES
+    c = parse_call_text(t)
+    if c is not None and c[0].lower() in {"date_seq_day", "date_seq_length", "date_from_iso_vec", "date_range"}:
+        return True
+    if c is not None and c[0].lower() == "seq":
+        pos_seq, kw_seq = c[1], c[2]
+        from_src = kw_seq.get("from", pos_seq[0] if len(pos_seq) >= 1 else "").strip()
+        by_src = kw_seq.get("by", pos_seq[2] if len(pos_seq) >= 3 else '"day"').strip()
+        by_txt = (_dequote_string_literal(by_src) or by_src).strip().lower()
+        seq_args = [p.strip() for p in pos_seq] + [v.strip() for v in kw_seq.values()]
+        return by_txt in {"day", "1 day", "days"} and (
+            _is_date_scalar_source(from_src)
+            or any(_is_date_scalar_source(v) for v in seq_args)
+            or any("as.date" in v.lower() for v in seq_args)
+        )
+    if c is not None and c[0].lower() == "range":
+        arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+        return _is_date_vector_source(arg)
+    if c is not None and c[0].lower() == "as.date":
+        arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+        return parse_call_text(arg) is not None and parse_call_text(arg)[0].lower() == "c"
+    m = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", t)
+    if m is not None and m.group(1).lower() in _KNOWN_DATE_VECTOR_NAMES:
+        idx_txt = m.group(2).strip()
+        return (
+            ":" in idx_txt
+            or "," in idx_txt
+            or idx_txt.lower().startswith(("seq", "which", "c("))
+            or any(op in idx_txt for op in ["==", "!=", "<=", ">=", "<", ">"])
+        )
+    return False
+
+
+def collect_date_assignments(stmts: list[object]) -> tuple[set[str], set[str]]:
+    scalars: set[str] = set()
+    vectors: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for st in stmts:
+            if not isinstance(st, Assign):
+                continue
+            name_l = st.name.lower()
+            rhs = st.expr.strip()
+            c = parse_call_text(rhs)
+            is_vec = False
+            is_scalar = False
+            if c is not None and c[0].lower() == "as.date":
+                arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+                arg_call = parse_call_text(arg)
+                is_vec = bool(arg_call is not None and arg_call[0].lower() == "c")
+                is_scalar = not is_vec
+            elif c is not None and c[0].lower() == "seq":
+                vals = list(c[1]) + list(c[2].values())
+                from_src = c[2].get("from", c[1][0].strip() if c[1] else "").strip()
+                from_call = parse_call_text(from_src)
+                is_vec = (
+                    any(v.strip().lower() in scalars for v in vals)
+                    or (
+                        from_call is not None
+                        and from_call[0].lower() == "as.date"
+                    )
+                )
+            elif c is not None and c[0].lower() in {"date_seq_day", "date_seq_length"}:
+                is_vec = True
+            elif re.fullmatch(r"[A-Za-z]\w*", rhs) and rhs.lower() in scalars:
+                is_scalar = True
+            elif re.fullmatch(r"[A-Za-z]\w*", rhs) and rhs.lower() in vectors:
+                is_vec = True
+            elif (m_date_subset := re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs)) is not None:
+                base_l = m_date_subset.group(1).lower()
+                idx_txt = m_date_subset.group(2).strip()
+                vectorish = (
+                    ":" in idx_txt
+                    or "," in idx_txt
+                    or idx_txt.lower().startswith(("seq", "which", "c("))
+                    or any(op in idx_txt for op in ["==", "!=", "<=", ">=", "<", ">"])
+                )
+                if base_l in vectors:
+                    is_vec = vectorish
+                    is_scalar = not vectorish
+            else:
+                for op in ["+", "-"]:
+                    parts = _split_top_level_token(rhs, op, from_right=True)
+                    if parts is not None:
+                        lhs_l = parts[0].strip().lower()
+                        rhs_l = parts[1].strip().lower()
+                        if lhs_l in scalars and _is_int_literal(rhs_l):
+                            is_scalar = True
+                        if lhs_l in vectors and _is_int_literal(rhs_l):
+                            is_vec = True
+                        break
+            if is_vec and name_l not in vectors:
+                vectors.add(name_l)
+                scalars.discard(name_l)
+                changed = True
+            elif is_scalar and name_l not in vectors and name_l not in scalars:
+                scalars.add(name_l)
+                changed = True
+    return scalars, vectors
+
+
 def _replace_complex_literals_outside_strings(expr: str) -> str:
     out: list[str] = []
     cur: list[str] = []
@@ -6212,6 +6359,47 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
+    c_date0 = parse_call_text(s)
+    if c_date0 is not None and c_date0[0].lower() == "as.date":
+        arg_date = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
+        arg_call = parse_call_text(arg_date)
+        if arg_call is not None and arg_call[0].lower() == "c":
+            return f"date_from_iso_vec({r_expr_to_fortran(arg_date)})"
+        return f"date_from_iso({r_expr_to_fortran(arg_date)})"
+    if c_date0 is not None and c_date0[0].lower() in {"min", "max", "range"}:
+        arg_date_min = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
+        if _is_date_vector_source(arg_date_min):
+            if c_date0[0].lower() == "min":
+                return f"minval({r_expr_to_fortran(arg_date_min)})"
+            if c_date0[0].lower() == "max":
+                return f"maxval({r_expr_to_fortran(arg_date_min)})"
+            return f"date_range({r_expr_to_fortran(arg_date_min)})"
+    if c_date0 is not None and c_date0[0].lower() == "format":
+        arg_fmt = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
+        fmt_src = c_date0[1][1].strip() if len(c_date0[1]) >= 2 else c_date0[2].get("format", c_date0[2].get("fmt", '"%F"')).strip()
+        if _is_date_vector_source(arg_fmt):
+            return f"date_format_vec({r_expr_to_fortran(arg_fmt)}, {r_expr_to_fortran(fmt_src)})"
+        if _is_date_scalar_source(arg_fmt):
+            return f"date_format({r_expr_to_fortran(arg_fmt)}, {r_expr_to_fortran(fmt_src)})"
+    if c_date0 is not None and c_date0[0].lower() == "as.character":
+        arg_chr = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
+        if _is_date_vector_source(arg_chr):
+            return f"date_to_char_vec({r_expr_to_fortran(arg_chr)})"
+        if _is_date_scalar_source(arg_chr):
+            return f"date_to_char({r_expr_to_fortran(arg_chr)})"
+    if c_date0 is not None and c_date0[0].lower() == "seq":
+        pos_seq, kw_seq = c_date0[1], c_date0[2]
+        from_src = kw_seq.get("from", pos_seq[0] if len(pos_seq) >= 1 else "").strip()
+        to_src = kw_seq.get("to", pos_seq[1] if len(pos_seq) >= 2 else "").strip()
+        by_src = kw_seq.get("by", pos_seq[2] if len(pos_seq) >= 3 else '"day"').strip()
+        len_src = kw_seq.get("length.out", kw_seq.get("length_out", "")).strip()
+        by_txt = (_dequote_string_literal(by_src) or by_src).strip().lower()
+        by_days = 1 if by_txt in {"day", "1 day", "days"} else None
+        if from_src and (_is_date_scalar_source(from_src) or from_src.lower() in _KNOWN_DATE_NAMES):
+            if len_src and by_days is not None:
+                return f"date_seq_length({r_expr_to_fortran(from_src)}, {by_days}, {_int_bound_expr(r_expr_to_fortran(len_src))})"
+            if to_src and by_days is not None:
+                return f"date_seq_day({r_expr_to_fortran(from_src)}, {r_expr_to_fortran(to_src)}, {by_days})"
     m_optim_par_early = re.match(r"^optim\s*\((.*)\)\s*(?:\$|%)\s*par\s*$", s, re.IGNORECASE)
     if m_optim_par_early is not None:
         c_optim_par = parse_call_text("optim(" + m_optim_par_early.group(1).strip() + ")")
@@ -6226,6 +6414,11 @@ def r_expr_to_fortran(expr: str) -> str:
     m_mask_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]$", s)
     if m_mask_subset0 is not None and m_mask_subset0.group(2).lower() in _KNOWN_LOGICAL_MATRIX_NAMES:
         return f"pack({m_mask_subset0.group(1)}, {m_mask_subset0.group(2)})"
+    m_date_mask_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*(.+)\s*\]$", s)
+    if m_date_mask_subset0 is not None and m_date_mask_subset0.group(1).lower() in _KNOWN_DATE_VECTOR_NAMES:
+        date_inner0 = m_date_mask_subset0.group(2).strip()
+        if any(op in date_inner0 for op in ["==", "!=", "<=", ">=", "<", ">"]):
+            return f"pack({m_date_mask_subset0.group(1)}, {r_expr_to_fortran(date_inner0)})"
     m_tri_subset0 = re.match(r"^([A-Za-z]\w*)\s*\[\s*((?:lower|upper)\.tri\s*\(.*\))\s*\]$", s, re.IGNORECASE)
     if m_tri_subset0 is not None:
         return f"pack({m_tri_subset0.group(1)}, {r_expr_to_fortran(m_tri_subset0.group(2))})"
@@ -11838,6 +12031,29 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    one_date_vec_f = r_expr_to_fortran(one) if has_r_mod else ""
+                    if has_r_mod and (
+                        _is_date_vector_source(one)
+                        or one_date_vec_f.startswith(("date_seq_day(", "date_seq_length(", "date_from_iso_vec(", "date_range("))
+                    ):
+                        _wstmt(f"call print_date_vector({one_date_vec_f})", st.comment)
+                        need_r_mod.add("print_date_vector")
+                        continue
+                    if has_r_mod and _is_date_scalar_source(one):
+                        _wstmt(f"call print_date({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.add("print_date")
+                        continue
+                    c_date_char_print = parse_call_text(one)
+                    if has_r_mod and c_date_char_print is not None and c_date_char_print[0].lower() in {"as.character", "format"}:
+                        one_date_char_f = r_expr_to_fortran(one)
+                        if one_date_char_f.startswith(("date_to_char_vec(", "date_format_vec(")):
+                            _wstmt(f"call print_char_vector({one_date_char_f})", st.comment)
+                            need_r_mod.update({"print_char_vector", one_date_char_f.split("(", 1)[0]})
+                            continue
+                        if one_date_char_f.startswith(("date_to_char(", "date_format(")):
+                            _wstmt(f'write(*,"(a)") trim({one_date_char_f})', st.comment)
+                            need_r_mod.add(one_date_char_f.split("(", 1)[0])
+                            continue
                     c_sprintf_print = parse_call_text(one)
                     if c_sprintf_print is not None and c_sprintf_print[0].lower() == "sprintf":
                         pos_sp = c_sprintf_print[1]
@@ -15665,6 +15881,12 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                 if _dequote_string_literal(rhs) is not None:
                     out.add(st.name)
                     continue
+                c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
+                    arg = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+                    if _is_date_scalar_source(arg):
+                        out.add(st.name)
+                        continue
                 m_char_scalar_subset = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs)
                 if m_char_scalar_subset is not None:
                     base = m_char_scalar_subset.group(1)
@@ -15714,6 +15936,11 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
                     out.add(st.name)
                     continue
+                if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
+                    arg = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+                    if _is_date_vector_source(arg):
+                        out.add(st.name)
+                        continue
                 if c_rhs is not None and c_rhs[0].lower() in {"read_csv_header_names", "lag_names", "ar_coef_names"}:
                     out.add(st.name)
                     continue
@@ -17468,6 +17695,7 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
+    global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
@@ -17483,6 +17711,8 @@ def transpile_r_to_fortran(
     _CATEGORICAL_LABELS = {}
     _TABLE_LABELS = {}
     _FIT_TERM_LABELS = {}
+    _KNOWN_DATE_NAMES = set()
+    _KNOWN_DATE_VECTOR_NAMES = set()
     _ARRAY_DIM_LABELS = {}
     _KNOWN_COMPLEX_VECTOR_NAMES = set()
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
@@ -17568,6 +17798,7 @@ def transpile_r_to_fortran(
         elif isinstance(st, ExprStmt):
             st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
     main_stmts = inline_single_use_temporaries(main_stmts)
+    _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES = collect_date_assignments(main_stmts)
     named_vectors: dict[str, tuple[list[str], list[str]]] = {}
     for st_nv in main_stmts:
         if not isinstance(st_nv, Assign):
@@ -17965,6 +18196,22 @@ def transpile_r_to_fortran(
     array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
+    for nm_date in _KNOWN_DATE_NAMES:
+        ints.add(nm_date)
+        real_scalars.discard(nm_date)
+        int_arrays.discard(nm_date)
+        real_arrays.discard(nm_date)
+        char_scalars.discard(nm_date)
+        char_arrays.discard(nm_date)
+        params.pop(nm_date, None)
+    for nm_date_vec in _KNOWN_DATE_VECTOR_NAMES:
+        int_arrays.add(nm_date_vec)
+        ints.discard(nm_date_vec)
+        real_scalars.discard(nm_date_vec)
+        real_arrays.discard(nm_date_vec)
+        char_scalars.discard(nm_date_vec)
+        char_arrays.discard(nm_date_vec)
+        params.pop(nm_date_vec, None)
     for nm in set(char_scalars) | set(char_arrays):
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -20887,6 +21134,17 @@ def transpile_r_to_fortran(
         "besselY",
         "besselI",
         "besselK",
+        "date_from_iso",
+        "date_from_iso_vec",
+        "date_to_char",
+        "date_to_char_vec",
+        "date_format",
+        "date_format_vec",
+        "print_date",
+        "print_date_vector",
+        "date_seq_day",
+        "date_seq_length",
+        "date_range",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
@@ -21439,6 +21697,41 @@ def _pretty_float_token(token: str) -> str:
     return out
 
 
+def _pretty_logical_tokens(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double and (ch.isalpha() or ch == "_"):
+            j = i + 1
+            while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tok = text[i:j]
+            if tok == "TRUE":
+                out.append("T")
+            elif tok == "FALSE":
+                out.append("F")
+            else:
+                out.append(tok)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
     s = text.replace("\r\n", "\n").replace("\r", "\n")
     s = re.sub(r"\breal\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*kind\s*=\s*dp\s*\)", r"\1", s, flags=re.IGNORECASE)
@@ -21456,6 +21749,7 @@ def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
         flags=re.IGNORECASE,
     )
     s = _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _pretty_float_token(m.group(1)), s)
+    s = _pretty_logical_tokens(s)
     lines = [" ".join(ln.split()) for ln in s.split("\n")]
     if strip_r_indices:
         lines = [re.sub(r"^\[\d+(?:,\d+)?\]\s*", "", ln) for ln in lines]
@@ -21496,6 +21790,11 @@ def _trim_zero_decimal_token(token: str) -> str:
 def _trim_zero_decimals_output_text(text: str) -> str:
     s = text.replace("\r\n", "\n").replace("\r", "\n")
     return _PRETTY_FLOAT_TOKEN_RE.sub(lambda m: _trim_zero_decimal_token(m.group(1)), s)
+
+
+def _strip_output_quotes_text(text: str) -> str:
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r'(?<!\S)"([^"\n]*)"(?!\S)', r"\1", s)
 
 
 def _wrap_output_text(text: str, width: int) -> str:
@@ -22311,6 +22610,7 @@ def _print_captured(
     strip_r_indices: bool = False,
     round_digits: int | None = None,
     trim_zero_decimals: bool = False,
+    strip_quotes: bool = False,
     wrap_out: int | None = None,
 ) -> None:
     out = cp.stdout or ""
@@ -22327,6 +22627,9 @@ def _print_captured(
     if trim_zero_decimals:
         out = _trim_zero_decimals_output_text(out)
         err = _trim_zero_decimals_output_text(err)
+    if strip_quotes:
+        out = _strip_output_quotes_text(out)
+        err = _strip_output_quotes_text(err)
     if wrap_out is not None:
         out = _wrap_output_text(out, wrap_out)
         err = _wrap_output_text(err, wrap_out)
@@ -22825,6 +23128,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--normalize-num-output")
     if args.pretty:
         cmd.append("--pretty")
+    if args.strip_quotes:
+        cmd.append("--strip-quotes")
     if args.round is not None:
         cmd.extend(["--round", str(args.round)])
     if args.round_both is not None:
@@ -23203,6 +23508,11 @@ def main() -> int:
         help="pretty-format displayed Fortran runtime output",
     )
     ap.add_argument(
+        "--strip-quotes",
+        action="store_true",
+        help="strip paired double quotes around output tokens before display/diff",
+    )
+    ap.add_argument(
         "--round",
         type=int,
         default=None,
@@ -23467,7 +23777,7 @@ def main() -> int:
         failed_r_run = next((rr for rr in r_runs if rr.returncode != 0), None)
         if failed_r_run is not None:
             print(f"Run (r): FAIL (exit {failed_r_run.returncode})")
-            _print_captured(failed_r_run, round_digits=args.round_both)
+            _print_captured(failed_r_run, round_digits=args.round_both, strip_quotes=args.strip_quotes)
             if not (r_run.stdout or "").strip() and not (r_run.stderr or "").strip():
                 print("Run (r): no stdout/stderr captured; process may have crashed before producing output.")
             return failed_r_run.returncode
@@ -23478,7 +23788,14 @@ def main() -> int:
         for i_rep, r_print_run in enumerate(r_print_runs, 1):
             if args.verbose_runs and args.run_repeat != 1:
                 print(f"Run (r) output {i_rep}/{args.run_repeat}:")
-            _print_captured(r_print_run, pretty=args.pretty, strip_r_indices=args.pretty, round_digits=args.round_both, wrap_out=args.wrap_out)
+            _print_captured(
+                r_print_run,
+                pretty=args.pretty,
+                strip_r_indices=args.pretty,
+                round_digits=args.round_both,
+                strip_quotes=args.strip_quotes,
+                wrap_out=args.wrap_out,
+            )
         if args.run_both:
             print()
 
@@ -23904,6 +24221,7 @@ def main() -> int:
                             pretty=args.pretty,
                             round_digits=fortran_round_digits,
                             trim_zero_decimals=args.trim_zero_decimals,
+                            strip_quotes=args.strip_quotes,
                             wrap_out=args.wrap_out,
                         )
                         return failed_frun.returncode
@@ -23920,6 +24238,7 @@ def main() -> int:
                             pretty=args.pretty,
                             round_digits=fortran_round_digits,
                             trim_zero_decimals=args.trim_zero_decimals,
+                            strip_quotes=args.strip_quotes,
                             wrap_out=args.wrap_out,
                         )
                 if args.time:
@@ -23975,6 +24294,7 @@ def main() -> int:
                     pretty=args.pretty,
                     round_digits=fortran_round_digits,
                     trim_zero_decimals=args.trim_zero_decimals,
+                    strip_quotes=args.strip_quotes,
                     wrap_out=args.wrap_out,
                 )
                 return failed_frun.returncode
@@ -23991,6 +24311,7 @@ def main() -> int:
                     pretty=args.pretty,
                     round_digits=fortran_round_digits,
                     trim_zero_decimals=args.trim_zero_decimals,
+                    strip_quotes=args.strip_quotes,
                     wrap_out=args.wrap_out,
                 )
 
@@ -24000,6 +24321,8 @@ def main() -> int:
                     r_blob = _pretty_output_text(r_blob, strip_r_indices=True)
                 if args.round_both is not None:
                     r_blob = _round_output_text(r_blob, args.round_both)
+                if args.strip_quotes:
+                    r_blob = _strip_output_quotes_text(r_blob)
                 if args.wrap_out is not None:
                     r_blob = _wrap_output_text(r_blob, args.wrap_out)
                 r_lines = _norm_output(r_blob)
@@ -24012,6 +24335,8 @@ def main() -> int:
                     f_blob = _round_output_text(f_blob, fortran_round_digits)
                 if args.trim_zero_decimals:
                     f_blob = _trim_zero_decimals_output_text(f_blob)
+                if args.strip_quotes:
+                    f_blob = _strip_output_quotes_text(f_blob)
                 if args.wrap_out is not None:
                     f_blob = _wrap_output_text(f_blob, args.wrap_out)
                 f_lines = _norm_output(f_blob)
