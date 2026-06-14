@@ -8264,6 +8264,41 @@ def r_expr_to_fortran(expr: str) -> str:
         a_f = _int_bound_expr(r_expr_to_fortran(s_seq[0].strip()))
         b_f = _int_bound_expr(r_expr_to_fortran(s_seq[1].strip()))
         return f"r_seq_int({a_f}, {b_f})"
+    m_matrix_linear_subset = re.match(r"^matrix\s*\((.*)\)\s*\[\s*(c\s*\(.*\)|[0-9]+[lL]?)\s*\]$", s, re.IGNORECASE)
+    if m_matrix_linear_subset is not None:
+        mat_src = "matrix(" + m_matrix_linear_subset.group(1).strip() + ")"
+        idx_src = m_matrix_linear_subset.group(2).strip()
+        idx_call = parse_call_text(idx_src)
+        if idx_call is not None and idx_call[0].lower() == "c":
+            idx_parts = [p.strip() for p in idx_call[1] + list(idx_call[2].values())]
+        else:
+            idx_parts = [idx_src]
+        if idx_parts and all(_is_int_literal(p) for p in idx_parts):
+            mat_call = parse_call_text(mat_src)
+            data_vals: list[str] | None = None
+            byrow_src = ""
+            if mat_call is not None and mat_call[0].lower() == "matrix":
+                pos_mx, kw_mx = mat_call[1], mat_call[2]
+                data_src_mx = pos_mx[0].strip() if pos_mx else kw_mx.get("data", "").strip()
+                byrow_src = kw_mx.get("byrow", pos_mx[3] if len(pos_mx) >= 4 else "").strip()
+                c_data = parse_call_text(data_src_mx)
+                seq_data = _split_top_level_colon(data_src_mx)
+                if seq_data is not None and all(_is_int_literal(p.strip()) for p in seq_data):
+                    a_i = int(_normalize_r_int_literal(seq_data[0].strip()))
+                    b_i = int(_normalize_r_int_literal(seq_data[1].strip()))
+                    step_i = 1 if b_i >= a_i else -1
+                    data_vals = [str(i) for i in range(a_i, b_i + step_i, step_i)]
+                elif c_data is not None and c_data[0].lower() == "c":
+                    vals_data = [p.strip() for p in c_data[1] + list(c_data[2].values())]
+                    if vals_data and all(_is_int_literal(v) or _is_real_literal(v) for v in vals_data):
+                        data_vals = [r_expr_to_fortran(v) for v in vals_data]
+            byrow_true = byrow_src.upper() in {"TRUE", ".TRUE.", "T", "1"}
+            if data_vals is not None and not byrow_true:
+                elems = []
+                for p in idx_parts:
+                    idx_i = int(_normalize_r_int_literal(p))
+                    elems.append(data_vals[(idx_i - 1) % len(data_vals)])
+                return "[" + ", ".join(elems) + "]"
     # matrix(data, nrow=..., ncol=...) in expression context
     c_mat = parse_call_text(s)
     if c_mat is not None and c_mat[0].lower() == "matrix":
@@ -10327,6 +10362,8 @@ def emit_stmts(
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
+            return 1
+        if re.match(r"^matrix\s*\(.*\)\s*\[[^\],]+(?:\]|\s*,)", t, re.IGNORECASE):
             return 1
         if re.match(r"^[A-Za-z]\w*\s*\[\s*(?:grep|order)\s*\(", t, re.IGNORECASE):
             return 1
