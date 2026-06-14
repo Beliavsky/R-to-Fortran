@@ -2,7 +2,7 @@
 
 `xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate numeric, array-oriented, and statistical R scripts into readable Fortran that can be compiled with `gfortran`.
 
-This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, and a growing subset of base R statistical algorithms.  The project now includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, and file I/O patterns used by the example corpus.
+This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, and a growing subset of base R statistical algorithms.  The project includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, random-number generation, and file I/O patterns used by the example corpus.
 
 ## Quick Start
 
@@ -30,10 +30,31 @@ Run both the original R script and the generated Fortran:
 python xr2f.py r_examples\xhello.r --run-both
 ```
 
+Time translation, compilation, and execution:
+
+```bat
+python xr2f.py r_examples\xrunif.r --time
+python xr2f.py r_examples\xrunif.r --time-both
+```
+
+Run repeated timing trials after one transpile/build:
+
+```bat
+python xr2f.py r_examples\xrunif.r --time --run-repeat 10
+python xr2f.py r_examples\xrunif.r --time --run-repeat 10 --verbose-runs
+```
+
 Create a single self-contained Fortran file with the needed runtime support prepended:
 
 ```bat
 python xr2f.py r_examples\xrunif.r --self-contained --compile
+```
+
+Start the interactive REPL:
+
+```bat
+python xr2f_repl.py
+python xr2f_repl.py r_examples\xrunif.r
 ```
 
 ## Example
@@ -81,15 +102,18 @@ end program xr2f_smoke
 
 - Python 3.11 or newer is recommended.
 - `gfortran` is needed for `--compile`, `--run`, `--run-both`, and batch compile/run modes.
+- Intel `ifx` is optional and can be selected with `--ifx` or from the REPL.
 - `Rscript` is needed for `--run-both`, `--run-diff`, and `--time-both`.
 - The helper runtime `r.f90` is used by default for R-like helper functions such as `rnorm_vec`, `sd`, `quantile`, matrix printing, and vector recycling.
 
 ## Files
 
 - `xr2f.py`: main R-to-Fortran transpiler.
+- `xr2f_repl.py`: interactive R-to-Fortran session runner.  It can load an R file, accept more R statements, run the generated Fortran, run R, compare both, and benchmark compiler choices.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
 - `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, and file-I/O helpers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
+- `compare_project_files.py`: helper for comparing selected source files against another checkout.
 - `tests/`: pytest tests for the standalone command-line tools.
 - `r_examples/`: small R scripts used as examples and regression inputs.  These include both R syntax probes and statistical algorithm examples.
 - `r_stat_examples/`: numbered statistical examples, including data-reading examples and base-R statistical workflows.
@@ -109,6 +133,7 @@ The supported subset is intentionally focused on numerical scripts:
 - Reductions and statistics such as `sum`, `mean`, `sd`, `var`, `min`, `max`, `quantile`, `median`, `summary`, `cumsum`, `cumprod`, and `diff`.
 - Matrix helpers such as `matrix`, `array`, `t`, `%*%`, `crossprod`, `tcrossprod`, `rowSums`, `colSums`, `det`, and `solve(a, b)` for selected cases.
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
+- Optional use of R's RNG through an R-linked shim with `--r-rng`.
 - Basic named vectors: construction with names, `names(v)`, `unname(v)`, named printing, positional indexing, literal-name indexing, and name-preserving printed arithmetic.
 - Selected data-frame and file-reading patterns such as `read.table(..., header = TRUE)` into numeric matrices.
 - Statistical distributions and tests such as normal/exponential/gamma/beta-related helpers, `t.test`, empirical CDF/KS-style helpers, and related summaries.
@@ -137,6 +162,92 @@ Use recycling diagnostics when porting R vector code:
 ```bat
 python xr2f.py foo.r --run --recycle-warn
 python xr2f.py foo.r --run --recycle-stop
+```
+
+Choose a compiler:
+
+```bat
+python xr2f.py foo.r --run --gfortran
+python xr2f.py foo.r --run --ifx
+python xr2f.py foo.r --time-both --gfortran --ifx
+```
+
+When both `--gfortran` and `--ifx` are supplied, `xr2f.py` runs the job once per compiler and prints a combined timing table.
+
+Use the R RNG shim when matching R random streams matters:
+
+```bat
+python xr2f.py foo.r --r-rng --run-both
+```
+
+On Windows this requires an R installation with headers/libraries available to the C and Fortran compilers.  `xr2f.py` caches compiled runtime objects to reduce repeat compile time where possible.
+
+## Interactive REPL
+
+`xr2f_repl.py` starts an interactive session.  A positional R file loads into the session instead of running and exiting:
+
+```bat
+python xr2f_repl.py r_examples\xrunif.r
+```
+
+Common commands:
+
+```text
+run        run accumulated session through Fortran
+time       run Fortran and show timing
+run-r      run accumulated session with Rscript
+time-r     run Rscript and show timing
+run-both   run R and Fortran and compare
+time-both  run R and Fortran with timing
+fortran    show the last generated Fortran
+list       list accumulated R lines
+clear      reset the session
+quit       exit
+```
+
+Bare expressions are evaluated but not accumulated:
+
+```text
+xr2f> x <- c(1, 2, 3)
+xr2f> mean(x)
+2
+xr2f> sum(x)
+6
+```
+
+Run commands accept an optional repeat count, `verbose`, and compiler specifications:
+
+```text
+xr2f> time 10
+xr2f> time 10 verbose
+xr2f> time-both 5 gfortran -O2 gfortran -O3
+xr2f> time-both gfortran -O3 -march=native ifx /O2
+```
+
+For repeated timing runs, translation and compilation happen once.  The executable or R script is then run repeatedly.  Repeated timing reports mean and sample standard deviation for the run stage.
+
+Use `--batch` for the old run-and-exit file behavior:
+
+```bat
+python xr2f_repl.py r_examples\xrunif.r --batch --mode time --repeat 10
+```
+
+## Fortran Escape Comments
+
+For diagnostics or unsupported cases, R comments beginning with `#f` or `#fortran` inject raw Fortran at that point:
+
+```r
+x <- rnorm(1000)
+#f print*, minval(x), maxval(x)
+```
+
+The payload is treated as raw Fortran.  Formatting and indentation may change, but semantic rewrites such as changing `print *` to `write(...)` are avoided.
+
+Disable this behavior when a script has ordinary comments that should not be treated as Fortran escapes:
+
+```bat
+python xr2f.py foo.r --no-fortran-comments
+python xr2f_repl.py foo.r --no-fortran-comments
 ```
 
 ## Batch Testing
@@ -193,6 +304,12 @@ Run both and compare normalized output:
 
 ```bat
 python xr2f.py foo.r --run-diff --normalize-num-output
+```
+
+For prettier comparisons:
+
+```bat
+python xr2f.py foo.r --run-both --pretty --round-both 4 --wrap-out 80 --trim-zd
 ```
 
 Differences can be legitimate when the R script uses random numbers, platform-dependent formatting, or unsupported R semantics.  For deterministic numerical scripts, `--run-diff` is the preferred regression check.
