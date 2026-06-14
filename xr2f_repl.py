@@ -177,6 +177,8 @@ def build_xr2f_command(
         cmd.append("--trim-zero-decimals")
     if args.r_rng:
         cmd.append("--r-rng")
+    if args.no_fortran_comments:
+        cmd.append("--no-fortran-comments")
     if not compiler_command:
         if args.ifx:
             cmd.append("--ifx")
@@ -472,6 +474,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wrap-out", type=int, help="pass --wrap-out N to xr2f.py")
     parser.add_argument("--trim-zero-decimals", "--trim-zd", action="store_true", help="trim trailing .0 output")
     parser.add_argument("--r-rng", action="store_true", help="use R RNG shim")
+    parser.add_argument("--no-fortran-comments", action="store_true", help="treat #f and #fortran comments as ordinary comments")
     parser.add_argument("--ifx", action="store_true", help="compile with ifx")
     parser.add_argument("--gfortran", action="store_true", help="compile with gfortran")
     parser.add_argument("--save-r", default=DEFAULT_SESSION_R, help="REPL session R file written on exit")
