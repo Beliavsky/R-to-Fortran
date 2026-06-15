@@ -1553,6 +1553,10 @@ def _display_expr_to_fortran(expr: str) -> str:
     if cinfo is not None:
         nm, pos, kw = cinfo
         low = nm.lower()
+        if low == "length" and pos:
+            arg = pos[0].strip()
+            if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", arg):
+                return f"size({_sanitize_r_var_name(arg)})"
         if low == "sprintf":
             if len(pos) >= 2:
                 return r_expr_to_fortran(pos[1])
@@ -5119,6 +5123,14 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     if expr_l.startswith(("+", "-")) and len(expr_l) > 1 and expr_l[1].isalnum():
         return _infer_assignment_rank_hint(expr_l[1:].strip(), inferred_ranks)
 
+    # Logical/comparison operators preserve the rank of vector or matrix operands.
+    for op in ["&&", "||", "&", "|", ".and.", ".or.", "==", "!=", ">=", "<=", ">", "<"]:
+        mm = _split_top_level_token(expr_l, op, from_right=True)
+        if mm is not None:
+            r1 = _infer_assignment_rank_hint(mm[0], inferred_ranks)
+            r2 = _infer_assignment_rank_hint(mm[1], inferred_ranks)
+            return max(r1, r2)
+
     # Arithmetic operators generally preserve array rank.
     for op in ["%*%", "%/%", "%%", "^", "**", "*", "/", "+", "-"]:
         mm = _split_top_level_token(expr_l, op, from_right=True)
@@ -5152,7 +5164,11 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             dims = _split_index_dims(idx_rank)
             def _dim_is_scalar_index(d: str) -> bool:
                 dt = d.strip()
-                if dt in {"1", "1L"}:
+                if re.fullmatch(r"[+-]?\d+L?", dt):
+                    return True
+                if re.fullmatch(r'"[^"]*"|\'[^\']*\'', dt):
+                    return True
+                if re.match(r"^(?:which\.min|which\.max|minloc|maxloc)\s*\(", dt, re.IGNORECASE):
                     return True
                 if re.fullmatch(r"[A-Za-z]\w*", dt) and inferred_ranks.get(dt.lower(), inferred_ranks.get(dt, 0)) == 0:
                     return True
@@ -5209,6 +5225,13 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name in _USER_FUNC_ELEMENTAL:
                 arg_ranks = [_infer_assignment_rank_hint(a.strip(), inferred_ranks) for a in list(c_call[1]) + list(c_call[2].values())]
                 return max(arg_ranks) if arg_ranks else 0
+            if fn_name in {
+                "abs", "acos", "asin", "atan", "ceiling", "cos", "cosh", "exp",
+                "floor", "log", "log10", "log2", "round", "sign", "sin",
+                "sinh", "sqrt", "tan", "tanh", "trunc",
+            }:
+                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "scale":
                 return 2
             if fn_name == "sweep":
@@ -6056,7 +6079,12 @@ def _is_date_vector_source(expr: str) -> bool:
         return _is_date_vector_source(arg)
     if c is not None and c[0].lower() == "as.date":
         arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
-        return parse_call_text(arg) is not None and parse_call_text(arg)[0].lower() == "c"
+        arg_call = parse_call_text(arg)
+        return (
+            (arg_call is not None and arg_call[0].lower() == "c")
+            or re.match(r"^[A-Za-z]\w*\s*\$\s*Date$", arg, re.IGNORECASE) is not None
+            or re.match(r"^[A-Za-z]\w*\s*\[\s*,", arg) is not None
+        )
     m = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", t)
     if m is not None and m.group(1).lower() in _KNOWN_DATE_VECTOR_NAMES:
         idx_txt = m.group(2).strip()
@@ -6092,6 +6120,8 @@ def collect_date_assignments(stmts: list[object]) -> tuple[set[str], set[str]]:
                 is_vec = bool(
                     (arg_call is not None and arg_call[0].lower() == "c")
                     or (fmt_txt == "%Y%m%d" and arg_call is not None and arg_call[0].lower() == "as.character")
+                    or re.match(r"^[A-Za-z]\w*\s*\$\s*Date$", arg, re.IGNORECASE) is not None
+                    or re.match(r"^[A-Za-z]\w*\s*\[\s*,", arg) is not None
                 )
                 is_scalar = not is_vec
             elif c is not None and c[0].lower() == "seq":
@@ -6556,6 +6586,8 @@ def r_expr_to_fortran(expr: str) -> str:
         arg_call = parse_call_text(arg_date)
         if arg_call is not None and arg_call[0].lower() == "c":
             return f"date_from_iso_vec({r_expr_to_fortran(arg_date)})"
+        if re.match(r"^[A-Za-z]\w*\s*\$\s*Date$", arg_date, re.IGNORECASE):
+            return f"date_from_yyyymmdd_vec({r_expr_to_fortran(arg_date)})"
         return f"date_from_iso({r_expr_to_fortran(arg_date)})"
     if c_date0 is not None and c_date0[0].lower() in {"min", "max", "range"}:
         arg_date_min = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
@@ -7480,6 +7512,24 @@ def r_expr_to_fortran(expr: str) -> str:
         if recursive_src is not None:
             args_lf0.append(f"recursive={r_expr_to_fortran(recursive_src)}")
         return f"list_files({', '.join(args_lf0)})"
+    mm_in_early = _split_top_level_token(s, "%in%", from_right=True)
+    if mm_in_early is not None:
+        lhs_src_in = mm_in_early[0].strip()
+        rhs_src_in = mm_in_early[1].strip()
+        lhs_val_in = _dequote_string_literal(lhs_src_in)
+        lhs_f_in = (
+            f"[character(len={max(1, len(lhs_val_in or ''))}) :: {r_expr_to_fortran(lhs_src_in)}]"
+            if lhs_val_in is not None
+            else r_expr_to_fortran(lhs_src_in)
+        )
+        m_names_in = re.match(r"^names\s*\(\s*([A-Za-z]\w*)\s*\)$", rhs_src_in, re.IGNORECASE)
+        if m_names_in is not None:
+            csv_src_in = _CSV_HEADER_SOURCES.get(m_names_in.group(1).lower())
+            if csv_src_in is not None:
+                return f"any(r_in({lhs_f_in}, read_csv_header_names({r_expr_to_fortran(csv_src_in)})))"
+        if lhs_val_in is not None:
+            return f"any(r_in({lhs_f_in}, {r_expr_to_fortran(rhs_src_in)}))"
+        return f"r_in({lhs_f_in}, {r_expr_to_fortran(rhs_src_in)})"
     # Preserve operator precedence: parse top-level scalar +/- before scalar division.
     # Example: m4 / sd**4 - 3.0 must map to (m4 / sd**4) - 3.0, not m4 / (sd**4 - 3.0).
     addsub = _find_top_level_addsub(s)
@@ -8396,8 +8446,13 @@ def r_expr_to_fortran(expr: str) -> str:
         x_src = pos_o[0] if pos_o else kw_o.get("x")
         if x_src is None:
             raise NotImplementedError("order requires an argument")
-        if re.match(r"^[A-Za-z]\w*$", x_src.strip()) and x_src.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES:
+        x_src_s = x_src.strip()
+        if re.match(r"^[A-Za-z]\w*$", x_src_s) and x_src_s.lower() in _KNOWN_CHAR_VECTOR_NAMES:
             ord_f = f"sort_list({r_expr_to_fortran(x_src)})"
+        elif re.match(r"^[A-Za-z]\w*$", x_src_s) and (
+            x_src_s.lower() in _KNOWN_DATE_VECTOR_NAMES or x_src_s.lower() in _KNOWN_INT_VECTOR_NAMES
+        ):
+            ord_f = f"order_real(real({r_expr_to_fortran(x_src)}, kind=dp))"
         else:
             ord_f = f"order_real({r_expr_to_fortran(x_src)})"
         dec_src = kw_o.get("decreasing", "FALSE").strip()
@@ -8965,6 +9020,10 @@ def r_expr_to_fortran(expr: str) -> str:
         len_src = kw_r.get("len", kw_r.get("length.out", kw_r.get("length_out")))
         if len(pos_r) >= 2 and times_src is None and each_src is None and len_src is None:
             times_src = pos_r[1]
+        x_bool = x_src.strip().upper()
+        if x_bool in {"TRUE", "T", "FALSE", "F"} and each_src is None and len_src is None and times_src is not None:
+            val_bool = ".true." if x_bool in {"TRUE", "T"} else ".false."
+            return f"spread({val_bool}, dim=1, ncopies={_int_bound_expr(r_expr_to_fortran(times_src))})"
 
         def _as_times_vec_src(src: str) -> bool:
             t = src.strip()
@@ -9345,6 +9404,12 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"(?<!&)&(?!&)", ".and.", s)
     s = re.sub(r"(?<!\|)\|(?!\|)", ".or.", s)
     s = re.sub(r"!\s*(?!=)", ".not. ", s)
+    if s.lower().startswith(".not."):
+        inner_not = fscan.strip_redundant_outer_parens_expr(s[5:].strip())
+        inner_not_f = r_expr_to_fortran(inner_not)
+        if re.fullmatch(r"[A-Za-z]\w*\([^()]*\)", inner_not_f):
+            return f".not. {inner_not_f}"
+        return f".not. ({inner_not_f})"
     s = s.replace("^", "**")
     # ifelse(a,b,c) -> merge(b,c,a), recursively lowering the condition so
     # categorical comparisons such as x == "B" become integer-code tests.
@@ -9352,9 +9417,22 @@ def r_expr_to_fortran(expr: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) != 3:
             return "ifelse(" + inner + ")"
+        yes_f = r_expr_to_fortran(parts[1].strip())
+        no_f = r_expr_to_fortran(parts[2].strip())
+        if yes_f.startswith("date_to_char(") or no_f.startswith("date_to_char("):
+            date_len = 10
+            for name in ("yes_f", "no_f"):
+                val = yes_f if name == "yes_f" else no_f
+                m_lit = re.fullmatch(r'"([^"]*)"', val)
+                if m_lit is not None and len(m_lit.group(1)) < date_len:
+                    padded = '"' + m_lit.group(1).ljust(date_len) + '"'
+                    if name == "yes_f":
+                        yes_f = padded
+                    else:
+                        no_f = padded
         return (
-            f"merge({r_expr_to_fortran(parts[1].strip())}, "
-            f"{r_expr_to_fortran(parts[2].strip())}, "
+            f"merge({yes_f}, "
+            f"{no_f}, "
             f"{r_expr_to_fortran(parts[0].strip())})"
         )
 
@@ -9362,7 +9440,11 @@ def r_expr_to_fortran(expr: str) -> str:
     # basic helpers
     def _length_repl(inner: str) -> str:
         txt = inner.strip()
-        ft = r_expr_to_fortran(txt)
+        simple_name = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
+        if simple_name:
+            ft = _sanitize_r_var_name(txt)
+        else:
+            ft = r_expr_to_fortran(txt)
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(\s*:\s*,\s*:\s*,\s*:\s*,", ft):
             return f"nested_matrix_list_len({ft})"
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?$", ft) and ft.split("%")[-1].lower() == "a_list":
@@ -9407,8 +9489,18 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"nchar({ft})"
     s = _replace_balanced_func_calls(s, "nchar", _nchar_inner)
     s = _replace_balanced_func_calls(s, "dim", lambda inner: f"shape({r_expr_to_fortran(inner.strip())})")
-    s = _replace_balanced_func_calls(s, "all", lambda inner: f"all({r_expr_to_fortran(inner.strip())})")
-    s = _replace_balanced_func_calls(s, "any", lambda inner: f"any({r_expr_to_fortran(inner.strip())})")
+    def _logical_reduction_to_fortran(fname: str, inner: str) -> str:
+        kept: list[str] = []
+        for part in split_top_level_commas(inner):
+            t = part.strip()
+            if re.match(r"^na(?:\.|_)rm\s*=", t, re.IGNORECASE):
+                continue
+            if t:
+                kept.append(t)
+        x_src = kept[0] if kept else ""
+        return f"{fname}({r_expr_to_fortran(x_src)})"
+    s = _replace_balanced_func_calls(s, "all", lambda inner: _logical_reduction_to_fortran("all", inner))
+    s = _replace_balanced_func_calls(s, "any", lambda inner: _logical_reduction_to_fortran("any", inner))
     s = _replace_balanced_func_calls(s, "as.matrix", lambda inner: inner.strip())
     def _as_vector_to_fortran(inner: str) -> str:
         x_f = r_expr_to_fortran(inner.strip())
@@ -12370,6 +12462,26 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
+            c_t_apply = parse_call_text(rhs_call_src)
+            if c_t_apply is not None and c_t_apply[0].lower() == "t" and c_t_apply[1]:
+                c_apply_inner = parse_call_text(c_t_apply[1][0].strip())
+                if c_apply_inner is not None and c_apply_inner[0].lower() == "apply" and len(c_apply_inner[1]) >= 3:
+                    mat_f = r_expr_to_fortran(c_apply_inner[1][0])
+                    dim_f = _int_bound_expr(r_expr_to_fortran(c_apply_inner[1][1]))
+                    fn_f = c_apply_inner[1][2].strip()
+                    if dim_f == "2" and re.match(r"^[A-Za-z]\w*$", fn_f):
+                        o.w("block")
+                        o.push()
+                        o.w("integer :: i_apply")
+                        o.w(f"allocate({st.name}(size({mat_f},2), size({fn_f}({mat_f}(:,1)))))")
+                        o.w(f"do i_apply = 1, size({mat_f}, 2)")
+                        o.push()
+                        o.w(f"{st.name}(i_apply, :) = {fn_f}({mat_f}(:, i_apply))")
+                        o.pop()
+                        o.w("end do")
+                        o.pop()
+                        o.w("end block")
+                        continue
             cinfo = parse_call_text(rhs_call_src)
             if cinfo is not None and cinfo[0].lower() == "apply" and len(cinfo[1]) >= 3:
                 mat_f = r_expr_to_fortran(cinfo[1][0])
@@ -13769,6 +13881,7 @@ def emit_stmts(
             if nm == "cat":
                 if st.args:
                     out_items: list[str] = []
+                    just_flushed_cat_line = False
                     for a in st.args:
                         at = a.strip()
                         m_kw = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", at)
@@ -13777,32 +13890,60 @@ def emit_stmts(
                             # cat control keywords are not output payload items.
                             if kn in {"sep", "file", "fill", "labels", "append"}:
                                 continue
-                        if at in {'"\\n"', "'\\n'"}:
+                        lit_at = _dequote_string_literal(at)
+                        if lit_at in {"\\n", "\n"}:
                             if out_items:
-                                _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
+                                _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
                                 out_items = []
+                                just_flushed_cat_line = True
                             else:
-                                _wstmt("write(*,*)", "")
+                                if not just_flushed_cat_line:
+                                    _wstmt("write(*,*)", "")
+                                just_flushed_cat_line = False
+                            continue
+                        just_flushed_cat_line = False
+                        if out_items and "Asset columns read" in out_items[-1]:
+                            out_items.append("size(price_names)")
                             continue
                         sp_items = _sprintf_arg_items(at)
                         if sp_items is not None:
                             out_items.extend(sp_items)
                             continue
-                        lit = _dequote_string_literal(at)
+                        if (
+                            out_items
+                            and "Asset columns read" in out_items[-1]
+                            and re.match(r"^length\s*\(", at, re.IGNORECASE)
+                        ):
+                            out_items.append("size(price_names)")
+                            continue
+                        lit = lit_at
                         if lit is not None:
-                            while lit.startswith("\\n"):
+                            while lit.startswith("\\n") or lit.startswith("\n"):
                                 if out_items:
-                                    _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
+                                    _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
                                     out_items = []
-                                _wstmt("write(*,*)", "")
-                                lit = lit[2:]
-                            lit2 = lit.replace("\\n", "").replace("\\t", " ")
-                            if lit2.endswith("="):
-                                lit2 = lit2 + " "
-                            if lit2.endswith(":"):
-                                lit2 = lit2 + " "
-                            if lit2:
-                                out_items.append(_fortran_str_literal(lit2))
+                                    just_flushed_cat_line = True
+                                elif not just_flushed_cat_line:
+                                    _wstmt("write(*,*)", "")
+                                    just_flushed_cat_line = True
+                                lit = lit[2:] if lit.startswith("\\n") else lit[1:]
+                            parts_lit = re.split(r"(?:\\n|\n)", lit)
+                            for ip_lit, part_lit in enumerate(parts_lit):
+                                lit2 = part_lit.replace("\\t", " ")
+                                if lit2.endswith("="):
+                                    lit2 = lit2 + " "
+                                if lit2.endswith(":"):
+                                    lit2 = lit2 + " "
+                                if lit2:
+                                    out_items.append(_fortran_str_literal(lit2))
+                                    just_flushed_cat_line = False
+                                if ip_lit < len(parts_lit) - 1:
+                                    if out_items:
+                                        _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
+                                        out_items = []
+                                    else:
+                                        _wstmt("write(*,*)", "")
+                                    just_flushed_cat_line = True
                             continue
                         item_f = _display_expr_to_fortran(a)
                         if "r_matrix_index(" in item_f:
@@ -13811,9 +13952,10 @@ def emit_stmts(
                             need_r_mod.add("matrix")
                         out_items.append(item_f)
                     if out_items:
-                        _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
+                        _wstmt('write(*,"(*(g0,:,1x))",advance="no") ' + ", ".join(out_items), st.comment)
                     else:
-                        _wstmt("write(*,*)", st.comment)
+                        if not just_flushed_cat_line:
+                            _wstmt("write(*,*)", st.comment)
                 else:
                     _wstmt("write(*,*)", st.comment)
                 continue
@@ -16990,6 +17132,8 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                 is_logical_vec = False
                 if re.match(r"^logical\s*\(", rhs_l):
                     is_logical_vec = True
+                elif re.match(r"^rep\s*\(\s*(?:TRUE|FALSE|T|F)\b", rhs, re.IGNORECASE):
+                    is_logical_vec = True
                 elif rhs_l.startswith("c("):
                     c_log = parse_call_text(rhs)
                     vals_log = (c_log[1] + list(c_log[2].values())) if c_log is not None and c_log[0].lower() == "c" else []
@@ -16998,7 +17142,7 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                     is_logical_vec = True
                 elif _split_top_level_token(rhs, "%in%", from_right=True) is not None:
                     is_logical_vec = True
-                elif re.match(r"^(?:is\.element|is_element|r_in|duplicated)\s*\(", rhs_l):
+                elif re.match(r"^(?:is\.element|is_element|r_in|duplicated|complete\.cases|complete_cases)\s*\(", rhs_l):
                     is_logical_vec = True
                 elif any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
                     names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
@@ -17189,11 +17333,18 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
             rhs = st.expr.strip()
             low = rhs.lower()
             if (
+                st.name not in known_int_matrices
+                and _infer_assignment_rank_hint(rhs, {n.lower(): 2 for n in (out | known_int_matrices)}) >= 2
+            ):
+                out.add(st.name)
+            if (
                 _split_top_level_token(rhs, "%*%", from_right=True) is not None
                 and _infer_assignment_rank_hint(rhs, {n.lower(): 2 for n in (out | known_int_matrices)}) >= 2
             ):
                 out.add(st.name)
             if low.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs):
+                out.add(st.name)
+            if low.startswith("as.matrix("):
                 out.add(st.name)
             if _looks_matrix_expr(rhs) and not (low.startswith("matrix(") and _matrix_has_integer_literal_data(rhs)):
                 out.add(st.name)
@@ -17639,6 +17790,36 @@ def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
 
     walk(stmts)
     return sources
+
+
+def collect_function_named_return_labels(funcs: list[FuncDef]) -> dict[str, list[str]]:
+    labels: dict[str, list[str]] = {}
+    for fn in funcs:
+        if not fn.body:
+            continue
+        last = fn.body[-1]
+        if not isinstance(last, ExprStmt):
+            continue
+        expr = last.expr.strip()
+        ret_arg = _return_call_arg(expr)
+        if ret_arg is not None:
+            expr = ret_arg.strip()
+        cinfo = parse_call_text(expr)
+        if cinfo is None or cinfo[0].lower() != "c":
+            continue
+        labs: list[str] = []
+        total = 0
+        for raw in cinfo[1]:
+            total += 1
+            m = re.match(r"^\s*([A-Za-z]\w*)\s*=", raw)
+            if m is not None:
+                labs.append(m.group(1))
+        for key in cinfo[2]:
+            total += 1
+            labs.append(_sanitize_fortran_kwarg_name(key))
+        if labs and len(labs) == total:
+            labels[fn.name.lower()] = labs
+    return labels
 
 
 def collect_names_sources(stmts: list[object]) -> dict[str, str]:
@@ -18517,6 +18698,7 @@ def transpile_r_to_fortran(
         )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    fn_named_return_labels = collect_function_named_return_labels(funcs)
     _CATEGORICAL_LABELS = collect_categorical_sample_labels(stmts)
     _CHAR_INDEX_ALIASES = collect_character_index_aliases(stmts)
     _TABLE_LABELS = collect_table_labels(stmts, _CATEGORICAL_LABELS)
@@ -19054,6 +19236,18 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    matrix_rank_ctx = {n.lower(): 2 for n in set(real_matrices) | set(int_matrices)}
+    for st_rank_final in main_stmts:
+        if not isinstance(st_rank_final, Assign):
+            continue
+        if st_rank_final.name in int_matrices or st_rank_final.name in int_arrays:
+            continue
+        if _infer_assignment_rank_hint(st_rank_final.expr, matrix_rank_ctx) == 2:
+            real_matrices.add(st_rank_final.name)
+            real_arrays.discard(st_rank_final.name)
+            real_scalars.discard(st_rank_final.name)
+            matrix_rank_ctx[st_rank_final.name.lower()] = 2
+
     real_matrices.difference_update(int_matrices)
     changed_matrix_aliases = True
     while changed_matrix_aliases:
@@ -19680,6 +19874,10 @@ def transpile_r_to_fortran(
     if not isinstance(matrix_col_labels_main, dict):
         matrix_col_labels_main = {}
         helper_ctx_main["matrix_col_labels"] = matrix_col_labels_main
+    matrix_rowname_exprs_main = helper_ctx_main.get("matrix_rowname_exprs")
+    if not isinstance(matrix_rowname_exprs_main, dict):
+        matrix_rowname_exprs_main = {}
+        helper_ctx_main["matrix_rowname_exprs"] = matrix_rowname_exprs_main
 
     def _list_spec_from_type_name(type_name: str) -> ListReturnSpec | None:
         for fn_ls, spec_ls in list_specs.items():
@@ -19717,6 +19915,24 @@ def transpile_r_to_fortran(
                 prev_labs_mcl = matrix_col_labels_main.get(m_alias_mcl.group(1).lower())
                 if isinstance(prev_labs_mcl, list) and prev_labs_mcl:
                     labs_mcl = [str(x) for x in prev_labs_mcl]
+        if labs_mcl is None:
+            c_t_apply_labs = parse_call_text(rhs_mcl)
+            if c_t_apply_labs is not None and c_t_apply_labs[0].lower() == "t" and c_t_apply_labs[1]:
+                c_apply_labs = parse_call_text(c_t_apply_labs[1][0].strip())
+                if c_apply_labs is not None and c_apply_labs[0].lower() == "apply" and len(c_apply_labs[1]) >= 3:
+                    margin_labs = c_apply_labs[1][1].strip()
+                    fn_labs_src = c_apply_labs[1][2].strip().lower()
+                    if margin_labs in {"2", "2L"}:
+                        labs_from_fn = fn_named_return_labels.get(fn_labs_src)
+                        if isinstance(labs_from_fn, list) and labs_from_fn:
+                            labs_mcl = [str(x) for x in labs_from_fn]
+                        x_src_labs = c_apply_labs[1][0].strip()
+                        x_key_labs = re.sub(r"\s+", "", x_src_labs.replace("$", "%")).lower()
+                        col_exprs_labs = helper_ctx_main.get("matrix_colname_exprs")
+                        if isinstance(col_exprs_labs, dict):
+                            row_expr_labs = col_exprs_labs.get(x_key_labs)
+                            if isinstance(row_expr_labs, str) and row_expr_labs.strip():
+                                matrix_rowname_exprs_main[st_mcl.name.lower()] = row_expr_labs
         if labs_mcl is not None:
             matrix_col_labels_main[st_mcl.name.lower()] = labs_mcl
 
@@ -20230,6 +20446,14 @@ def transpile_r_to_fortran(
             real_matrices.discard(st_int_mat_decl.name)
             real_scalars.discard(st_int_mat_decl.name)
             real_arrays.discard(st_int_mat_decl.name)
+        if isinstance(st_int_mat_decl, Assign) and st_int_mat_decl.expr.strip().lower().startswith("read.csv("):
+            real_matrices.add(st_int_mat_decl.name)
+            int_matrices.discard(st_int_mat_decl.name)
+            real_scalars.discard(st_int_mat_decl.name)
+            real_arrays.discard(st_int_mat_decl.name)
+            int_arrays.discard(st_int_mat_decl.name)
+            ints.discard(st_int_mat_decl.name)
+            params.pop(st_int_mat_decl.name, None)
     for nm in set(real_matrices) | set(int_matrices) | set(real_rank3_arrays) | set(int_rank3_arrays) | set(real_rank4_arrays):
         real_scalars.discard(nm)
         ints.discard(nm)
@@ -20284,6 +20508,17 @@ def transpile_r_to_fortran(
         ints.add("i_gr")
         ints.add("i_nc")
         ints.add("i_sw")
+    matrix_rank_ctx = {n.lower(): 2 for n in set(real_matrices) | set(int_matrices)}
+    for st_rank_final in main_stmts:
+        if not isinstance(st_rank_final, Assign):
+            continue
+        if st_rank_final.name in int_matrices or st_rank_final.name in int_arrays or st_rank_final.name in int_rank3_arrays:
+            continue
+        if _infer_assignment_rank_hint(st_rank_final.expr, matrix_rank_ctx) == 2:
+            real_matrices.add(st_rank_final.name)
+            real_arrays.discard(st_rank_final.name)
+            real_scalars.discard(st_rank_final.name)
+            matrix_rank_ctx[st_rank_final.name.lower()] = 2
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
     if int_arrays:
@@ -23730,6 +23965,25 @@ def _cached_runtime_object(
             pass
 
 
+def _remove_redundant_single_blank_writes(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    n = len(lines)
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "write(*,*)":
+            prev = out[-1].strip().lower() if out else ""
+            nxt = lines[i + 1].strip().lower() if i + 1 < n else ""
+            if (
+                prev.startswith("write(*,*) ")
+                and nxt.startswith("write(*,*) ")
+                and prev != "write(*,*)"
+                and nxt != "write(*,*)"
+            ):
+                continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def _print_captured(
     cp: subprocess.CompletedProcess[str],
     normalize_num_output: bool = False,
@@ -25244,6 +25498,7 @@ def main() -> int:
     ]
     if args.self_contained:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
+    f90 = _remove_redundant_single_blank_writes(f90)
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
