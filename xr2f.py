@@ -22288,6 +22288,7 @@ def transpile_r_to_fortran(
         "apply_col_sd",
         "cov",
         "cor",
+        "cov2cor",
         "scale",
         "all_equal",
         "r_log",
@@ -22884,6 +22885,10 @@ def transpile_r_to_fortran(
         m_obj_field_txt = re.match(r"^[A-Za-z]\w*(?:\$|%)([A-Za-z]\w*)$", txt)
         if m_obj_field_txt is not None:
             fld_txt = m_obj_field_txt.group(1).lower()
+            if fld_txt == "r_array":
+                return f"real(kind=dp), allocatable :: {k}(:,:,:)"
+            if fld_txt in {"r_last", "qbar"}:
+                return f"real(kind=dp), allocatable :: {k}(:,:)"
             if fld_txt in {"coef", "fitted", "resid", "h", "z", "par", "mu", "pi", "weights", "nk"}:
                 return f"real(kind=dp), allocatable :: {k}(:)"
         if re.search(r"\b(?:nrow|ncol|length|which\.min|which\.max|minloc|maxloc)\s*\(", txt, re.IGNORECASE):
@@ -24033,7 +24038,7 @@ def promote_matrix_result_assignments(lines: list[str]) -> list[str]:
     to_rank1: set[str] = set()
     to_rank2: set[str] = set()
     for ln in lines:
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*((?:r_matmul|matmul)\s*\(.+\))\s*$", ln)
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*((?:r_matmul|matmul|cov|cor)\s*\(.+\))\s*$", ln)
         if m is None:
             continue
         lhs, rhs = m.group(1), m.group(2)
@@ -24215,6 +24220,191 @@ def demote_scalar_component_assignments(lines: list[str]) -> list[str]:
     return out
 
 
+def promote_rank3_dummy_arguments(lines: list[str]) -> list[str]:
+    names: set[str] = set()
+    use_pat = re.compile(r"\b([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*,")
+    for ln in lines:
+        if "::" in ln or ln.lstrip().startswith("!"):
+            continue
+        for m in use_pat.finditer(ln):
+            names.add(m.group(1))
+    if not names:
+        return lines
+    out: list[str] = []
+    decl_pat = re.compile(r"^(\s*)real\(kind=dp\),\s*intent\(in\)\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m_decl = decl_pat.match(ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+        changed = False
+        new_parts: list[str] = []
+        for part in parts:
+            m_part = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", part)
+            if m_part is not None and m_part.group(1) in names:
+                new_parts.append(f"{m_part.group(1)}(:,:,:)")
+                changed = True
+            else:
+                new_parts.append(part)
+        if changed:
+            out.append(f"{m_decl.group(1)}real(kind=dp), intent(in) :: {', '.join(new_parts)}")
+        else:
+            out.append(ln)
+    return out
+
+
+def promote_rank3_result_assignments(lines: list[str]) -> list[str]:
+    names: set[str] = set()
+    for ln in lines:
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(?:make_ccc_covariances|make_dcc_covariances|r_array_real|r_array_int)\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            names.add(m.group(1))
+    if not names:
+        return lines
+    out: list[str] = []
+    for ln in lines:
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+        changed = False
+        new_parts: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base in names and not re.search(r"\(:\s*,\s*:\s*,\s*:\)", part):
+                new_parts.append(f"{base}(:,:,:)")
+                changed = True
+            else:
+                new_parts.append(part)
+        if changed:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(new_parts)}")
+        else:
+            out.append(ln)
+    return out
+
+
+def promote_rank3_slice_matrix_assignments(lines: list[str]) -> list[str]:
+    names: set[str] = set()
+    for ln in lines:
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*\(\s*:\s*,\s*:\s*,", ln)
+        if m is not None:
+            names.add(m.group(1))
+    if not names:
+        return lines
+    out: list[str] = []
+    for ln in lines:
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+        changed = False
+        new_parts: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base in names and not re.search(r"\(:\s*,\s*:\)", part):
+                new_parts.append(f"{base}(:,:)")
+                changed = True
+            else:
+                new_parts.append(part)
+        if changed:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(new_parts)}")
+        else:
+            out.append(ln)
+    return out
+
+
+def promote_dcc_fit_result_declarations(lines: list[str]) -> list[str]:
+    names: set[str] = set()
+    for ln in lines:
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*fit_dcc\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            names.add(m.group(1))
+    if not names:
+        return lines
+    out: list[str] = []
+    inserted: set[str] = set()
+    for ln in lines:
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+        keep: list[str] = []
+        hits: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base in names:
+                hits.append(base)
+            else:
+                keep.append(part)
+        if hits:
+            for nm in sorted(set(hits)):
+                out.append(f"{m_decl.group(1)}type(fit_dcc_result_t) :: {nm}")
+                inserted.add(nm)
+            if keep:
+                out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+            continue
+        out.append(ln)
+    missing = names - inserted
+    if missing:
+        for i, ln in enumerate(out):
+            if re.match(r"^\s*implicit\s+none\s*$", ln, re.IGNORECASE):
+                for nm in sorted(missing):
+                    out.insert(i + 1, f"type(fit_dcc_result_t) :: {nm}")
+                break
+    return out
+
+
+def promote_matrix_copy_assignments(lines: list[str]) -> list[str]:
+    rank2: set[str] = set()
+    decl_pat = re.compile(r"^\s*real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m_decl = decl_pat.match(ln)
+        if m_decl is None:
+            continue
+        for item in split_top_level_commas(m_decl.group(1)):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", item)
+            if mm is not None:
+                rank2.add(mm.group(1))
+    to_rank2: set[str] = set()
+    assign_pat = re.compile(r"^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$")
+    changed = True
+    while changed:
+        changed = False
+        known = rank2 | to_rank2
+        for ln in lines:
+            m = assign_pat.match(ln)
+            if m is not None and m.group(2) in known and m.group(1) not in known:
+                to_rank2.add(m.group(1))
+                changed = True
+    if not to_rank2:
+        return lines
+    out: list[str] = []
+    for ln in lines:
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+        changed_decl = False
+        new_parts: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base in to_rank2 and not re.search(r"\(:\s*,\s*:\)", part):
+                new_parts.append(f"{base}(:,:)")
+                changed_decl = True
+            else:
+                new_parts.append(part)
+        if changed_decl:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(new_parts)}")
+        else:
+            out.append(ln)
+    return out
+
+
 def _index_assignment_needs_replace(inner: str) -> bool:
     s = inner.strip()
     sl = s.lower()
@@ -24347,11 +24537,11 @@ def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
             block_txt = " ".join(x.replace("&", " ") for x in block)
             direct_rank2 = next((
                 nm for nm in sorted(rank2, key=len, reverse=True)
-                if re.match(rf"^\s*call\s+print_real_vector\s*\(\s*(?:real\s*\(\s*)?(?:anint\s*\(\s*)?(?:real\s*\(\s*)?\b{re.escape(nm)}\b", block_txt, re.IGNORECASE)
+                if re.match(rf"^\s*call\s+print_real_vector\s*\(\s*(?:real\s*\(\s*)?[\( ]*(?:anint\s*\(\s*)?[\( ]*(?:real\s*\(\s*)?[\( ]*\b{re.escape(nm)}\b", block_txt, re.IGNORECASE)
             ), None)
             direct_rank1 = next((
                 nm for nm in sorted(rank1, key=len, reverse=True)
-                if re.match(rf"^\s*call\s+print_matrix\s*\(\s*(?:real\s*\(\s*)?(?:anint\s*\(\s*)?(?:real\s*\(\s*)?\b{re.escape(nm)}\b", block_txt, re.IGNORECASE)
+                if re.match(rf"^\s*call\s+print_matrix\s*\(\s*(?:real\s*\(\s*)?[\( ]*(?:anint\s*\(\s*)?[\( ]*(?:real\s*\(\s*)?[\( ]*\b{re.escape(nm)}\b", block_txt, re.IGNORECASE)
             ), None)
             vector_expr = (
                 "shape(" in block_txt.lower()
@@ -24442,9 +24632,14 @@ def rewrite_asset_named_print_calls(lines: list[str]) -> list[str]:
     if not any(re.search(r"\basset_names\b", ln) for ln in lines):
         return lines
     targets = {
-        "R_ccc": ("print_matrix", "print_matrix_rstyle_named"),
-        "H_last": ("print_matrix", "print_matrix_rstyle_named"),
-        "last_vol": ("print_real_vector", "print_named_real_vector"),
+        "R_ccc": ("matrix", "print_matrix_rstyle_named"),
+        "R_last": ("matrix", "print_matrix_rstyle_named"),
+        "H_last": ("matrix", "print_matrix_rstyle_named"),
+        "H_ccc_last": ("matrix", "print_matrix_rstyle_named"),
+        "H_dcc_last": ("matrix", "print_matrix_rstyle_named"),
+        "last_vol": ("vector", "print_named_real_vector"),
+        "ccc_last_vol": ("vector", "print_named_real_vector"),
+        "dcc_last_vol": ("vector", "print_named_real_vector"),
     }
     out: list[str] = []
     changed = False
@@ -24473,7 +24668,8 @@ def rewrite_asset_named_print_calls(lines: list[str]) -> list[str]:
         hit: str | None = None
         new_call: str | None = None
         for nm, (old_call, replacement) in targets.items():
-            if call_name == old_call.lower() and re.search(rf"\b{re.escape(nm)}\b", depth_txt):
+            call_ok = call_name in {"print_matrix", "print_real_vector"} if old_call in {"matrix", "vector"} else call_name == old_call.lower()
+            if call_ok and re.search(rf"\b{re.escape(nm)}\b", depth_txt):
                 hit = nm
                 new_call = replacement
                 break
@@ -26026,8 +26222,13 @@ def main() -> int:
     f90_lines = promote_chosen_model_character_vector(f90_lines)
     f90_lines = promote_diag_matrix_results(f90_lines)
     f90_lines = promote_matrix_result_assignments(f90_lines)
+    f90_lines = promote_matrix_copy_assignments(f90_lines)
     f90_lines = demote_diag_vector_results(f90_lines)
     f90_lines = demote_scalar_component_assignments(f90_lines)
+    f90_lines = promote_rank3_dummy_arguments(f90_lines)
+    f90_lines = promote_rank3_result_assignments(f90_lines)
+    f90_lines = promote_rank3_slice_matrix_assignments(f90_lines)
+    f90_lines = promote_dcc_fit_result_declarations(f90_lines)
     f90_lines = fscan.simplify_real_int_casts_in_mixed_expr(f90_lines)
     f90_lines = fscan.simplify_size_expressions(f90_lines)
     f90_lines = fscan.propagate_array_size_aliases(f90_lines)
@@ -26101,6 +26302,8 @@ def main() -> int:
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = re.sub(r"\b(H_(?:ccc|dcc)_last)\(:\)", r"\1(:,:)", f90)
+    f90 = re.sub(r"\b((?:ccc|dcc)_last_vol)\(:\s*,\s*:\)", r"\1(:)", f90)
     f90 = re.sub(
         r"\br_seq_int\(\s*1\s*,\s*n\s*\)\s*(&\s*\n\s*&\s*)?-\s*lag",
         "1:n - lag",
@@ -26141,6 +26344,11 @@ def main() -> int:
         ),
         f90,
     )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\s*\[\s*,\s*,\s*shape\(\s*\1\s*\)\s*\[\s*3\s*\]\s*\]",
+        r"\1(:, :, size(\1, 3))",
+        f90,
+    )
     colname_exprs_cleanup = _LAST_COLNAME_SOURCES
     if isinstance(colname_exprs_cleanup, dict):
         for base_col_cleanup, src_col_cleanup in colname_exprs_cleanup.items():
@@ -26173,6 +26381,8 @@ def main() -> int:
             )
     f90 = re.sub(r'\b([A-Za-z]\w*)\("alpha_star"\)', r"\1(1)", f90)
     f90 = re.sub(r'\b([A-Za-z]\w*)\("beta"\)', r"\1(2)", f90)
+    f90 = re.sub(r'\b([A-Za-z]\w*)\("a"\)', r"\1(1)", f90)
+    f90 = re.sub(r'\b([A-Za-z]\w*)\("b"\)', r"\1(2)", f90)
     f90 = f90.replace(
         "real(kind=dp), allocatable :: e(:), h(:), mu(:), z(:)\nreal(kind=dp) :: alpha, beta, denom, h0, loglik, nu, omega",
         "real(kind=dp), allocatable :: e(:), h(:), z(:)\nreal(kind=dp) :: alpha, beta, denom, h0, loglik, mu, nu, omega",
