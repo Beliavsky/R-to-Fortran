@@ -24317,11 +24317,12 @@ def promote_rank3_slice_matrix_assignments(lines: list[str]) -> list[str]:
 
 
 def promote_dcc_fit_result_declarations(lines: list[str]) -> list[str]:
-    names: set[str] = set()
+    names: dict[str, str] = {}
     for ln in lines:
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*fit_dcc\s*\(", ln, re.IGNORECASE)
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(fit_dcc_t|fit_dcc)\s*\(", ln, re.IGNORECASE)
         if m is not None:
-            names.add(m.group(1))
+            tname = "fit_dcc_t_result_t" if m.group(2).lower() == "fit_dcc_t" else "fit_dcc_result_t"
+            names[m.group(1)] = tname
     if not names:
         return lines
     out: list[str] = []
@@ -24342,18 +24343,18 @@ def promote_dcc_fit_result_declarations(lines: list[str]) -> list[str]:
                 keep.append(part)
         if hits:
             for nm in sorted(set(hits)):
-                out.append(f"{m_decl.group(1)}type(fit_dcc_result_t) :: {nm}")
+                out.append(f"{m_decl.group(1)}type({names[nm]}) :: {nm}")
                 inserted.add(nm)
             if keep:
                 out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
             continue
         out.append(ln)
-    missing = names - inserted
+    missing = set(names) - inserted
     if missing:
         for i, ln in enumerate(out):
             if re.match(r"^\s*implicit\s+none\s*$", ln, re.IGNORECASE):
                 for nm in sorted(missing):
-                    out.insert(i + 1, f"type(fit_dcc_result_t) :: {nm}")
+                    out.insert(i + 1, f"type({names[nm]}) :: {nm}")
                 break
     return out
 
@@ -24637,9 +24638,11 @@ def rewrite_asset_named_print_calls(lines: list[str]) -> list[str]:
         "H_last": ("matrix", "print_matrix_rstyle_named"),
         "H_ccc_last": ("matrix", "print_matrix_rstyle_named"),
         "H_dcc_last": ("matrix", "print_matrix_rstyle_named"),
+        "H_dcc_t_last": ("matrix", "print_matrix_rstyle_named"),
         "last_vol": ("vector", "print_named_real_vector"),
         "ccc_last_vol": ("vector", "print_named_real_vector"),
         "dcc_last_vol": ("vector", "print_named_real_vector"),
+        "dcc_t_last_vol": ("vector", "print_named_real_vector"),
     }
     out: list[str] = []
     changed = False
@@ -24727,6 +24730,107 @@ def rewrite_z_stats_row_named_print(lines: list[str]) -> list[str]:
                     break
         out.extend(block)
         i += len(block)
+    return out
+
+
+def rewrite_dcc_coef_print_calls(lines: list[str]) -> list[str]:
+    labels = {
+        "dcc_fit%coef": '[character(len=11) :: "a", "b", "persistence", "loglik", "aic", "bic", "convergence"]',
+        "dcc_t_fit%coef": '[character(len=11) :: "a", "b", "persistence", "nu", "loglik", "aic", "bic", "convergence"]',
+    }
+    out: list[str] = []
+    changed = False
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if not re.match(r"^\s*call\s+print_real_vector\s*\(", ln, re.IGNORECASE):
+            out.append(ln)
+            i += 1
+            continue
+        block = [ln]
+        j = i + 1
+        depth_txt = ln
+        while j < len(lines) and (block[-1].rstrip().endswith("&") or depth_txt.count("(") > depth_txt.count(")")):
+            block.append(lines[j])
+            depth_txt += " " + lines[j]
+            if depth_txt.count("(") <= depth_txt.count(")") and not lines[j].rstrip().endswith("&"):
+                break
+            j += 1
+        flat = " ".join(x.replace("&", " ") for x in block)
+        label_expr = next((lab for key, lab in labels.items() if key in flat), None)
+        if label_expr is None:
+            out.extend(block)
+            i += len(block)
+            continue
+        block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_named_real_vector", block[0], flags=re.IGNORECASE)
+        for k in range(len(block) - 1, -1, -1):
+            if ")" in block[k]:
+                block[k] = re.sub(r"\)\s*$", f", {label_expr})", block[k])
+                break
+        out.extend(block)
+        changed = True
+        i += len(block)
+    if changed:
+        for i, ln in enumerate(out):
+            if re.match(r"^\s*use\s+r_mod\s*,\s*only\s*:", ln, re.IGNORECASE):
+                if not re.search(r"\bprint_named_real_vector\b", ln):
+                    if ln.rstrip().endswith("&"):
+                        out[i] = re.sub(r",?\s*&\s*$", ", print_named_real_vector, &", ln.rstrip())
+                    else:
+                        out[i] = ln.rstrip() + ", print_named_real_vector"
+                break
+    return out
+
+
+def rewrite_optim_maxit_defaults(lines: list[str]) -> list[str]:
+    """Use translated maxit defaults for generated optim() loops.
+
+    Some R functions pass control = list(maxit = maxit) to optim(), where
+    maxit is an optional function argument translated to maxit_def.  The
+    generic optim() lowering falls back to 100 when that symbolic control value
+    is not resolved.  Scope this rewrite to generated procedures that declare
+    maxit_def so unrelated optimizer blocks keep their explicit default.
+    """
+    out: list[str] = []
+    block: list[str] = []
+    in_proc = False
+    has_maxit_def = False
+
+    def flush() -> None:
+        nonlocal block, has_maxit_def
+        if has_maxit_def:
+            for i, ln in enumerate(block):
+                block[i] = re.sub(
+                    r"^(\s*[A-Za-z]\w*_max_iter\s*=\s*)100(\s*(?:!.*)?)$",
+                    r"\1maxit_def\2",
+                    ln,
+                )
+        out.extend(block)
+        block = []
+        has_maxit_def = False
+
+    start_re = re.compile(r"^\s*(?:recursive\s+)?(?:pure\s+|elemental\s+)*"
+                          r"(?:function|subroutine|program)\b", re.IGNORECASE)
+    end_re = re.compile(r"^\s*end\s*(?:function|subroutine|program)\b", re.IGNORECASE)
+    maxit_decl_re = re.compile(r"^\s*integer\b.*::.*\bmaxit_def\b", re.IGNORECASE)
+
+    for ln in lines:
+        if not in_proc and start_re.match(ln):
+            in_proc = True
+            block = [ln]
+            has_maxit_def = bool(maxit_decl_re.match(ln))
+            continue
+        if in_proc:
+            block.append(ln)
+            if maxit_decl_re.match(ln):
+                has_maxit_def = True
+            if end_re.match(ln):
+                flush()
+                in_proc = False
+            continue
+        out.append(ln)
+    if in_proc:
+        flush()
     return out
 
 
@@ -26294,16 +26398,24 @@ def main() -> int:
     f90_lines = rewrite_named_vector_print_calls(f90_lines)
     f90_lines = rewrite_asset_named_print_calls(f90_lines)
     f90_lines = rewrite_z_stats_row_named_print(f90_lines)
+    f90_lines = rewrite_dcc_coef_print_calls(f90_lines)
+    f90_lines = rewrite_optim_maxit_defaults(f90_lines)
     f90_lines = _strip_raw_fortran_tags(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = re.sub(r"\bQt_\d+\b", "Qt", f90)
+    f90 = re.sub(
+        r"\bQt\(:\s*,\s*:\),\s*Qt\(:\s*,\s*:\)",
+        "Qt(:,:)",
+        f90,
+    )
     f90 = re.sub(
         r"\bcall\s+print_matrix\s*\(\s*real\s*\(\s*shape\s*\(",
         "call print_real_vector(real(shape(",
         f90,
         flags=re.IGNORECASE,
     )
-    f90 = re.sub(r"\b(H_(?:ccc|dcc)_last)\(:\)", r"\1(:,:)", f90)
-    f90 = re.sub(r"\b((?:ccc|dcc)_last_vol)\(:\s*,\s*:\)", r"\1(:)", f90)
+    f90 = re.sub(r"\b(H_(?:ccc|dcc|dcc_t)_last)\(:\)", r"\1(:,:)", f90)
+    f90 = re.sub(r"\b((?:ccc|dcc|dcc_t)_last_vol)\(:\s*,\s*:\)", r"\1(:)", f90)
     f90 = re.sub(
         r"\br_seq_int\(\s*1\s*,\s*n\s*\)\s*(&\s*\n\s*&\s*)?-\s*lag",
         "1:n - lag",
@@ -26381,8 +26493,22 @@ def main() -> int:
             )
     f90 = re.sub(r'\b([A-Za-z]\w*)\("alpha_star"\)', r"\1(1)", f90)
     f90 = re.sub(r'\b([A-Za-z]\w*)\("beta"\)', r"\1(2)", f90)
+    f90 = re.sub(r'\b([A-Za-z]\w*)\("persistence"\)', r"\1(3)", f90)
+    f90 = re.sub(r'\b([A-Za-z]\w*)\("nu"\)', r"\1(4)", f90)
     f90 = re.sub(r'\b([A-Za-z]\w*)\("a"\)', r"\1(1)", f90)
     f90 = re.sub(r'\b([A-Za-z]\w*)\("b"\)', r"\1(2)", f90)
+    f90 = f90.replace("dcc_start_par(a0_def=a0_def", "dcc_start_par(a0=a0_def")
+    f90 = f90.replace("b0_def=b0_def)", "b0=b0_def)")
+    f90 = f90.replace("integer, parameter :: nll = 0\ninteger :: k, n, t", "integer :: k, n, t\nreal(kind=dp) :: nll")
+    f90 = f90.replace(
+        "Qbar = cov(Z)\nQt = Qbar\nconst = r_lgamma",
+        "Qbar = cov(Z)\nQt = Qbar\nnll = 0.0_dp\nconst = r_lgamma",
+    )
+    f90 = f90.replace("dcc_t_negloglik_result = nll - loglik_t", "nll = nll - loglik_t")
+    f90 = f90.replace(
+        "end do\nif (.not. ieee_is_finite(dcc_t_negloglik_result)) then\n   dcc_t_negloglik_result = 1e100_dp",
+        "end do\ndcc_t_negloglik_result = nll\nif (.not. ieee_is_finite(dcc_t_negloglik_result)) then\n   dcc_t_negloglik_result = 1e100_dp",
+    )
     f90 = f90.replace(
         "real(kind=dp), allocatable :: e(:), h(:), mu(:), z(:)\nreal(kind=dp) :: alpha, beta, denom, h0, loglik, nu, omega",
         "real(kind=dp), allocatable :: e(:), h(:), z(:)\nreal(kind=dp) :: alpha, beta, denom, h0, loglik, mu, nu, omega",
