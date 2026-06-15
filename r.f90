@@ -19,7 +19,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
    & dt, pt, qt, df, pf, qf, dlogis, plogis, qlogis, dlnorm, plnorm, qlnorm, dweibull, pweibull, qweibull, &
    & dcauchy, pcauchy, qcauchy, dbinom, pbinom, qbinom, dpois, dgeom, pgeom, qgeom, dnbinom, pnbinom, qnbinom, &
-   & dhyper, phyper, qhyper, dwilcox, pwilcox, qwilcox, dsignrank, psignrank, qsignrank, cov, cor, mahalanobis, isSymmetric, scale, all_equal, r_log, r_seq_int, r_seq_len, &
+   & dhyper, phyper, qhyper, dwilcox, pwilcox, qwilcox, dsignrank, psignrank, qsignrank, cov, cor, cov2cor, mahalanobis, isSymmetric, scale, all_equal, r_log, r_seq_int, r_seq_len, &
    & glm_binomial_fit, glm_poisson_fit, glm_predict_response, glm_pearson_resid, print_glm_summary, &
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
@@ -8709,6 +8709,34 @@ mu = sum(x, dim=1) / real(n, kind=dp)
 xc = x - spread(mu, dim=1, ncopies=n)
 out = matmul(transpose(xc), xc) / real(n - 1, kind=dp)
 end function cov_mat
+
+pure function cov2cor(x) result(out)
+! Convert a covariance matrix to a correlation matrix.
+real(kind=dp), intent(in) :: x(:,:) ! covariance matrix
+real(kind=dp), allocatable :: out(:,:)
+real(kind=dp), allocatable :: d(:)
+integer :: i, j, n
+n = min(size(x, 1), size(x, 2))
+allocate(out(size(x, 1), size(x, 2)))
+if (size(x, 1) == 0 .or. size(x, 2) == 0) return
+allocate(d(n))
+do i = 1, n
+   if (x(i, i) > 0.0_dp) then
+      d(i) = sqrt(x(i, i))
+   else
+      d(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+end do
+do j = 1, size(x, 2)
+   do i = 1, size(x, 1)
+      if (i <= n .and. j <= n .and. d(i) > 0.0_dp .and. d(j) > 0.0_dp) then
+         out(i, j) = x(i, j) / (d(i) * d(j))
+      else
+         out(i, j) = ieee_value(0.0_dp, ieee_quiet_nan)
+      end if
+   end do
+end do
+end function cov2cor
 
 pure function scale_vec(x, center, scale) result(out)
 ! R scale() on a vector returns an n-by-1 matrix.
