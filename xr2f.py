@@ -9985,6 +9985,12 @@ def r_expr_to_fortran(expr: str) -> str:
         lambda m: f"{m.group(1)}({_int_bound_expr(r_expr_to_fortran(m.group(2)))} + 1:{_int_bound_expr(r_expr_to_fortran(m.group(3)))})",
         s,
     )
+    s = re.sub(
+        r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*(\[[^\[\]]*ieee_value[^\[\]]*\])\s*\]",
+        lambda m: f"r_index_real({m.group(1)}, {m.group(2)})",
+        s,
+        flags=re.IGNORECASE,
+    )
     # R indexing: a[1] -> a(1), a%b[2] -> a%b(2)
     idx_pat = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[([^\[\]]+)\]")
     prev = None
@@ -10008,6 +10014,8 @@ def r_expr_to_fortran(expr: str) -> str:
             if il in {"true", "false", "t", "f", ".true.", ".false."}:
                 mask_scalar = ".true." if il in {"true", "t", ".true."} else ".false."
                 return f"pack({base}, spread({mask_scalar}, dim=1, ncopies=size({base})))"
+            if "ieee_value" in il:
+                return f"r_index_real({base}, {r_expr_to_fortran(inner)})"
             if (
                 il in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is_na\s*\(", il)
@@ -10701,6 +10709,8 @@ def emit_stmts(
                 or inner_l in {"true", "false", "t", "f", ".true.", ".false."}
                 or inner_l in _KNOWN_VECTOR_NAMES
                 or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                or "ieee_value" in inner_l
+                or re.search(r"\bNA\b", inner, re.IGNORECASE) is not None
                 or re.match(r"^is\.na\s*\(", inner_l)
                 or re.match(r"^is_na\s*\(", inner_l)
                 or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", "&", "|", ".and.", ".or."))
@@ -21298,6 +21308,7 @@ def transpile_r_to_fortran(
         "r_rep_int",
         "r_drop_index",
         "r_drop_indices",
+        "r_index_real",
         "r_matrix_col",
         "char_join",
         "list_files",
