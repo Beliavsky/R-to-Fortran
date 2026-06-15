@@ -11159,6 +11159,37 @@ def emit_stmts(
         vals = ", ".join('"' + x.replace('"', '""') + '"' for x in labels)
         return f"[character(len={width}) :: {vals}]"
 
+    def _matrix_vector_subset_label_expr_for_print(expr_txt: str) -> str | None:
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*\[(.*)\]\s*$", expr_txt.strip())
+        if m is None:
+            return None
+        base = m.group(1)
+        if base not in int_matrix_vars and base not in real_matrix_vars:
+            return None
+        dims_all = _split_index_dims(m.group(2).strip())
+        if any(re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE) for d in dims_all):
+            return None
+        dims = [d for d in dims_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+        if len(dims) < 2:
+            return None
+
+        def is_scalar_index(src: str) -> bool:
+            t = src.strip()
+            return bool(t) and t != ":" and _split_top_level_colon(t) is None and not t.startswith("-")
+
+        row_idx = dims[0].strip()
+        col_idx = dims[1].strip()
+        if is_scalar_index(row_idx) and col_idx == "":
+            labels = _matrix_col_labels_for_print(base)
+            if labels is not None:
+                return _char_array_literal(labels)
+            return _matrix_col_label_expr_for_print(base)
+        if row_idx == "" and is_scalar_index(col_idx):
+            row_expr = _matrix_row_label_expr_for_print(base)
+            if row_expr is not None:
+                return row_expr
+        return None
+
     def _table_labels_for_expr(expr_txt: str) -> tuple[list[str] | None, list[str] | None] | None:
         t_tbl = expr_txt.strip()
         if re.fullmatch(r"[A-Za-z]\w*", t_tbl):
@@ -13100,6 +13131,14 @@ def emit_stmts(
                                         f"call print_named_real_vector(real({val_expr_nv}, kind=dp), {name_expr_nv})",
                                         st.comment,
                                     )
+                                need_r_mod.add("print_named_real_vector")
+                                continue
+                            matrix_subset_names = _matrix_vector_subset_label_expr_for_print(one)
+                            if matrix_subset_names is not None:
+                                _wstmt(
+                                    f"call print_named_real_vector(real({one_f}, kind=dp), {matrix_subset_names})",
+                                    st.comment,
+                                )
                                 need_r_mod.add("print_named_real_vector")
                                 continue
                             m_int_matrix_linear_print = re.match(r"^([A-Za-z]\w*)\s*\[", one.strip())
