@@ -4657,6 +4657,38 @@ def _stmt_uses_name(st: object, name: str) -> int:
     return 0
 
 
+def _expr_uses_name_with_subset(expr: str, name: str) -> bool:
+    return re.search(rf"\b{re.escape(name)}\s*\[", expr) is not None
+
+
+def _stmt_uses_name_with_subset(st: object, name: str) -> bool:
+    if isinstance(st, Assign):
+        return _expr_uses_name_with_subset(st.expr, name)
+    if isinstance(st, PrintStmt):
+        return any(_expr_uses_name_with_subset(a, name) for a in st.args)
+    if isinstance(st, CallStmt):
+        return any(_expr_uses_name_with_subset(a, name) for a in st.args)
+    if isinstance(st, ExprStmt):
+        return _expr_uses_name_with_subset(st.expr, name)
+    if isinstance(st, ForStmt):
+        return _expr_uses_name_with_subset(st.iter_expr, name) or any(
+            _stmt_uses_name_with_subset(b, name) for b in st.body
+        )
+    if isinstance(st, WhileStmt):
+        return _expr_uses_name_with_subset(st.cond, name) or any(
+            _stmt_uses_name_with_subset(b, name) for b in st.body
+        )
+    if isinstance(st, RepeatStmt):
+        return any(_stmt_uses_name_with_subset(b, name) for b in st.body)
+    if isinstance(st, IfStmt):
+        return (
+            _expr_uses_name_with_subset(st.cond, name)
+            or any(_stmt_uses_name_with_subset(b, name) for b in st.then_body)
+            or any(_stmt_uses_name_with_subset(b, name) for b in st.else_body)
+        )
+    return False
+
+
 def _stmt_writes_name(st: object, name: str) -> bool:
     if isinstance(st, Assign):
         return st.name == name
@@ -4870,6 +4902,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
                 i += 1
                 continue
             if parse_call_text(st.expr.strip()) is not None and _stmt_uses_name_as_reducer_arg(out[use_j], name):
+                i += 1
+                continue
+            if _looks_matrix_expr(st.expr) and _stmt_uses_name_with_subset(out[use_j], name):
                 i += 1
                 continue
             if _stmt_uses_name_in_model_formula(out[use_j], name):
@@ -10807,6 +10842,14 @@ def emit_stmts(
                     and not d.strip().startswith("-")
                     and ":" not in d
                     and _split_top_level_colon(d.strip()) is None
+                    and not (
+                        re.fullmatch(r"[A-Za-z]\w*", d.strip()) is not None
+                        and d.strip().lower() in {v.lower() for v in vector_vars}
+                    )
+                    and not (
+                        re.fullmatch(r"[A-Za-z]\w*", d.strip()) is not None
+                        and d.strip().lower() in _KNOWN_VECTOR_NAMES
+                    )
                     for d in dims
                 ]
                 if all(scalar_dims):
@@ -10884,6 +10927,8 @@ def emit_stmts(
             if nm_c in {"qr.coef", "qr_coef", "qr.fitted", "qr_fitted", "qr.resid", "qr_resid", "qr.qty", "qr_qty", "qr.qy", "qr_qy", "qr.solve", "qr_solve"}:
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
+                return 1
+            if nm_c in {"colmeans", "colsums", "rowmeans", "rowsums"}:
                 return 1
             if nm_c == "apply_col_sd":
                 return 1
@@ -22322,6 +22367,13 @@ def transpile_r_functions_to_fortran_module(
 def _norm_output(s: str) -> list[str]:
     lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines = [" ".join(ln.split()) for ln in lines]
+    lines = [re.sub(r"^\[\d+\]\s*", "", ln) for ln in lines]
+    lines = [
+        ln
+        for ln in lines
+        if ln != "During startup - Warning messages:"
+        and re.match(r"^\d+:\s+Setting LC_[A-Z_]+=.* failed$", ln) is None
+    ]
     while lines and lines[-1] == "":
         lines.pop()
     return lines
