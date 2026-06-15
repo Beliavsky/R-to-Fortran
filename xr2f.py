@@ -43,6 +43,7 @@ _SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
 _KNOWN_INT_VECTOR_NAMES: set[str] = set()
+_KNOWN_INT_CONSTANTS: dict[str, int] = {}
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
@@ -618,6 +619,49 @@ def _split_top_level_else(text: str) -> tuple[str, str] | None:
                 if left and right:
                     return left, right
         i += 1
+    return None
+
+
+def _split_trailing_r_subset(expr: str) -> tuple[str, str] | None:
+    s = expr.strip()
+    if not s.endswith("]"):
+        return None
+    depth = 0
+    par = 0
+    brace = 0
+    in_single = False
+    in_double = False
+    esc = False
+    for i in range(len(s) - 1, -1, -1):
+        ch = s[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "]":
+            depth += 1
+        elif ch == "[":
+            depth -= 1
+            if depth == 0 and par == 0 and brace == 0:
+                return s[:i].strip(), s[i + 1 : -1].strip()
+        elif ch == ")":
+            par += 1
+        elif ch == "(":
+            par -= 1
+        elif ch == "}":
+            brace += 1
+        elif ch == "{":
+            brace -= 1
     return None
 
 
@@ -2870,7 +2914,12 @@ def _matrix_has_integer_literal_data(expr: str) -> bool:
         return False
     pos, kw = cinfo[1], cinfo[2]
     data_src = pos[0] if pos else kw.get("data", "")
-    return _strict_int_vector_literal_from_c(data_src.strip()) is not None
+    data_txt = data_src.strip()
+    return (
+        _strict_int_vector_literal_from_c(data_txt) is not None
+        or _split_top_level_colon(data_txt) is not None
+        or data_txt.lower().startswith(("integer(", "r_seq_int(", "r_seq_len(", "r_rep_int("))
+    )
 
 
 def _expr_uses_int64(txt: str) -> bool:
@@ -6447,6 +6496,34 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"date_seq_length({r_expr_to_fortran(from_src)}, {by_days}, {_int_bound_expr(r_expr_to_fortran(len_src))})"
             if to_src and by_days is not None:
                 return f"date_seq_day({r_expr_to_fortran(from_src)}, {r_expr_to_fortran(to_src)}, {by_days})"
+    trailing_subset = _split_trailing_r_subset(s)
+    if trailing_subset is not None:
+        base_subset, idx_subset = trailing_subset
+        idx_dims_subset = _split_index_dims(idx_subset)
+        if len(idx_dims_subset) == 1 and _looks_matrix_expr(base_subset):
+            idx_src_subset = idx_dims_subset[0].strip()
+            if idx_src_subset:
+                known_logical_names = set(globals().get("_KNOWN_LOGICAL_VECTOR_NAMES", set())) | set(
+                    globals().get("_KNOWN_LOGICAL_MATRIX_NAMES", set())
+                )
+                logical_idx_subset = (
+                    re.search(r"(?<![<>=!])(?:==|!=|<=|>=|<|>)(?![<>=])", idx_src_subset) is not None
+                    or re.search(r"\b(?:is\.na|is\.finite|is_finite|is\.nan|is_nan)\s*\(", idx_src_subset, re.IGNORECASE)
+                    is not None
+                    or idx_src_subset.lower() in known_logical_names
+                )
+                if logical_idx_subset:
+                    idx_f_txt = r_expr_to_fortran(idx_src_subset).strip()
+                else:
+                    idx_f_subset = _strict_int_vector_literal_from_c(idx_src_subset) or r_expr_to_fortran(idx_src_subset)
+                    idx_f_txt = idx_f_subset.strip()
+                    if not (
+                        idx_f_txt.startswith("[")
+                        or re.match(r"^[A-Za-z]\w*\s*\(", idx_f_txt)
+                        or (re.fullmatch(r"[A-Za-z]\w*", idx_f_txt) and idx_f_txt.lower() in _KNOWN_VECTOR_NAMES)
+                    ):
+                        idx_f_txt = f"[{_int_bound_expr(idx_f_txt)}]"
+                return f"r_matrix_index({r_expr_to_fortran(base_subset)}, {idx_f_txt})"
     m_optim_par_early = re.match(r"^optim\s*\((.*)\)\s*(?:\$|%)\s*par\s*$", s, re.IGNORECASE)
     if m_optim_par_early is not None:
         c_optim_par = parse_call_text("optim(" + m_optim_par_early.group(1).strip() + ")")
@@ -6998,26 +7075,39 @@ def r_expr_to_fortran(expr: str) -> str:
         if mm_op is not None:
             a_txt = mm_op[0].strip()
             b_txt = mm_op[1].strip()
+            def _paren_operand(src_f: str) -> str:
+                t_f = src_f.strip()
+                if re.fullmatch(r"\(\s*[+-]?\d+(?:\.\d*)?(?:_[A-Za-z]\w*)?\s*\)", t_f):
+                    return t_f[1:-1].strip()
+                if re.match(r"^[A-Za-z]\w*\s*\(", t_f) and t_f.endswith(")"):
+                    return t_f
+                if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)?(?:\([^()]*\))?", t_f):
+                    return t_f
+                if _is_int_literal(t_f) or _is_real_literal(t_f) or re.fullmatch(r"[A-Za-z]\w*", t_f):
+                    return t_f
+                if t_f.startswith("[") and t_f.endswith("]"):
+                    return t_f
+                return f"({t_f})"
             if a_txt and b_txt and (_is_complex_expr_source(a_txt) or _is_complex_expr_source(b_txt)):
-                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
+                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             if a_txt and b_txt and _looks_matrix_expr(a_txt) and _looks_matrix_expr(b_txt):
-                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
+                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             a_probe = fscan.strip_redundant_outer_parens_expr(a_txt) if a_txt else ""
             b_probe = fscan.strip_redundant_outer_parens_expr(b_txt) if b_txt else ""
             a_rank = _arith_known_array_rank(a_probe)
             b_rank = _arith_known_array_rank(b_probe)
             if a_rank >= 2 or b_rank >= 2:
-                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
+                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             a_vec = (_looks_vector_expr_for_recycle(a_probe) if a_probe else False) or a_rank == 1
             b_vec = (_looks_vector_expr_for_recycle(b_probe) if b_probe else False) or b_rank == 1
             if a_txt and b_txt and a_vec and b_vec:
                 a_f = r_expr_to_fortran(a_txt)
                 b_f = r_expr_to_fortran(b_txt)
                 if _NO_RECYCLE:
-                    return f"({a_f}) {op} ({b_f})"
+                    return f"{_paren_operand(a_f)} {op} {_paren_operand(b_f)}"
                 return f"{fn}(real({a_f}, kind=dp), real({b_f}, kind=dp))"
             if a_txt and b_txt and (a_vec or b_vec):
-                return f"({r_expr_to_fortran(a_txt)}) {op} ({r_expr_to_fortran(b_txt)})"
+                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
     c_cor0 = parse_call_text(s)
     if c_cor0 is not None and c_cor0[0].lower() in {"cor", "cov"}:
         vals_cor = list(c_cor0[1])
@@ -8264,16 +8354,30 @@ def r_expr_to_fortran(expr: str) -> str:
         a_f = _int_bound_expr(r_expr_to_fortran(s_seq[0].strip()))
         b_f = _int_bound_expr(r_expr_to_fortran(s_seq[1].strip()))
         return f"r_seq_int({a_f}, {b_f})"
-    m_matrix_linear_subset = re.match(r"^matrix\s*\((.*)\)\s*\[\s*(c\s*\(.*\)|[0-9]+[lL]?)\s*\]$", s, re.IGNORECASE)
+    m_matrix_linear_subset = re.match(r"^matrix\s*\((.*)\)\s*\[\s*(-?\s*c\s*\(.*\)|-?\s*[0-9]+[lL]?)\s*\]$", s, re.IGNORECASE)
     if m_matrix_linear_subset is not None:
         mat_src = "matrix(" + m_matrix_linear_subset.group(1).strip() + ")"
         idx_src = m_matrix_linear_subset.group(2).strip()
-        idx_call = parse_call_text(idx_src)
+        neg_subset = idx_src.startswith("-")
+        idx_body_src = idx_src[1:].strip() if neg_subset else idx_src
+        idx_call = parse_call_text(idx_body_src)
         if idx_call is not None and idx_call[0].lower() == "c":
             idx_parts = [p.strip() for p in idx_call[1] + list(idx_call[2].values())]
         else:
-            idx_parts = [idx_src]
-        if idx_parts and all(_is_int_literal(p) for p in idx_parts):
+            idx_parts = [idx_body_src]
+        def _static_int_index_value(src_idx: str) -> int | None:
+            t_idx = src_idx.strip()
+            if _is_int_literal(t_idx):
+                return int(_normalize_r_int_literal(t_idx))
+            if re.fullmatch(r"[A-Za-z]\w*", t_idx) and t_idx.lower() in _KNOWN_INT_CONSTANTS:
+                return _KNOWN_INT_CONSTANTS[t_idx.lower()]
+            return None
+
+        idx_values_opt = [_static_int_index_value(p) for p in idx_parts]
+        if idx_parts and all(v is not None for v in idx_values_opt):
+            idx_values = [int(v) for v in idx_values_opt if v is not None]
+            all_negative = all(v < 0 for v in idx_values)
+            neg_subset = neg_subset or all_negative
             mat_call = parse_call_text(mat_src)
             data_vals: list[str] | None = None
             byrow_src = ""
@@ -8294,9 +8398,12 @@ def r_expr_to_fortran(expr: str) -> str:
                         data_vals = [r_expr_to_fortran(v) for v in vals_data]
             byrow_true = byrow_src.upper() in {"TRUE", ".TRUE.", "T", "1"}
             if data_vals is not None and not byrow_true:
+                if neg_subset:
+                    drop = {abs(v) for v in idx_values}
+                    elems = [v for i, v in enumerate(data_vals, start=1) if i not in drop]
+                    return "[" + ", ".join(elems) + "]"
                 elems = []
-                for p in idx_parts:
-                    idx_i = int(_normalize_r_int_literal(p))
+                for idx_i in idx_values:
                     elems.append(data_vals[(idx_i - 1) % len(data_vals)])
                 return "[" + ", ".join(elems) + "]"
     # matrix(data, nrow=..., ncol=...) in expression context
@@ -8326,15 +8433,6 @@ def r_expr_to_fortran(expr: str) -> str:
             or _real_vector_constructor_from_mixed_c(data_src.strip())
             or r_expr_to_fortran(data_src)
         )
-        if nr_src is None:
-            nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
-            nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
-        else:
-            nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
-            if nc_src is None:
-                nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
-            else:
-                nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
         if data_f.strip().startswith("ieee_value("):
             data_f = f"[{data_f}]"
         elif not (
@@ -8344,6 +8442,19 @@ def r_expr_to_fortran(expr: str) -> str:
         ):
             data_f = f"[{data_f}]"
         byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
+        if nr_src is None:
+            nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
+            nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
+        else:
+            nr_f = _int_bound_expr(r_expr_to_fortran(nr_src))
+            if nc_src is None:
+                if _HAS_R_MOD and not byrow_true:
+                    return f"matrix({data_f}, {nr_f})"
+                nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
+            else:
+                nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
+        if _HAS_R_MOD and not byrow_true:
+            return f"matrix({data_f}, {nr_f}, {nc_f})"
         if byrow_true:
             return f"transpose(reshape({data_f}, [{nc_f}, {nr_f}], pad={data_f}))"
         return f"reshape({data_f}, [{nr_f}, {nc_f}], pad={data_f})"
@@ -12745,6 +12856,10 @@ def emit_stmts(
                         or _split_top_level_token(one, "%*%", from_right=True) is not None
                     ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        if "r_matrix_index(" in one_f:
+                            need_r_mod.add("r_matrix_index")
+                        if re.search(r"\bmatrix\s*\(", one_f):
+                            need_r_mod.add("matrix")
                         one_f_simple = one_f.strip()
                         m_rle_field_print = re.match(r"^([A-Za-z]\w*)%((?:lengths)|(?:values))(?:\s*\(.*\))?$", one_f_simple, re.IGNORECASE)
                         if m_rle_field_print is not None and m_rle_field_print.group(1) in rle_vars_ctx:
@@ -12871,6 +12986,11 @@ def emit_stmts(
                                         st.comment,
                                     )
                                 need_r_mod.add("print_named_real_vector")
+                                continue
+                            m_int_matrix_linear_print = re.match(r"^([A-Za-z]\w*)\s*\[", one.strip())
+                            if m_int_matrix_linear_print is not None and m_int_matrix_linear_print.group(1) in int_matrix_vars:
+                                _wstmt(f"call print_integer_vector({one_f})", st.comment)
+                                need_r_mod.add("print_integer_vector")
                                 continue
                             if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in real_vector_vars:
                                 _wstmt(f"call print_real_vector({one_f})", st.comment)
@@ -13295,6 +13415,11 @@ def emit_stmts(
                             if kn in {"sep", "file", "fill", "labels", "append"}:
                                 continue
                         if at in {'"\\n"', "'\\n'"}:
+                            if out_items:
+                                _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
+                                out_items = []
+                            else:
+                                _wstmt("write(*,*)", "")
                             continue
                         sp_items = _sprintf_arg_items(at)
                         if sp_items is not None:
@@ -13316,7 +13441,12 @@ def emit_stmts(
                             if lit2:
                                 out_items.append(_fortran_str_literal(lit2))
                             continue
-                        out_items.append(_display_expr_to_fortran(a))
+                        item_f = _display_expr_to_fortran(a)
+                        if "r_matrix_index(" in item_f:
+                            need_r_mod.add("r_matrix_index")
+                        if re.search(r"\bmatrix\s*\(", item_f):
+                            need_r_mod.add("matrix")
+                        out_items.append(item_f)
                     if out_items:
                         _wstmt("write(*,*) " + ", ".join(out_items), st.comment)
                     else:
@@ -18215,6 +18345,13 @@ def transpile_r_to_fortran(
 
     assign_counts = infer_assigned_names(main_stmts)
     ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+    _KNOWN_INT_CONSTANTS.clear()
+    for _p_nm, _p_val in params.items():
+        if _is_int_literal(str(_p_val).strip()):
+            _KNOWN_INT_CONSTANTS[_p_nm.lower()] = int(_normalize_r_int_literal(str(_p_val).strip()))
+    for _st_const in main_stmts:
+        if isinstance(_st_const, Assign) and _is_int_literal(_st_const.expr.strip()):
+            _KNOWN_INT_CONSTANTS[_st_const.name.lower()] = int(_normalize_r_int_literal(_st_const.expr.strip()))
     for st_ret in main_stmts:
         if not isinstance(st_ret, Assign):
             continue
@@ -18309,6 +18446,7 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    real_matrices.difference_update(int_matrices)
     changed_matrix_aliases = True
     while changed_matrix_aliases:
         changed_matrix_aliases = False
@@ -18592,6 +18730,7 @@ def transpile_r_to_fortran(
         real_rank3_arrays.discard(nm)
         real_rank4_arrays.discard(nm)
         int_matrices.discard(nm)
+    real_matrices.difference_update(int_matrices)
     helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
@@ -19365,6 +19504,7 @@ def transpile_r_to_fortran(
             real_scalars.add(nm)
             ints.discard(nm)
 
+    real_matrices.difference_update(int_matrices)
     helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
@@ -19439,6 +19579,12 @@ def transpile_r_to_fortran(
                 _force_scalar_matrix_element_aliases(st_scalar_alias.body)
 
     _force_scalar_matrix_element_aliases(main_stmts)
+    for st_int_mat_decl in main_stmts:
+        if isinstance(st_int_mat_decl, Assign) and _matrix_has_integer_literal_data(st_int_mat_decl.expr.strip()):
+            int_matrices.add(st_int_mat_decl.name)
+            real_matrices.discard(st_int_mat_decl.name)
+            real_scalars.discard(st_int_mat_decl.name)
+            real_arrays.discard(st_int_mat_decl.name)
     for nm in set(real_matrices) | set(int_matrices) | set(real_rank3_arrays) | set(int_rank3_arrays) | set(real_rank4_arrays):
         real_scalars.discard(nm)
         ints.discard(nm)
@@ -21053,6 +21199,7 @@ def transpile_r_to_fortran(
         "print_matrix_rstyle",
         "print_real_scalar",
         "print_real_vector",
+        "print_integer_vector",
         "print_summary",
         "lm_coef",
         "normal_cdf",
