@@ -24,15 +24,15 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
-   & r_paste0_real, r_paste0_int, &
-   & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_head, r_array_real, r_array_int, r_array_char, matrix, &
+   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, &
+   & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_matrix_index, r_head, rev_int, rev_real, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
-   & print_real_vector, print_char_vector, &
+   & print_real_vector, print_integer_vector, print_char_vector, &
    & print_named_real_vector, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
-   & union, intersect, setdiff, setequal, findInterval, &
+   & union, intersect, setdiff, setequal, findInterval, cut, outer, &
    & cumsum, cumprod, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
    & nchar, char_join, list_files, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
@@ -47,6 +47,9 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & runmed, ksmooth, lowess, loess_fit, predict_loess, smooth_spline, &
    & predict_smooth_spline, dist, hclust_result_t, hclust, cutree, &
    & print_kruskal_test
+public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char, date_to_char_vec, &
+   & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
+   & date_seq_day, date_seq_length, date_range
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -492,24 +495,32 @@ interface r_add
    module procedure r_add_vv
    module procedure r_add_vs
    module procedure r_add_sv
+   module procedure r_add_mv
+   module procedure r_add_vm
 end interface r_add
 
 interface r_sub
    module procedure r_sub_vv
    module procedure r_sub_vs
    module procedure r_sub_sv
+   module procedure r_sub_mv
+   module procedure r_sub_vm
 end interface r_sub
 
 interface r_mul
    module procedure r_mul_vv
    module procedure r_mul_vs
    module procedure r_mul_sv
+   module procedure r_mul_mv
+   module procedure r_mul_vm
 end interface r_mul
 
 interface r_div
    module procedure r_div_vv
    module procedure r_div_vs
    module procedure r_div_sv
+   module procedure r_div_mv
+   module procedure r_div_vm
 end interface r_div
 
 interface r_array
@@ -565,6 +576,23 @@ interface r_drop_indices
    module procedure r_drop_indices_real
    module procedure r_drop_indices_int
 end interface r_drop_indices
+
+interface r_matrix_index
+   module procedure r_matrix_index_real
+   module procedure r_matrix_index_int
+   module procedure r_matrix_index_real_logical
+   module procedure r_matrix_index_int_logical
+end interface r_matrix_index
+
+interface r_matrix_col
+   module procedure r_matrix_col_real
+   module procedure r_matrix_col_int
+end interface r_matrix_col
+
+interface r_matrix_row
+   module procedure r_matrix_row_real
+   module procedure r_matrix_row_int
+end interface r_matrix_row
 
 interface unique
    module procedure unique_int
@@ -647,8 +675,10 @@ end interface diff
 interface diag
    module procedure diag_mat_real
    module procedure diag_vec_real
+   module procedure diag_vec_real_n
    module procedure diag_mat_int
    module procedure diag_vec_int
+   module procedure diag_vec_int_n
    module procedure diag_scalar_int
    module procedure diag_scalar_real_n
 end interface diag
@@ -872,6 +902,233 @@ end interface r_typeof
 
 contains
 
+real(kind=dp) function r_elapsed() result(out)
+! Wall-clock elapsed time in seconds.
+integer :: count, rate
+call system_clock(count=count, count_rate=rate)
+if (rate > 0) then
+   out = real(count, kind=dp) / real(rate, kind=dp)
+else
+   out = 0.0_dp
+end if
+end function r_elapsed
+
+pure integer function date_digit(ch) result(out)
+! Convert one decimal character to an integer digit.
+character(len=1), intent(in) :: ch ! character to decode
+integer :: k
+k = iachar(ch) - iachar("0")
+if (k < 0 .or. k > 9) then
+   out = 0
+else
+   out = k
+end if
+end function date_digit
+
+pure integer function date_int_slice(s, i1, i2) result(out)
+! Decode a decimal substring.
+character(len=*), intent(in) :: s ! source string
+integer, intent(in) :: i1 ! first character position
+integer, intent(in) :: i2 ! last character position
+integer :: i
+out = 0
+do i = i1, i2
+   out = 10 * out + date_digit(s(i:i))
+end do
+end function date_int_slice
+
+pure integer function date_days_from_civil(y, m, d) result(z)
+! Convert a Gregorian date to days since 1970-01-01.
+integer, intent(in) :: y ! calendar year
+integer, intent(in) :: m ! calendar month
+integer, intent(in) :: d ! calendar day
+integer :: yy, era, yoe, doy, doe, mp
+yy = y
+if (m <= 2) yy = yy - 1
+if (yy >= 0) then
+   era = yy / 400
+else
+   era = (yy - 399) / 400
+end if
+yoe = yy - era * 400
+mp = m
+if (mp > 2) then
+   mp = mp - 3
+else
+   mp = mp + 9
+end if
+doy = (153 * mp + 2) / 5 + d - 1
+doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+z = era * 146097 + doe - 719468
+end function date_days_from_civil
+
+pure subroutine date_civil_from_days(z, y, m, d)
+! Convert days since 1970-01-01 to Gregorian date fields.
+integer, intent(in) :: z ! days since 1970-01-01
+integer, intent(out) :: y ! calendar year
+integer, intent(out) :: m ! calendar month
+integer, intent(out) :: d ! calendar day
+integer :: zz, era, doe, yoe, doy, mp
+zz = z + 719468
+if (zz >= 0) then
+   era = zz / 146097
+else
+   era = (zz - 146096) / 146097
+end if
+doe = zz - era * 146097
+yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+y = yoe + era * 400
+doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+mp = (5 * doy + 2) / 153
+d = doy - (153 * mp + 2) / 5 + 1
+if (mp < 10) then
+   m = mp + 3
+else
+   m = mp - 9
+end if
+if (m <= 2) y = y + 1
+end subroutine date_civil_from_days
+
+pure function date_from_iso(s) result(out)
+! Parse an ISO yyyy-mm-dd date as days since 1970-01-01.
+character(len=*), intent(in) :: s ! ISO date string
+integer :: out
+integer :: y, m, d
+y = date_int_slice(s, 1, 4)
+m = date_int_slice(s, 6, 7)
+d = date_int_slice(s, 9, 10)
+out = date_days_from_civil(y, m, d)
+end function date_from_iso
+
+pure function date_from_iso_vec(s) result(out)
+! Parse a vector of ISO yyyy-mm-dd strings as day counts.
+character(len=*), intent(in) :: s(:) ! ISO date strings
+integer :: out(size(s))
+integer :: i
+do i = 1, size(s)
+   out(i) = date_from_iso(s(i))
+end do
+end function date_from_iso_vec
+
+pure function date_from_yyyymmdd_vec(x) result(out)
+! Parse numeric yyyymmdd values as day counts.
+real(kind=dp), intent(in) :: x(:) ! dates encoded as yyyymmdd
+integer :: out(size(x))
+integer :: i, v, y, m, d
+do i = 1, size(x)
+   v = nint(x(i))
+   y = v / 10000
+   m = mod(v / 100, 100)
+   d = mod(v, 100)
+   out(i) = date_days_from_civil(y, m, d)
+end do
+end function date_from_yyyymmdd_vec
+
+pure function date_to_char(x) result(out)
+! Format a day count as yyyy-mm-dd.
+integer, intent(in) :: x ! days since 1970-01-01
+character(len=10) :: out
+integer :: y, m, d
+call date_civil_from_days(x, y, m, d)
+write(out, "(i4.4,a,i2.2,a,i2.2)") y, "-", m, "-", d
+end function date_to_char
+
+pure function date_to_char_vec(x) result(out)
+! Format day counts as yyyy-mm-dd strings.
+integer, intent(in) :: x(:) ! days since 1970-01-01
+character(len=10) :: out(size(x))
+integer :: i
+do i = 1, size(x)
+   out(i) = date_to_char(x(i))
+end do
+end function date_to_char_vec
+
+pure function date_format(x, fmt) result(out)
+! Format a day count for a small subset of R date formats.
+integer, intent(in) :: x ! days since 1970-01-01
+character(len=*), intent(in) :: fmt ! one of %Y, %m, %d, or %F
+character(len=10) :: out
+integer :: y, m, d
+call date_civil_from_days(x, y, m, d)
+select case (trim(fmt))
+case ("%Y")
+   write(out, "(i4.4)") y
+case ("%m")
+   write(out, "(i2.2)") m
+case ("%d")
+   write(out, "(i2.2)") d
+case default
+   out = date_to_char(x)
+end select
+end function date_format
+
+pure function date_format_vec(x, fmt) result(out)
+! Format day counts for a small subset of R date formats.
+integer, intent(in) :: x(:) ! days since 1970-01-01
+character(len=*), intent(in) :: fmt ! one of %Y, %m, %d, or %F
+character(len=10) :: out(size(x))
+integer :: i
+do i = 1, size(x)
+   out(i) = date_format(x(i), fmt)
+end do
+end function date_format_vec
+
+subroutine print_date(x)
+! Print one R-like Date value.
+integer, intent(in) :: x ! days since 1970-01-01
+write(*, "(a)") trim(date_to_char(x))
+end subroutine print_date
+
+subroutine print_date_vector(x)
+! Print an R-like Date vector.
+integer, intent(in) :: x(:) ! days since 1970-01-01
+call print_char_vector(date_to_char_vec(x))
+end subroutine print_date_vector
+
+pure function date_seq_day(from, to, by) result(out)
+! Create a daily Date sequence between two endpoints.
+integer, intent(in) :: from ! first date day count
+integer, intent(in) :: to ! final date day count
+integer, intent(in), optional :: by ! step in days
+integer, allocatable :: out(:)
+integer :: step, n, i
+step = 1
+if (present(by)) step = by
+if (step == 0) then
+   allocate(out(0))
+   return
+end if
+if ((step > 0 .and. from > to) .or. (step < 0 .and. from < to)) then
+   allocate(out(0))
+   return
+end if
+n = abs((to - from) / step) + 1
+allocate(out(n))
+do i = 1, n
+   out(i) = from + (i - 1) * step
+end do
+end function date_seq_day
+
+pure function date_seq_length(from, by, n) result(out)
+! Create a Date sequence with a requested length.
+integer, intent(in) :: from ! first date day count
+integer, intent(in) :: by ! step in days
+integer, intent(in) :: n ! requested length
+integer, allocatable :: out(:)
+integer :: i
+allocate(out(max(0, n)))
+do i = 1, size(out)
+   out(i) = from + (i - 1) * by
+end do
+end function date_seq_length
+
+pure function date_range(x) result(out)
+! Return minimum and maximum Date day counts.
+integer, intent(in) :: x(:) ! Date day counts
+integer :: out(2)
+out = [minval(x), maxval(x)]
+end function date_range
+
 function r_character(n) result(out)
 ! Allocate an R-like character vector initialized to empty strings.
 integer, intent(in) :: n ! requested vector length
@@ -919,6 +1176,30 @@ allocate(out(m))
 if (m > 0) out = pack(x, keep)
 end function r_drop_index_int
 
+pure function rev_real(x) result(out)
+! Return a real vector in reverse order.
+real(kind=dp), intent(in) :: x(:) ! source vector
+real(kind=dp), allocatable :: out(:)
+integer :: i, n
+n = size(x)
+allocate(out(n))
+do i = 1, n
+   out(i) = x(n - i + 1)
+end do
+end function rev_real
+
+pure function rev_int(x) result(out)
+! Return an integer vector in reverse order.
+integer, intent(in) :: x(:) ! source vector
+integer, allocatable :: out(:)
+integer :: i, n
+n = size(x)
+allocate(out(n))
+do i = 1, n
+   out(i) = x(n - i + 1)
+end do
+end function rev_int
+
 pure function r_drop_indices_real(x, drop) result(out)
 ! Return a vector with one or more positions removed.
 real(kind=dp), intent(in) :: x(:) ! source vector
@@ -962,6 +1243,175 @@ m = count(keep)
 allocate(out(m))
 if (m > 0) out = pack(x, keep)
 end function r_drop_indices_int
+
+pure function r_matrix_index_real(x, idx) result(out)
+! Return R-style linear indexing of a matrix in column-major order.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: idx(:) ! one-dimensional R subscript
+real(kind=dp), allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i, k, n, m
+n = size(x)
+if (size(idx) == 0 .or. n <= 0) then
+   allocate(out(0))
+   return
+end if
+if (all(idx <= 0) .and. any(idx < 0)) then
+   allocate(keep(n))
+   keep = .true.
+   do i = 1, size(idx)
+      k = abs(idx(i))
+      if (k >= 1 .and. k <= n) keep(k) = .false.
+   end do
+   m = count(keep)
+   allocate(out(m))
+   if (m > 0) out = pack(reshape(x, [n]), keep)
+else
+   m = count(idx /= 0)
+   allocate(out(m))
+   k = 0
+   do i = 1, size(idx)
+      if (idx(i) == 0) cycle
+      if (idx(i) >= 1 .and. idx(i) <= n) then
+         k = k + 1
+         out(k) = x(mod(idx(i) - 1, size(x, 1)) + 1, ((idx(i) - 1) / size(x, 1)) + 1)
+      end if
+   end do
+   if (k < m) out = out(:k)
+end if
+end function r_matrix_index_real
+
+pure function r_matrix_index_int(x, idx) result(out)
+! Return R-style linear indexing of an integer matrix in column-major order.
+integer, intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: idx(:) ! one-dimensional R subscript
+integer, allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i, k, n, m
+n = size(x)
+if (size(idx) == 0 .or. n <= 0) then
+   allocate(out(0))
+   return
+end if
+if (all(idx <= 0) .and. any(idx < 0)) then
+   allocate(keep(n))
+   keep = .true.
+   do i = 1, size(idx)
+      k = abs(idx(i))
+      if (k >= 1 .and. k <= n) keep(k) = .false.
+   end do
+   m = count(keep)
+   allocate(out(m))
+   if (m > 0) out = pack(reshape(x, [n]), keep)
+else
+   m = count(idx /= 0)
+   allocate(out(m))
+   k = 0
+   do i = 1, size(idx)
+      if (idx(i) == 0) cycle
+      if (idx(i) >= 1 .and. idx(i) <= n) then
+         k = k + 1
+         out(k) = x(mod(idx(i) - 1, size(x, 1)) + 1, ((idx(i) - 1) / size(x, 1)) + 1)
+      end if
+   end do
+   if (k < m) out = out(:k)
+end if
+end function r_matrix_index_int
+
+pure function r_matrix_index_real_logical(x, mask) result(out)
+! Return R-style logical linear indexing of a matrix in column-major order.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:,:) ! same-shape selection mask
+real(kind=dp), allocatable :: out(:)
+integer :: m
+m = count(mask)
+allocate(out(m))
+if (m > 0) out = pack(x, mask)
+end function r_matrix_index_real_logical
+
+pure function r_matrix_index_int_logical(x, mask) result(out)
+! Return R-style logical linear indexing of an integer matrix in column-major order.
+integer, intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:,:) ! same-shape selection mask
+integer, allocatable :: out(:)
+integer :: m
+m = count(mask)
+allocate(out(m))
+if (m > 0) out = pack(x, mask)
+end function r_matrix_index_int_logical
+
+pure function r_matrix_col_real(x, j) result(out)
+! Return one matrix column as a vector.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: j ! one-based column index
+real(kind=dp), allocatable :: out(:)
+allocate(out(size(x, 1)))
+if (j >= 1 .and. j <= size(x, 2)) then
+   out = x(:, j)
+else
+   out = 0.0_dp
+end if
+end function r_matrix_col_real
+
+pure function r_matrix_col_int(x, j) result(out)
+! Return one integer matrix column as a vector.
+integer, intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: j ! one-based column index
+integer, allocatable :: out(:)
+allocate(out(size(x, 1)))
+if (j >= 1 .and. j <= size(x, 2)) then
+   out = x(:, j)
+else
+   out = 0
+end if
+end function r_matrix_col_int
+
+pure function r_matrix_row_real(x, i) result(out)
+! Return one matrix row as a vector.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: i ! one-based row index
+real(kind=dp), allocatable :: out(:)
+allocate(out(size(x, 2)))
+if (i >= 1 .and. i <= size(x, 1)) then
+   out = x(i, :)
+else
+   out = 0.0_dp
+end if
+end function r_matrix_row_real
+
+pure function r_matrix_row_int(x, i) result(out)
+! Return one integer matrix row as a vector.
+integer, intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: i ! one-based row index
+integer, allocatable :: out(:)
+allocate(out(size(x, 2)))
+if (i >= 1 .and. i <= size(x, 1)) then
+   out = x(i, :)
+else
+   out = 0
+end if
+end function r_matrix_row_int
+
+pure function r_index_real(x, idx) result(out)
+! Return vector indexing with real indices so NaN indices become real NA.
+integer, intent(in) :: x(:) ! source integer vector
+real(kind=dp), intent(in) :: idx(:) ! one-based real/NA indices
+real(kind=dp), allocatable :: out(:)
+integer :: i, k
+allocate(out(size(idx)))
+do i = 1, size(idx)
+   if (.not. ieee_is_finite(idx(i))) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else
+      k = int(idx(i))
+      if (k >= 1 .and. k <= size(x)) then
+         out(i) = real(x(k), kind=dp)
+      else
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      end if
+   end if
+end do
+end function r_index_real
 
 
 subroutine set_print_int_like(flag)
@@ -2524,6 +2974,17 @@ else
    write(*,"(*(g0,1x))") x
 end if
 end subroutine print_real_vector
+
+subroutine print_integer_vector(x)
+! Print one integer vector with R-like spacing.
+integer, intent(in) :: x(:) ! values to print
+integer :: i
+do i = 1, size(x)
+   write(*,"(i0)", advance="no") x(i)
+   if (i < size(x)) write(*,"(a)", advance="no") " "
+end do
+write(*,*)
+end subroutine print_integer_vector
 
 subroutine print_char_vector(x)
 ! Print char vector values in an R-like format.
@@ -5633,6 +6094,52 @@ do i = 1, size(x)
 end do
 end function findInterval
 
+pure function cut(x, breaks, include_lowest, labels) result(out)
+! Return integer bin numbers for cut(x, breaks, labels = FALSE).
+real(kind=dp), intent(in) :: x(:) ! values to classify
+real(kind=dp), intent(in) :: breaks(:) ! ordered bin boundaries
+logical, intent(in), optional :: include_lowest ! include first lower boundary
+logical, intent(in), optional :: labels ! accepted for R call compatibility
+integer, allocatable :: out(:)
+logical :: inc_low
+integer :: i, j, nb
+inc_low = .false.
+if (present(include_lowest)) inc_low = include_lowest
+nb = max(0, size(breaks) - 1)
+allocate(out(size(x)))
+out = 0
+do i = 1, size(x)
+   do j = 1, nb
+      if (j == 1 .and. inc_low) then
+         if (x(i) >= breaks(j) .and. x(i) <= breaks(j + 1)) then
+            out(i) = j
+            exit
+         end if
+      else
+         if (x(i) > breaks(j) .and. x(i) <= breaks(j + 1)) then
+            out(i) = j
+            exit
+         end if
+      end if
+   end do
+end do
+if (present(labels)) continue
+end function cut
+
+pure function outer(x, y) result(out)
+! Return the default R outer(x, y) product matrix.
+real(kind=dp), intent(in) :: x(:) ! row-factor vector
+real(kind=dp), intent(in) :: y(:) ! column-factor vector
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j
+allocate(out(size(x), size(y)))
+do i = 1, size(x)
+   do j = 1, size(y)
+      out(i, j) = x(i) * y(j)
+   end do
+end do
+end function outer
+
 pure function cumprod_real(x) result(out)
 ! Return cumulative products of a real vector.
 real(kind=dp), intent(in) :: x(:) ! input vector
@@ -5715,6 +6222,14 @@ do i = 1, n
 end do
 end function diag_vec_real
 
+pure function diag_vec_real_n(v, n) result(out)
+! Create diagonal real matrix from a real vector; n is accepted for R compatibility.
+real(kind=dp), intent(in) :: v(:)
+integer, intent(in) :: n
+real(kind=dp), allocatable :: out(:,:)
+out = diag_vec_real(v)
+end function diag_vec_real_n
+
 pure function diag_mat_int(a) result(out)
 ! Return diagonal of an integer matrix.
 integer, intent(in) :: a(:,:)
@@ -5739,6 +6254,14 @@ do i = 1, n
    out(i, i) = v(i)
 end do
 end function diag_vec_int
+
+pure function diag_vec_int_n(v, n) result(out)
+! Create diagonal integer matrix from an integer vector; n is accepted for R compatibility.
+integer, intent(in) :: v(:)
+integer, intent(in) :: n
+integer, allocatable :: out(:,:)
+out = diag_vec_int(v)
+end function diag_vec_int_n
 
 pure function diag_scalar_int(n) result(out)
 ! Create an n by n integer identity matrix, matching R diag(n).
@@ -7357,22 +7880,29 @@ pure function matrix_real(x, nrow, ncol) result(out)
 ! Build matrix with R-like recycling in column-major order.
 real(kind=dp), intent(in) :: x(:) ! values recycled into the matrix
 integer, intent(in) :: nrow ! requested row count
-integer, intent(in) :: ncol ! requested column count
+integer, intent(in), optional :: ncol ! requested column count; inferred from x and nrow if absent
 real(kind=dp), allocatable :: out(:,:)
 real(kind=dp), allocatable :: buf(:)
-integer :: i, need_n, nx
+integer :: i, need_n, nx, nc
 nx = size(x)
-if (nrow < 0 .or. ncol < 0) then
+if (present(ncol)) then
+   nc = ncol
+else if (nrow > 0) then
+   nc = (nx + nrow - 1) / nrow
+else
+   nc = 0
+end if
+if (nrow < 0 .or. nc < 0) then
    allocate(out(0, 0))
    return
 end if
-need_n = nrow * ncol
+need_n = nrow * nc
 if (need_n <= 0) then
-   allocate(out(nrow, ncol))
+   allocate(out(nrow, nc))
    return
 end if
 if (nx <= 0) then
-   allocate(out(nrow, ncol))
+   allocate(out(nrow, nc))
    out = 0.0_dp
    return
 end if
@@ -7380,29 +7910,36 @@ allocate(buf(need_n))
 do i = 1, need_n
    buf(i) = x(modulo(i - 1, nx) + 1)
 end do
-out = reshape(buf, [nrow, ncol])
+out = reshape(buf, [nrow, nc])
 end function matrix_real
 
 pure function matrix_int(x, nrow, ncol) result(out)
 ! Integer variant of matrix() with R-like recycling.
 integer, intent(in) :: x(:) ! values recycled into the matrix
 integer, intent(in) :: nrow ! requested row count
-integer, intent(in) :: ncol ! requested column count
+integer, intent(in), optional :: ncol ! requested column count; inferred from x and nrow if absent
 integer, allocatable :: out(:,:)
 integer, allocatable :: buf(:)
-integer :: i, need_n, nx
+integer :: i, need_n, nx, nc
 nx = size(x)
-if (nrow < 0 .or. ncol < 0) then
+if (present(ncol)) then
+   nc = ncol
+else if (nrow > 0) then
+   nc = (nx + nrow - 1) / nrow
+else
+   nc = 0
+end if
+if (nrow < 0 .or. nc < 0) then
    allocate(out(0, 0))
    return
 end if
-need_n = nrow * ncol
+need_n = nrow * nc
 if (need_n <= 0) then
-   allocate(out(nrow, ncol))
+   allocate(out(nrow, nc))
    return
 end if
 if (nx <= 0) then
-   allocate(out(nrow, ncol))
+   allocate(out(nrow, nc))
    out = 0
    return
 end if
@@ -7410,7 +7947,7 @@ allocate(buf(need_n))
 do i = 1, need_n
    buf(i) = x(modulo(i - 1, nx) + 1)
 end do
-out = reshape(buf, [nrow, ncol])
+out = reshape(buf, [nrow, nc])
 end function matrix_int
 
 pure function r_matmul_vv_real(a, b) result(out)
@@ -7726,6 +8263,124 @@ n = size(b)
 allocate(out(n))
 if (n > 0) out = a / b
 end function r_div_sv
+
+function r_add_mv(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and add.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+real(kind=dp), intent(in) :: b(:) ! right operand vector
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, na, nb
+na = size(a)
+nb = size(b)
+allocate(out(size(a, 1), size(a, 2)))
+if (na <= 0) return
+call maybe_warn_recycle("x + y", na, nb)
+do i = 1, na
+   out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
+      a(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) + b(modulo(i - 1, nb) + 1)
+end do
+end function r_add_mv
+
+function r_add_vm(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and add.
+real(kind=dp), intent(in) :: a(:) ! left operand vector
+real(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+real(kind=dp), allocatable :: out(:,:)
+out = r_add_mv(b, a)
+end function r_add_vm
+
+function r_sub_mv(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and subtract.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+real(kind=dp), intent(in) :: b(:) ! right operand vector
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, na, nb
+na = size(a)
+nb = size(b)
+allocate(out(size(a, 1), size(a, 2)))
+if (na <= 0) return
+call maybe_warn_recycle("x - y", na, nb)
+do i = 1, na
+   out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
+      a(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) - b(modulo(i - 1, nb) + 1)
+end do
+end function r_sub_mv
+
+function r_sub_vm(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and subtract from it.
+real(kind=dp), intent(in) :: a(:) ! left operand vector
+real(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, nb, na
+na = size(a)
+nb = size(b)
+allocate(out(size(b, 1), size(b, 2)))
+if (nb <= 0) return
+call maybe_warn_recycle("x - y", na, nb)
+do i = 1, nb
+   out(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1) = &
+      a(modulo(i - 1, na) + 1) - b(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1)
+end do
+end function r_sub_vm
+
+function r_mul_mv(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and multiply.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+real(kind=dp), intent(in) :: b(:) ! right operand vector
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, na, nb
+na = size(a)
+nb = size(b)
+allocate(out(size(a, 1), size(a, 2)))
+if (na <= 0) return
+call maybe_warn_recycle("x * y", na, nb)
+do i = 1, na
+   out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
+      a(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) * b(modulo(i - 1, nb) + 1)
+end do
+end function r_mul_mv
+
+function r_mul_vm(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and multiply.
+real(kind=dp), intent(in) :: a(:) ! left operand vector
+real(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+real(kind=dp), allocatable :: out(:,:)
+out = r_mul_mv(b, a)
+end function r_mul_vm
+
+function r_div_mv(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and divide.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+real(kind=dp), intent(in) :: b(:) ! right operand vector
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, na, nb
+na = size(a)
+nb = size(b)
+allocate(out(size(a, 1), size(a, 2)))
+if (na <= 0) return
+call maybe_warn_recycle("x / y", na, nb)
+do i = 1, na
+   out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
+      a(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) / b(modulo(i - 1, nb) + 1)
+end do
+end function r_div_mv
+
+function r_div_vm(a, b) result(out)
+! Recycle a vector across a matrix in R column-major order and divide by it.
+real(kind=dp), intent(in) :: a(:) ! left operand vector
+real(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, nb, na
+na = size(a)
+nb = size(b)
+allocate(out(size(b, 1), size(b, 2)))
+if (nb <= 0) return
+call maybe_warn_recycle("x / y", na, nb)
+do i = 1, nb
+   out(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1) = &
+      a(modulo(i - 1, na) + 1) / b(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1)
+end do
+end function r_div_vm
 
 pure function r_array_real(x, dim) result(out)
 ! Build 2D real array with R-like recycling.
@@ -8419,8 +9074,9 @@ subroutine read_csv_real_matrix(file_path, x)
 ! Read a comma-delimited numeric CSV with one header row into a matrix.
 character(len=*), intent(in) :: file_path ! input CSV file path
 real(kind=dp), allocatable, intent(out) :: x(:,:) ! numeric data rows
-integer :: fp, ios, nrow, ncol, i, k
 character(len=4096) :: line
+character(len=256) :: token
+integer :: fp, ios, nrow, ncol, i, j, k, start, stop, yy, mm, dd
 nrow = 0
 ncol = 0
 open(newunit=fp, file=file_path, status="old", action="read")
@@ -8453,11 +9109,34 @@ do
    read(fp, "(A)", iostat=ios) line
    if (ios /= 0) exit
    if (len_trim(line) == 0) cycle
-   do k = 1, len_trim(line)
-      if (line(k:k) == ",") line(k:k) = " "
-   end do
    i = i + 1
-   read(line, *) x(i, 1:ncol)
+   start = 1
+   do j = 1, ncol
+      stop = len_trim(line) + 1
+      do k = start, len_trim(line)
+         if (line(k:k) == ",") then
+            stop = k
+            exit
+         end if
+      end do
+      token = adjustl(line(start:stop - 1))
+      read(token, *, iostat=ios) x(i, j)
+      if (ios /= 0) then
+         if (len_trim(token) >= 10 .and. token(5:5) == "-" .and. token(8:8) == "-") then
+            read(token(1:4), *, iostat=ios) yy
+            if (ios == 0) read(token(6:7), *, iostat=ios) mm
+            if (ios == 0) read(token(9:10), *, iostat=ios) dd
+            if (ios == 0) then
+               x(i, j) = real(yy * 10000 + mm * 100 + dd, kind=dp)
+            else
+               x(i, j) = ieee_value(0.0_dp, ieee_quiet_nan)
+            end if
+         else
+            x(i, j) = ieee_value(0.0_dp, ieee_quiet_nan)
+         end if
+      end if
+      start = stop + 1
+   end do
 end do
 close(fp)
 end subroutine read_csv_real_matrix
@@ -8579,23 +9258,59 @@ end subroutine print_matrix_real
 subroutine print_matrix_rstyle_real(x)
 ! Print a real matrix with R-like column and row labels.
 real(kind=dp), intent(in) :: x(:,:) ! matrix to print
-integer :: i
+integer :: i, j
+integer(kind=int64) :: k
+logical :: all_int
+real(kind=dp) :: r, tol
+character(len=12) :: col_label
+all_int = .true.
+do i = 1, size(x, 1)
+   do j = 1, size(x, 2)
+      r = x(i, j)
+      if (.not. ieee_is_finite(r)) then
+         all_int = .false.
+         exit
+      end if
+      if (abs(r) > real(huge(0_int64), kind=dp)) then
+         all_int = .false.
+         exit
+      end if
+      k = nint(r, kind=int64)
+      tol = print_int_like_tol * max(1.0_dp, abs(r))
+      if (abs(r - real(k, kind=dp)) > tol) then
+         all_int = .false.
+         exit
+      end if
+   end do
+   if (.not. all_int) exit
+end do
 write(*,'(7x)', advance='no')
 do i = 1, size(x, 2)
-   write(*,'("[,",i0,"]",8x)', advance='no') i
+   write(col_label, '("[,",i0,"]")') i
+   write(*,'(a12,1x)', advance='no') adjustl(col_label)
 end do
 write(*,*)
 do i = 1, size(x, 1)
    write(*,'("[",i0,",]",1x)', advance='no') i
-   write(*,'(*(es12.5,1x))') x(i, :)
+   do j = 1, size(x, 2)
+      if (all_int) then
+         write(*,'(i12,1x)', advance='no') nint(x(i, j), kind=int64)
+      else if (x(i, j) == 0.0_dp .or. (abs(x(i, j)) >= 1.0e-4_dp .and. abs(x(i, j)) < 1.0e6_dp)) then
+         write(*,'(f12.4,1x)', advance='no') x(i, j)
+      else
+         write(*,'(es12.5,1x)', advance='no') x(i, j)
+      end if
+   end do
+   write(*,*)
 end do
 end subroutine print_matrix_rstyle_real
 
-subroutine print_matrix_rstyle_named_real(x, names, int_cols)
+subroutine print_matrix_rstyle_named_real(x, names, int_cols, row_names)
 ! Print a real matrix with R-like row labels and provided column names.
 real(kind=dp), intent(in) :: x(:,:) ! matrix to print
 character(len=*), intent(in) :: names(:) ! column names
 logical, intent(in), optional :: int_cols(:) ! columns to print as integers
+character(len=*), intent(in), optional :: row_names(:) ! row names
 integer :: i, j
 logical :: as_int_col
 write(*,'(7x)', advance='no')
@@ -8608,7 +9323,11 @@ do i = 1, size(x, 2)
 end do
 write(*,*)
 do i = 1, size(x, 1)
-   write(*,'("[",i0,",]",1x)', advance='no') i
+   if (present(row_names) .and. i <= size(row_names)) then
+      write(*,'(a6,1x)', advance='no') trim(row_names(i))
+   else
+      write(*,'("[",i0,",]",1x)', advance='no') i
+   end if
    do j = 1, size(x, 2)
       as_int_col = .false.
       if (present(int_cols)) then
