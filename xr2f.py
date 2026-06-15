@@ -57,6 +57,7 @@ _NULL_ARRAY_SENTINELS: dict[str, str] = {}
 _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
 _CATEGORICAL_LABELS: dict[str, list[str]] = {}
+_CHAR_INDEX_ALIASES: dict[str, str] = {}
 _TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
 _FIT_TERM_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
@@ -7102,8 +7103,28 @@ def r_expr_to_fortran(expr: str) -> str:
                 ny = str(nlab_y) if nlab_y else _int_bound_expr(f"maxval({y_f}) - minval({y_f}) + 1")
                 return f"table2({x_tab}, {y_tab}, {nx}, {ny})"
             if vals:
-                vtab = r_expr_to_fortran(vals[0])
-                nlab = len(_CATEGORICAL_LABELS.get(vals[0].strip().lower(), []))
+                v_src = vals[0].strip()
+                c_factor_tab = parse_call_text(v_src)
+                factor_levels_src = ""
+                if c_factor_tab is not None and c_factor_tab[0].lower() == "factor" and c_factor_tab[1]:
+                    factor_arg = c_factor_tab[1][0].strip()
+                    factor_levels_src = c_factor_tab[2].get("levels", "").strip()
+                    alias_src = _CHAR_INDEX_ALIASES.get(factor_arg.lower())
+                    if alias_src:
+                        v_src = alias_src
+                    else:
+                        m_factor_label_index = re.match(r"^[A-Za-z]\w*\s*\[\s*([A-Za-z]\w*)\s*\]$", factor_arg)
+                        if m_factor_label_index is not None:
+                            v_src = m_factor_label_index.group(1)
+                vtab = r_expr_to_fortran(v_src)
+                if factor_levels_src:
+                    levels_f = r_expr_to_fortran(factor_levels_src)
+                    nlab = _KNOWN_INT_CONSTANTS.get(factor_levels_src.lower(), 0)
+                    if not nlab:
+                        nlab_expr = f"size({levels_f})"
+                        return f"tabulate({vtab}, {nlab_expr})"
+                else:
+                    nlab = len(_CATEGORICAL_LABELS.get(v_src.lower(), []))
                 vtab_shifted = vtab if nlab else f"({vtab} - minval({vtab}) + 1)"
                 nbins = str(nlab) if nlab else _int_bound_expr(f"maxval({vtab}) - minval({vtab}) + 1")
                 return f"tabulate({vtab_shifted}, {nbins})"
@@ -16672,6 +16693,30 @@ def collect_table_labels(stmts: list[object], categorical_labels: dict[str, list
     return out
 
 
+def collect_character_index_aliases(stmts: list[object]) -> dict[str, str]:
+    """Track character label vectors created by indexing labels with integer codes."""
+    out: dict[str, str] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                m = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]\s*$", st.expr.strip())
+                if m is not None:
+                    out[st.name.lower()] = m.group(2)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return out
+
+
 def infer_function_character_scalars(fn: FuncDef) -> set[str]:
     """Infer character scalar locals from string comparisons and string helpers."""
     out: set[str] = set()
@@ -18300,7 +18345,7 @@ def transpile_r_to_fortran(
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
-    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _TABLE_LABELS, _FIT_TERM_LABELS
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
@@ -18316,6 +18361,7 @@ def transpile_r_to_fortran(
     _LIST_FIELD_NAME_ALIASES = {}
     _DATA_FRAME_FORCE_MATERIALIZE = set()
     _CATEGORICAL_LABELS = {}
+    _CHAR_INDEX_ALIASES = {}
     _TABLE_LABELS = {}
     _FIT_TERM_LABELS = {}
     _KNOWN_DATE_NAMES = set()
@@ -18359,6 +18405,7 @@ def transpile_r_to_fortran(
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
     _CATEGORICAL_LABELS = collect_categorical_sample_labels(stmts)
+    _CHAR_INDEX_ALIASES = collect_character_index_aliases(stmts)
     _TABLE_LABELS = collect_table_labels(stmts, _CATEGORICAL_LABELS)
     _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
     _VOID_FUNCTION_LIKE = {
@@ -18793,6 +18840,15 @@ def transpile_r_to_fortran(
             continue
         rhs_real_f = r_expr_to_fortran(st_real_expr.expr.strip())
         if re.search(r"\[\s*(?:lower\.tri|upper\.tri)\s*\(", st_real_expr.expr.strip(), re.IGNORECASE):
+            real_arrays.add(st_real_expr.name)
+            ints.discard(st_real_expr.name)
+            int_arrays.discard(st_real_expr.name)
+            real_scalars.discard(st_real_expr.name)
+            params.pop(st_real_expr.name, None)
+            continue
+        if re.search(r"\breal\s*\(\s*tabulate\s*\(", rhs_real_f, re.IGNORECASE) or re.search(
+            r"\bprop_table\s*\(", rhs_real_f, re.IGNORECASE
+        ):
             real_arrays.add(st_real_expr.name)
             ints.discard(st_real_expr.name)
             int_arrays.discard(st_real_expr.name)
@@ -23083,6 +23139,15 @@ def protect_rep_helper_calls(lines: list[str], *, restore: bool = False) -> list
     return out
 
 
+def rewrite_mixed_rep_int_real_constructors(lines: list[str]) -> list[str]:
+    """Coerce integer rep vectors inside array constructors that also contain reals."""
+    out: list[str] = []
+    pat = re.compile(r"\[(r_rep_int\([^]]+\],\s*times\s*=\s*[^)]+\)),\s*([+-]?\d+(?:\.\d*)?_dp)\]")
+    for ln in lines:
+        out.append(pat.sub(r"[real(\1, kind=dp), \2]", ln))
+    return out
+
+
 def _index_assignment_needs_replace(inner: str) -> bool:
     s = inner.strip()
     sl = s.lower()
@@ -24706,6 +24771,7 @@ def main() -> int:
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
     f90_lines = rewrite_matrix_linear_indices(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
+    f90_lines = rewrite_mixed_rep_int_real_constructors(f90_lines)
     f90_lines = fscan.simplify_real_int_casts_in_mixed_expr(f90_lines)
     f90_lines = fscan.simplify_size_expressions(f90_lines)
     f90_lines = fscan.propagate_array_size_aliases(f90_lines)
