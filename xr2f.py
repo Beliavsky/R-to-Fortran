@@ -682,6 +682,7 @@ def _looks_vector_expr_for_recycle(expr: str) -> bool:
         return False
     nm = c[0].lower()
     return nm in {
+        "c",
         "r_seq_int",
         "r_seq_len",
         "r_seq_int_by",
@@ -7058,6 +7059,9 @@ def r_expr_to_fortran(expr: str) -> str:
             return 1
         if _looks_matrix_expr(t):
             return 2
+        c_direct_probe = parse_call_text(t)
+        if c_direct_probe is not None and c_direct_probe[0].lower() in {"matrix", "array"}:
+            return 2
         for op_probe in ["+", "-", "*", "/"]:
             mm_probe = _split_top_level_token(t, op_probe, from_right=True)
             if mm_probe is not None:
@@ -7088,6 +7092,15 @@ def r_expr_to_fortran(expr: str) -> str:
                 if t_f.startswith("[") and t_f.endswith("]"):
                     return t_f
                 return f"({t_f})"
+            def _real_arg(src_f: str) -> str:
+                t_f = src_f.strip()
+                if re.match(r"^real\s*\(", t_f, re.IGNORECASE):
+                    return t_f
+                if t_f.startswith("[") and t_f.endswith("]") and "_dp" in t_f:
+                    return t_f
+                if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+|\d+[eE][+-]?\d+)(?:_dp)?", t_f):
+                    return t_f if "_dp" in t_f.lower() else f"real({t_f}, kind=dp)"
+                return f"real({t_f}, kind=dp)"
             if a_txt and b_txt and (_is_complex_expr_source(a_txt) or _is_complex_expr_source(b_txt)):
                 return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             if a_txt and b_txt and _looks_matrix_expr(a_txt) and _looks_matrix_expr(b_txt):
@@ -7096,16 +7109,22 @@ def r_expr_to_fortran(expr: str) -> str:
             b_probe = fscan.strip_redundant_outer_parens_expr(b_txt) if b_txt else ""
             a_rank = _arith_known_array_rank(a_probe)
             b_rank = _arith_known_array_rank(b_probe)
-            if a_rank >= 2 or b_rank >= 2:
-                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             a_vec = (_looks_vector_expr_for_recycle(a_probe) if a_probe else False) or a_rank == 1
             b_vec = (_looks_vector_expr_for_recycle(b_probe) if b_probe else False) or b_rank == 1
+            if a_rank >= 2 or b_rank >= 2:
+                if a_txt and b_txt and ((a_rank >= 2 and b_vec) or (b_rank >= 2 and a_vec)):
+                    a_f = r_expr_to_fortran(a_txt)
+                    b_f = r_expr_to_fortran(b_txt)
+                    if _NO_RECYCLE:
+                        return f"{_paren_operand(a_f)} {op} {_paren_operand(b_f)}"
+                    return f"{fn}({_real_arg(a_f)}, {_real_arg(b_f)})"
+                return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
             if a_txt and b_txt and a_vec and b_vec:
                 a_f = r_expr_to_fortran(a_txt)
                 b_f = r_expr_to_fortran(b_txt)
                 if _NO_RECYCLE:
                     return f"{_paren_operand(a_f)} {op} {_paren_operand(b_f)}"
-                return f"{fn}(real({a_f}, kind=dp), real({b_f}, kind=dp))"
+                return f"{fn}({_real_arg(a_f)}, {_real_arg(b_f)})"
             if a_txt and b_txt and (a_vec or b_vec):
                 return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
     c_cor0 = parse_call_text(s)
@@ -13889,6 +13908,80 @@ def emit_stmts(
                     is_tri_mask_lhs = bool(re.match(r"^!?\s*(?:lower\.tri|upper\.tri)\s*\(", inner_lhs, re.IGNORECASE))
                     if "," not in inner_lhs or is_tri_mask_lhs:
                         inner_l = inner_lhs.lower()
+                        if (
+                            not is_tri_mask_lhs
+                            and base_lhs in (int_matrix_vars | real_matrix_vars | logical_matrix_vars)
+                            and not (
+                                inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                                or inner_l in _KNOWN_LOGICAL_MATRIX_NAMES
+                                or re.match(r"^is\.na\s*\(", inner_l)
+                                or re.match(r"^is_na\s*\(", inner_l)
+                                or inner_l.startswith("!")
+                                or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+                            )
+                        ):
+                            idx_vec_f = _strict_int_vector_literal_from_c(inner_lhs) or r_expr_to_fortran(inner_lhs)
+                            idx_vec_f = idx_vec_f.strip()
+                            if _is_int_literal(inner_lhs) or (
+                                re.fullmatch(r"[A-Za-z]\w*", inner_lhs)
+                                and inner_lhs.lower() not in _KNOWN_VECTOR_NAMES
+                                and inner_lhs not in vector_vars
+                            ):
+                                idx_scalar = _int_bound_expr(idx_vec_f)
+                                _wstmt(
+                                    f"{base_lhs_f}(mod(({idx_scalar}) - 1, size({base_lhs_f},1)) + 1, "
+                                    f"((({idx_scalar}) - 1) / size({base_lhs_f},1)) + 1) = {rhs}",
+                                    st.comment,
+                                )
+                                continue
+                            if not (
+                                idx_vec_f.startswith("[")
+                                or re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?(?:\s*\(|$)", idx_vec_f)
+                            ):
+                                idx_vec_f = f"[{_int_bound_expr(idx_vec_f)}]"
+                            rhs_src_lin = asn[1].strip()
+                            rhs_is_vec_lin = (
+                                parse_call_text(rhs_src_lin) is not None
+                                and parse_call_text(rhs_src_lin)[0].lower() in {"c", "seq", "seq_len", "seq_along"}
+                            ) or rhs_src_lin in vector_vars or rhs_src_lin.lower() in _KNOWN_VECTOR_NAMES
+                            o.w("block")
+                            o.push()
+                            o.w("integer :: i_lin, idx_lin")
+                            o.w("integer, allocatable :: idx_lin_vec(:)")
+                            if rhs_is_vec_lin:
+                                if base_lhs in int_matrix_vars:
+                                    o.w("integer, allocatable :: rhs_lin_vec(:)")
+                                elif base_lhs in logical_matrix_vars:
+                                    o.w("logical, allocatable :: rhs_lin_vec(:)")
+                                else:
+                                    o.w("real(kind=dp), allocatable :: rhs_lin_vec(:)")
+                            o.w(f"idx_lin_vec = {idx_vec_f}")
+                            if rhs_is_vec_lin:
+                                if base_lhs in int_matrix_vars:
+                                    o.w(f"rhs_lin_vec = int({rhs})")
+                                elif base_lhs in logical_matrix_vars:
+                                    o.w(f"rhs_lin_vec = {rhs}")
+                                else:
+                                    o.w(f"rhs_lin_vec = real({rhs}, kind=dp)")
+                            o.w("do i_lin = 1, size(idx_lin_vec)")
+                            o.push()
+                            o.w("idx_lin = idx_lin_vec(i_lin)")
+                            o.w(f"if (idx_lin >= 1 .and. idx_lin <= size({base_lhs_f})) then")
+                            o.push()
+                            rhs_assign_lin = (
+                                "rhs_lin_vec(mod(i_lin - 1, size(rhs_lin_vec)) + 1)" if rhs_is_vec_lin else rhs
+                            )
+                            o.w(
+                                f"{base_lhs_f}(mod(idx_lin - 1, size({base_lhs_f},1)) + 1, "
+                                f"((idx_lin - 1) / size({base_lhs_f},1)) + 1) = {rhs_assign_lin}"
+                            )
+                            o.pop()
+                            o.w("end if")
+                            o.pop()
+                            o.w("end do")
+                            o.pop()
+                            o.w("end block")
+                            continue
                         if (
                             inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
                             or inner_l in _KNOWN_LOGICAL_MATRIX_NAMES
@@ -22435,20 +22528,59 @@ def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
 
 def rewrite_matrix_linear_indices(lines: list[str]) -> list[str]:
     """Lower simple R-style linear indexing of matrices to Fortran row/column indexing."""
-    matrices: set[str] = set()
+    matrices: dict[str, str] = {}
     decl_re = re.compile(r"\b(?:real\s*\([^)]*\)|integer|logical)\s*,\s*allocatable\s*::\s*(.*)", re.IGNORECASE)
     for ln in lines:
         m = decl_re.search(ln)
         if m is None:
             continue
+        decl_l = ln.lower()
+        kind = "integer" if re.search(r"\binteger\s*,", decl_l) else ("logical" if re.search(r"\blogical\s*,", decl_l) else "real")
         for nm in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)", m.group(1)):
-            matrices.add(nm)
+            matrices[nm] = kind
     if not matrices:
         return lines
     out: list[str] = []
     for ln in lines:
         if "::" in ln:
             out.append(ln)
+            continue
+        m_rmi_assign = re.match(r"^(\s*)r_matrix_index\s*\(\s*([A-Za-z]\w*)\s*,\s*(.+)\)\s*=\s*(.+)$", ln)
+        if m_rmi_assign is not None and m_rmi_assign.group(2) in matrices:
+            ind = m_rmi_assign.group(1)
+            nm = m_rmi_assign.group(2)
+            idx_expr = m_rmi_assign.group(3).strip()
+            rhs_expr = m_rmi_assign.group(4).strip()
+            rhs_is_vec = rhs_expr.startswith("[") or re.match(r"^[A-Za-z]\w*\s*\(", rhs_expr) is not None
+            out.append(f"{ind}block")
+            out.append(f"{ind}   integer :: i_lin, idx_lin")
+            out.append(f"{ind}   integer, allocatable :: idx_lin_vec(:)")
+            if rhs_is_vec:
+                if matrices[nm] == "integer":
+                    out.append(f"{ind}   integer, allocatable :: rhs_lin_vec(:)")
+                elif matrices[nm] == "logical":
+                    out.append(f"{ind}   logical, allocatable :: rhs_lin_vec(:)")
+                else:
+                    out.append(f"{ind}   real(kind=dp), allocatable :: rhs_lin_vec(:)")
+            out.append(f"{ind}   idx_lin_vec = {idx_expr}")
+            if rhs_is_vec:
+                if matrices[nm] == "integer":
+                    out.append(f"{ind}   rhs_lin_vec = int({rhs_expr})")
+                elif matrices[nm] == "logical":
+                    out.append(f"{ind}   rhs_lin_vec = {rhs_expr}")
+                else:
+                    out.append(f"{ind}   rhs_lin_vec = real({rhs_expr}, kind=dp)")
+            out.append(f"{ind}   do i_lin = 1, size(idx_lin_vec)")
+            out.append(f"{ind}      idx_lin = idx_lin_vec(i_lin)")
+            out.append(f"{ind}      if (idx_lin >= 1 .and. idx_lin <= size({nm})) then")
+            rhs_assign = "rhs_lin_vec(mod(i_lin - 1, size(rhs_lin_vec)) + 1)" if rhs_is_vec else rhs_expr
+            out.append(
+                f"{ind}         {nm}(mod(idx_lin - 1, size({nm},1)) + 1, "
+                f"((idx_lin - 1) / size({nm},1)) + 1) = {rhs_assign}"
+            )
+            out.append(f"{ind}      end if")
+            out.append(f"{ind}   end do")
+            out.append(f"{ind}end block")
             continue
         new = ln
         for nm in sorted(matrices, key=len, reverse=True):
