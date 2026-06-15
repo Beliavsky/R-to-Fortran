@@ -2742,6 +2742,8 @@ def _index_dim_to_fortran(base: str, dimno: int, d: str) -> str:
     dt = d.strip()
     if dt == "":
         return ":"
+    if re.fullmatch(r"[+-]?0+[lL]?", dt) is not None:
+        return "1:0"
     dim_labels = _ARRAY_DIM_LABELS.get(base.lower())
     lab_dt = _dequote_string_literal(dt)
     if dim_labels is not None and lab_dt is not None and 1 <= dimno <= len(dim_labels):
@@ -9968,7 +9970,9 @@ def r_expr_to_fortran(expr: str) -> str:
             s,
         )
         s = pat_neg_one.sub(
-            lambda m: f"r_drop_index({m.group(1)}, int({r_expr_to_fortran(m.group(2).strip())}))",
+            lambda m: f"{m.group(1)}(1:0)"
+            if re.fullmatch(r"[+-]?0+[lL]?", m.group(2).strip())
+            else f"r_drop_index({m.group(1)}, int({r_expr_to_fortran(m.group(2).strip())}))",
             s,
         )
     s = re.sub(
@@ -9999,6 +10003,8 @@ def r_expr_to_fortran(expr: str) -> str:
         # Logical masking for 1D vectors: x[mask] -> pack(x, mask)
         if "," not in inner:
             il = inner.lower()
+            if re.fullmatch(r"[+-]?0+[lL]?", inner.strip()) is not None:
+                return f"{base}(1:0)"
             if il in {"true", "false", "t", "f", ".true.", ".false."}:
                 mask_scalar = ".true." if il in {"true", "t", ".true."} else ".false."
                 return f"pack({base}, spread({mask_scalar}, dim=1, ncopies=size({base})))"
@@ -10691,6 +10697,7 @@ def emit_stmts(
             inner_l = inner.lower()
             if (
                 inner.startswith("-")
+                or re.fullmatch(r"[+-]?0+[lL]?", inner.strip()) is not None
                 or inner_l in {"true", "false", "t", "f", ".true.", ".false."}
                 or inner_l in _KNOWN_VECTOR_NAMES
                 or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
