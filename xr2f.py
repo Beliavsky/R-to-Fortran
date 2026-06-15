@@ -9999,6 +9999,9 @@ def r_expr_to_fortran(expr: str) -> str:
         # Logical masking for 1D vectors: x[mask] -> pack(x, mask)
         if "," not in inner:
             il = inner.lower()
+            if il in {"true", "false", "t", "f", ".true.", ".false."}:
+                mask_scalar = ".true." if il in {"true", "t", ".true."} else ".false."
+                return f"pack({base}, spread({mask_scalar}, dim=1, ncopies=size({base})))"
             if (
                 il in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is_na\s*\(", il)
@@ -10688,6 +10691,7 @@ def emit_stmts(
             inner_l = inner.lower()
             if (
                 inner.startswith("-")
+                or inner_l in {"true", "false", "t", "f", ".true.", ".false."}
                 or inner_l in _KNOWN_VECTOR_NAMES
                 or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is\.na\s*\(", inner_l)
