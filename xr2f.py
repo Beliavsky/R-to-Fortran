@@ -2733,7 +2733,7 @@ def _index_inner_1d_to_fortran(inner: str) -> str:
     if m_which is not None:
         fn = "minloc" if m_which.group(1).lower() == "min" else "maxloc"
         inner = m_which.group(2).strip()
-        return f"{fn}({inner}, dim=1)"
+        return f"{fn}({r_expr_to_fortran(inner)}, dim=1)"
     return r_expr_to_fortran(t)
 
 
@@ -6501,6 +6501,37 @@ def r_expr_to_fortran(expr: str) -> str:
     if trailing_subset is not None:
         base_subset, idx_subset = trailing_subset
         idx_dims_subset = _split_index_dims(idx_subset)
+        idx_dims_clean_subset = [d for d in idx_dims_subset if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+        if len(idx_dims_clean_subset) >= 2 and _looks_matrix_expr(base_subset):
+            drop_false_subset = any(
+                re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE)
+                for d in idx_dims_subset
+            )
+            row_src_subset = idx_dims_clean_subset[0].strip()
+            col_src_subset = idx_dims_clean_subset[1].strip()
+            if row_src_subset == "" and col_src_subset and not re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
+                return f"r_matrix_col({r_expr_to_fortran(base_subset)}, {_int_bound_expr(r_expr_to_fortran(col_src_subset))})"
+            row_f_subset = ":" if row_src_subset == "" else _index_dim_to_fortran(r_expr_to_fortran(base_subset), 1, row_src_subset)
+            col_f_subset = ":" if col_src_subset == "" else _index_dim_to_fortran(r_expr_to_fortran(base_subset), 2, col_src_subset)
+            if (
+                drop_false_subset
+                and row_src_subset == ""
+                and col_src_subset
+                and ":" not in col_f_subset
+                and not col_f_subset.startswith("[")
+                and not re.match(r"^[A-Za-z]\w*\s*\(", col_f_subset)
+            ):
+                col_f_subset = f"{col_f_subset}:{col_f_subset}"
+            if (
+                drop_false_subset
+                and col_src_subset == ""
+                and row_src_subset
+                and ":" not in row_f_subset
+                and not row_f_subset.startswith("[")
+                and not re.match(r"^[A-Za-z]\w*\s*\(", row_f_subset)
+            ):
+                row_f_subset = f"{row_f_subset}:{row_f_subset}"
+            return f"{r_expr_to_fortran(base_subset)}({row_f_subset}, {col_f_subset})"
         if len(idx_dims_subset) == 1 and _looks_matrix_expr(base_subset):
             idx_src_subset = idx_dims_subset[0].strip()
             if idx_src_subset:
@@ -8041,6 +8072,11 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is None:
             raise NotImplementedError(f"{c_wm[0]} requires an argument")
         fn_wm = "maxloc" if c_wm[0].lower() == "which.max" else "minloc"
+        m_wm_col = re.match(r"^([A-Za-z]\w*)\s*\[\s*,\s*(.+?)\s*\]$", x_src.strip())
+        if m_wm_col is not None:
+            base_wm = m_wm_col.group(1)
+            col_wm = m_wm_col.group(2).strip()
+            return f"{fn_wm}({base_wm}(:, {_index_dim_to_fortran(base_wm, 2, col_wm)}), dim=1)"
         return f"{fn_wm}({r_expr_to_fortran(x_src)}, dim=1)"
     s = _replace_balanced_func_calls(
         s,
@@ -8051,6 +8087,11 @@ def r_expr_to_fortran(expr: str) -> str:
         s,
         "which.max",
         lambda inner: f"maxloc({r_expr_to_fortran(inner.strip())}, dim=1)",
+    )
+    s = re.sub(
+        r"\b(minloc|maxloc)\s*\(\s*([A-Za-z]\w*)\s*\[\s*,\s*([^\]]+?)\s*\]\s*,\s*dim\s*=\s*1\s*\)",
+        lambda m: f"{m.group(1)}({m.group(2)}(:, {_index_dim_to_fortran(m.group(2), 2, m.group(3).strip())}), dim=1)",
+        s,
     )
     s = _replace_balanced_func_calls(
         s,
@@ -9969,8 +10010,12 @@ def r_expr_to_fortran(expr: str) -> str:
             ):
                 return f"pack({base}, {r_expr_to_fortran(inner)})"
         else:
-            dims = _split_index_dims(inner)
-            dims = [d for d in dims if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+            dims_all = _split_index_dims(inner)
+            drop_false_idx = any(
+                re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE)
+                for d in dims_all
+            )
+            dims = [d for d in dims_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
             if len(dims) >= 2 and dims[1].strip() == "":
                 row_idx = dims[0].strip()
                 il = row_idx.lower()
@@ -9988,6 +10033,19 @@ def r_expr_to_fortran(expr: str) -> str:
                         f"reshape(pack({base}, spread({mask_f}, dim=2, ncopies=size({base},2))), "
                         f"[count({mask_f}), size({base},2)])"
                     )
+            if drop_false_idx and len(dims) >= 2:
+                row_src_idx = dims[0].strip()
+                col_src_idx = dims[1].strip()
+                if row_src_idx == "" and col_src_idx:
+                    col_f_idx = _index_dim_to_fortran(base, 2, col_src_idx)
+                    if ":" not in col_f_idx and not col_f_idx.startswith("[") and not re.match(r"^[A-Za-z]\w*\s*\(", col_f_idx):
+                        return f"{base}(:, {col_f_idx}:{col_f_idx})"
+                    return f"{base}(:, {col_f_idx})"
+                if col_src_idx == "" and row_src_idx:
+                    row_f_idx = _index_dim_to_fortran(base, 1, row_src_idx)
+                    if ":" not in row_f_idx and not row_f_idx.startswith("[") and not re.match(r"^[A-Za-z]\w*\s*\(", row_f_idx):
+                        return f"{base}({row_f_idx}:{row_f_idx}, :)"
+                    return f"{base}({row_f_idx}, :)"
         return f"{base}({_index_inner_to_fortran(inner, base=base)})"
     while prev != s:
         prev = s
@@ -10602,13 +10660,24 @@ def emit_stmts(
                 return 2
         m_r_ix = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\]]+)\]$", t)
         if m_r_ix and (m_r_ix.group(1) in int_matrix_vars or m_r_ix.group(1) in real_matrix_vars):
-            dims = _split_index_dims(m_r_ix.group(2).strip())
+            dims_all = _split_index_dims(m_r_ix.group(2).strip())
+            drop_false = any(re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE) for d in dims_all)
+            dims = [d for d in dims_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
             if len(dims) >= 2:
+                if drop_false:
+                    return 2
                 scalar_dims = [
-                    d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None
+                    d.strip() != ""
+                    and not d.strip().startswith("-")
+                    and ":" not in d
+                    and _split_top_level_colon(d.strip()) is None
                     for d in dims
                 ]
-                return 0 if all(scalar_dims) else 2
+                if all(scalar_dims):
+                    return 0
+                if any(scalar_dims):
+                    return 1
+                return 2
             return 1
         if m_r_ix and (
             m_r_ix.group(1) in int_vector_vars
@@ -10861,7 +10930,13 @@ def emit_stmts(
             if fld in {"a", "merge"} and len(dims) >= 2:
                 return 2
             if fld in {"centers", "table", "design", "sigma", "y"} and len(dims) >= 2:
-                scalar_dims = [d.strip() != "" and ":" not in d and _split_top_level_colon(d.strip()) is None for d in dims]
+                scalar_dims = [
+                    d.strip() != ""
+                    and not d.strip().startswith("-")
+                    and ":" not in d
+                    and _split_top_level_colon(d.strip()) is None
+                    for d in dims
+                ]
                 return 0 if all(scalar_dims) else 2
             if fld in {"coef", "fitted", "resid", "intercept", "mu", "pi", "weights", "means", "sds", "vars", "nk"}:
                 return 0 if len(dims) == 1 and dims[0].strip() and ":" not in dims[0] and _split_top_level_colon(dims[0].strip()) is None else 1
@@ -21212,6 +21287,7 @@ def transpile_r_to_fortran(
         "r_rep_int",
         "r_drop_index",
         "r_drop_indices",
+        "r_matrix_col",
         "char_join",
         "list_files",
         "strsplit_fixed",
