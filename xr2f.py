@@ -24307,9 +24307,16 @@ def promote_rank3_dummy_arguments(lines: list[str]) -> list[str]:
 def promote_rank3_result_assignments(lines: list[str]) -> list[str]:
     names: set[str] = set()
     for ln in lines:
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(?:make_ccc_covariances|make_dcc_covariances|r_array_real|r_array_int)\s*\(", ln, re.IGNORECASE)
-        if m is not None:
-            names.add(m.group(1))
+        m_cov = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(?:make_ccc_covariances|make_dcc_covariances)\s*\(", ln, re.IGNORECASE)
+        if m_cov is not None:
+            names.add(m_cov.group(1))
+            continue
+        m_arr = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(r_array_real|r_array_int)\s*\((.+)\)\s*$", ln, re.IGNORECASE)
+        if m_arr is not None:
+            c_arr = parse_call_text(f"{m_arr.group(2)}({m_arr.group(3)})")
+            shape_src = c_arr[1][1].strip() if c_arr is not None and len(c_arr[1]) >= 2 else ""
+            if shape_src.startswith("[") and shape_src.endswith("]") and len(split_top_level_commas(shape_src[1:-1])) >= 3:
+                names.add(m_arr.group(1))
     if not names:
         return lines
     out: list[str] = []
@@ -24993,10 +25000,23 @@ def rewrite_dummy_rank_prints_text(f90: str) -> str:
 def rewrite_vector_slice_assignment_ranks_text(f90: str) -> str:
     """Demote locals assigned from a single row/column slice of a matrix."""
     vec_names: set[str] = set()
+    mat_names: set[str] = set()
     assign_re = re.compile(
         r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*(?:%[A-Za-z]\w*)?\s*\((.+)\)\s*$",
         re.IGNORECASE,
     )
+    def is_scalar_slice_dim(d: str) -> bool:
+        dl = d.lower().strip()
+        if dl == "":
+            return False
+        if _split_top_level_colon(dl) is not None:
+            return False
+        if dl.startswith("[") or dl.startswith("match(") or dl.startswith("which("):
+            return False
+        if re.search(r"\b(?:r_seq\w*|pack|spread|merge)\s*\(", dl):
+            return False
+        return True
+
     for ln in f90.splitlines():
         m = assign_re.match(ln)
         if m is None:
@@ -25005,26 +25025,26 @@ def rewrite_vector_slice_assignment_ranks_text(f90: str) -> str:
         if len(dims) != 2:
             continue
         d1, d2 = dims[0].strip(), dims[1].strip()
-        def is_scalar_slice_dim(d: str) -> bool:
-            dl = d.lower().strip()
-            if dl == "":
-                return False
-            if _split_top_level_colon(dl) is not None:
-                return False
-            if dl.startswith("[") or dl.startswith("match(") or dl.startswith("which("):
-                return False
-            if re.search(r"\b(?:r_seq|pack|spread|merge)\s*\(", dl):
-                return False
-            return True
         if (is_scalar_slice_dim(d1) and d2 == ":") or (d1 == ":" and is_scalar_slice_dim(d2)):
             vec_names.add(m.group(1))
-    if not vec_names:
+        elif (not is_scalar_slice_dim(d1) and d2 == ":") or (d1 == ":" and not is_scalar_slice_dim(d2)):
+            mat_names.add(m.group(1))
+    vec_names -= mat_names
+    if not vec_names and not mat_names:
         return f90
     for nm in sorted(vec_names, key=len, reverse=True):
-        f90 = re.sub(rf"\b{re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
+        f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
         f90 = re.sub(
             rf"\bcall\s+print_matrix\s*\(\s*{re.escape(nm)}\s*\)",
             f"call print_real_vector({nm})",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    for nm in sorted(mat_names, key=len, reverse=True):
+        f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*\)", f"{nm}(:,:)", f90)
+        f90 = re.sub(
+            rf"\bcall\s+print_real_vector\s*\(\s*{re.escape(nm)}\s*\)",
+            f"call print_matrix({nm})",
             f90,
             flags=re.IGNORECASE,
         )
@@ -25118,6 +25138,149 @@ def rewrite_vector_workvar_ranks_text(f90: str) -> str:
         else:
             out.append(ln)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_scalar_table_extract_decls_text(f90: str) -> str:
+    scalar_names: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(
+            r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*\(\s*minloc\s*\(",
+            ln,
+            re.IGNORECASE,
+        )
+        if m is not None:
+            scalar_names.add(m.group(1))
+    if not scalar_names:
+        return f90
+    lines = f90.splitlines()
+    out: list[str] = []
+    pending_scalars: list[str] = []
+    real_alloc_re = re.compile(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m = real_alloc_re.match(ln)
+        if m is None:
+            if pending_scalars:
+                out.append(f"integer :: {', '.join(pending_scalars)}")
+                pending_scalars = []
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m.group(2))]
+        keep: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            mm = re.match(r"^([A-Za-z]\w*)\s*\(:\s*\)$", part)
+            if mm is not None and mm.group(1) in scalar_names:
+                moved.append(mm.group(1))
+            else:
+                keep.append(part)
+        if moved:
+            if keep:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+            pending_scalars.extend(moved)
+        else:
+            if pending_scalars:
+                out.append(f"integer :: {', '.join(pending_scalars)}")
+                pending_scalars = []
+            out.append(ln)
+    if pending_scalars:
+        out.append(f"integer :: {', '.join(pending_scalars)}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_acf_names_print_text(f90: str) -> str:
+    acf_names: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_acf\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            acf_names.add(m.group(1))
+    for nm in acf_names:
+        f90 = re.sub(
+            rf'write\(\*,"\(g0\)"\)\s+r_paste0_int\("",\s*r_seq_int\(1,\s*size\({re.escape(nm)}\)\)\)',
+            'write(*,"(*(g0,:,1x))") "acf", "type", "n.used", "lag", "series", "snames"',
+            f90,
+            flags=re.IGNORECASE,
+        )
+    return f90
+
+
+def rewrite_named_which_min_print_text(f90: str) -> str:
+    return re.sub(
+        r'write\(\*,"\(g0\)"\)\s+r_paste0_int\("",\s*r_seq_int\(1,\s*size\(minloc\(([A-Za-z]\w*),\s*dim=1\)\)\)\)',
+        r'write(*,"(a)") trim(\1_names(minloc(\1, dim=1)))',
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
+def remove_noncomplex_redecls_text(f90: str) -> str:
+    complex_names: set[str] = set()
+    complex_decl_re = re.compile(r"^\s*complex\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in f90.splitlines():
+        m = complex_decl_re.match(ln)
+        if m is None:
+            continue
+        for part in split_top_level_commas(m.group(1)):
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", base):
+                complex_names.add(base.lower())
+    if not complex_names:
+        return f90
+    lines = f90.splitlines()
+    out: list[str] = []
+    decl_re = re.compile(r"^(\s*)(real\(kind=dp\)|integer)(\s*,\s*allocatable)?\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m = decl_re.match(ln)
+        if m is None:
+            out.append(ln)
+            continue
+        kept: list[str] = []
+        for part in split_top_level_commas(m.group(4)):
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base.lower() not in complex_names:
+                kept.append(part.strip())
+        if kept:
+            out.append(f"{m.group(1)}{m.group(2)}{m.group(3) or ''} :: {', '.join(kept)}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_cbind_prints_text(f90: str) -> str:
+    return re.sub(
+        r"\bcall\s+print_real_vector\s*\(\s*cbind\s*\(",
+        "call print_matrix(cbind(",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
+def rewrite_matmul_vector_result_ranks_text(f90: str) -> str:
+    rank1: set[str] = set()
+    decl_re = re.compile(r"^\s*(?:real\(kind=dp\)|integer|complex\(kind=dp\))(?:\s*,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+    for ln in f90.splitlines():
+        m = decl_re.match(ln)
+        if m is None:
+            continue
+        for part in split_top_level_commas(m.group(1)):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part)
+            if mm is not None and "," not in mm.group(2):
+                rank1.add(mm.group(1).lower())
+    vec_results: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matmul\s*\((.+)\)\s*$", ln, re.IGNORECASE)
+        if m is None:
+            continue
+        args = split_top_level_commas(m.group(2))
+        if len(args) != 2:
+            continue
+        rhs2 = args[1].strip()
+        root2 = re.match(r"^([A-Za-z]\w*)\b", rhs2)
+        if root2 is not None and root2.group(1).lower() in rank1:
+            vec_results.add(m.group(1))
+    if not vec_results:
+        return f90
+    for nm in sorted(vec_results, key=len, reverse=True):
+        f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
+        f90 = re.sub(rf"\bcall\s+print_matrix\s*\(\s*{re.escape(nm)}\s*\)", f"call print_real_vector({nm})", f90, flags=re.IGNORECASE)
+    return f90
 
 
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
@@ -26692,7 +26855,13 @@ def main() -> int:
     f90 = rewrite_dummy_rank_prints_text(f90)
     f90 = rewrite_vector_slice_assignment_ranks_text(f90)
     f90 = rewrite_vector_workvar_ranks_text(f90)
+    f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = remove_duplicate_function_result_decls_text(f90)
+    f90 = rewrite_acf_names_print_text(f90)
+    f90 = rewrite_named_which_min_print_text(f90)
+    f90 = remove_noncomplex_redecls_text(f90)
+    f90 = rewrite_cbind_prints_text(f90)
+    f90 = rewrite_matmul_vector_result_ranks_text(f90)
     f90 = re.sub(
         r"spread\s*\(\s*all\s*\(\s*ieee_is_finite\s*\(([^()]+)\)\s*\)\s*,\s*dim\s*=\s*2",
         r"spread(all(ieee_is_finite(\1), dim=2), dim=2",
