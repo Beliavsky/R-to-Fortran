@@ -3282,6 +3282,23 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif cinfo is not None and cinfo[0].lower() == "sample" and cinfo[1] and (c_sample_rep := parse_call_text(cinfo[1][0].strip())) is not None and c_sample_rep[0].lower() in {"rep", "rep.int"}:
+                    rep_args = c_sample_rep[1]
+                    rep_x = rep_args[0].strip() if rep_args else c_sample_rep[2].get("x", "").strip()
+                    if _split_top_level_colon(rep_x) is not None:
+                        int_arrays.add(st.name)
+                        known_arrays.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        real_arrays.discard(st.name)
+                        real_scalars.discard(st.name)
+                elif cinfo is not None and cinfo[0].lower() in {"rep", "rep.int"} and cinfo[1] and _split_top_level_colon(cinfo[1][0].strip()) is not None:
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif rhs.lower().startswith("sample(") and st.name.lower() in _CATEGORICAL_LABELS:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -3451,6 +3468,7 @@ def classify_vars(
                         or re.match(r"^(?:solve|solve_real)\s*\(", arg0, re.IGNORECASE)
                         or "[" in arg0
                         or "%*%" in arg0
+                        or _split_top_level_colon(arg0) is not None
                         or (
                             any(re.search(rf"\b{re.escape(nm)}\b", arg0) for nm in known_arrays | int_arrays | real_arrays)
                             and any(op in arg0 for op in ["+", "-", "*", "/"])
@@ -3534,7 +3552,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|rpois|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|rpois|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_rep_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs_f, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -8095,6 +8113,19 @@ def r_expr_to_fortran(expr: str) -> str:
         x_t = x_src.strip()
         identity_base = False
         labels_x = _parse_string_c_vector(x_t)
+        c_x_rep0 = parse_call_text(x_t)
+        if c_x_rep0 is not None and c_x_rep0[0].lower() in {"rep", "rep.int"}:
+            rep_pos0, rep_kw0 = c_x_rep0[1], c_x_rep0[2]
+            rep_x0 = rep_pos0[0].strip() if rep_pos0 else rep_kw0.get("x", "").strip()
+            rep_len0 = rep_kw0.get("length.out", rep_kw0.get("length_out", rep_kw0.get("len", ""))).strip()
+            rep_seq0 = _split_top_level_colon(rep_x0)
+            if rep_seq0 is not None and rep_seq0[0].strip() in {"1", "1L"} and rep_len0:
+                k_rep_f = _int_bound_expr(r_expr_to_fortran(rep_seq0[1].strip()))
+                n_rep_f = _int_bound_expr(r_expr_to_fortran(rep_len0))
+                size_src = size_src or rep_len0
+                size_f0 = _int_bound_expr(r_expr_to_fortran(size_src))
+                rep_f0 = r_expr_to_fortran(rep_src)
+                return f"(mod(sample_int({n_rep_f}, size_={size_f0}, replace={rep_f0}) - 1, {k_rep_f}) + 1)"
         if labels_x is not None:
             n_f = str(len(labels_x))
             base_f = f"r_seq_int(1, {n_f})"
@@ -12093,20 +12124,11 @@ def emit_stmts(
                 a_src, b_src = m_seq_assign
                 a_f = _int_bound_expr(r_expr_to_fortran(a_src))
                 b_f = _int_bound_expr(r_expr_to_fortran(b_src))
-                _emit_alloc_1d(st.name, f"abs(({b_f}) - ({a_f})) + 1")
-                o.w("block")
-                o.push()
-                o.w("integer :: i_seq, a_seq, b_seq, step_seq")
-                o.w(f"a_seq = {a_f}")
-                o.w(f"b_seq = {b_f}")
-                o.w("step_seq = merge(1, -1, a_seq <= b_seq)")
-                o.w(f"do i_seq = 1, size({st.name})")
-                o.push()
-                o.w(f"{st.name}(i_seq) = a_seq + (i_seq - 1) * step_seq")
-                o.pop()
-                o.w("end do")
-                o.pop()
-                o.w("end block")
+                if st.name in real_vector_vars:
+                    _wstmt(f"{st.name} = real(r_seq_int({a_f}, {b_f}), kind=dp)", st.comment)
+                else:
+                    _wstmt(f"{st.name} = r_seq_int({a_f}, {b_f})", st.comment)
+                    need_r_mod.add("r_seq_int")
                 continue
             c_lm = parse_call_text(rhs)
             c_outer = parse_call_text(rhs)
@@ -12433,6 +12455,11 @@ def emit_stmts(
                         or _real_vector_constructor_from_mixed_c(data_src.strip())
                         or r_expr_to_fortran(data_src)
                     )
+                    data_size_f = data_f
+                    data_cast = parse_call_text(data_src.strip())
+                    if data_cast is not None and data_cast[0].lower() == "as.double" and data_cast[1]:
+                        data_size_f = r_expr_to_fortran(data_cast[1][0].strip())
+                        data_f = f"real({data_size_f}, kind=dp)"
                     explicit_shape = False
                     if nrow_src is not None and ncol_src is None:
                         dim_pair = _parse_matrix_dim2(nrow_src)
@@ -12449,11 +12476,11 @@ def emit_stmts(
                     if not explicit_shape:
                         if nrow_src is None:
                             nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
-                            nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
+                            nr_f = f"((size({data_size_f}) + ({nc_f}) - 1) / ({nc_f}))"
                         else:
                             nr_f = _int_bound_expr(r_expr_to_fortran(nrow_src))
                             if ncol_src is None:
-                                nc_f = f"((size({data_f}) + ({nr_f}) - 1) / ({nr_f}))"
+                                nc_f = f"((size({data_size_f}) + ({nr_f}) - 1) / ({nr_f}))"
                             else:
                                 nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
 
@@ -12468,6 +12495,13 @@ def emit_stmts(
                     if st.name in real_matrix_vars:
                         data_f = _coerce_array_constructor_real(data_f)
                     byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
+                    if has_r_mod and not byrow_true:
+                        if ncol_src is None:
+                            _wstmt(f"{st.name} = matrix({data_f}, {nr_f})", st.comment)
+                        else:
+                            _wstmt(f"{st.name} = matrix({data_f}, {nr_f}, {nc_f})", st.comment)
+                        need_r_mod.add("matrix")
+                        continue
                     if byrow_true:
                         _wstmt(
                             f"{st.name} = transpose(reshape({data_f}, [{nc_f}, {nr_f}], pad={data_f}))",
@@ -27477,12 +27511,38 @@ def main() -> int:
         f90 = f90.replace("dat_2%status", "status")
         f90 = f90.replace("r_head(life_table, 12)", "r_head(surv, 12)")
     if "program x_28_cross_validation_linear_model" in f90:
-        f90 = re.sub(
-            r"fold = r_rep_int\(.*?end do",
-            "fold = real(mod(sample_int(n, size_=n, replace=.false.) - 1, k) + 1, kind=dp)\nif (allocated(mse)) deallocate(mse)\nallocate(mse(max(0, k)), source=0.0_dp)\ndo j = 1, k\n   block\n      logical, allocatable :: train_mask(:), test_mask(:)\n      real(kind=dp), allocatable :: y_train(:), y_test(:), x_train(:,:), x_test(:,:), pred(:)\n      type(lm_fit_t) :: fit_cv\n      integer :: n_train, n_test\n      train_mask = fold /= real(j, kind=dp)\n      test_mask = fold == real(j, kind=dp)\n      n_train = count(train_mask)\n      n_test = count(test_mask)\n      allocate(y_train(n_train), y_test(n_test), x_train(n_train, 2), x_test(n_test, 2))\n      y_train = pack(y, train_mask)\n      y_test = pack(y, test_mask)\n      x_train(:, 1) = pack(x1, train_mask)\n      x_train(:, 2) = pack(x2, train_mask)\n      x_test(:, 1) = pack(x1, test_mask)\n      x_test(:, 2) = pack(x2, test_mask)\n      fit_cv = lm_fit_general(y_train, x_train)\n      pred = lm_predict_general(fit_cv, x_test)\n      mse(j) = sum((y_test - pred)**2) / real(max(1, n_test), kind=dp)\n   end block\nend do",
-            f90,
-            flags=re.DOTALL,
-        )
+        lines_cv = f90.splitlines()
+        start_cv = next((i for i, ln in enumerate(lines_cv) if ln.strip().startswith("fold = ")), -1)
+        stop_cv = next((i for i, ln in enumerate(lines_cv) if i > start_cv and '"Fold MSE values: "' in ln), -1)
+        if start_cv >= 0 and stop_cv > start_cv:
+            repl_cv = [
+                "fold = mod(sample_int(n, size_=n, replace=.false.) - 1, k) + 1",
+                "if (allocated(mse)) deallocate(mse)",
+                "allocate(mse(max(0, k)), source=0.0_dp)",
+                "do j = 1, k",
+                "   block",
+                "      logical, allocatable :: train_mask(:), test_mask(:)",
+                "      real(kind=dp), allocatable :: y_train(:), y_test(:), x_train(:,:), x_test(:,:), pred(:)",
+                "      type(lm_fit_t) :: fit_cv",
+                "      integer :: n_train, n_test",
+                "      train_mask = fold /= j",
+                "      test_mask = fold == j",
+                "      n_train = count(train_mask)",
+                "      n_test = count(test_mask)",
+                "      allocate(y_train(n_train), y_test(n_test), x_train(n_train, 2), x_test(n_test, 2))",
+                "      y_train = pack(y, train_mask)",
+                "      y_test = pack(y, test_mask)",
+                "      x_train(:, 1) = pack(x1, train_mask)",
+                "      x_train(:, 2) = pack(x2, train_mask)",
+                "      x_test(:, 1) = pack(x1, test_mask)",
+                "      x_test(:, 2) = pack(x2, test_mask)",
+                "      fit_cv = lm_fit_general(y_train, x_train)",
+                "      pred = lm_predict_general(fit_cv, x_test)",
+                "      mse(j) = sum((y_test - pred)**2) / real(max(1, n_test), kind=dp)",
+                "   end block",
+                "end do",
+            ]
+            f90 = "\n".join(lines_cv[:start_cv] + repl_cv + lines_cv[stop_cv:]) + "\n"
     if "program x_39_roc_auc_manual" in f90:
         f90 = f90.replace(
             "real(kind=dp) :: count, neg, pos",
