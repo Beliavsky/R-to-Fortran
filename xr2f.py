@@ -43,6 +43,7 @@ _SUBROUTINE_FUNCTIONS: set[str] = set()
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
 _KNOWN_INT_VECTOR_NAMES: set[str] = set()
+_CURRENT_INT_ARRAY_NAMES: set[str] = set()
 _KNOWN_INT_CONSTANTS: dict[str, int] = {}
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
@@ -6597,8 +6598,10 @@ def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src:
         _is_int_literal(af)
         or actual_l in _KNOWN_INT_NAMES
         or actual_l in _KNOWN_INT_VECTOR_NAMES
+        or actual_l in _CURRENT_INT_ARRAY_NAMES
         or af.lower() in _KNOWN_INT_NAMES
         or af.lower() in _KNOWN_INT_VECTOR_NAMES
+        or af.lower() in _CURRENT_INT_ARRAY_NAMES
     )
     if _is_int_literal(af):
         return f"{int(af)}.0_dp"
@@ -10589,6 +10592,7 @@ def emit_stmts(
     alloc_seen: set[str] | None = None,
     helper_ctx: dict[str, object] | None = None,
 ) -> None:
+    global _CURRENT_INT_ARRAY_NAMES
     if alloc_seen is None:
         alloc_seen = set()
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
@@ -10737,6 +10741,7 @@ def emit_stmts(
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
         vector_vars = set(int_vector_vars) | set(real_vector_vars) | set(logical_vector_vars)
+    _CURRENT_INT_ARRAY_NAMES = {n.lower() for n in (set(int_vector_vars) | set(int_matrix_vars))}
     list_locals: dict[str, dict[str, object]] = {}
     if helper_ctx is not None:
         ll = helper_ctx.get("list_locals")
@@ -10789,6 +10794,40 @@ def emit_stmts(
                     rf"\b{re.escape(nm)}\s*\(\s*r_seq_int\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)\s*\)",
                     rf"{nm}(\1:\2)",
                     stmt_line,
+                )
+        local_int_actuals = {n.lower() for n in (set(int_vector_vars) | set(int_matrix_vars))}
+        local_int_actuals |= set(_KNOWN_INT_VECTOR_NAMES)
+        if local_int_actuals:
+            def _coerce_user_call_actuals(fn_name: str, inner: str) -> str:
+                kinds = _USER_FUNC_ARG_KIND.get(fn_name.lower())
+                if not kinds or "real" not in kinds:
+                    return f"{fn_name}({inner})"
+                idx_map = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
+                parts = split_top_level_commas(inner)
+                out_parts: list[str] = []
+                pos_i = 0
+                for p in parts:
+                    ps = p.strip()
+                    m_kw = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", ps, re.DOTALL)
+                    if m_kw is not None:
+                        key = _sanitize_fortran_kwarg_name(m_kw.group(1)).lower()
+                        val = m_kw.group(2).strip()
+                        idx = idx_map.get(key, -1)
+                        if idx >= 0 and idx < len(kinds) and kinds[idx] == "real" and val.lower() in local_int_actuals:
+                            val = f"real({val}, kind=dp)"
+                        out_parts.append(f"{m_kw.group(1)}={val}")
+                        continue
+                    if pos_i < len(kinds) and kinds[pos_i] == "real" and ps.lower() in local_int_actuals:
+                        ps = f"real({ps}, kind=dp)"
+                    out_parts.append(ps)
+                    pos_i += 1
+                return f"{fn_name}({', '.join(out_parts)})"
+
+            for fn_name in sorted(_USER_FUNC_ARG_KIND, key=len, reverse=True):
+                stmt_line = _replace_balanced_func_calls(
+                    stmt_line,
+                    fn_name,
+                    lambda inner, fn_name=fn_name: _coerce_user_call_actuals(fn_name, inner),
                 )
         t = (cmt or "").strip()
         if t:
@@ -19449,6 +19488,7 @@ def transpile_r_to_fortran(
                 else
                 "real"
                 if a in fn_declared_double_args
+                or arg_rank_f.get(a, 0) >= 1
                 else
                 "integer"
                 if (
