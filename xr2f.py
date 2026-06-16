@@ -11458,6 +11458,31 @@ def emit_stmts(
                 return 1
         return None
 
+    def _is_integer_rank1_expr_for_print(src_expr: str, f_expr: str) -> bool:
+        src = src_expr.strip()
+        src_l = src.lower()
+        ff = f_expr.strip()
+        ff_l = ff.lower()
+        if re.fullmatch(r"[A-Za-z]\w*", ff) and ff in int_vector_vars:
+            return True
+        if re.fullmatch(r"[A-Za-z]\w*", src) and src in int_vector_vars:
+            return True
+        if re.match(r"^shape\s*\(", ff_l):
+            return True
+        if re.match(r"^dim\s*\(", src_l):
+            return True
+        if re.match(r"^(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length|r_drop_index|r_drop_indices|which|order|match|minloc|maxloc)\s*\(", ff_l):
+            return True
+        if re.match(r"^(?:seq_len|seq_along|which|order|match)\s*\(", src_l):
+            return True
+        m_subset_int = re.match(r"^([A-Za-z]\w*)\s*\[", src)
+        if m_subset_int is not None and m_subset_int.group(1) in int_vector_vars:
+            return True
+        m_subset_int_f = re.match(r"^([A-Za-z]\w*)\s*\(", ff)
+        if m_subset_int_f is not None and m_subset_int_f.group(1) in int_vector_vars:
+            return True
+        return False
+
     def _named_vector_print_parts(expr_txt: str) -> tuple[str, str, bool] | None:
         """Return (value_expr, names_expr, value_is_scalar) for printable named vectors."""
         t = expr_txt.strip()
@@ -13573,8 +13598,12 @@ def emit_stmts(
                         ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple)\s*\(", one_f_simple, re.IGNORECASE):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
-                        if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in int_vector_vars:
-                            _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
+                        if _is_integer_rank1_expr_for_print(one, one_f):
+                            if has_r_mod:
+                                _wstmt(f"call print_integer_vector({one_f})", st.comment)
+                                need_r_mod.add("print_integer_vector")
+                            else:
+                                _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
                             continue
                         if has_r_mod:
                             m_char_subset_print = re.match(r"^([A-Za-z]\w*)\s*\[.+\]$", one.strip())
