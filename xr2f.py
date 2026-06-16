@@ -18951,7 +18951,7 @@ def _annotation_kind_maps_for_function(fn: FuncDef) -> dict[str, str]:
     return kinds
 
 
-def annotate_r_source_with_declares(src: str, stem: str) -> str:
+def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False) -> str:
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
@@ -18972,7 +18972,8 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
         kinds = _annotation_kind_maps_for_function(fn)
         ordered: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for nm in list(fn.args) + sorted(k for k in kinds if k not in fn.args):
+        names_for_decl = list(fn.args) if args_only else list(fn.args) + sorted(k for k in kinds if k not in fn.args)
+        for nm in names_for_decl:
             raw_nm = raw_name.get(nm, nm)
             if raw_nm in seen:
                 continue
@@ -18981,30 +18982,32 @@ def annotate_r_source_with_declares(src: str, stem: str) -> str:
         if ordered:
             func_specs[fn.name] = ordered
 
-    assign_counts = infer_assigned_names(main_stmts)
-    ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
-    array_params = infer_main_array_params(main_stmts, assign_counts)
-    pi_trig_args = _collect_pi_trig_array_args(main_stmts)
-    array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
-    char_scalars = infer_main_character_scalars(main_stmts)
-    char_arrays = infer_main_character_arrays(main_stmts)
-    for nm_char_arr in set(char_arrays):
-        ints.discard(nm_char_arr)
-        int_arrays.discard(nm_char_arr)
-        real_arrays.discard(nm_char_arr)
-        real_scalars.discard(nm_char_arr)
-        params.pop(nm_char_arr, None)
-    logical_scalars = infer_main_logical_scalars(main_stmts)
-    main_kinds: dict[str, str] = {}
-    for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
-        main_kinds[nm] = "integer"
-    for nm in sorted(real_scalars | real_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind != "integer"}):
-        main_kinds.setdefault(nm, "double")
-    for nm in sorted(char_scalars | char_arrays):
-        main_kinds.setdefault(nm, "character")
-    for nm in sorted(logical_scalars):
-        main_kinds.setdefault(nm, "logical")
-    main_specs = [(raw_name.get(nm, nm), kind) for nm, kind in sorted(main_kinds.items())]
+    main_specs: list[tuple[str, str]] = []
+    if not args_only:
+        assign_counts = infer_assigned_names(main_stmts)
+        ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+        array_params = infer_main_array_params(main_stmts, assign_counts)
+        pi_trig_args = _collect_pi_trig_array_args(main_stmts)
+        array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
+        char_scalars = infer_main_character_scalars(main_stmts)
+        char_arrays = infer_main_character_arrays(main_stmts)
+        for nm_char_arr in set(char_arrays):
+            ints.discard(nm_char_arr)
+            int_arrays.discard(nm_char_arr)
+            real_arrays.discard(nm_char_arr)
+            real_scalars.discard(nm_char_arr)
+            params.pop(nm_char_arr, None)
+        logical_scalars = infer_main_logical_scalars(main_stmts)
+        main_kinds: dict[str, str] = {}
+        for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
+            main_kinds[nm] = "integer"
+        for nm in sorted(real_scalars | real_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind != "integer"}):
+            main_kinds.setdefault(nm, "double")
+        for nm in sorted(char_scalars | char_arrays):
+            main_kinds.setdefault(nm, "character")
+        for nm in sorted(logical_scalars):
+            main_kinds.setdefault(nm, "logical")
+        main_specs = [(raw_name.get(nm, nm), kind) for nm, kind in sorted(main_kinds.items())]
 
     func_open_lines = _collect_func_open_lines(src)
     insert_after: dict[int, list[str]] = {}
@@ -26318,6 +26321,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--annotate-r")
         if args.annotate_r:
             cmd.append(args.annotate_r)
+    if getattr(args, "annotate_r_args", None) is not None:
+        cmd.append("--annotate-r-args")
+        if args.annotate_r_args:
+            cmd.append(args.annotate_r_args)
     if args.if_const_aggressive:
         cmd.append("--if-const-aggressive")
     if args.no_format_print:
@@ -26633,6 +26640,13 @@ def main() -> int:
         metavar="OUT.r",
         help="write an R copy annotated with inferred declare(type(...)) statements; default: <input>_annotated.r",
     )
+    ap.add_argument(
+        "--annotate-r-args",
+        nargs="?",
+        const="",
+        metavar="OUT.r",
+        help="write an R copy annotated only with inferred declare(type(...)) statements for function arguments",
+    )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
     ap.add_argument(
@@ -26865,6 +26879,9 @@ def main() -> int:
             if args.annotate_r:
                 print("When input uses globbing with multiple matches, explicit --annotate-r OUT.r is not supported.")
                 return 1
+            if getattr(args, "annotate_r_args", None):
+                print("When input uses globbing with multiple matches, explicit --annotate-r-args OUT.r is not supported.")
+                return 1
             rc = 0
             summary_rows: list[dict[str, object]] = []
             total = len(matches)
@@ -26931,6 +26948,7 @@ def main() -> int:
     run_cwd = Path.cwd().resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     annotate_r_path: Path | None = None
+    annotate_r_args_only = False
     if args.annotate_r is not None:
         if args.annotate_r:
             ann_cand = Path(args.annotate_r)
@@ -26940,6 +26958,16 @@ def main() -> int:
                 annotate_r_path = ann_cand.resolve()
         else:
             annotate_r_path = (artifact_dir / f"{in_path.stem}_annotated.r").resolve()
+    elif getattr(args, "annotate_r_args", None) is not None:
+        annotate_r_args_only = True
+        if args.annotate_r_args:
+            ann_cand = Path(args.annotate_r_args)
+            if args.out_dir and not ann_cand.is_absolute():
+                annotate_r_path = (Path(args.out_dir) / ann_cand).resolve()
+            else:
+                annotate_r_path = ann_cand.resolve()
+        else:
+            annotate_r_path = (artifact_dir / f"{in_path.stem}_annotated_args.r").resolve()
     py_out_path: Path | None = None
     if args.via_python:
         if args.out_python:
@@ -27058,7 +27086,7 @@ def main() -> int:
             _warn_approximate_r_function_calls(src)
         if annotate_r_path is not None:
             try:
-                annotated_r = annotate_r_source_with_declares(src, in_path.stem)
+                annotated_r = annotate_r_source_with_declares(src, in_path.stem, args_only=annotate_r_args_only)
             except NotImplementedError as e:
                 print(f"Annotate R: FAIL ({e})")
                 return 1
@@ -27081,7 +27109,7 @@ def main() -> int:
             return 1
     elif annotate_r_path is not None:
         try:
-            annotated_r = annotate_r_source_with_declares(src, in_path.stem)
+            annotated_r = annotate_r_source_with_declares(src, in_path.stem, args_only=annotate_r_args_only)
         except NotImplementedError as e:
             print(f"Annotate R: FAIL ({e})")
             return 1
