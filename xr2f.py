@@ -3275,6 +3275,13 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif cinfo is not None and cinfo[0].lower() == "sample" and cinfo[1] and _split_top_level_colon(cinfo[1][0].strip()) is not None:
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif rhs.lower().startswith("sample(") and st.name.lower() in _CATEGORICAL_LABELS:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -3558,7 +3565,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif rhs.startswith("c(") or rhs.startswith("runif(") or rhs.startswith("rnorm(") or rhs.startswith("ifelse("):
+                elif rhs.startswith("c(") or re.match(r"^(?:runif|rnorm|ifelse)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -3653,6 +3660,17 @@ def classify_vars(
                     known_arrays.discard(st.name)
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
+                elif (
+                    st.name in real_arrays
+                    and re.search(rf"\b{re.escape(st.name)}\b", rhs)
+                    and re.search(r"\b(?:sum|mean|sd|rowSums|colSums)\s*\(", rhs, re.IGNORECASE)
+                ):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif (
                     re.search(r"\bsummary\s*\(.+\)\s*\$\s*r\.squared\b", rhs, re.IGNORECASE)
                     or re.search(r"\blm_r_squared_general\s*\(", rhs_f, re.IGNORECASE)
@@ -10631,6 +10649,7 @@ def emit_stmts(
     acf_vars_ctx: set[str] = set()
     nlm_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
+    benchmark_vars: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -11895,6 +11914,10 @@ def emit_stmts(
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
+            if re.match(r"^\s*(?:[A-Za-z]\w*::)?mark\s*\(", st.expr.strip(), re.IGNORECASE):
+                benchmark_vars.add(st.name)
+                _wcomment(f"bench::mark assignment `{st.name}` omitted")
+                continue
             c_scale_track = parse_call_text(st.expr.strip())
             if c_scale_track is not None and c_scale_track[0].lower() == "scale":
                 x_scale_src = c_scale_track[1][0].strip() if c_scale_track[1] else c_scale_track[2].get("x", "").strip()
@@ -12944,6 +12967,13 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if one in benchmark_vars:
+                        _wcomment(f"print({one}) omitted: bench::mark output is not translated")
+                        continue
+                    one_probe_f = r_expr_to_fortran(one)
+                    if re.match(r"^\s*mark\s*\(", one_probe_f, re.IGNORECASE):
+                        _wcomment(f"print({one}) omitted: bench::mark output is not translated")
+                        continue
                     if one in list_locals:
                         _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
                         continue
@@ -15586,6 +15616,34 @@ def emit_function(
     elif re.search(r"\b[A-Za-z]\w*_mat\b", ret_expr_src):
         # Heuristic: expressions over *_mat temporaries are typically matrix-valued.
         ret_rank = 2
+    if ret_rank == 0:
+        ret_rank_hints: dict[str, int] = {
+            a.lower(): infer_arg_rank(fn, a)
+            for a in fn.args
+            if infer_arg_rank(fn, a) > 0
+        }
+        for nm_ret_rank in infer_assigned_names(body_stmts):
+            rk_ret_nm = _infer_local_array_rank(body_stmts, nm_ret_rank)
+            if rk_ret_nm > 0:
+                ret_rank_hints[nm_ret_rank.lower()] = rk_ret_nm
+        m_ret_subset = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]$", ret_expr_src)
+        if m_ret_subset is not None:
+            base_ret = m_ret_subset.group(1).lower()
+            idx_ret = m_ret_subset.group(2).lower()
+            if ret_rank_hints.get(base_ret, 0) >= 1 and ret_rank_hints.get(idx_ret, 0) >= 1:
+                ret_rank = 1
+        elif re.fullmatch(r"[A-Za-z]\w*", ret_expr_src):
+            for st_ret_alias in reversed(body_stmts):
+                if not isinstance(st_ret_alias, Assign) or st_ret_alias.name != ret_expr_src:
+                    continue
+                rhs_ret_alias = st_ret_alias.expr.strip()
+                m_ret_subset = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]$", rhs_ret_alias)
+                if m_ret_subset is not None:
+                    base_ret = m_ret_subset.group(1).lower()
+                    idx_ret = m_ret_subset.group(2).lower()
+                    if ret_rank_hints.get(base_ret, 0) >= 1 and ret_rank_hints.get(idx_ret, 0) >= 1:
+                        ret_rank = 1
+                break
     ret_ident_m = re.match(r"^[A-Za-z]\w*$", last_expr_for_ret)
     if list_spec is None and ret_ident_m is not None and has_explicit_return:
         ret_ident = ret_ident_m.group(0)
@@ -16705,6 +16763,9 @@ def emit_function(
         ints.difference_update(int_arrays)
         ints.difference_update(real_arrays)
         real_scalars.difference_update(int_arrays)
+        for ret_decl_set in (ints, real_scalars, int_arrays, real_arrays, logical_arrays, logical_scalars):
+            ret_decl_set.discard(rname)
+        params.pop(rname, None)
         if ints - int64_locals:
             o.w("integer :: " + ", ".join(sorted(ints - int64_locals)))
         if int64_locals:
