@@ -4423,7 +4423,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         re.IGNORECASE,
     )
     pat_mat_call_rhs = re.compile(
-        rf"^\s*{nm}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|forwardsolve|backsolve|t|diag|toeplitz|qr\.(?:Q|R)|qr_[QR])\s*\(",
+        rf"^\s*{nm}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|t|diag|toeplitz|qr\.(?:Q|R)|qr_[QR])\s*\(",
         re.IGNORECASE,
     )
     pat_spread_rhs = re.compile(
@@ -4450,7 +4450,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         mat_call_rhs = re.compile(
-            rf"^\s*{v}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|forwardsolve|backsolve|t|diag|toeplitz)\s*\(",
+            rf"^\s*{v}\s*<-\s*(?:try\s*\(\s*)?(?:[A-Za-z]\w*_mat|r_matmul|sweep|crossprod|tcrossprod|chol|t|diag|toeplitz)\s*\(",
             re.IGNORECASE,
         )
         spread_rhs = re.compile(rf"^\s*{v}\s*<-\s*.*\b(?:spread|r_matmul)\s*\(", re.IGNORECASE)
@@ -4503,6 +4503,16 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             return 1
         if re.match(rf"^\s*{nm}\s*<-\s*autocov_matrices\s*\(", t, re.IGNORECASE):
             return 3
+        m_tri_rhs_rank = re.match(rf"^\s*{nm}\s*<-\s*(forwardsolve|backsolve)\s*\((.+)\)\s*$", t, re.IGNORECASE)
+        if m_tri_rhs_rank is not None:
+            c_tri_rank = parse_call_text(m_tri_rhs_rank.group(0).split("<-", 1)[1].strip())
+            if c_tri_rank is not None:
+                b_src_rank = c_tri_rank[1][1].strip() if len(c_tri_rank[1]) >= 2 else c_tri_rank[2].get("b", c_tri_rank[2].get("x", "")).strip()
+                if b_src_rank:
+                    if re.match(r"^(?:t|transpose)\s*\(", b_src_rank, re.IGNORECASE):
+                        return 2
+                    return 2 if _infer_assignment_rank_hint(b_src_rank, {}) >= 2 else 1
+            return 1
         m_array_rhs_rank = re.match(rf"^\s*{nm}\s*<-\s*(array\s*\(.+\))\s*$", t, re.IGNORECASE)
         if m_array_rhs_rank is not None:
             dim_parts_rank = _array_dim_parts(m_array_rhs_rank.group(1))
@@ -4557,6 +4567,20 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         if m_rank1_slice_rhs is not None:
+            return 1
+        m_rank1_row_slice_rhs = re.match(
+            rf"^\s*{nm}\s*<-\s*[A-Za-z]\w*(?:\$[A-Za-z]\w*)?\s*(?:\([^,]+,\s*:\s*\)|\[[^,\]]+,\s*\])\s*$",
+            t,
+            re.IGNORECASE,
+        )
+        if m_rank1_row_slice_rhs is not None:
+            return 1
+        m_rank1_col_slice_rhs = re.match(
+            rf"^\s*{nm}\s*<-\s*[A-Za-z]\w*(?:\$[A-Za-z]\w*)?\s*\[\s*,\s*[^,\]]+\]\s*$",
+            t,
+            re.IGNORECASE,
+        )
+        if m_rank1_col_slice_rhs is not None:
             return 1
         if (
             _has_rank2_index_use(t, name)
@@ -5211,7 +5235,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "array":
                 dim_parts = _array_dim_parts(expr)
                 return len(dim_parts) if dim_parts is not None and dim_parts else 3
-            if fn_name == "t":
+            if fn_name in {"t", "transpose"}:
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
             if fn_name == "apply":
@@ -5253,6 +5277,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "sweep":
                 x_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 return _infer_assignment_rank_hint(x_src, inferred_ranks) if x_src else 2
+            if fn_name in {"forwardsolve", "backsolve"}:
+                rhs_src = c_call[1][1].strip() if len(c_call[1]) >= 2 else c_call[2].get("b", c_call[2].get("x", "")).strip()
+                rhs_rank = _infer_assignment_rank_hint(rhs_src, inferred_ranks) if rhs_src else 1
+                return 2 if rhs_rank >= 2 else 1
             if fn_name in {
                 "matrix",
                 "cbind",
@@ -5265,8 +5293,6 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "r_matmul",
                 "toeplitz",
                 "chol2inv",
-                "forwardsolve",
-                "backsolve",
                 "as.matrix",
                 "read.table",
                 "read.csv",
@@ -24221,36 +24247,60 @@ def demote_scalar_component_assignments(lines: list[str]) -> list[str]:
 
 
 def promote_rank3_dummy_arguments(lines: list[str]) -> list[str]:
-    names: set[str] = set()
     use_pat = re.compile(r"\b([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*,")
-    for ln in lines:
-        if "::" in ln or ln.lstrip().startswith("!"):
-            continue
-        for m in use_pat.finditer(ln):
-            names.add(m.group(1))
-    if not names:
-        return lines
-    out: list[str] = []
+    proc_start = re.compile(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\b", re.IGNORECASE)
+    proc_end = re.compile(r"^\s*end\s*(?:function|subroutine)\b", re.IGNORECASE)
     decl_pat = re.compile(r"^(\s*)real\(kind=dp\),\s*intent\(in\)\s*::\s*(.+)$", re.IGNORECASE)
-    for ln in lines:
-        m_decl = decl_pat.match(ln)
-        if m_decl is None:
-            out.append(ln)
-            continue
-        parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
-        changed = False
-        new_parts: list[str] = []
-        for part in parts:
-            m_part = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", part)
-            if m_part is not None and m_part.group(1) in names:
-                new_parts.append(f"{m_part.group(1)}(:,:,:)")
-                changed = True
+
+    def rewrite_block(block: list[str]) -> list[str]:
+        names: set[str] = set()
+        for ln in block:
+            if "::" in ln or ln.lstrip().startswith("!"):
+                continue
+            for m in use_pat.finditer(ln):
+                names.add(m.group(1))
+        if not names:
+            return block
+        out_block: list[str] = []
+        for ln in block:
+            m_decl = decl_pat.match(ln)
+            if m_decl is None:
+                out_block.append(ln)
+                continue
+            parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+            changed = False
+            new_parts: list[str] = []
+            for part in parts:
+                m_part = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", part)
+                if m_part is not None and m_part.group(1) in names:
+                    new_parts.append(f"{m_part.group(1)}(:,:,:)")
+                    changed = True
+                else:
+                    new_parts.append(part)
+            if changed:
+                out_block.append(f"{m_decl.group(1)}real(kind=dp), intent(in) :: {', '.join(new_parts)}")
             else:
-                new_parts.append(part)
-        if changed:
-            out.append(f"{m_decl.group(1)}real(kind=dp), intent(in) :: {', '.join(new_parts)}")
-        else:
-            out.append(ln)
+                out_block.append(ln)
+        return out_block
+
+    out: list[str] = []
+    block: list[str] = []
+    in_proc = False
+    for ln in lines:
+        if not in_proc and proc_start.match(ln):
+            in_proc = True
+            block = [ln]
+            continue
+        if in_proc:
+            block.append(ln)
+            if proc_end.match(ln):
+                out.extend(rewrite_block(block))
+                block = []
+                in_proc = False
+            continue
+        out.append(ln)
+    if in_proc:
+        out.extend(rewrite_block(block))
     return out
 
 
@@ -24503,9 +24553,6 @@ def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
                 rank2.add(mm2.group(1))
         if not ln.rstrip().endswith("&"):
             cont_kind = None
-    if not rank1:
-        if not rank2:
-            return lines
     out: list[str] = []
     call_pat = re.compile(r"(\bcall\s+print_mat\s*\([^)]*\bx\s*=\s*)([A-Za-z]\w*)(\s*[),])", re.IGNORECASE)
     i = 0
@@ -24549,7 +24596,32 @@ def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
                 or re.search(r"\bsum\s*\(.+\bdim\s*=\s*1\b", block_txt, re.IGNORECASE) is not None
                 or re.search(r"\bapply_col_sd\s*\(", block_txt, re.IGNORECASE) is not None
             )
+            matrix_expr = (
+                (
+                    re.match(r"^\s*call\s+print_real_vector\s*\(\s*reshape\s*\(", block_txt, re.IGNORECASE) is not None
+                    and re.search(r",\s*\[[^\]]*,[^\]]*\]\s*\)", block_txt, re.IGNORECASE) is not None
+                    and re.search(r",\s*\[\s*size\s*\([^]]+\)\s*\]\s*\)", block_txt, re.IGNORECASE) is None
+                )
+                or re.match(
+                    r"^\s*call\s+print_real_vector\s*\(\s*reshape\s*\(\s*[A-Za-z]\w*\s*,\s*"
+                    r"\[\s*size\s*\(\s*[A-Za-z]\w*\s*\)\s*,\s*1\s*\]\s*\)",
+                    block_txt,
+                    re.IGNORECASE,
+                ) is not None
+                or re.match(
+                    r"^\s*call\s+print_real_vector\s*\(\s*"
+                    r"(?:real\s*\(\s*)?(?:anint\s*\(\s*)?(?:real\s*\(\s*)?"
+                    r"\b(?:matrix|r_matmul|matmul|transpose)\s*\(",
+                    block_txt,
+                    re.IGNORECASE,
+                ) is not None
+            )
             if direct_rank2 is not None and "print_real_vector" in block[0]:
+                block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_matrix", block[0], flags=re.IGNORECASE)
+                out.extend(block)
+                i += len(block)
+                continue
+            if matrix_expr and "print_real_vector" in block[0]:
                 block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_matrix", block[0], flags=re.IGNORECASE)
                 out.extend(block)
                 i += len(block)
@@ -24832,6 +24904,220 @@ def rewrite_optim_maxit_defaults(lines: list[str]) -> list[str]:
     if in_proc:
         flush()
     return out
+
+
+def rewrite_matrix_reshape_prints_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if not re.match(r"^\s*call\s+print_real_vector\s*\(\s*reshape\s*\(", ln, re.IGNORECASE):
+            out.append(ln)
+            i += 1
+            continue
+        block = [ln]
+        j = i + 1
+        while j < len(lines) and (block[-1].rstrip().endswith("&") or "])" not in " ".join(block)):
+            block.append(lines[j])
+            j += 1
+        flat = " ".join(x.replace("&", " ") for x in block)
+        if (
+            re.search(r",\s*\[[^\]]*,[^\]]*\]\s*\)\s*\)?\s*$", flat, re.IGNORECASE)
+            and re.search(r",\s*\[\s*size\s*\([^]]+\)\s*\]\s*\)\s*\)?\s*$", flat, re.IGNORECASE) is None
+        ):
+            block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_matrix", block[0], flags=re.IGNORECASE)
+        out.extend(block)
+        i += len(block)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_dummy_rank_prints_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    rank: dict[str, int] = {}
+    in_proc = False
+    proc_start = re.compile(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:subroutine|function)\b", re.IGNORECASE)
+    proc_end = re.compile(r"^\s*end\s*(?:subroutine|function)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\))\s*,[^:]*intent\s*\([^)]*\)[^:]*::\s*(.*)$", re.IGNORECASE)
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if proc_start.match(ln):
+            in_proc = True
+            rank = {}
+            out.append(ln)
+            i += 1
+            continue
+        if in_proc:
+            m = decl_re.match(ln)
+            if m is not None:
+                for item in split_top_level_commas(m.group(1)):
+                    mm = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", item)
+                    if mm is not None:
+                        dims = mm.group(2)
+                        rank[mm.group(1)] = 1 + dims.count(",")
+                out.append(ln)
+                i += 1
+                continue
+            if re.match(r"^\s*call\s+(?:print_real_vector|print_matrix)\s*\(", ln, re.IGNORECASE):
+                block = [ln]
+                j = i + 1
+                depth_txt = ln
+                while j < len(lines) and (block[-1].rstrip().endswith("&") or depth_txt.count("(") > depth_txt.count(")")):
+                    block.append(lines[j])
+                    depth_txt += " " + lines[j]
+                    if depth_txt.count("(") <= depth_txt.count(")") and not lines[j].rstrip().endswith("&"):
+                        break
+                    j += 1
+                flat = " ".join(x.replace("&", " ") for x in block)
+                for nm, rk in sorted(rank.items(), key=lambda x: len(x[0]), reverse=True):
+                    if not re.search(rf"\b{re.escape(nm)}\b", flat):
+                        continue
+                    if rk == 2 and re.match(r"^\s*call\s+print_real_vector\b", flat, re.IGNORECASE):
+                        block[0] = re.sub(r"\bcall\s+print_real_vector\b", "call print_matrix", block[0], flags=re.IGNORECASE)
+                    elif rk == 1 and re.match(r"^\s*call\s+print_matrix\b", flat, re.IGNORECASE):
+                        block[0] = re.sub(r"\bcall\s+print_matrix\b", "call print_real_vector", block[0], flags=re.IGNORECASE)
+                    break
+                out.extend(block)
+                i += len(block)
+                continue
+            if proc_end.match(ln):
+                in_proc = False
+                rank = {}
+        out.append(ln)
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_vector_slice_assignment_ranks_text(f90: str) -> str:
+    """Demote locals assigned from a single row/column slice of a matrix."""
+    vec_names: set[str] = set()
+    assign_re = re.compile(
+        r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*(?:%[A-Za-z]\w*)?\s*\((.+)\)\s*$",
+        re.IGNORECASE,
+    )
+    for ln in f90.splitlines():
+        m = assign_re.match(ln)
+        if m is None:
+            continue
+        dims = _split_index_dims(m.group(2))
+        if len(dims) != 2:
+            continue
+        d1, d2 = dims[0].strip(), dims[1].strip()
+        def is_scalar_slice_dim(d: str) -> bool:
+            dl = d.lower().strip()
+            if dl == "":
+                return False
+            if _split_top_level_colon(dl) is not None:
+                return False
+            if dl.startswith("[") or dl.startswith("match(") or dl.startswith("which("):
+                return False
+            if re.search(r"\b(?:r_seq|pack|spread|merge)\s*\(", dl):
+                return False
+            return True
+        if (is_scalar_slice_dim(d1) and d2 == ":") or (d1 == ":" and is_scalar_slice_dim(d2)):
+            vec_names.add(m.group(1))
+    if not vec_names:
+        return f90
+    for nm in sorted(vec_names, key=len, reverse=True):
+        f90 = re.sub(rf"\b{re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
+        f90 = re.sub(
+            rf"\bcall\s+print_matrix\s*\(\s*{re.escape(nm)}\s*\)",
+            f"call print_real_vector({nm})",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    return f90
+
+
+def remove_duplicate_function_result_decls_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    in_func = False
+    result_name = ""
+    result_declared = False
+    func_re = re.compile(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\b.*\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", re.IGNORECASE)
+    end_re = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    decl_re = re.compile(r"^(\s*(?:real|integer|logical|complex|character|type\s*\([^)]*\))[^:]*::\s*)(.*)$", re.IGNORECASE)
+    for ln in lines:
+        m_func = func_re.match(ln)
+        if m_func is not None:
+            in_func = True
+            result_name = m_func.group(1)
+            result_declared = False
+            out.append(ln)
+            continue
+        if in_func and end_re.match(ln):
+            in_func = False
+            result_name = ""
+            result_declared = False
+            out.append(ln)
+            continue
+        if in_func and result_name:
+            m_decl = decl_re.match(ln)
+            if m_decl is not None:
+                prefix, items_src = m_decl.group(1), m_decl.group(2)
+                items = split_top_level_commas(items_src)
+                kept: list[str] = []
+                has_result = False
+                for item in items:
+                    m_item = re.match(r"\s*([A-Za-z]\w*)\b", item)
+                    if m_item is not None and m_item.group(1).lower() == result_name.lower():
+                        has_result = True
+                        if not result_declared:
+                            kept.append(item)
+                        continue
+                    kept.append(item)
+                if has_result:
+                    if result_declared:
+                        if kept:
+                            out.append(prefix + ", ".join(x.strip() for x in kept))
+                    else:
+                        result_declared = True
+                        out.append(prefix + ", ".join(x.strip() for x in kept))
+                    continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_vector_workvar_ranks_text(f90: str) -> str:
+    vec_names: set[str] = set()
+    for ln in f90.splitlines():
+        m_rep = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_rep_(?:real|int)\s*\(", ln, re.IGNORECASE)
+        if m_rep is not None:
+            vec_names.add(m_rep.group(1))
+        m_slice = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*\([^,()]+:[^,()]+\)\s*$", ln, re.IGNORECASE)
+        if m_slice is not None:
+            vec_names.add(m_slice.group(1))
+    if not vec_names:
+        return f90
+    for nm in sorted(vec_names, key=len, reverse=True):
+        f90 = re.sub(rf"\b{re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
+    lines = f90.splitlines()
+    out: list[str] = []
+    scalar_real_decl = re.compile(r"^(\s*)real\(kind=dp\)\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m = scalar_real_decl.match(ln)
+        if m is None:
+            out.append(ln)
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m.group(2))]
+        promote: list[str] = []
+        keep: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*=.*$", "", part).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", base) and base in vec_names:
+                promote.append(f"{base}(:)")
+            else:
+                keep.append(part)
+        if promote:
+            if keep:
+                out.append(f"{m.group(1)}real(kind=dp) :: {', '.join(keep)}")
+            out.append(f"{m.group(1)}real(kind=dp), allocatable :: {', '.join(promote)}")
+        else:
+            out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
@@ -26402,6 +26688,23 @@ def main() -> int:
     f90_lines = rewrite_optim_maxit_defaults(f90_lines)
     f90_lines = _strip_raw_fortran_tags(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = rewrite_matrix_reshape_prints_text(f90)
+    f90 = rewrite_dummy_rank_prints_text(f90)
+    f90 = rewrite_vector_slice_assignment_ranks_text(f90)
+    f90 = rewrite_vector_workvar_ranks_text(f90)
+    f90 = remove_duplicate_function_result_decls_text(f90)
+    f90 = re.sub(
+        r"spread\s*\(\s*all\s*\(\s*ieee_is_finite\s*\(([^()]+)\)\s*\)\s*,\s*dim\s*=\s*2",
+        r"spread(all(ieee_is_finite(\1), dim=2), dim=2",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"count\s*\(\s*all\s*\(\s*ieee_is_finite\s*\(([^()]+)\)\s*\)\s*\)",
+        r"count(all(ieee_is_finite(\1), dim=2))",
+        f90,
+        flags=re.IGNORECASE,
+    )
     f90 = re.sub(r"\bQt_\d+\b", "Qt", f90)
     f90 = re.sub(
         r"\bQt\(:\s*,\s*:\),\s*Qt\(:\s*,\s*:\)",
@@ -26617,6 +26920,8 @@ def main() -> int:
         extra_use_names.append("print_real_vector")
     if "call print_integer_vector(" in f90:
         extra_use_names.append("print_integer_vector")
+    if "call print_matrix(" in f90:
+        extra_use_names.append("print_matrix => print_matrix_rstyle")
     if extra_use_names:
         extra_use = "use r_mod, only: " + ", ".join(sorted(set(extra_use_names)))
         f90 = re.sub(r"(?m)^implicit none$", extra_use + "\nimplicit none", f90)
