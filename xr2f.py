@@ -37,9 +37,13 @@ _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
 _USER_FUNC_ARG_RANK: dict[str, dict[str, int]] = {}
 _USER_FUNC_RETURN_RANK: dict[str, int] = {}
+_USER_FUNC_RETURN_KIND: dict[str, str] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _VOID_FUNCTION_LIKE: set[str] = set()
 _SUBROUTINE_FUNCTIONS: set[str] = set()
+_INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
+_R_EXPRESSION_OBJECTS: dict[str, str] = {}
+_R_DERIVATIVE_OBJECTS: dict[str, str] = {}
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
 _KNOWN_INT_VECTOR_NAMES: set[str] = set()
@@ -3085,9 +3089,16 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
                 else:
                     mark_expr(d)
 
+    def mark_integer_modulus_operands(txt: str) -> None:
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:%%|%/%)\s*(-?\d+[lL]?)\b", txt):
+            out.add(m.group(1))
+        for m in re.finditer(r"\b(-?\d+[lL]?)\s*(?:%%|%/%)\s*([A-Za-z]\w*)\b", txt):
+            out.add(m.group(2))
+
     def scan_text(txt: str) -> None:
         mark_call_args(txt)
         mark_indices(txt)
+        mark_integer_modulus_operands(txt)
 
     def walk(ss: list[object]) -> None:
         for st in ss:
@@ -3151,6 +3162,273 @@ def _function_declared_double_args(fn: FuncDef) -> set[str]:
             continue
         for m in re.finditer(r"\b([A-Za-z]\w*)\s*=\s*double\s*\(", txt, re.IGNORECASE):
             out.add(m.group(1))
+    return out
+
+
+def _r_expression_inner(expr: str) -> str | None:
+    c = parse_call_text(expr.strip())
+    if c is None or c[0].lower() != "expression" or not c[1]:
+        return None
+    if len(c[1]) != 1 or c[2]:
+        raise NotImplementedError("unsupported expression(): only a single unnamed expression is currently supported")
+    return c[1][0].strip()
+
+
+def _is_symbolic_object_expr(expr: str) -> bool:
+    c = parse_call_text(expr.strip())
+    return c is not None and c[0].lower() in {"expression", "d"}
+
+
+def _drop_symbolic_object_assignments(stmts: list[object]) -> list[object]:
+    out: list[object] = []
+    for st in stmts:
+        if isinstance(st, Assign) and _is_symbolic_object_expr(st.expr):
+            continue
+        if isinstance(st, FuncDef):
+            out.append(FuncDef(st.name, list(st.args), dict(st.defaults), _drop_symbolic_object_assignments(st.body), st.leading_comments))
+        elif isinstance(st, IfStmt):
+            out.append(IfStmt(st.cond, _drop_symbolic_object_assignments(st.then_body), _drop_symbolic_object_assignments(st.else_body)))
+        elif isinstance(st, ForStmt):
+            out.append(ForStmt(st.var, st.iter_expr, _drop_symbolic_object_assignments(st.body)))
+        elif isinstance(st, WhileStmt):
+            out.append(WhileStmt(st.cond, _drop_symbolic_object_assignments(st.body)))
+        elif isinstance(st, RepeatStmt):
+            out.append(RepeatStmt(_drop_symbolic_object_assignments(st.body)))
+        else:
+            out.append(st)
+    return out
+
+
+def _symbolic_paren(expr: str) -> str:
+    t = expr.strip()
+    if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)?(?:\([^()]*\))?", t) or _is_int_literal(t) or _is_real_literal(t):
+        return t
+    return f"({t})"
+
+
+def _symbolic_derivative_fortran(expr: str, var: str) -> str:
+    t = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    if not t:
+        raise NotImplementedError("unsupported D() expression: empty expression")
+    if t == var:
+        return "1.0_dp"
+    if _is_int_literal(t) or _is_real_literal(t):
+        return "0.0_dp"
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        return "0.0_dp"
+    if t.startswith("-"):
+        return f"(-{_symbolic_paren(_symbolic_derivative_fortran(t[1:].strip(), var))})"
+
+    for op in ["+", "-"]:
+        mm = _split_top_level_token(t, op, from_right=True)
+        if mm is not None and mm[0].strip():
+            lhs, rhs = mm[0].strip(), mm[1].strip()
+            dl = _symbolic_derivative_fortran(lhs, var)
+            dr = _symbolic_derivative_fortran(rhs, var)
+            return f"{_symbolic_paren(dl)} {op} {_symbolic_paren(dr)}"
+
+    mm = _split_top_level_token(t, "*", from_right=True)
+    if mm is not None:
+        lhs, rhs = mm[0].strip(), mm[1].strip()
+        lf, rf = r_expr_to_fortran(lhs), r_expr_to_fortran(rhs)
+        dl, dr = _symbolic_derivative_fortran(lhs, var), _symbolic_derivative_fortran(rhs, var)
+        return f"{_symbolic_paren(dl)} * {_symbolic_paren(rf)} + {_symbolic_paren(lf)} * {_symbolic_paren(dr)}"
+
+    mm = _split_top_level_token(t, "/", from_right=True)
+    if mm is not None:
+        lhs, rhs = mm[0].strip(), mm[1].strip()
+        lf, rf = r_expr_to_fortran(lhs), r_expr_to_fortran(rhs)
+        dl, dr = _symbolic_derivative_fortran(lhs, var), _symbolic_derivative_fortran(rhs, var)
+        return f"(({_symbolic_paren(dl)} * {_symbolic_paren(rf)} - {_symbolic_paren(lf)} * {_symbolic_paren(dr)}) / ({_symbolic_paren(rf)}**2))"
+
+    mm = _split_top_level_token(t, "^", from_right=True)
+    if mm is not None:
+        lhs, rhs = mm[0].strip(), mm[1].strip()
+        if not (_is_int_literal(rhs) or _is_real_literal(rhs)):
+            raise NotImplementedError("unsupported D() expression: only constant exponents are supported")
+        n_f = r_expr_to_fortran(rhs)
+        n_minus_1 = str(float(rhs.rstrip("Ll")) - 1.0) + "_dp" if _is_int_literal(rhs) else f"(({n_f}) - 1.0_dp)"
+        lf = r_expr_to_fortran(lhs)
+        dl = _symbolic_derivative_fortran(lhs, var)
+        return f"{_symbolic_paren(n_f)} * {_symbolic_paren(lf)}**{_symbolic_paren(n_minus_1)} * {_symbolic_paren(dl)}"
+
+    c = parse_call_text(t)
+    if c is not None:
+        fn = c[0].lower()
+        if len(c[1]) != 1 or c[2]:
+            raise NotImplementedError(f"unsupported D() expression: function `{c[0]}` arguments are not supported")
+        inner = c[1][0].strip()
+        inner_f = r_expr_to_fortran(inner)
+        din = _symbolic_derivative_fortran(inner, var)
+        if fn == "sin":
+            return f"cos({_symbolic_paren(inner_f)}) * {_symbolic_paren(din)}"
+        if fn == "cos":
+            return f"(-sin({_symbolic_paren(inner_f)}) * {_symbolic_paren(din)})"
+        if fn == "tan":
+            return f"(({_symbolic_paren(din)}) / (cos({_symbolic_paren(inner_f)})**2))"
+        if fn == "exp":
+            return f"exp({_symbolic_paren(inner_f)}) * {_symbolic_paren(din)}"
+        if fn == "log":
+            return f"({_symbolic_paren(din)} / {_symbolic_paren(inner_f)})"
+        if fn == "sqrt":
+            return f"({_symbolic_paren(din)} / (2.0_dp * sqrt({_symbolic_paren(inner_f)})))"
+        if fn == "gamma":
+            return f"gamma({_symbolic_paren(inner_f)}) * r_digamma(real({_symbolic_paren(inner_f)}, kind=dp)) * {_symbolic_paren(din)}"
+        if fn in {"lgamma", "log_gamma"}:
+            return f"r_digamma(real({_symbolic_paren(inner_f)}, kind=dp)) * {_symbolic_paren(din)}"
+        if fn == "erf":
+            return f"(2.0_dp / sqrt(acos(-1.0_dp))) * exp(-({_symbolic_paren(inner_f)})**2) * {_symbolic_paren(din)}"
+        if fn == "erfc":
+            return f"(-(2.0_dp / sqrt(acos(-1.0_dp))) * exp(-({_symbolic_paren(inner_f)})**2) * {_symbolic_paren(din)})"
+        if fn == "sinpi":
+            return f"acos(-1.0_dp) * cos(acos(-1.0_dp) * real({_symbolic_paren(inner_f)}, kind=dp)) * {_symbolic_paren(din)}"
+        if fn == "cospi":
+            return f"(-acos(-1.0_dp) * sin(acos(-1.0_dp) * real({_symbolic_paren(inner_f)}, kind=dp)) * {_symbolic_paren(din)})"
+        if fn == "tanpi":
+            return f"(acos(-1.0_dp) * {_symbolic_paren(din)} / (cos(acos(-1.0_dp) * real({_symbolic_paren(inner_f)}, kind=dp))**2))"
+        raise NotImplementedError(f"unsupported D() expression: function `{c[0]}` is not supported")
+
+    raise NotImplementedError(
+        "unsupported symbolic derivative expression in D(): only arithmetic expressions in one variable "
+        "with +, -, *, /, ^, sin, cos, tan, exp, log, sqrt, gamma, lgamma/log_gamma, erf, erfc, "
+        "sinpi, cospi, and tanpi are currently supported"
+    )
+
+
+def _collect_symbolic_derivatives(stmts: list[object]) -> tuple[dict[str, str], dict[str, str]]:
+    exprs: dict[str, str] = {}
+    derivs: dict[str, str] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                inner = _r_expression_inner(rhs)
+                if inner is not None:
+                    exprs[st.name] = inner
+                    continue
+                c = parse_call_text(rhs)
+                if c is not None and c[0].lower() == "d":
+                    target_src = c[1][0].strip() if c[1] else c[2].get("expr", "").strip()
+                    var_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("name", c[2].get("var", "")).strip()
+                    var_name = _dequote_string_literal(var_src) or var_src
+                    expr_src = _r_expression_inner(target_src) if target_src else None
+                    if expr_src is None and target_src in exprs:
+                        expr_src = exprs[target_src]
+                    if expr_src is None:
+                        raise NotImplementedError("unsupported D() expression: derivative target is not a known expression() object")
+                    derivs[st.name] = _symbolic_derivative_fortran(expr_src, var_name)
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    return exprs, derivs
+
+
+def remove_unused_iso_fortran_env_dp_imports(lines: list[str]) -> list[str]:
+    """Remove `dp => real64` imports from scopes that do not use `dp`."""
+    out = list(lines)
+    remove_lines: set[int] = set()
+
+    def code_only(ln: str) -> str:
+        return ln.split("!", 1)[0]
+
+    def scope_end(start: int) -> int:
+        unit_kind = ""
+        for j in range(start - 1, -1, -1):
+            txt = code_only(out[j]).strip()
+            if not txt:
+                continue
+            m = re.match(r"^(module|program|subroutine|function)\s+([A-Za-z]\w*)\b", txt, re.IGNORECASE)
+            if m is not None and not re.match(r"^module\s+procedure\b", txt, re.IGNORECASE):
+                unit_kind = m.group(1).lower()
+            break
+        if not unit_kind:
+            return len(out)
+        pat = re.compile(rf"^\s*end\s+{re.escape(unit_kind)}\b", re.IGNORECASE)
+        for j in range(start + 1, len(out)):
+            if pat.search(code_only(out[j])):
+                return j
+        return len(out)
+
+    for i, ln in enumerate(out):
+        m = re.match(r"^(\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\s*,\s*only\s*:\s*)(.*)$", code_only(ln), re.IGNORECASE)
+        if m is None:
+            continue
+        end = scope_end(i)
+        body = "\n".join(
+            code_only(out[j])
+            for j in range(i + 1, end)
+            if not re.match(r"^\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\b", code_only(out[j]), re.IGNORECASE)
+        )
+        if re.search(r"\bdp\b", body):
+            continue
+        imports = [p.strip() for p in m.group(2).split(",") if p.strip()]
+        imports = [p for p in imports if not re.match(r"^dp\s*(?:=>\s*real64)?$", p, re.IGNORECASE)]
+        if imports:
+            out[i] = m.group(1) + ", ".join(imports)
+        else:
+            remove_lines.add(i)
+    return [ln for idx, ln in enumerate(out) if idx not in remove_lines]
+
+
+def add_missing_iso_fortran_env_dp_imports(lines: list[str]) -> list[str]:
+    """Add `dp => real64` imports to scopes that use dp but lack the import."""
+    out = list(lines)
+
+    def code_only(ln: str) -> str:
+        return ln.split("!", 1)[0]
+
+    def find_scope_end(start: int, unit_kind: str) -> int:
+        pat = re.compile(rf"^\s*end\s+{re.escape(unit_kind)}\b", re.IGNORECASE)
+        for j in range(start + 1, len(out)):
+            if pat.search(code_only(out[j])):
+                return j
+        return len(out)
+
+    i = 0
+    while i < len(out):
+        txt = code_only(out[i]).strip()
+        m = re.match(r"^(module|program|subroutine|function)\s+([A-Za-z]\w*)\b", txt, re.IGNORECASE)
+        if m is None or re.match(r"^module\s+procedure\b", txt, re.IGNORECASE):
+            i += 1
+            continue
+        unit_kind = m.group(1).lower()
+        end = find_scope_end(i, unit_kind)
+        scope_txt = "\n".join(code_only(out[j]) for j in range(i + 1, end))
+        if not re.search(r"\bkind\s*=\s*dp\b|_dp\b", scope_txt, re.IGNORECASE):
+            i += 1
+            continue
+        has_dp_import = False
+        for j in range(i + 1, end):
+            ln = code_only(out[j])
+            if re.match(r"^\s*implicit\s+none\b", ln, re.IGNORECASE):
+                break
+            m_use = re.match(r"^(\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\s*,\s*only\s*:\s*)(.*)$", ln, re.IGNORECASE)
+            if m_use is not None and re.search(r"\bdp\b", m_use.group(2), re.IGNORECASE):
+                has_dp_import = True
+                break
+        if has_dp_import:
+            i += 1
+            continue
+        insert_at = i + 1
+        while insert_at < end and (
+            not code_only(out[insert_at]).strip()
+            or re.match(r"^\s*use\b", code_only(out[insert_at]), re.IGNORECASE)
+            or code_only(out[insert_at - 1]).rstrip().endswith("&")
+        ):
+            insert_at += 1
+        out.insert(insert_at, "use, intrinsic :: iso_fortran_env, only: dp => real64")
+        i = insert_at + 1
     return out
 
 
@@ -3243,6 +3521,15 @@ def classify_vars(
             elif isinstance(st, Assign):
                 rhs = st.expr.strip()
                 rhs_l = rhs.lower()
+                c_symbolic = parse_call_text(rhs)
+                if c_symbolic is not None and c_symbolic[0].lower() in {"expression", "d"}:
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    ints.discard(st.name)
+                    real_scalars.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                    continue
                 rhs_f = r_expr_to_fortran(rhs)
                 rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
                 cinfo = parse_call_text(rhs_call_src)
@@ -5068,7 +5355,7 @@ def _assigned_names_in_stmts(stmts: list[object]) -> set[str]:
 
 def rename_reserved_main_names(stmts: list[object]) -> list[object]:
     """Rename main-scope R names that collide with generated Fortran names."""
-    reserved = {"dp"}
+    reserved = {"dp", "count"}
     assigned = _assigned_names_in_stmts(stmts)
     mapping: dict[str, str] = {}
     used = {nm.lower() for nm in assigned} | reserved
@@ -6659,6 +6946,15 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
+    c_eval0 = parse_call_text(s)
+    if c_eval0 is not None and c_eval0[0].lower() == "eval":
+        target_eval = c_eval0[1][0].strip() if c_eval0[1] else c_eval0[2].get("expr", "").strip()
+        if target_eval in _R_DERIVATIVE_OBJECTS:
+            return _R_DERIVATIVE_OBJECTS[target_eval]
+        raise NotImplementedError("unsupported eval(): only known D(expression(...), var) derivative objects are currently supported")
+    c_expr0 = parse_call_text(s)
+    if c_expr0 is not None and c_expr0[0].lower() in {"expression", "d"}:
+        raise NotImplementedError("unsupported expression/D() object in executable expression; use eval() on a known D() result")
     if re.match(r"^proc\.time\s*\(\s*\)\s*\[\[\s*['\"]elapsed['\"]\s*\]\]\s*$", s, re.IGNORECASE):
         return "r_elapsed()"
     if re.match(r"^proc\.time\s*\(\s*\)\s*\[\s*3(?:L|\.0+)?\s*\]\s*$", s, re.IGNORECASE):
@@ -6879,6 +7175,24 @@ def r_expr_to_fortran(expr: str) -> str:
         fn_tri = "lower_tri" if c_tri0[0].lower() == "lower.tri" else "upper_tri"
         return f"{fn_tri}(real({r_expr_to_fortran(x_src)}, kind=dp), diag={r_expr_to_fortran(diag_src)})"
     c_nlm0 = parse_call_text(s)
+    c_integrate0 = parse_call_text(s)
+    if c_integrate0 is not None and c_integrate0[0].lower() == "integrate":
+        _nm_int, pos_int, kw_int = c_integrate0
+        fn_src = kw_int.get("f", pos_int[0] if len(pos_int) >= 1 else "").strip()
+        lower_src = kw_int.get("lower", pos_int[1] if len(pos_int) >= 2 else "0.0").strip()
+        upper_src = kw_int.get("upper", pos_int[2] if len(pos_int) >= 3 else "1.0").strip()
+        args_int = [
+            r_expr_to_fortran(fn_src),
+            f"lower=real({r_expr_to_fortran(lower_src)}, kind=dp)",
+            f"upper=real({r_expr_to_fortran(upper_src)}, kind=dp)",
+        ]
+        rel_tol_src = kw_int.get("rel.tol", kw_int.get("rel_tol"))
+        if rel_tol_src is not None:
+            args_int.append(f"rel_tol=real({r_expr_to_fortran(rel_tol_src)}, kind=dp)")
+        subdivisions_src = kw_int.get("subdivisions")
+        if subdivisions_src is not None:
+            args_int.append(f"subdivisions={_int_bound_expr(r_expr_to_fortran(subdivisions_src))}")
+        return f"integrate({', '.join(args_int)})"
     if c_nlm0 is not None and c_nlm0[0].lower() == "nlm":
         _nm_nlm, pos_nlm, kw_nlm = c_nlm0
         fn_src = pos_nlm[0].strip() if pos_nlm else kw_nlm.get("f", "").strip()
@@ -9992,7 +10306,7 @@ def r_expr_to_fortran(expr: str) -> str:
         inner_f = r_expr_to_fortran(x_src)
         dim_suffix = f", dim={_int_bound_expr(r_expr_to_fortran(dim_src))}" if dim_src is not None else ""
         if _is_logical_reduction_arg(x_src, inner_f):
-            return f"sum(merge(1, 0, {inner_f}){dim_suffix})"
+            return f"count({inner_f}{dim_suffix})"
         if na_rm:
             return f"sum({_non_na_pack_expr(inner_f)}{dim_suffix})"
         return f"sum({inner_f}{dim_suffix})"
@@ -11945,6 +12259,10 @@ def emit_stmts(
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
+            c_symbolic_assign = parse_call_text(st.expr.strip())
+            if c_symbolic_assign is not None and c_symbolic_assign[0].lower() in {"expression", "d"}:
+                _wcomment(f"symbolic expression assignment `{st.name}` resolved at transpile time")
+                continue
             if re.match(r"^\s*(?:[A-Za-z]\w*::)?mark\s*\(", st.expr.strip(), re.IGNORECASE):
                 benchmark_vars.add(st.name)
                 _wcomment(f"bench::mark assignment `{st.name}` omitted")
@@ -13290,6 +13608,10 @@ def emit_stmts(
                         _wstmt(f"call print_nlm_result({one_f_early})", st.comment)
                         need_r_mod.update({"print_nlm_result", "nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t"})
                         continue
+                    if re.match(r"^integrate\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_integrate_result({one_f_early})", st.comment)
+                        need_r_mod.update({"integrate", "integrate_result_t", "print_integrate_result"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -13345,6 +13667,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in nlm_vars_ctx:
                         _wstmt(f"call print_nlm_result({one})", st.comment)
                         need_r_mod.update({"print_nlm_result", "nlm_result_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "integrate_result_t":
+                        _wstmt(f"call print_integrate_result({one})", st.comment)
+                        need_r_mod.update({"print_integrate_result", "integrate_result_t"})
                         continue
                     if c_one is not None and c_one[0].lower() == "acf":
                         _wstmt(f"call print_acf({r_expr_to_fortran(one)})", st.comment)
@@ -13729,6 +14055,13 @@ def emit_stmts(
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
                         if re.match(r"^anyDuplicated\s*\(", one_f.strip(), re.IGNORECASE):
+                            _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
+                            continue
+                        scalar_kind_one = _expr_kind_simple(one)
+                        if scalar_kind_one == "int":
+                            _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
+                            continue
+                        if scalar_kind_one == "logical":
                             _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
                             continue
                         m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
@@ -15067,7 +15400,14 @@ def emit_stmts(
                 else:
                     _wstmt(f"print *, {expr_print_f}", st.comment)
                 continue
-            _wstmt(f"print *, {r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))}", st.comment)
+            expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
+            scalar_kind_print = _expr_kind_simple(expr_print_src)
+            if scalar_kind_print == "int":
+                _wstmt(f'write(*,"(g0)") {expr_print_f}', st.comment)
+            elif scalar_kind_print == "logical":
+                _wstmt(f'write(*,"(g0)") {expr_print_f}', st.comment)
+            else:
+                _wstmt(f"print *, {expr_print_f}", st.comment)
             continue
         else:
             raise NotImplementedError(f"unsupported statement: {type(st).__name__}")
@@ -15081,6 +15421,22 @@ def _expr_kind_simple(expr: str) -> str:
         return "real"
     if t in {"TRUE", "FALSE"}:
         return "logical"
+    c = parse_call_text(t)
+    if c is not None:
+        nm, pos, kw = c
+        key = nm.lower()
+        if key in _USER_FUNC_RETURN_KIND:
+            return _USER_FUNC_RETURN_KIND[key]
+        if key == "sum" and pos:
+            return "int" if _expr_kind_simple(pos[0].strip()) == "logical" else "real"
+        if key == "merge" and len(pos) >= 2:
+            a_kind = _expr_kind_simple(pos[0].strip())
+            b_kind = _expr_kind_simple(pos[1].strip())
+            if a_kind == "int" and b_kind == "int":
+                return "int"
+            if a_kind == "logical" and b_kind == "logical":
+                return "logical"
+            return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
     if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
@@ -15809,6 +16165,7 @@ def emit_function(
         and ret_rank == 0
         and all(arg_rank.get(a, 0) == 0 for a in fn.args)
         and fn.name.lower() not in _NLM_OBJECTIVE_NAMES
+        and fn.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
     )
     pref = "pure elemental " if is_elemental else ("pure " if can_be_pure else "")
     for cmt in fn.leading_comments:
@@ -15833,6 +16190,7 @@ def emit_function(
     fn_char_scalars = infer_function_character_scalars(fn)
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     fn_int_args = infer_function_integer_names(fn)
+    fn_int_mod_args = infer_function_integer_modulus_arg_names(fn)
     fn_proc_args = infer_function_callback_args(fn)
 
     def _arg_list_result_type(arg_name: str) -> str | None:
@@ -15883,6 +16241,11 @@ def emit_function(
             arg_type[a] = "char_array"
             continue
         ar = arg_rank.get(a, 0)
+        if ar >= 1 and a in fn_int_mod_args:
+            dims = "(" + ":," * (ar - 1) + ":)"
+            o.w(f"integer, intent({intent}){opt} :: {a}{dims}")
+            arg_type[a] = "integer_array"
+            continue
         if ar >= 1:
             dims = "(" + ":," * (ar - 1) + ":)"
             o.w(f"real(kind=dp), intent({intent}){opt} :: {a}{dims}")
@@ -15932,6 +16295,21 @@ def emit_function(
             if t == "integer":
                 arg_local_decl_lines.append(f"integer :: {loc}")
                 dflt_f = _int_bound_expr(r_expr_to_fortran(dflt))
+            elif t == "integer_array":
+                ar_loc = max(1, arg_rank.get(a, 1))
+                dims_loc = "(" + ":," * (ar_loc - 1) + ":)"
+                zero_dims = "(" + ",".join("0" for _ in range(ar_loc)) + ")"
+                arg_local_decl_lines.append(f"integer, allocatable :: {loc}{dims_loc}")
+                if dflt.upper() == "NULL":
+                    _NULL_ARRAY_SENTINELS[a.lower()] = loc
+                    _NULL_ARRAY_SENTINELS[loc.lower()] = loc
+                    arg_local_init_lines.append(f"if (present({a})) then")
+                    arg_local_init_lines.append(f"{loc} = {a}")
+                    arg_local_init_lines.append("else")
+                    arg_local_init_lines.append(f"allocate({loc}{zero_dims})")
+                    arg_local_init_lines.append("end if")
+                    continue
+                dflt_f = r_expr_to_fortran(dflt)
             elif t == "logical":
                 arg_local_decl_lines.append(f"logical :: {loc}")
                 dflt_f = r_expr_to_fortran(dflt)
@@ -15971,6 +16349,11 @@ def emit_function(
             continue
         if t == "integer":
             arg_local_decl_lines.append(f"integer :: {loc}")
+            arg_local_init_lines.append(f"{loc} = {a}")
+        elif t == "integer_array":
+            ar_loc = max(1, arg_rank.get(a, 1))
+            dims_loc = "(" + ":," * (ar_loc - 1) + ":)"
+            arg_local_decl_lines.append(f"integer, allocatable :: {loc}{dims_loc}")
             arg_local_init_lines.append(f"{loc} = {a}")
         elif t == "logical":
             arg_local_decl_lines.append(f"logical :: {loc}")
@@ -16267,6 +16650,13 @@ def emit_function(
                                 need_r_mod.add("nlm_result_t")
                                 need_r_mod.add("nlm_stub")
                             continue
+                        if callee.lower() == "integrate":
+                            local_list_types[lhs_nm] = "integrate_result_t"
+                            if has_r_mod:
+                                need_r_mod.add("integrate")
+                                need_r_mod.add("integrate_result_t")
+                                need_r_mod.add("print_integrate_result")
+                            continue
                         if callee.lower() == "max_col" and has_r_mod:
                             need_r_mod.add("max_col")
                     m_alias = re.match(r"^([A-Za-z]\w*)$", rhs_txt)
@@ -16411,6 +16801,12 @@ def emit_function(
             "par": "numeric(0)",
             "value": "0.0",
             "convergence": "0",
+        }
+        list_type_fields["integrate_result_t"] = {
+            "value": "0.0",
+            "abs_error": "0.0",
+            "subdivisions": "0",
+            "message": "0",
         }
 
         def _local_field_expr(base: str, fld: str) -> object | None:
@@ -16995,6 +17391,22 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
                     ints.add(st.name)
                     changed = True
     return ints
+
+
+def infer_function_integer_modulus_arg_names(fn: FuncDef) -> set[str]:
+    """Infer function arguments that should remain integer arrays for integer modulus/division."""
+    arg_names = {a.lower(): a for a in fn.args}
+    out: set[str] = set()
+    for txt in _collect_stmt_expr_texts(fn.body):
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*(?:%%|%/%)\s*(-?\d+[lL]?)\b", txt):
+            canon = arg_names.get(m.group(1).lower())
+            if canon is not None:
+                out.add(canon)
+        for m in re.finditer(r"\b(-?\d+[lL]?)\s*(?:%%|%/%)\s*([A-Za-z]\w*)\b", txt):
+            canon = arg_names.get(m.group(2).lower())
+            if canon is not None:
+                out.add(canon)
+    return out
 
 
 def infer_function_callback_args(fn: FuncDef) -> set[str]:
@@ -19180,7 +19592,7 @@ def transpile_r_to_fortran(
     recycle_stop: bool = False,
     fortran_comments: bool = True,
 ) -> str:
-    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -19212,6 +19624,8 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
+    _R_EXPRESSION_OBJECTS = {}
+    _R_DERIVATIVE_OBJECTS = {}
     _MIXED_CHARACTER_COERCION_WARNINGS = set()
     _CALL_COERCION_WARNINGS = set()
     unit_name = _fortran_ident(stem)
@@ -19228,6 +19642,8 @@ def transpile_r_to_fortran(
     stmts = attach_function_adjacent_comments(stmts)
     loop_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
+    _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS = _collect_symbolic_derivatives(stmts)
+    stmts = _drop_symbolic_object_assignments(stmts)
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
@@ -19395,6 +19811,7 @@ def transpile_r_to_fortran(
     fn_real_array_names: dict[str, set[str]] = {f.name: infer_function_real_array_names(f) for f in funcs}
     fn_real_matrix_names: dict[str, set[str]] = {f.name: infer_function_real_matrix_names(f) for f in funcs}
     _USER_FUNC_RETURN_RANK = {}
+    _USER_FUNC_RETURN_KIND = {}
     def _function_tail_rank(fn_rank_tail: FuncDef) -> int | None:
         inferred_ret_ranks: dict[str, int] = {}
         for a_tail in fn_rank_tail.args:
@@ -19451,6 +19868,16 @@ def transpile_r_to_fortran(
         return stmt_rank(fn_rank_tail.body[-1])
 
     for f_rank_ret in funcs:
+        if f_rank_ret.body and isinstance(f_rank_ret.body[-1], ExprStmt):
+            ret_kind_expr = f_rank_ret.body[-1].expr.strip()
+            ret_kind_arg = _return_call_arg(ret_kind_expr)
+            if ret_kind_arg is not None:
+                ret_kind_expr = ret_kind_arg.strip()
+            ret_kind = _expr_kind_simple(ret_kind_expr)
+            if ret_kind in {"integer", "int"}:
+                _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = "int"
+            elif ret_kind in {"logical", "real"}:
+                _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = ret_kind
         rr = _function_tail_rank(f_rank_ret)
         if (rr is None or rr <= 0) and f_rank_ret.name.lower() == "normalize" and f_rank_ret.args:
             rr = max(1, infer_arg_rank(f_rank_ret, f_rank_ret.args[0]))
@@ -19495,6 +19922,7 @@ def transpile_r_to_fortran(
     _USER_FUNC_ARG_RANK = {}
     _USER_FUNC_ELEMENTAL = set()
     _NLM_OBJECTIVE_NAMES = set()
+    _INTEGRATE_OBJECTIVE_NAMES = set()
     _NLM_CLOSURE_WRAPPERS = {}
     _FORCED_FUNC_ARG_RANKS = {}
     def _collect_nlm_objectives(ss_nlm: list[object]) -> None:
@@ -19533,6 +19961,42 @@ def transpile_r_to_fortran(
                     _NLM_OBJECTIVE_NAMES.add(fn_obj.lower())
 
     _collect_nlm_objectives(stmts)
+    def _collect_integrate_objectives(ss_int: list[object]) -> None:
+        for st_int in ss_int:
+            expr_int = ""
+            if isinstance(st_int, Assign):
+                expr_int = st_int.expr.strip()
+            elif isinstance(st_int, ExprStmt):
+                asn_int = split_top_level_assignment(st_int.expr.strip())
+                expr_int = (asn_int[1] if asn_int is not None else st_int.expr).strip()
+            elif isinstance(st_int, PrintStmt):
+                for a_int in st_int.args:
+                    c_pr_int = parse_call_text(a_int.strip())
+                    if c_pr_int is not None and c_pr_int[0].lower() == "integrate":
+                        fn_obj = c_pr_int[1][0].strip() if c_pr_int[1] else c_pr_int[2].get("f", "").strip()
+                        if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                            _INTEGRATE_OBJECTIVE_NAMES.add(fn_obj.lower())
+                continue
+            elif isinstance(st_int, IfStmt):
+                _collect_integrate_objectives(st_int.then_body)
+                _collect_integrate_objectives(st_int.else_body)
+                continue
+            elif isinstance(st_int, ForStmt):
+                _collect_integrate_objectives(st_int.body)
+                continue
+            elif isinstance(st_int, WhileStmt):
+                _collect_integrate_objectives(st_int.body)
+                continue
+            elif isinstance(st_int, RepeatStmt):
+                _collect_integrate_objectives(st_int.body)
+                continue
+            c_int_obj = parse_call_text(expr_int)
+            if c_int_obj is not None and c_int_obj[0].lower() == "integrate":
+                fn_obj = c_int_obj[1][0].strip() if c_int_obj[1] else c_int_obj[2].get("f", "").strip()
+                if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                    _INTEGRATE_OBJECTIVE_NAMES.add(fn_obj.lower())
+
+    _collect_integrate_objectives(stmts)
     for f in funcs:
         _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
     _USER_FUNC_ARG_RANK = {
@@ -19563,6 +20027,7 @@ def transpile_r_to_fortran(
         kinds: list[str] = []
         fn_ints = fn_int_names.get(f.name, set())
         fn_int_arrs = fn_int_array_names.get(f.name, set())
+        fn_int_mod_args = infer_function_integer_modulus_arg_names(f)
         fn_declared_double_args = _function_declared_double_args(f)
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
@@ -19574,6 +20039,7 @@ def transpile_r_to_fortran(
             f.name.lower() not in fn_return_array_kind
             and (not _stmt_tree_has_side_effect_ops(f_body_eff))
             and all(arg_rank_f.get(a, 0) == 0 for a in f.args)
+            and f.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
         ):
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
@@ -19583,14 +20049,17 @@ def transpile_r_to_fortran(
                 else
                 "real"
                 if a in fn_declared_double_args
-                or arg_rank_f.get(a, 0) >= 1
                 else
                 "integer"
                 if (
-                    a in fn_ints
+                    a in fn_int_mod_args
+                    or (arg_rank_f.get(a, 0) == 0 and a in fn_ints)
                     or a in fn_int_arrs
                     or a in {"asset_names", "price_names"}
                 )
+                else
+                "real"
+                if arg_rank_f.get(a, 0) >= 1
                 else "real"
             )
         _USER_FUNC_ARG_KIND[f.name.lower()] = kinds
@@ -20292,6 +20761,9 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "nlm":
                 nlm_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t", "print_nlm_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
+                list_vars[st.name] = "integrate_result_t"
+                helper_ctx_main["need_r_mod"].update({"integrate", "integrate_result_t", "print_integrate_result"})
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -22668,6 +23140,9 @@ def transpile_r_to_fortran(
         "decompose",
         "decompose_result_t",
         "ecdf_eval",
+        "integrate",
+        "integrate_result_t",
+        "print_integrate_result",
         "ks_test",
         "ks_test_result_t",
         "print_ks_test",
@@ -22951,6 +23426,10 @@ def transpile_r_to_fortran(
         mod_needed.add("nlm_result_t")
     if re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", main_text_now, re.IGNORECASE):
         main_needed.add("nlm_result_t")
+    if re.search(r"\btype\s*\(\s*integrate_result_t\s*\)", mod_text_now, re.IGNORECASE):
+        mod_needed.add("integrate_result_t")
+    if re.search(r"\btype\s*\(\s*integrate_result_t\s*\)", main_text_now, re.IGNORECASE):
+        main_needed.add("integrate_result_t")
     if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now, re.IGNORECASE):
         mod_needed.add("hclust_result_t")
     if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", main_text_now, re.IGNORECASE):
@@ -27613,6 +28092,12 @@ def main() -> int:
         extra_use_names.append("print_matrix => print_matrix_rstyle")
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
+    f90_had_trailing_newline = f90.endswith("\n")
+    f90_lines = add_missing_iso_fortran_env_dp_imports(f90.splitlines())
+    f90_lines = remove_unused_iso_fortran_env_dp_imports(f90_lines)
+    f90 = "\n".join(add_missing_iso_fortran_env_dp_imports(f90_lines))
+    if f90_had_trailing_newline:
+        f90 += "\n"
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
     migrated_block = ""
