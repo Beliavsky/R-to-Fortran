@@ -10109,16 +10109,28 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"merge(1.0_dp, merge(-1.0_dp, 0.0_dp, ({xr}) < 0.0_dp), ({xr}) > 0.0_dp)"
 
     def _round_to_fortran(inner: str) -> str:
+        cinfo = parse_call_text("round(" + inner.strip() + ")")
+        if cinfo is not None:
+            _, pos_args, named_args = cinfo
+            x_src = pos_args[0].strip() if pos_args else named_args.get("x", "").strip()
+            if not x_src:
+                return "round()"
+            digits_src = "0"
+            if len(pos_args) >= 2 and pos_args[1].strip():
+                digits_src = pos_args[1].strip()
+            elif named_args.get("digits", "").strip():
+                digits_src = named_args["digits"].strip()
+            x_f = r_expr_to_fortran(x_src)
+            digits_f = _int_bound_expr(r_expr_to_fortran(digits_src))
+            return f"r_round(real({x_f}, kind=dp), {digits_f})"
         parts = split_top_level_commas(inner)
         if not parts:
             return "round()"
         x_f = r_expr_to_fortran(parts[0].strip())
-        xr = f"real({x_f}, kind=dp)"
+        digits_f = "0"
         if len(parts) >= 2 and parts[1].strip():
             digits_f = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
-            scale = f"(10.0_dp ** ({digits_f}))"
-            return f"anint(({xr}) * {scale}) / {scale}"
-        return f"anint({xr})"
+        return f"r_round(real({x_f}, kind=dp), {digits_f})"
 
     s = _replace_balanced_func_calls(s, "sign", _sign_to_fortran)
     s = _replace_balanced_func_calls(s, "round", _round_to_fortran)
@@ -12900,6 +12912,88 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    c_print_round = parse_call_text(one)
+                    if has_r_mod and c_print_round is not None and c_print_round[0].lower() == "round":
+                        pos_round = c_print_round[1]
+                        named_round = c_print_round[2]
+                        round_x_src = pos_round[0].strip() if pos_round else named_round.get("x", "").strip()
+                        if round_x_src:
+                            round_digits_src = "0"
+                            if len(pos_round) >= 2 and pos_round[1].strip():
+                                round_digits_src = pos_round[1].strip()
+                            elif named_round.get("digits", "").strip():
+                                round_digits_src = named_round["digits"].strip()
+                            round_digits_f = _int_bound_expr(r_expr_to_fortran(round_digits_src))
+                            round_x_f = r_expr_to_fortran(round_x_src)
+                            if _looks_matrix_expr(round_x_src) or _expr_rank_for_print(round_x_src) == 2:
+                                row_label_expr = _matrix_row_label_expr_for_print(round_x_src)
+                                labels = _matrix_col_labels_for_print(round_x_src)
+                                if labels is not None:
+                                    int_cols = _int_col_mask_literal(labels)
+                                    if row_label_expr is not None:
+                                        _wstmt(
+                                            f"call print_table2({round_x_f}, {row_label_expr}, {_char_array_literal(labels)})",
+                                            st.comment,
+                                        )
+                                        need_r_mod.add("print_table2")
+                                    else:
+                                        names_f = _char_array_literal(labels)
+                                        if int_cols is not None:
+                                            _wstmt(
+                                                f"call print_matrix_rstyle_named({round_x_f}, names={names_f}, int_cols={int_cols}, digits={round_digits_f})",
+                                                st.comment,
+                                            )
+                                        else:
+                                            _wstmt(
+                                                f"call print_matrix_rstyle_named({round_x_f}, names={names_f}, digits={round_digits_f})",
+                                                st.comment,
+                                            )
+                                        need_r_mod.add("print_matrix_rstyle_named")
+                                else:
+                                    label_expr = _matrix_col_label_expr_for_print(round_x_src)
+                                    if label_expr is not None:
+                                        if row_label_expr is not None:
+                                            _wstmt(f"call print_table2({round_x_f}, {row_label_expr}, {label_expr})", st.comment)
+                                            need_r_mod.add("print_table2")
+                                        else:
+                                            _wstmt(
+                                                f"call print_matrix_rstyle_named({round_x_f}, names={label_expr}, digits={round_digits_f})",
+                                                st.comment,
+                                            )
+                                            need_r_mod.add("print_matrix_rstyle_named")
+                                    else:
+                                        _wstmt(f"call print_matrix({round_x_f}, digits={round_digits_f})", st.comment)
+                                        need_r_mod.add("print_matrix_rstyle")
+                                continue
+                            if _expr_rank_for_print(round_x_src) == 1:
+                                named_parts_round = _named_vector_print_parts(round_x_src)
+                                if named_parts_round is not None:
+                                    val_expr_round, name_expr_round, scalar_round = named_parts_round
+                                    if "r_paste0_real(" in name_expr_round:
+                                        need_r_mod.add("r_paste0_real")
+                                    if scalar_round:
+                                        _wstmt(
+                                            f"call print_named_real_vector([real({val_expr_round}, kind=dp)], names={name_expr_round}, digits={round_digits_f})",
+                                            st.comment,
+                                        )
+                                    else:
+                                        _wstmt(
+                                            f"call print_named_real_vector(real({val_expr_round}, kind=dp), names={name_expr_round}, digits={round_digits_f})",
+                                            st.comment,
+                                        )
+                                    need_r_mod.add("print_named_real_vector")
+                                    continue
+                                matrix_subset_names_round = _matrix_vector_subset_label_expr_for_print(round_x_src)
+                                if matrix_subset_names_round is not None:
+                                    _wstmt(
+                                        f"call print_named_real_vector(real({round_x_f}, kind=dp), names={matrix_subset_names_round}, digits={round_digits_f})",
+                                        st.comment,
+                                    )
+                                    need_r_mod.add("print_named_real_vector")
+                                    continue
+                                _wstmt(f"call print_real_vector({round_x_f}, digits={round_digits_f})", st.comment)
+                                need_r_mod.add("print_real_vector")
+                                continue
                     one_date_vec_f = r_expr_to_fortran(one) if has_r_mod else ""
                     if has_r_mod and (
                         _is_date_vector_source(one)
@@ -15765,6 +15859,7 @@ def emit_function(
     if emit_as_subroutine and fn.name.lower() == "print_vec" and {"name", "x"} <= set(fn.args):
         if helper_ctx is not None:
             helper_ctx.setdefault("need_r_mod", set()).add("print_real_vector")
+            helper_ctx.setdefault("need_r_mod", set()).add("r_round")
         o.w("if (present(digits)) then")
         o.push()
         o.w("digits_def = digits")
@@ -15775,13 +15870,14 @@ def emit_function(
         o.pop()
         o.w("end if")
         o.w('write(*,"(a,a)") trim(name), ":"')
-        o.w("call print_real_vector(anint(real(x, kind=dp) * (10.0_dp ** digits_def)) / (10.0_dp ** digits_def))")
+        o.w("call print_real_vector(r_round(real(x, kind=dp), digits_def))")
         o.w(f"end subroutine {fn.name}")
         return False
 
     if emit_as_subroutine and fn.name.lower() == "print_mat" and {"name", "x"} <= set(fn.args):
         if helper_ctx is not None:
             helper_ctx.setdefault("need_r_mod", set()).add("print_matrix_rstyle")
+            helper_ctx.setdefault("need_r_mod", set()).add("r_round")
         o.w("if (present(digits)) then")
         o.push()
         o.w("digits_def = digits")
@@ -15792,7 +15888,7 @@ def emit_function(
         o.pop()
         o.w("end if")
         o.w('write(*,"(a,a)") trim(name), ":"')
-        o.w("call print_matrix(anint(real(x, kind=dp) * (10.0_dp ** digits_def)) / (10.0_dp ** digits_def))")
+        o.w("call print_matrix(r_round(real(x, kind=dp), digits_def))")
         o.w(f"end subroutine {fn.name}")
         return False
 
@@ -22322,6 +22418,7 @@ def transpile_r_to_fortran(
     "rbind",
     "numeric",
         "pmax",
+        "r_round",
         "sd",
         "r_sd",
         "var",
@@ -23241,6 +23338,13 @@ def _pretty_float_token(token: str) -> str:
     if "." not in out and "e" not in out and "E" not in out:
         out = f"{out}.0"
     return out
+
+
+def _normalize_numeric_leading_zeros_text(text: str) -> str:
+    """Normalize numeric tokens like .5 and -.5 to 0.5 and -0.5."""
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"(?<![\w.])([+-]?)\.(\d+)(?=([eEdD][+-]?\d+)?(?![\w.]))", r"\g<1>0.\2", s)
+    return s
 
 
 def _pretty_logical_tokens(text: str) -> str:
@@ -25323,6 +25427,154 @@ def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
     return f90
 
 
+def simplify_real_dp_casts_text(f90: str) -> str:
+    """Remove redundant real(..., kind=dp) casts when the operand is already real(dp)."""
+    if "real(" not in f90:
+        return f90
+    real_vars: set[str] = set()
+    real_dp_funcs: set[str] = {"r_round"}
+    current_fn: str | None = None
+    current_result: str | None = None
+    for line in f90.splitlines():
+        m_fn = re.match(
+            r"\s*(?:(?:pure|elemental|recursive)\s+)*"
+            r"(?:(?:real|integer|logical|complex|character)\s*\([^)]*\)\s+)?"
+            r"function\s+([A-Za-z]\w*)\b.*?\bresult\s*\(\s*([A-Za-z]\w*)\s*\)",
+            line,
+            re.IGNORECASE,
+        )
+        if m_fn is not None:
+            current_fn = m_fn.group(1)
+            current_result = m_fn.group(2)
+            if re.match(r"\s*(?:(?:pure|elemental|recursive)\s+)*real\s*\(\s*kind\s*=\s*dp\s*\)", line, re.IGNORECASE):
+                real_dp_funcs.add(current_fn.lower())
+        elif re.match(r"\s*end\s+function\b", line, re.IGNORECASE):
+            current_fn = None
+            current_result = None
+        if not re.match(r"\s*real\s*\(\s*kind\s*=\s*dp\s*\)", line, re.IGNORECASE):
+            continue
+        if "::" not in line:
+            continue
+        rhs = line.split("::", 1)[1]
+        for part in split_top_level_commas(rhs):
+            name = part.split("=", 1)[0].strip()
+            name = re.sub(r"\(.*\)$", "", name).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", name):
+                real_vars.add(name.lower())
+                if current_fn is not None and current_result is not None and name.lower() == current_result.lower():
+                    real_dp_funcs.add(current_fn.lower())
+
+    if real_vars:
+        f90 = re.sub(
+            r"\br_round\s*\(\s*real\s*\(\s*([A-Za-z]\w*)\s*,\s*kind\s*=\s*dp\s*\)\s*,",
+            lambda m: f"r_round({m.group(1)},"
+            if m.group(1).lower() in real_vars
+            else m.group(0),
+            f90,
+            flags=re.IGNORECASE,
+        )
+    f90 = re.sub(
+        r"\br_round\s*\(\s*real\s*\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?_dp)\s*,\s*kind\s*=\s*dp\s*\)\s*,",
+        r"r_round(\1,",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = _replace_balanced_func_calls(
+        f90,
+        "real",
+        lambda inner: (
+            parts[0].strip()
+            if (parts := split_top_level_commas(inner))
+            and len(parts) == 2
+            and (m_call := re.match(r"^\s*([A-Za-z]\w*)\s*\(", parts[0].strip()))
+            and m_call.group(1).lower() in real_dp_funcs
+            and re.fullmatch(r"(?i)kind\s*=\s*dp", parts[1].strip())
+            else f"real({inner})"
+        ),
+    )
+    return f90
+
+
+def add_missing_r_mod_uses_per_scope_text(f90: str, names: set[str]) -> str:
+    """Add late-discovered r_mod imports only to scopes that do not already import them."""
+    if not names:
+        return f90
+
+    def _target_name(name: str) -> str:
+        return name.split("=>", 1)[1].strip() if "=>" in name else name.strip()
+
+    needed = {_target_name(nm) for nm in names if _target_name(nm)}
+    if not needed:
+        return f90
+
+    lines = f90.splitlines()
+    out: list[str] = []
+    scope_start = 0
+    for i, line in enumerate(lines):
+        if re.match(r"\s*(?:module|program)\s+\w+\s*$", line, re.IGNORECASE):
+            scope_start = len(out)
+        if re.match(r"\s*implicit\s+none\s*$", line, re.IGNORECASE):
+            scope_text = "\n".join(out[scope_start:])
+            imported = {nm.lower() for nm in _r_mod_needed_public_names(scope_text)}
+            missing = {nm for nm in needed if nm.lower() not in imported}
+            if missing:
+                out.append("use r_mod, only: " + _render_r_mod_only(missing))
+        out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def keyword_print_helper_actuals_after_named_text(f90: str) -> str:
+    """For known print helpers, keyword positional actuals after a named actual."""
+    specs = {
+        "print_matrix_rstyle_named": ["names", "int_cols", "row_names", "digits"],
+        "print_named_real_vector": ["names", "digits"],
+    }
+
+    def _has_named_actual(txt: str) -> bool:
+        return re.match(r"^\s*[A-Za-z]\w*\s*=", txt) is not None
+
+    def _keyword_inner(inner: str, params: list[str]) -> str:
+        inner = re.sub(r"&\s*\n\s*&\s*", " ", inner)
+        parts = split_top_level_commas(inner)
+        if len(parts) <= 2 or not any(_has_named_actual(p) for p in parts[1:]):
+            return inner
+        used: set[str] = set()
+        for p in parts[1:]:
+            m = re.match(r"^\s*([A-Za-z]\w*)\s*=", p)
+            if m is not None:
+                used.add(m.group(1).lower())
+        out = [parts[0].strip()]
+        next_pos = 0
+        seen_named = False
+        for p in parts[1:]:
+            p_str = p.strip()
+            m = re.match(r"^\s*([A-Za-z]\w*)\s*=", p_str)
+            if m is not None:
+                seen_named = True
+                out.append(p_str)
+                continue
+            if seen_named:
+                while next_pos < len(params) and params[next_pos].lower() in used:
+                    next_pos += 1
+                if next_pos < len(params):
+                    key = params[next_pos]
+                    used.add(key.lower())
+                    next_pos += 1
+                    out.append(f"{key}={p_str}")
+                    continue
+            out.append(p_str)
+            next_pos += 1
+        return ", ".join(out)
+
+    for fn, params in specs.items():
+        f90 = _replace_balanced_func_calls(
+            f90,
+            fn,
+            lambda inner, params=params, fn=fn: f"{fn}({_keyword_inner(inner, params)})",
+        )
+    return f90
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -25493,18 +25745,52 @@ def _remove_redundant_single_blank_writes(f90: str) -> str:
     lines = f90.splitlines()
     out: list[str] = []
     n = len(lines)
-    for i, line in enumerate(lines):
+    i = 0
+    while i < n:
+        line = lines[i]
         if line.strip().lower() == "write(*,*)":
             prev = out[-1].strip().lower() if out else ""
             nxt = lines[i + 1].strip().lower() if i + 1 < n else ""
+            if i + 1 < n:
+                m_fmt = re.match(
+                    r'^(\s*)write\s*\(\s*\*\s*,\s*(["\'])\((.*)\)\2\s*\)(.*)$',
+                    lines[i + 1],
+                    re.IGNORECASE,
+                )
+                if m_fmt is not None and not m_fmt.group(3).lstrip().startswith("/"):
+                    out.append(
+                        f'{m_fmt.group(1)}write(*,{m_fmt.group(2)}(/,{m_fmt.group(3)}){m_fmt.group(2)}){m_fmt.group(4)}'
+                    )
+                    i += 2
+                    continue
             if (
                 prev.startswith("write(*,*) ")
                 and nxt.startswith("write(*,*) ")
                 and prev != "write(*,*)"
                 and nxt != "write(*,*)"
             ):
+                i += 1
                 continue
         out.append(line)
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def _simplify_single_literal_g0_writes(f90: str) -> str:
+    """Use scalar g0 formats for single literal writes."""
+    lines = f90.splitlines()
+    out: list[str] = []
+    pat = re.compile(
+        r"""^(\s*)write\s*\(\s*\*\s*,\s*(["'])\((/,)?\*\(g0,:,1x\)\)\2\s*\)\s+((?:"(?:[^"]|"")*")|(?:'(?:[^']|'')*'))(\s*(?:!.*)?)$""",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        m = pat.match(line)
+        if m is None:
+            out.append(line)
+            continue
+        fmt = "(/,g0)" if m.group(3) else "(g0)"
+        out.append(f"{m.group(1)}write(*,{m.group(2)}{fmt}{m.group(2)}) {m.group(4)}{m.group(5)}")
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -25521,8 +25807,8 @@ def _print_captured(
     out = cp.stdout or ""
     err = cp.stderr or ""
     if normalize_num_output:
-        out = fscan.normalize_numeric_leading_zeros_text(out)
-        err = fscan.normalize_numeric_leading_zeros_text(err)
+        out = _normalize_numeric_leading_zeros_text(out)
+        err = _normalize_numeric_leading_zeros_text(err)
     if pretty:
         out = _pretty_output_text(out, strip_r_indices=strip_r_indices)
         err = _pretty_output_text(err, strip_r_indices=strip_r_indices)
@@ -26411,7 +26697,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--normalize-num-output",
+        "--leading-zero",
         action="store_true",
+        dest="normalize_num_output",
         help="normalize Fortran run output numeric tokens like .5/-.5 to 0.5/-0.5",
     )
     ap.add_argument(
@@ -26903,6 +27191,8 @@ def main() -> int:
     f90 = rewrite_cbind_prints_text(f90)
     f90 = rewrite_matmul_vector_result_ranks_text(f90)
     f90 = rewrite_read_csv_matrix_arg_ranks_text(f90)
+    f90 = simplify_real_dp_casts_text(f90)
+    f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
         r"spread\s*\(\s*all\s*\(\s*ieee_is_finite\s*\(([^()]+)\)\s*\)\s*,\s*dim\s*=\s*2",
         r"spread(all(ieee_is_finite(\1), dim=2), dim=2",
@@ -27133,8 +27423,7 @@ def main() -> int:
     if "call print_matrix(" in f90:
         extra_use_names.append("print_matrix => print_matrix_rstyle")
     if extra_use_names:
-        extra_use = "use r_mod, only: " + ", ".join(sorted(set(extra_use_names)))
-        f90 = re.sub(r"(?m)^implicit none$", extra_use + "\nimplicit none", f90)
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
     migrated_block = ""
@@ -27149,6 +27438,7 @@ def main() -> int:
     if args.self_contained:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
     f90 = _remove_redundant_single_blank_writes(f90)
+    f90 = _simplify_single_literal_g0_writes(f90)
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
@@ -27396,7 +27686,7 @@ def main() -> int:
                 r_lines = _norm_output(r_blob)
                 f_blob = (frun.stdout or "") + (("\n" + frun.stderr) if frun.stderr else "")
                 if args.normalize_num_output:
-                    f_blob = fscan.normalize_numeric_leading_zeros_text(f_blob)
+                    f_blob = _normalize_numeric_leading_zeros_text(f_blob)
                 if args.pretty:
                     f_blob = _pretty_output_text(f_blob)
                 if fortran_round_digits is not None:
