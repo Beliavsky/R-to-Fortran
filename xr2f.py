@@ -25283,6 +25283,17 @@ def rewrite_matmul_vector_result_ranks_text(f90: str) -> str:
     return f90
 
 
+def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
+    names: set[str] = set()
+    for m in re.finditer(r"\bcall\s+read_csv_real_matrix\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*\)", f90, re.IGNORECASE):
+        names.add(m.group(1))
+    if not names:
+        return f90
+    for nm in sorted(names, key=len, reverse=True):
+        f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*\)", f"{nm}(:,:)", f90)
+    return f90
+
+
 def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     """Mark likely PURE procedures using xpure.py analysis logic."""
     try:
@@ -26862,6 +26873,7 @@ def main() -> int:
     f90 = remove_noncomplex_redecls_text(f90)
     f90 = rewrite_cbind_prints_text(f90)
     f90 = rewrite_matmul_vector_result_ranks_text(f90)
+    f90 = rewrite_read_csv_matrix_arg_ranks_text(f90)
     f90 = re.sub(
         r"spread\s*\(\s*all\s*\(\s*ieee_is_finite\s*\(([^()]+)\)\s*\)\s*,\s*dim\s*=\s*2",
         r"spread(all(ieee_is_finite(\1), dim=2), dim=2",
