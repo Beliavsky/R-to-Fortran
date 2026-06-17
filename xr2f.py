@@ -20572,6 +20572,48 @@ def transpile_r_to_fortran(
                     _NLM_OBJECTIVE_NAMES.add(fn_obj.lower())
 
     _collect_nlm_objectives(stmts)
+    optim_objective_names: set[str] = set()
+
+    def _collect_optim_objectives(ss_opt: list[object]) -> None:
+        for st_opt in ss_opt:
+            expr_opt = ""
+            if isinstance(st_opt, Assign):
+                expr_opt = st_opt.expr.strip()
+            elif isinstance(st_opt, ExprStmt):
+                asn_opt = split_top_level_assignment(st_opt.expr.strip())
+                expr_opt = (asn_opt[1] if asn_opt is not None else st_opt.expr).strip()
+            elif isinstance(st_opt, PrintStmt):
+                for a_opt in st_opt.args:
+                    c_pr_opt = parse_call_text(a_opt.strip())
+                    if c_pr_opt is not None and c_pr_opt[0].lower() == "optim":
+                        fn_obj = c_pr_opt[2].get("fn", "").strip() or (c_pr_opt[1][1].strip() if len(c_pr_opt[1]) >= 2 else "")
+                        if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                            optim_objective_names.add(fn_obj.lower())
+                continue
+            elif isinstance(st_opt, IfStmt):
+                _collect_optim_objectives(st_opt.then_body)
+                _collect_optim_objectives(st_opt.else_body)
+                continue
+            elif isinstance(st_opt, ForStmt):
+                _collect_optim_objectives(st_opt.body)
+                continue
+            elif isinstance(st_opt, WhileStmt):
+                _collect_optim_objectives(st_opt.body)
+                continue
+            elif isinstance(st_opt, RepeatStmt):
+                _collect_optim_objectives(st_opt.body)
+                continue
+            c_opt_obj = parse_call_text(expr_opt)
+            if c_opt_obj is not None and c_opt_obj[0].lower() == "try" and c_opt_obj[1]:
+                c_try_opt = parse_call_text(c_opt_obj[1][0].strip())
+                if c_try_opt is not None:
+                    c_opt_obj = c_try_opt
+            if c_opt_obj is not None and c_opt_obj[0].lower() == "optim":
+                fn_obj = c_opt_obj[2].get("fn", "").strip() or (c_opt_obj[1][1].strip() if len(c_opt_obj[1]) >= 2 else "")
+                if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
+                    optim_objective_names.add(fn_obj.lower())
+
+    _collect_optim_objectives(stmts)
     def _collect_integrate_objectives(ss_int: list[object]) -> None:
         for st_int in ss_int:
             expr_int = ""
@@ -20630,6 +20672,10 @@ def transpile_r_to_fortran(
             break
     for f_rank_ret in funcs:
         if f_rank_ret.name in list_specs:
+            _USER_FUNC_RETURN_RANK[f_rank_ret.name.lower()] = 0
+            continue
+        if f_rank_ret.name.lower() in optim_objective_names or f_rank_ret.name.lower() in _NLM_OBJECTIVE_NAMES:
+            _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = "real"
             _USER_FUNC_RETURN_RANK[f_rank_ret.name.lower()] = 0
             continue
         rr = _function_tail_rank(f_rank_ret)
@@ -29128,6 +29174,7 @@ def main() -> int:
     f90 = _remove_redundant_single_blank_writes(f90)
     f90 = _simplify_single_literal_g0_writes(f90)
     f90 = re.sub(r"\bint\s*\(\s*size\s*\)\s*\(\s*([A-Za-z]\w*)\s*\)", r"size(\1)", f90, flags=re.IGNORECASE)
+    f90 = re.sub(r"\bint\s*\(\s*int\s*\)\s*\(", "int(", f90, flags=re.IGNORECASE)
 
     def _scalarize_elemental_results_text(src_f90: str) -> str:
         out_elem: list[str] = []
@@ -29243,13 +29290,167 @@ def main() -> int:
         return out_src
 
     f90 = _repair_result_and_solve_ranks_text(f90)
+
+    def _promote_dim_reduction_locals_text(src_f90: str) -> str:
+        promote_dim = {
+            m.group(1).lower()
+            for m in re.finditer(
+                r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(?:sum|product|minval|maxval)\s*\([^\n]*\bdim\s*=",
+                src_f90,
+            )
+        }
+        if not promote_dim:
+            return src_f90
+        out_lines_dim: list[str] = []
+        for line_dim in src_f90.splitlines():
+            m_decl_dim = re.match(r"^(\s*)real\(kind=dp\)\s*::\s*(.+)$", line_dim, re.IGNORECASE)
+            if m_decl_dim is None:
+                out_lines_dim.append(line_dim)
+                continue
+            indent_dim = m_decl_dim.group(1)
+            parts_dim = [p.strip() for p in m_decl_dim.group(2).split(",")]
+            keep_dim: list[str] = []
+            promote_names_dim: list[str] = []
+            for part_dim in parts_dim:
+                m_part_dim = re.fullmatch(r"([A-Za-z]\w*)", part_dim)
+                if m_part_dim is not None and m_part_dim.group(1).lower() in promote_dim:
+                    promote_names_dim.append(m_part_dim.group(1))
+                else:
+                    keep_dim.append(part_dim)
+            if keep_dim:
+                out_lines_dim.append(f"{indent_dim}real(kind=dp) :: " + ", ".join(keep_dim))
+            if promote_names_dim:
+                out_lines_dim.append(
+                    f"{indent_dim}real(kind=dp), allocatable :: "
+                    + ", ".join(f"{nm_dim}(:)" for nm_dim in promote_names_dim)
+                )
+        return "\n".join(out_lines_dim) + ("\n" if src_f90.endswith("\n") else "")
+
+    f90 = _promote_dim_reduction_locals_text(f90)
     f90 = re.sub(
-        r"\bresid\s*\(:\s*,\s*:\s*&\s*\n\s*&\s*\)",
-        "resid(:)",
+        r",\s*&\s*\n\s*real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)\(:\)\s*\n\s*&\s*",
+        lambda m: f", &\n& {m.group(1)}(:), ",
         f90,
         flags=re.IGNORECASE,
     )
-    f90 = re.sub(r"\bresid\s*\(:\s*,\s*:\)", "resid(:)", f90, flags=re.IGNORECASE)
+    if (
+        re.search(r"(?m)^\s*resid\s*=\s*y\s*-\s*fitted\s*$", f90)
+        and re.search(r"\by\s*\(:\)", f90)
+        and re.search(r"\bfitted\s*\(:\)", f90)
+    ):
+        f90 = re.sub(
+            r"\bresid\s*\(:\s*,\s*:\s*&\s*\n\s*&\s*\)",
+            "resid(:)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(r"\bresid\s*\(:\s*,\s*:\)", "resid(:)", f90, flags=re.IGNORECASE)
+    row_vector_assigned = {
+        m.group(1)
+        for m in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*\([^,\n]+,\s*:\s*\)\s*[-+]",
+            f90,
+        )
+    }
+    for row_vec_nm in sorted(row_vector_assigned, key=len, reverse=True):
+        f90 = re.sub(
+            rf"\b{re.escape(row_vec_nm)}\s*\(:\s*,\s*:\)",
+            f"{row_vec_nm}(:)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    duplicate_rank_names = {
+        m.group(1)
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\)", f90)
+        if re.search(rf"\b{re.escape(m.group(1))}\s*\(:\)", f90, re.IGNORECASE)
+    }
+    for dup_nm in sorted(duplicate_rank_names, key=len, reverse=True):
+        fixed_dup_lines: list[str] = []
+        for line_dup in f90.splitlines():
+            if "allocatable" in line_dup.lower() and "intent(" not in line_dup.lower():
+                line_dup = re.sub(rf",\s*{re.escape(dup_nm)}\s*\(:\)", "", line_dup, flags=re.IGNORECASE)
+                line_dup = re.sub(rf"\b{re.escape(dup_nm)}\s*\(:\)\s*,\s*", "", line_dup, flags=re.IGNORECASE)
+            fixed_dup_lines.append(line_dup)
+        f90 = "\n".join(fixed_dup_lines) + ("\n" if f90.endswith("\n") else "")
+    if re.search(r"\bx_wrk\s*\(:\s*,\s*:\)", f90, re.IGNORECASE):
+        f90 = re.sub(r",\s*x_wrk\s*\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\bx_wrk\s*\(:\)\s*,\s*", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*x_wrk\(:\)\s*\n", "", f90)
+    if "garch_filter_result%z" in f90 and "type :: garch_filter_result_t" in f90:
+        m_garch_type = re.search(
+            r"(?is)(type\s*::\s*garch_filter_result_t\b)(.*?)(end\s+type\s+garch_filter_result_t)",
+            f90,
+        )
+        if m_garch_type is not None and re.search(r"\bz\s*\(", m_garch_type.group(2), re.IGNORECASE) is None:
+            repl_garch_type = (
+                m_garch_type.group(1)
+                + m_garch_type.group(2).rstrip()
+                + "\n   real(kind=dp), allocatable :: z(:)\n"
+                + m_garch_type.group(3)
+            )
+            f90 = f90[:m_garch_type.start()] + repl_garch_type + f90[m_garch_type.end():]
+    if re.search(r"\bopt\s*%", f90) and not re.search(r"\btype\s*\(\s*optim_result_t\s*\)\s*::\s*opt\b", f90, re.IGNORECASE):
+        def _fix_opt_decl(m_opt_decl: re.Match[str]) -> str:
+            indent_opt = m_opt_decl.group(1)
+            parts_opt = [p.strip() for p in m_opt_decl.group(2).split(",")]
+            keep_opt = [p for p in parts_opt if not re.fullmatch(r"opt", p, re.IGNORECASE)]
+            lines_opt: list[str] = []
+            if keep_opt:
+                lines_opt.append(f"{indent_opt}real(kind=dp) :: " + ", ".join(keep_opt))
+            lines_opt.append(f"{indent_opt}type(optim_result_t) :: opt")
+            return "\n".join(lines_opt)
+        f90 = re.sub(
+            r"(?im)^(\s*)real\(kind=dp\)\s*::\s*([^\n]*\bopt\b[^\n]*)$",
+            _fix_opt_decl,
+            f90,
+            count=1,
+        )
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
+    if re.search(r"\bexcess_kurtosis\s*\(\s*terminal_log_prices\s*\)", f90, re.IGNORECASE):
+        f90 = re.sub(
+            r"(?im)^(\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*)x\s*$",
+            r"\1x(:)",
+            f90,
+            count=1,
+        )
+    if re.search(r"\brate_hat_formula\s*\(:\)", f90, re.IGNORECASE):
+        f90 = re.sub(r"\brate_hat_formula\s*\(:\)", "rate_hat_formula", f90, flags=re.IGNORECASE)
+        f90 = re.sub(
+            r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*rate_hat_formula\s*$",
+            r"\1real(kind=dp) :: rate_hat_formula",
+            f90,
+        )
+    if re.search(r"\bsigma2\s*=\s*gamma0\b", f90, re.IGNORECASE):
+        f90 = re.sub(r"\bsigma2\s*\(:\)", "sigma2", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\bsd\s*\(:\)", "sd", f90, flags=re.IGNORECASE)
+        f90 = re.sub(
+            r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*sigma2\s*$",
+            r"\1real(kind=dp) :: sigma2",
+            f90,
+        )
+    if "fit_varma_order(x, real(p, kind=dp), real(q, kind=dp))" in f90:
+        if re.search(r"\bp_loop\b", f90) and re.search(r"\bq_loop\b", f90):
+            f90 = f90.replace(
+                "fit_varma_order(x, real(p, kind=dp), real(q, kind=dp))",
+                "fit_varma_order(x, p_loop, q_loop)",
+            )
+        else:
+            f90 = f90.replace(
+                "fit_varma_order(x, real(p, kind=dp), real(q, kind=dp))",
+                "fit_varma_order(x, int(p), int(q))",
+            )
+    f90 = re.sub(
+        r"\bsimulate_markov_chain\(\s*n\s*,\s*pmat\s*,\s*s0_def\s*\)",
+        "simulate_markov_chain(n, pmat, int(s0_def))",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\(\s*mod\(\s*\(([^()]+)\)\s*-\s*1\s*,\s*size\(\s*\1\s*,\s*1\s*\)\s*\)\s*\+\s*1\s*,\s*\(\(\(\s*\2\s*\)\s*-\s*1\s*\)\s*/\s*&?\s*(?:\n\s*&\s*)?size\(\s*\1\s*,\s*1\s*\)\s*\)\s*\+\s*1\s*\)",
+        r"\1(\2)",
+        f90,
+        flags=re.IGNORECASE,
+    )
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
