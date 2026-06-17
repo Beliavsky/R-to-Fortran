@@ -17419,6 +17419,19 @@ def emit_function(
                     real_scalars.discard(target)
                     params.pop(target, None)
                     return True
+                if cn_expr == "diag":
+                    arg_diag = c_expr[1][0].strip() if c_expr[1] else c_expr[2].get("x", "").strip()
+                    diag_arg_rank = _infer_assignment_rank_hint(
+                        arg_diag,
+                        {n.lower(): 2 for n in known_arrays} | {n.lower(): 1 for n in real_arrays | int_arrays},
+                    ) if arg_diag else 0
+                    real_arrays.add(target)
+                    known_arrays.add(target)
+                    ints.discard(target)
+                    int_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
                 if cn_expr in {"c", "numeric", "as.numeric", "pack", "coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums"}:
                     real_arrays.add(target)
                     known_arrays.add(target)
@@ -17601,6 +17614,19 @@ def emit_function(
                 local_ranks[st_seq_rank.name] = 1
             if re.match(r"^diag\s*\(.*\)\s*[-+]", st_seq_rank.expr.strip(), re.IGNORECASE):
                 local_ranks[st_seq_rank.name] = 2
+                real_arrays.add(st_seq_rank.name)
+                ints.discard(st_seq_rank.name)
+                int_arrays.discard(st_seq_rank.name)
+                real_scalars.discard(st_seq_rank.name)
+                params.pop(st_seq_rank.name, None)
+            c_diag_rank = parse_call_text(st_seq_rank.expr.strip())
+            if c_diag_rank is not None and c_diag_rank[0].lower() == "diag":
+                diag_arg = c_diag_rank[1][0].strip() if c_diag_rank[1] else c_diag_rank[2].get("x", "").strip()
+                diag_arg_rank = _infer_assignment_rank_hint(
+                    diag_arg,
+                    {n.lower(): r for n, r in local_ranks.items()},
+                ) if diag_arg else 0
+                local_ranks[st_seq_rank.name] = 1 if diag_arg_rank >= 2 else 2
                 real_arrays.add(st_seq_rank.name)
                 ints.discard(st_seq_rank.name)
                 int_arrays.discard(st_seq_rank.name)
@@ -25601,11 +25627,82 @@ def promote_chosen_model_character_vector(lines: list[str]) -> list[str]:
 
 
 def promote_diag_matrix_results(lines: list[str]) -> list[str]:
+    rank2: set[str] = set()
+    decl_pat = re.compile(r"^\s*real\(kind=dp\)(?:\s*,\s*[^:]*)?\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m_decl = decl_pat.match(ln)
+        if m_decl is None:
+            continue
+        for item in split_top_level_commas(m_decl.group(1)):
+            mm2 = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", item)
+            if mm2 is not None:
+                rank2.add(mm2.group(1))
+
+    def _diag_calls(rhs: str) -> list[str]:
+        calls: list[str] = []
+        pos = 0
+        while True:
+            m_diag = re.search(r"\bdiag\s*\(", rhs[pos:], re.IGNORECASE)
+            if m_diag is None:
+                break
+            start = pos + m_diag.start()
+            open_i = rhs.find("(", start)
+            if open_i < 0:
+                break
+            depth = 0
+            in_str: str | None = None
+            esc = False
+            end_i: int | None = None
+            for i in range(open_i, len(rhs)):
+                ch = rhs[i]
+                if in_str is not None:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == in_str:
+                        in_str = None
+                    continue
+                if ch in ("'", '"'):
+                    in_str = ch
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_i = i
+                        break
+            if end_i is None:
+                break
+            calls.append(rhs[start : end_i + 1])
+            pos = end_i + 1
+        return calls
+
+    def _diag_matrix_call(call_text: str) -> bool:
+        c = parse_call_text(call_text.strip())
+        if c is None or c[0].lower() != "diag":
+            return False
+        args = c[1]
+        if len(args) >= 2:
+            return True
+        if not args:
+            return False
+        first = args[0].strip()
+        m_name = re.match(r"^([A-Za-z]\w*)$", first)
+        return m_name is None or m_name.group(1) not in rank2
+
     names: set[str] = set()
     for ln in lines:
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*diag\s*\(.+,\s*[^,]+\)\s*$", ln)
-        if m is not None:
-            names.add(m.group(1))
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", ln)
+        if m is None:
+            continue
+        lhs, rhs = m.group(1), m.group(2).strip()
+        calls = _diag_calls(rhs)
+        if calls and any(_diag_matrix_call(call) for call in calls):
+            first_call = calls[0].strip()
+            if rhs == first_call or rhs.startswith(first_call + " ") or re.search(r"(?:^|[+\-*/]\s*)" + re.escape(first_call), rhs):
+                names.add(lhs)
     if not names:
         return lines
     out: list[str] = []
@@ -25830,6 +25927,62 @@ def demote_scalar_component_assignments(lines: list[str]) -> list[str]:
                 out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}{suffix}")
             continue
         out.append(ln)
+    return out
+
+
+def remove_real_names_shadowing_derived_locals(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    derived_names: set[str] = set()
+    type_decl_pat = re.compile(r"^\s*type\s*\([^)]*\)\s*::\s*(.+)$", re.IGNORECASE)
+    real_decl_pat = re.compile(r"^(\s*)real\(kind=dp\)(?:\s*,\s*[^:]*)?\s*::\s*(.+)$", re.IGNORECASE)
+    scope_start_pat = re.compile(r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine|program)\b", re.IGNORECASE)
+    scope_end_pat = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+
+    for ln in lines:
+        if scope_start_pat.match(ln):
+            derived_names = set()
+        m_type = type_decl_pat.match(ln)
+        if m_type is not None:
+            for item in split_top_level_commas(m_type.group(1)):
+                base = re.sub(r"\s*\(.*\)\s*$", "", item.split("=", 1)[0].strip()).strip()
+                if base:
+                    derived_names.add(base)
+            out.append(ln)
+            continue
+        m_real = real_decl_pat.match(ln)
+        if m_real is not None and derived_names:
+            parts = [p.strip() for p in split_top_level_commas(m_real.group(2))]
+            kept: list[str] = []
+            for part in parts:
+                base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                if base not in derived_names:
+                    kept.append(part)
+            if not kept:
+                if scope_end_pat.match(ln):
+                    derived_names = set()
+                continue
+            if len(kept) != len(parts):
+                out.append(f"{m_real.group(1)}real(kind=dp) :: {', '.join(kept)}")
+            else:
+                out.append(ln)
+            if scope_end_pat.match(ln):
+                derived_names = set()
+            continue
+        out.append(ln)
+        if scope_end_pat.match(ln):
+            derived_names = set()
+    return out
+
+
+def rewrite_logical_helper_print_calls(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    pat = re.compile(r"^(\s*)call\s+print_real_scalar\s*\(((?:starts_with_simple|ends_with_simple)\s*\(.+\))\)\s*$", re.IGNORECASE)
+    for ln in lines:
+        m = pat.match(ln)
+        if m is None:
+            out.append(ln)
+        else:
+            out.append(f'{m.group(1)}write(*,"(*(g0,1x))") {m.group(2)}')
     return out
 
 
@@ -28586,6 +28739,8 @@ def main() -> int:
     f90_lines = promote_matrix_result_assignments(f90_lines)
     f90_lines = promote_matrix_copy_assignments(f90_lines)
     f90_lines = demote_diag_vector_results(f90_lines)
+    f90_lines = remove_real_names_shadowing_derived_locals(f90_lines)
+    f90_lines = rewrite_logical_helper_print_calls(f90_lines)
     f90_lines = demote_scalar_component_assignments(f90_lines)
     f90_lines = promote_rank3_dummy_arguments(f90_lines)
     f90_lines = promote_rank3_result_assignments(f90_lines)
