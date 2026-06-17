@@ -16565,6 +16565,14 @@ def emit_function(
             rdecl = "integer"
         elif ret_ident in b_real_scalars0:
             rdecl = "real(kind=dp)"
+    if list_spec is None and _USER_FUNC_RETURN_RANK.get(fn.name.lower()) == 0:
+        ret_rank = 0
+        if _USER_FUNC_RETURN_KIND.get(fn.name.lower()) == "int":
+            rdecl = "integer"
+        elif _USER_FUNC_RETURN_KIND.get(fn.name.lower()) == "logical":
+            rdecl = "logical"
+        else:
+            rdecl = "real(kind=dp)"
     if ret_type_name is not None:
         rdecl = f"type({ret_type_name})"
     elif ret_is_char:
@@ -29376,19 +29384,23 @@ def main() -> int:
         f90 = re.sub(r",\s*x_wrk\s*\(:\)", "", f90, flags=re.IGNORECASE)
         f90 = re.sub(r"\bx_wrk\s*\(:\)\s*,\s*", "", f90, flags=re.IGNORECASE)
         f90 = re.sub(r"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*x_wrk\(:\)\s*\n", "", f90)
-    if "garch_filter_result%z" in f90 and "type :: garch_filter_result_t" in f90:
-        m_garch_type = re.search(
-            r"(?is)(type\s*::\s*garch_filter_result_t\b)(.*?)(end\s+type\s+garch_filter_result_t)",
+    z_result_types = {
+        m.group(1).lower() + "_t"
+        for m in re.finditer(r"\b([A-Za-z]\w*_result)\s*%\s*z\b", f90, re.IGNORECASE)
+    }
+    for z_type in sorted(z_result_types, key=len, reverse=True):
+        m_z_type = re.search(
+            rf"(?is)(type\s*::\s*{re.escape(z_type)}\b)(.*?)(end\s+type\s+{re.escape(z_type)})",
             f90,
         )
-        if m_garch_type is not None and re.search(r"\bz\s*\(", m_garch_type.group(2), re.IGNORECASE) is None:
-            repl_garch_type = (
-                m_garch_type.group(1)
-                + m_garch_type.group(2).rstrip()
+        if m_z_type is not None and re.search(r"\bz\s*\(", m_z_type.group(2), re.IGNORECASE) is None:
+            repl_z_type = (
+                m_z_type.group(1)
+                + m_z_type.group(2).rstrip()
                 + "\n   real(kind=dp), allocatable :: z(:)\n"
-                + m_garch_type.group(3)
+                + m_z_type.group(3)
             )
-            f90 = f90[:m_garch_type.start()] + repl_garch_type + f90[m_garch_type.end():]
+            f90 = f90[:m_z_type.start()] + repl_z_type + f90[m_z_type.end():]
     if re.search(r"\bopt\s*%", f90) and not re.search(r"\btype\s*\(\s*optim_result_t\s*\)\s*::\s*opt\b", f90, re.IGNORECASE):
         def _fix_opt_decl(m_opt_decl: re.Match[str]) -> str:
             indent_opt = m_opt_decl.group(1)
@@ -29408,7 +29420,7 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
     if re.search(r"\bexcess_kurtosis\s*\(\s*terminal_log_prices\s*\)", f90, re.IGNORECASE):
         f90 = re.sub(
-            r"(?im)^(\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*)x\s*$",
+            r"(?ims)(function\s+excess_kurtosis\s*\(\s*x\s*\).*?^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*)x\s*$",
             r"\1x(:)",
             f90,
             count=1,
@@ -29437,11 +29449,23 @@ def main() -> int:
         else:
             f90 = f90.replace(
                 "fit_varma_order(x, real(p, kind=dp), real(q, kind=dp))",
-                "fit_varma_order(x, int(p), int(q))",
+                "fit_varma_order(x, real(int(p(1,1)), kind=dp), real(int(q(1,1)), kind=dp))",
             )
+    f90 = f90.replace(
+        "fit_varma_order(x, int(p), int(q))",
+        "fit_varma_order(x, real(int(p(1,1)), kind=dp), real(int(q(1,1)), kind=dp))",
+    )
     f90 = re.sub(
         r"\bsimulate_markov_chain\(\s*n\s*,\s*pmat\s*,\s*s0_def\s*\)",
         "simulate_markov_chain(n, pmat, int(s0_def))",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    if re.search(r"\bs0_def\s*\(:\s*,\s*:\)", f90, re.IGNORECASE):
+        f90 = re.sub(r"\bint\s*\(\s*s0_def\s*\)", "int(s0_def(1,1))", f90, flags=re.IGNORECASE)
+    f90 = re.sub(
+        r"(?m)^(\s*coef_row_result\(\s*\d+\s*\)\s*=\s*fit%\s*intercept)\s*$",
+        r"\1(1)",
         f90,
         flags=re.IGNORECASE,
     )
@@ -29450,6 +29474,30 @@ def main() -> int:
         r"\1(\2)",
         f90,
         flags=re.IGNORECASE,
+    )
+    matrix_names_final = {
+        m.group(1)
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\)", f90)
+    }
+    for mat_final in sorted(matrix_names_final, key=len, reverse=True):
+        f90 = re.sub(
+            rf"(?m)^(\s*){re.escape(mat_final)}\(\s*([A-Za-z0-9_+\-*/ ()]+?)\s*\)\s*=",
+            lambda m: (
+                f"{m.group(1)}{mat_final}(mod(({m.group(2).strip()}) - 1, size({mat_final}, 1)) + 1, "
+                f"((({m.group(2).strip()}) - 1) / size({mat_final}, 1)) + 1) ="
+            ),
+            f90,
+        )
+    def _normalize_alloc_vec_decl(m_vec_decl: re.Match[str]) -> str:
+        indent_vec, typ_vec, rest_vec = m_vec_decl.group(1), m_vec_decl.group(2), m_vec_decl.group(3)
+        names_vec = [p.strip()[:-3].strip() for p in rest_vec.split(",") if p.strip().endswith("(:)")]
+        if not names_vec:
+            return m_vec_decl.group(0)
+        return f"{indent_vec}{typ_vec}, allocatable, dimension(:) :: " + ", ".join(names_vec)
+    f90 = re.sub(
+        r"(?im)^(\s*)(real\(kind=dp\)|integer|logical),\s*allocatable\s*::\s*([A-Za-z]\w*\(:\)(?:\s*,\s*[A-Za-z]\w*\(:\))+)\s*$",
+        _normalize_alloc_vec_decl,
+        f90,
     )
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
