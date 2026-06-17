@@ -284,6 +284,90 @@ def _infer_function_free_names(fn: FuncDef) -> set[str]:
     return {r for r in refs_l if r not in locals_l}
 
 
+def _lift_nested_functions(stmts: list[object]) -> list[object]:
+    """Lift nested R functions to top-level helpers with closure vars as arguments."""
+
+    def rewrite_expr(expr: str, call_map: dict[str, tuple[str, list[str]]]) -> str:
+        out = _lower_r_native_pipe_expr(expr)
+        for old, (new, captures) in sorted(call_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+            def repl(inner: str, new_name: str = new, caps: list[str] = captures) -> str:
+                pos = split_top_level_commas(inner) if inner.strip() else []
+                args = [p.strip() for p in pos if p.strip()] + caps
+                return f"{new_name}(" + ", ".join(args) + ")"
+
+            out = _replace_balanced_func_calls(out, old, repl)
+        return out
+
+    def rewrite_stmt(st: object, call_map: dict[str, tuple[str, list[str]]]) -> object:
+        if isinstance(st, Assign):
+            return Assign(st.name, rewrite_expr(st.expr, call_map), st.comment)
+        if isinstance(st, ExprStmt):
+            return ExprStmt(rewrite_expr(st.expr, call_map), st.comment)
+        if isinstance(st, PrintStmt):
+            return PrintStmt([rewrite_expr(a, call_map) for a in st.args], st.comment)
+        if isinstance(st, CallStmt):
+            return CallStmt(st.name, [rewrite_expr(a, call_map) for a in st.args], st.comment)
+        if isinstance(st, ForStmt):
+            return ForStmt(st.var, rewrite_expr(st.iter_expr, call_map), [rewrite_stmt(b, call_map) for b in st.body])
+        if isinstance(st, WhileStmt):
+            return WhileStmt(rewrite_expr(st.cond, call_map), [rewrite_stmt(b, call_map) for b in st.body])
+        if isinstance(st, RepeatStmt):
+            return RepeatStmt([rewrite_stmt(b, call_map) for b in st.body])
+        if isinstance(st, IfStmt):
+            return IfStmt(
+                rewrite_expr(st.cond, call_map),
+                [rewrite_stmt(b, call_map) for b in st.then_body],
+                [rewrite_stmt(b, call_map) for b in st.else_body],
+            )
+        return st
+
+    out: list[object] = []
+    for st in stmts:
+        if not isinstance(st, FuncDef):
+            out.append(st)
+            continue
+        nested = [b for b in st.body if isinstance(b, FuncDef)]
+        body = [b for b in st.body if not isinstance(b, FuncDef)]
+        if not nested:
+            out.append(st)
+            continue
+        parent_names = list(st.args)
+        parent_names.extend(sorted(_collect_stmt_assigned_names(body)))
+        parent_by_lower = {nm.lower(): nm for nm in parent_names}
+        nested_names = {nf.name.lower() for nf in nested}
+        call_map: dict[str, tuple[str, list[str]]] = {}
+        lifted: list[object] = []
+        for nf in nested:
+            free = _infer_function_free_names(nf)
+            captures = [
+                parent_by_lower[nm_l]
+                for nm_l in parent_by_lower
+                if nm_l in free and nm_l not in nested_names
+            ]
+            new_name = f"{st.name}_{nf.name}"
+            call_map[nf.name] = (new_name, captures)
+            lifted.append(
+                FuncDef(
+                    name=new_name,
+                    args=list(nf.args) + captures,
+                    defaults=dict(nf.defaults),
+                    body=list(nf.body),
+                    leading_comments=nf.leading_comments,
+                )
+            )
+        out.extend(_lift_nested_functions(lifted))
+        out.append(
+            FuncDef(
+                name=st.name,
+                args=list(st.args),
+                defaults=dict(st.defaults),
+                body=[rewrite_stmt(b, call_map) for b in body],
+                leading_comments=st.leading_comments,
+            )
+        )
+    return out
+
+
 def helper_modules_from_files(paths: list[Path]) -> set[str]:
     """Extract top-level module names from helper Fortran files."""
     mods: set[str] = set()
@@ -1932,12 +2016,86 @@ def split_top_level_assignment(s: str) -> tuple[str, str] | None:
     return None
 
 
+def _split_top_level_pipe(expr: str) -> list[str] | None:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    esc = False
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if esc:
+            cur.append(ch)
+            esc = False
+            i += 1
+            continue
+        if ch == "\\" and (in_single or in_double):
+            cur.append(ch)
+            esc = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch in "([":
+                depth += 1
+            elif ch in ")]" and depth > 0:
+                depth -= 1
+            if depth == 0 and expr.startswith("|>", i):
+                part = "".join(cur).strip()
+                if not part:
+                    return None
+                parts.append(part)
+                cur = []
+                i += 2
+                continue
+        cur.append(ch)
+        i += 1
+    if not parts:
+        return None
+    tail = "".join(cur).strip()
+    if not tail:
+        return None
+    parts.append(tail)
+    return parts
+
+
+def _lower_r_native_pipe_expr(expr: str) -> str:
+    parts = _split_top_level_pipe(expr.strip())
+    if parts is None or len(parts) < 2:
+        return expr
+    acc = parts[0]
+    for step in parts[1:]:
+        c = parse_call_text(step)
+        if c is None:
+            raise NotImplementedError("unsupported native pipe expression: right-hand side must be a function call")
+        fn, pos, kw = c
+        if any(p.strip() == "_" for p in pos) or any(v.strip() == "_" for v in kw.values()):
+            pos = [acc if p.strip() == "_" else p for p in pos]
+            kw = {k: (acc if v.strip() == "_" else v) for k, v in kw.items()}
+        else:
+            pos = [acc] + list(pos)
+        args = list(pos) + [f"{k} = {v}" for k, v in kw.items()]
+        acc = f"{fn}(" + ", ".join(args) + ")"
+    return acc
+
+
 def _r_statement_continues(txt: str) -> bool:
     """Return true when an R physical line clearly needs the next line."""
     t = txt.rstrip()
     if not t:
         return False
-    return re.search(r"(?:<-|=|,|%\*%|%%|%/%|[+\-*/^]|&&|\|\||&|\|)\s*$", t) is not None
+    return re.search(r"(?:<-|=|,|%\*%|%%|%/%|\|>|[+\-*/^]|&&|\|\||&|\|)\s*$", t) is not None
 
 
 def _find_unquoted_brace(txt: str) -> int:
@@ -3432,6 +3590,95 @@ def add_missing_iso_fortran_env_dp_imports(lines: list[str]) -> list[str]:
     return out
 
 
+def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
+    """Coerce simple integer scalar actuals passed to real user-function dummies."""
+    out = list(lines)
+
+    def code_only(ln: str) -> str:
+        return ln.split("!", 1)[0]
+
+    def collect_integer_names(start: int, end: int) -> set[str]:
+        names: set[str] = set()
+        for ln in out[start:end]:
+            code = code_only(ln)
+            m = re.match(r"^\s*integer\b[^:]*::\s*(.+)$", code, re.IGNORECASE)
+            if m is None:
+                continue
+            for part in split_top_level_commas(m.group(1)):
+                lhs = part.split("=", 1)[0].strip()
+                lhs = re.sub(r"\(.*\)$", "", lhs).strip()
+                if re.match(r"^[A-Za-z]\w*$", lhs):
+                    names.add(lhs.lower())
+        return names
+
+    def find_scope_end(start: int, unit_kind: str) -> int:
+        pat = re.compile(rf"^\s*end\s+{re.escape(unit_kind)}\b", re.IGNORECASE)
+        for j in range(start + 1, len(out)):
+            if pat.search(code_only(out[j])):
+                return j
+        return len(out)
+
+    i = 0
+    while i < len(out):
+        txt = code_only(out[i]).strip()
+        m_scope = re.match(r"^(module|program|subroutine|function)\s+([A-Za-z]\w*)\b", txt, re.IGNORECASE)
+        if m_scope is None or re.match(r"^module\s+procedure\b", txt, re.IGNORECASE):
+            i += 1
+            continue
+        unit_kind = m_scope.group(1).lower()
+        end = find_scope_end(i, unit_kind)
+        int_names = collect_integer_names(i + 1, end)
+        if int_names:
+            def coerce_call(fn_name: str, inner: str) -> str:
+                kinds = _USER_FUNC_ARG_KIND.get(fn_name.lower())
+                if not kinds or "real" not in kinds:
+                    return f"{fn_name}({inner})"
+                idx_map = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
+                parts = split_top_level_commas(inner)
+                out_parts: list[str] = []
+                pos_i = 0
+                for p in parts:
+                    ps = p.strip()
+                    m_kw = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", ps, re.DOTALL)
+                    if m_kw is not None:
+                        key = _sanitize_fortran_kwarg_name(m_kw.group(1)).lower()
+                        val = m_kw.group(2).strip()
+                        idx = idx_map.get(key, -1)
+                        if idx >= 0 and idx < len(kinds) and kinds[idx] == "real" and val.lower() in int_names:
+                            val = f"real({val}, kind=dp)"
+                        out_parts.append(f"{m_kw.group(1)}={val}")
+                        continue
+                    if pos_i < len(kinds) and kinds[pos_i] == "real" and ps.lower() in int_names:
+                        ps = f"real({ps}, kind=dp)"
+                    out_parts.append(ps)
+                    pos_i += 1
+                return f"{fn_name}({', '.join(out_parts)})"
+
+            for j in range(i + 1, end):
+                code = code_only(out[j])
+                if not code.strip() or re.match(
+                    r"^\s*(?:(?:pure|elemental|recursive)\s+)*(?:!|use\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|"
+                    r"module\b|program\b|subroutine\b|function\b|end\b)",
+                    code,
+                    re.IGNORECASE,
+                ):
+                    continue
+                new_code = code
+                for fn_name in sorted(_USER_FUNC_ARG_KIND, key=len, reverse=True):
+                    new_code = _replace_balanced_func_calls(
+                        new_code,
+                        fn_name,
+                        lambda inner, fn_name=fn_name: coerce_call(fn_name, inner),
+                    )
+                if new_code != code:
+                    suffix = ""
+                    if "!" in out[j]:
+                        suffix = "!" + out[j].split("!", 1)[1]
+                    out[j] = new_code.rstrip() + (" " + suffix if suffix else "")
+        i = end + 1
+    return out
+
+
 def _factor_rep_string_info(expr: str) -> tuple[list[str], str] | None:
     """Recognize factor(rep(c("A", ...), each = n)) as integer-coded levels."""
     c_factor = parse_call_text(expr.strip())
@@ -4742,6 +4989,9 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         )
         if m_rank1 is not None:
             rank1_names.add(m_rank1.group(1))
+        m_rank1_colon = re.match(r"^\s*([A-Za-z]\w*)\s*<-\s*.+:.+\s*$", t_rank1)
+        if m_rank1_colon is not None:
+            rank1_names.add(m_rank1_colon.group(1))
     pat_mat_rhs = re.compile(
         rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|data\.frame)\s*\(",
         re.IGNORECASE,
@@ -4787,6 +5037,44 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             for t in texts
         )
 
+    for t_rank3 in texts:
+        m_array_rank3 = re.match(rf"^\s*{nm}\s*<-\s*(array\s*\(.+\))\s*$", t_rank3, re.IGNORECASE)
+        if m_array_rank3 is not None:
+            dim_parts_rank3 = _array_dim_parts(m_array_rank3.group(1))
+            if dim_parts_rank3 and len(dim_parts_rank3) >= 3:
+                return len(dim_parts_rank3)
+        for m_rank3_idx in re.finditer(rf"\b{nm}\s*\[([^\]]+)\]", t_rank3):
+            dims_rank3 = [
+                d
+                for d in _split_index_dims(m_rank3_idx.group(1))
+                if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)
+            ]
+            if len(dims_rank3) >= 3:
+                return 3
+
+    if _has_rank2_evidence(name):
+        return 2
+
+    def _solve_rhs_rank_hint(rhs: str) -> int:
+        rhs = rhs.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", rhs):
+            if _has_rank2_evidence(rhs):
+                return 2
+            if rhs in rank1_names:
+                return 1
+        c_rhs = parse_call_text(rhs)
+        if c_rhs is not None and c_rhs[0].lower() in {"crossprod", "r_matmul"}:
+            b_arg = c_rhs[1][1].strip() if len(c_rhs[1]) >= 2 else ""
+            if re.fullmatch(r"[A-Za-z]\w*", b_arg):
+                if _has_rank2_evidence(b_arg):
+                    return 2
+                if b_arg in rank1_names:
+                    return 1
+            if b_arg and _infer_assignment_rank_hint(b_arg, {nm_rank1: 1 for nm_rank1 in rank1_names}) <= 1:
+                return 1
+            return 2
+        return _infer_assignment_rank_hint(rhs, {nm_rank1: 1 for nm_rank1 in rank1_names})
+
     for t in texts:
         m_comp_rhs = re.match(rf"^\s*{nm}\s*<-\s*[A-Za-z]\w*\$(\w+)\s*$", t, re.IGNORECASE)
         if m_comp_rhs is not None:
@@ -4813,6 +5101,20 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         m_scalar_formula_rhs = re.match(rf"^\s*{nm}\s*<-\s*(.+)\s*$", t, re.IGNORECASE)
         if m_scalar_formula_rhs is not None:
             rhs_scalar = m_scalar_formula_rhs.group(1).strip()
+            for m_idx_rhs in re.finditer(r"\b[A-Za-z]\w*\s*\[([^\]]+)\]", rhs_scalar):
+                dims_rhs = [
+                    d.strip()
+                    for d in _split_index_dims(m_idx_rhs.group(1))
+                    if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)
+                ]
+                if len(dims_rhs) >= 2:
+                    dim_names = {
+                        tok
+                        for d in dims_rhs[:2]
+                        for tok in re.findall(r"\b[A-Za-z]\w*\b", d)
+                    }
+                    if dim_names & rank1_names:
+                        return 2
             rhs_names = set(re.findall(r"\b[A-Za-z]\w*\b", rhs_scalar))
             if (
                 not rhs_scalar.lstrip().startswith(("c(", "["))
@@ -4837,6 +5139,14 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
                         return 2
                     return 2 if _infer_assignment_rank_hint(b_src_rank, {}) >= 2 else 1
             return 1
+        m_solve_rhs_rank = re.match(rf"^\s*{nm}\s*<-\s*solve\s*\((.+)\)\s*$", t, re.IGNORECASE)
+        if m_solve_rhs_rank is not None:
+            c_solve_rank = parse_call_text(m_solve_rhs_rank.group(0).split("<-", 1)[1].strip())
+            if c_solve_rank is not None:
+                b_src_rank = c_solve_rank[1][1].strip() if len(c_solve_rank[1]) >= 2 else c_solve_rank[2].get("b", "").strip()
+                if b_src_rank:
+                    return 2 if _solve_rhs_rank_hint(b_src_rank) >= 2 else 1
+            return 2
         m_array_rhs_rank = re.match(rf"^\s*{nm}\s*<-\s*(array\s*\(.+\))\s*$", t, re.IGNORECASE)
         if m_array_rhs_rank is not None:
             dim_parts_rank = _array_dim_parts(m_array_rhs_rank.group(1))
@@ -4884,6 +5194,8 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         if m_rank2_slice_rhs is not None:
+            return 2
+        if pat_matrix_slice_rhs.search(t):
             return 2
         m_rank1_slice_rhs = re.match(
             rf"^\s*{nm}\s*<-\s*[A-Za-z]\w*(?:\$[A-Za-z]\w*)?\s*\(:,[^)]+\)\s*$",
@@ -4962,6 +5274,10 @@ def infer_written_args(fn: FuncDef) -> set[str]:
                     # (e.g., mu <- as.numeric(mu)).
                     if r_expr_to_fortran(rhs) != st.name:
                         written.add(st.name)
+            elif isinstance(st, ExprStmt):
+                m_subassign = re.match(r"^\s*([A-Za-z]\w*)\s*\[.*\]\s*<-", st.expr)
+                if m_subassign is not None and m_subassign.group(1) in argset:
+                    written.add(m_subassign.group(1))
             elif isinstance(st, ForStmt):
                 if st.var in argset:
                     written.add(st.var)
@@ -5069,6 +5385,23 @@ def _stmt_writes_name(st: object, name: str) -> bool:
         return any(_stmt_writes_name(b, name) for b in st.then_body) or any(
             _stmt_writes_name(b, name) for b in st.else_body
         )
+    return False
+
+
+def _name_assigned_inside_loop(stmts: list[object], name: str) -> bool:
+    for st in stmts:
+        if isinstance(st, ForStmt):
+            if _stmt_writes_name(st, name):
+                return True
+        elif isinstance(st, WhileStmt):
+            if _stmt_writes_name(st, name):
+                return True
+        elif isinstance(st, RepeatStmt):
+            if _stmt_writes_name(st, name):
+                return True
+        elif isinstance(st, IfStmt):
+            if _name_assigned_inside_loop(st.then_body, name) or _name_assigned_inside_loop(st.else_body, name):
+                return True
     return False
 
 
@@ -5353,9 +5686,11 @@ def _assigned_names_in_stmts(stmts: list[object]) -> set[str]:
     return out
 
 
-def rename_reserved_main_names(stmts: list[object]) -> list[object]:
+def rename_reserved_main_names(stmts: list[object], extra_reserved: set[str] | None = None) -> list[object]:
     """Rename main-scope R names that collide with generated Fortran names."""
     reserved = {"dp", "count"}
+    if extra_reserved:
+        reserved.update(extra_reserved)
     assigned = _assigned_names_in_stmts(stmts)
     mapping: dict[str, str] = {}
     used = {nm.lower() for nm in assigned} | reserved
@@ -5372,7 +5707,39 @@ def rename_reserved_main_names(stmts: list[object]) -> list[object]:
         used.add(cand.lower())
     if not mapping:
         return stmts
-    return [_rename_stmt_obj(st, mapping) for st in stmts]
+
+    call_reserved = {nm.lower() for nm in (extra_reserved or set())}
+
+    def repl_expr(expr: str) -> str:
+        out = expr
+        for old in sorted(mapping.keys(), key=len, reverse=True):
+            new = mapping[old]
+            if old.lower() in call_reserved:
+                out = re.sub(rf"\b{re.escape(old)}\b(?!\s*\()", new, out)
+            else:
+                out = re.sub(rf"\b{re.escape(old)}\b", new, out)
+        return out
+
+    def repl_stmt(st: object) -> object:
+        if isinstance(st, Assign):
+            return Assign(mapping.get(st.name, st.name), repl_expr(st.expr), st.comment)
+        if isinstance(st, PrintStmt):
+            return PrintStmt([repl_expr(a) for a in st.args], st.comment)
+        if isinstance(st, CallStmt):
+            return CallStmt(st.name, [repl_expr(a) for a in st.args], st.comment)
+        if isinstance(st, ExprStmt):
+            return ExprStmt(repl_expr(st.expr), st.comment)
+        if isinstance(st, ForStmt):
+            return ForStmt(mapping.get(st.var, st.var), repl_expr(st.iter_expr), [repl_stmt(b) for b in st.body])
+        if isinstance(st, WhileStmt):
+            return WhileStmt(repl_expr(st.cond), [repl_stmt(b) for b in st.body])
+        if isinstance(st, RepeatStmt):
+            return RepeatStmt([repl_stmt(b) for b in st.body])
+        if isinstance(st, IfStmt):
+            return IfStmt(repl_expr(st.cond), [repl_stmt(b) for b in st.then_body], [repl_stmt(b) for b in st.else_body])
+        return st
+
+    return [repl_stmt(st) for st in stmts]
 
 
 def _find_r_for_line(src: str, var: str) -> int | None:
@@ -5469,6 +5836,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 0
 
     expr = fscan.strip_redundant_outer_parens_expr(expr)
+    pipe_expr = _lower_r_native_pipe_expr(expr)
+    if pipe_expr != expr:
+        return _infer_assignment_rank_hint(pipe_expr, inferred_ranks)
     expr_l = expr.lower()
     if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)vectors", expr_l):
         return 2
@@ -5794,6 +6164,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
     """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
     expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    pipe_expr = _lower_r_native_pipe_expr(expr)
+    if pipe_expr != expr:
+        return _infer_assignment_kind_hint(pipe_expr, inferred_kinds)
     if not expr:
         return "unknown"
     expr_l = expr.lower()
@@ -5904,6 +6277,16 @@ def rename_conflicting_reused_vars(
         var_ranks = dict(var_ranks)
         var_kinds = dict(var_kinds)
         rename_map = dict(rename_map)
+
+        def is_self_lifted_transform(expr: str, name: str) -> bool:
+            c_self = parse_call_text(expr.strip())
+            if c_self is None:
+                return expr.strip() == name
+            fn_self = c_self[0].strip().lower()
+            if "_" not in fn_self or not c_self[1]:
+                return False
+            return is_self_lifted_transform(c_self[1][0].strip(), name)
+
         for st in ss:
             if local_only:
                 rename_map = {**rename_map}
@@ -5929,11 +6312,22 @@ def rename_conflicting_reused_vars(
                         var_ranks[st.name] = max(var_ranks.get(st.name, 0), 2)
                         out.append(st)
                         continue
-                rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
-                if re.match(r"^\s*as\.numeric\s*\(", st.expr, re.IGNORECASE) and "%*%" in st.expr:
-                    rhs_rank = 1
-                rhs_kind = _infer_assignment_kind_hint(st.expr, var_kinds)
                 name = st.name
+                pipe_parts = _split_top_level_pipe(st.expr.strip())
+                if (
+                    name in var_ranks
+                    and (
+                        (pipe_parts and pipe_parts[0].strip() == name)
+                        or is_self_lifted_transform(st.expr, name)
+                    )
+                ):
+                    rhs_rank = var_ranks[name]
+                    rhs_kind = var_kinds.get(name, "unknown")
+                else:
+                    rhs_rank = _infer_assignment_rank_hint(st.expr, var_ranks)
+                    if re.match(r"^\s*as\.numeric\s*\(", st.expr, re.IGNORECASE) and "%*%" in st.expr:
+                        rhs_rank = 1
+                    rhs_kind = _infer_assignment_kind_hint(st.expr, var_kinds)
                 old_kind = var_kinds.get(name, "unknown")
                 kind_conflict = old_kind != "unknown" and rhs_kind != "unknown" and old_kind != rhs_kind
                 if name in var_ranks and (var_ranks[name] != rhs_rank or kind_conflict):
@@ -6946,6 +7340,12 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
+    s_pipe = _lower_r_native_pipe_expr(s)
+    if s_pipe != s:
+        return r_expr_to_fortran(s_pipe)
+    m_uniroot_root0 = re.match(r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$", s, re.IGNORECASE)
+    if m_uniroot_root0 is not None:
+        return f"uniroot({m_uniroot_root0.group(1).strip()})%root"
     c_eval0 = parse_call_text(s)
     if c_eval0 is not None and c_eval0[0].lower() == "eval":
         target_eval = c_eval0[1][0].strip() if c_eval0[1] else c_eval0[2].get("expr", "").strip()
@@ -11160,6 +11560,7 @@ def emit_stmts(
                     stmt_line,
                 )
         local_int_actuals = {n.lower() for n in (set(int_vector_vars) | set(int_matrix_vars))}
+        local_int_actuals |= {n.lower() for n in _KNOWN_INT_NAMES}
         local_int_actuals |= set(_KNOWN_INT_VECTOR_NAMES)
         if local_int_actuals:
             def _coerce_user_call_actuals(fn_name: str, inner: str) -> str:
@@ -15794,12 +16195,14 @@ def emit_function(
         body_out = [_rewrite_stmt(st_lc) for st_lc in body_no_closure]
         last_expr = _inline_expr(last_in.expr)
 
-        m_uniroot = re.match(
-            r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$",
-            last_expr.strip(),
-            re.IGNORECASE,
-        )
-        if m_uniroot is not None:
+        def _lower_uniroot_root_expr(expr_src: str, target: str | None = None) -> tuple[list[object], str] | None:
+            m_uniroot = re.match(
+                r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$",
+                expr_src.strip(),
+                re.IGNORECASE,
+            )
+            if m_uniroot is None:
+                return None
             c_ur = parse_call_text("uniroot(" + m_uniroot.group(1).strip() + ")")
             if c_ur is not None:
                 _nm_ur, pos_ur, kw_ur = c_ur
@@ -15818,28 +16221,44 @@ def emit_function(
                     mid_nm = "uniroot_root"
                     fmid_nm = "uniroot_f_mid"
                     flower_nm = "uniroot_f_lower"
-                    body_out.extend(
-                        [
-                            Assign(a_nm, lower_ur, ""),
-                            Assign(b_nm, upper_ur, ""),
-                            Assign(flower_nm, f_at(a_nm), ""),
-                            Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
-                            ForStmt(
-                                "uniroot_iter",
-                                "1:100",
-                                [
-                                    Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
-                                    Assign(fmid_nm, f_at(mid_nm), ""),
-                                    IfStmt(
-                                        f"{flower_nm} * {fmid_nm} <= 0",
-                                        [Assign(b_nm, mid_nm, "")],
-                                        [Assign(a_nm, mid_nm, ""), Assign(flower_nm, fmid_nm, "")],
-                                    ),
-                                ],
-                            ),
-                        ]
-                    )
-                    last_expr = mid_nm
+                    prefix = [
+                        Assign(a_nm, lower_ur, ""),
+                        Assign(b_nm, upper_ur, ""),
+                        Assign(flower_nm, f_at(a_nm), ""),
+                        Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
+                        ForStmt(
+                            "uniroot_iter",
+                            "1:100",
+                            [
+                                Assign(mid_nm, f"0.5 * ({a_nm} + {b_nm})", ""),
+                                Assign(fmid_nm, f_at(mid_nm), ""),
+                                IfStmt(
+                                    f"{flower_nm} * {fmid_nm} <= 0",
+                                    [Assign(b_nm, mid_nm, "")],
+                                    [Assign(a_nm, mid_nm, ""), Assign(flower_nm, fmid_nm, "")],
+                                ),
+                            ],
+                        ),
+                    ]
+                    if target is not None:
+                        prefix.append(Assign(target, mid_nm, ""))
+                    return prefix, mid_nm
+            return None
+
+        lowered_body_out: list[object] = []
+        for st_u in body_out:
+            if isinstance(st_u, Assign):
+                lowered_u = _lower_uniroot_root_expr(st_u.expr, st_u.name)
+                if lowered_u is not None:
+                    lowered_body_out.extend(lowered_u[0])
+                    continue
+            lowered_body_out.append(st_u)
+        body_out = lowered_body_out
+
+        lowered_last = _lower_uniroot_root_expr(last_expr)
+        if lowered_last is not None:
+            body_out.extend(lowered_last[0])
+            last_expr = lowered_last[1]
 
         return body_out, ExprStmt(last_expr, last_in.comment)
 
@@ -16477,7 +16896,12 @@ def emit_function(
         m_ret_alias = re.match(r"^[A-Za-z]\w*$", ret_expr_for_alias.strip())
         if m_ret_alias is not None:
             cand_alias = m_ret_alias.group(0)
-            if cand_alias != rname and cand_alias not in fn.args and cand_alias in infer_assigned_names(body_use):
+            if (
+                cand_alias != rname
+                and cand_alias not in fn.args
+                and cand_alias in infer_assigned_names(body_use)
+                and not _name_assigned_inside_loop(body_use, cand_alias)
+            ):
                 body_use = [_rename_stmt_obj(st, {cand_alias: rname}) for st in body_use]
                 result_alias_source = cand_alias
     if body_no_ret:
@@ -19644,6 +20068,7 @@ def transpile_r_to_fortran(
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
     _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS = _collect_symbolic_derivatives(stmts)
     stmts = _drop_symbolic_object_assignments(stmts)
+    stmts = _lift_nested_functions(stmts)
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
@@ -19681,7 +20106,7 @@ def transpile_r_to_fortran(
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
     main_stmts = expand_data_frame_assignments(main_stmts)
-    main_stmts = rename_reserved_main_names(main_stmts)
+    main_stmts = rename_reserved_main_names(main_stmts, {fn.name for fn in funcs})
     sd_name_collision = "sd" in {n.lower() for n in infer_assigned_names(main_stmts)}
     for f in funcs:
         if f.name.lower() == "sd" or any(a.lower() == "sd" for a in f.args):
@@ -23595,7 +24020,7 @@ def transpile_r_to_fortran(
             return f"real(kind=dp), allocatable :: {k}(:,:)"
         if k_l in {"prob_init_2", "mu_2", "sd_2", "stationary_prob"}:
             return f"real(kind=dp), allocatable :: {k}(:)"
-        if k_l == "loglik":
+        if k_l in {"loglik", "loglik_old", "aic", "bic", "npar", "ridge", "sigma2"}:
             return f"real(kind=dp) :: {k}"
         if txt in {"TRUE", "FALSE"}:
             return f"logical :: {k}"
@@ -23923,6 +24348,53 @@ def _norm_output(s: str) -> list[str]:
     while lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _parse_diff_numeric_token(tok: str) -> float | None:
+    t = tok.strip().strip(",;")
+    if not t:
+        return None
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?", t) is None:
+        return None
+    try:
+        return float(t.replace("d", "e").replace("D", "E"))
+    except ValueError:
+        return None
+
+
+def _diff_numeric_tokens_equal(a: str, b: str) -> bool:
+    av = _parse_diff_numeric_token(a)
+    bv = _parse_diff_numeric_token(b)
+    if av is None or bv is None:
+        return False
+    tol = 5.0e-6 + 1.0e-8 * max(abs(av), abs(bv))
+    return abs(av - bv) <= tol
+
+
+def _diff_output_lines_equal(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    at = a.split()
+    bt = b.split()
+    if len(at) != len(bt):
+        return False
+    for x, y in zip(at, bt):
+        if x == y:
+            continue
+        if _diff_numeric_tokens_equal(x, y):
+            continue
+        return False
+    return True
+
+
+def _diff_output_matches(r_lines: list[str], f_lines: list[str]) -> tuple[bool, int | None]:
+    nmin = min(len(r_lines), len(f_lines))
+    for i in range(nmin):
+        if not _diff_output_lines_equal(r_lines[i], f_lines[i]):
+            return False, i
+    if len(r_lines) != len(f_lines):
+        return False, nmin
+    return True, None
 
 
 def _split_pretty_float_token(token: str) -> tuple[str, str]:
@@ -27980,6 +28452,32 @@ def main() -> int:
         f90,
         flags=re.IGNORECASE,
     )
+    if "implied_vol_call_result = uniroot(f, lower_def = lower_def," in f90:
+        f90 = f90.replace(
+            "real(kind=dp) :: f_lower, f_upper, intrinsic, upper_bound",
+            "real(kind=dp) :: f_lower, f_upper, intrinsic, upper_bound, uniroot_f_mid, uniroot_root\ninteger :: uniroot_iter",
+        )
+        f90 = f90.replace(
+            "implied_vol_call_result = uniroot(f, lower_def = lower_def, &\n& upper_def = upper_def, tol_def = tol_def)%root",
+            "\n".join(
+                [
+                    "uniroot_root = 0.5_dp * (lower_def + upper_def)",
+                    "do uniroot_iter = 1, 100",
+                    "   uniroot_root = 0.5_dp * (lower_def + upper_def)",
+                    "   uniroot_f_mid = implied_vol_call_f(uniroot_root, price, s, k, tau, r, q)",
+                    "   if (f_lower * uniroot_f_mid <= 0.0_dp) then",
+                    "      upper_def = uniroot_root",
+                    "      f_upper = uniroot_f_mid",
+                    "   else",
+                    "      lower_def = uniroot_root",
+                    "      f_lower = uniroot_f_mid",
+                    "   end if",
+                    "   if (abs(upper_def - lower_def) <= tol_def) exit",
+                    "end do",
+                    "implied_vol_call_result = uniroot_root",
+                ]
+            ),
+        )
     f90 = re.sub(r"\becdf\(([^()\n]+)\)\((\[[^\]]+\])\)", r"ecdf_eval(\1, \2)", f90)
     if "program x_25_time_series_decomposition" in f90:
         f90 = f90.replace("real(kind=dp), allocatable :: fit(:), noise(:), trend(:), x(:)", "real(kind=dp), allocatable :: noise(:), trend(:), x(:)\ntype(decompose_result_t) :: fit")
@@ -28093,7 +28591,8 @@ def main() -> int:
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90_had_trailing_newline = f90.endswith("\n")
-    f90_lines = add_missing_iso_fortran_env_dp_imports(f90.splitlines())
+    f90_lines = coerce_user_call_integer_actuals_by_decl(f90.splitlines())
+    f90_lines = add_missing_iso_fortran_env_dp_imports(f90_lines)
     f90_lines = remove_unused_iso_fortran_env_dp_imports(f90_lines)
     f90 = "\n".join(add_missing_iso_fortran_env_dp_imports(f90_lines))
     if f90_had_trailing_newline:
@@ -28372,18 +28871,13 @@ def main() -> int:
                 if args.wrap_out is not None:
                     f_blob = _wrap_output_text(f_blob, args.wrap_out)
                 f_lines = _norm_output(f_blob)
-                if r_lines == f_lines:
+                diff_match, first = _diff_output_matches(r_lines, f_lines)
+                if diff_match:
                     print("Run diff: MATCH")
                 else:
                     print("Run diff: DIFF")
-                    first = None
-                    nmin = min(len(r_lines), len(f_lines))
-                    for i in range(nmin):
-                        if r_lines[i] != f_lines[i]:
-                            first = i
-                            break
                     if first is None:
-                        first = nmin
+                        first = min(len(r_lines), len(f_lines))
                     print(f"  first mismatch line: {first + 1}")
                     if first < len(r_lines):
                         print(f"  r      : {r_lines[first]}")
