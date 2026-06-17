@@ -5885,6 +5885,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     # Constructor vectors/matrices.
     if expr_l.startswith("c(") or expr_f.startswith("c("):
         return 1
+    if re.match(r"^(?:rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along)\s*\(", expr_l):
+        return 1
 
     m_subset_rank = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr)
     if m_subset_rank is not None:
@@ -9929,16 +9931,23 @@ def r_expr_to_fortran(expr: str) -> str:
             t = src.strip()
             return t.startswith("c(") or (":" in t and "(" not in t and ")" not in t)
 
+        def _rep_count_expr(src: str) -> str:
+            f = r_expr_to_fortran(src)
+            b = _int_bound_expr(f)
+            if b == f:
+                return f"int({f})"
+            return b
+
         args_out: list[str] = [x_f]
         if times_src is not None:
             if _as_times_vec_src(times_src):
                 tv_seq = _split_top_level_colon(times_src.strip())
                 if tv_seq is not None:
-                    tv = f"r_seq_int({_int_bound_expr(r_expr_to_fortran(tv_seq[0].strip()))}, {_int_bound_expr(r_expr_to_fortran(tv_seq[1].strip()))})"
+                    tv = f"r_seq_int({_rep_count_expr(tv_seq[0].strip())}, {_rep_count_expr(tv_seq[1].strip())})"
                 elif times_src.strip().startswith("c(") and times_src.strip().endswith(")"):
                     inner_t = times_src.strip()[2:-1].strip()
                     parts_t = split_top_level_commas(inner_t) if inner_t else []
-                    vals_t = ", ".join(_int_bound_expr(r_expr_to_fortran(p.strip())) for p in parts_t if p.strip())
+                    vals_t = ", ".join(_rep_count_expr(p.strip()) for p in parts_t if p.strip())
                     tv = f"[{vals_t}]"
                 else:
                     tv = r_expr_to_fortran(times_src)
@@ -9946,11 +9955,11 @@ def r_expr_to_fortran(expr: str) -> str:
                     tv = f"[{_int_bound_expr(tv)}]"
                 args_out.append(f"times_vec={tv}")
             else:
-                args_out.append(f"times={_int_bound_expr(r_expr_to_fortran(times_src))}")
+                args_out.append(f"times={_rep_count_expr(times_src)}")
         if each_src is not None:
-            args_out.append(f"each={_int_bound_expr(r_expr_to_fortran(each_src))}")
+            args_out.append(f"each={_rep_count_expr(each_src)}")
         if len_src is not None:
-            args_out.append(f"len_out={_int_bound_expr(r_expr_to_fortran(len_src))}")
+            args_out.append(f"len_out={_rep_count_expr(len_src)}")
 
         return f"{rep_fn}(" + ", ".join(args_out) + ")"
     c_repint = parse_call_text(s)
@@ -12125,6 +12134,8 @@ def emit_stmts(
             if nm_c in return_array_fns:
                 return _USER_FUNC_RETURN_RANK.get(nm_c, 1)
             if nm_c in _USER_FUNC_ARG_KIND:
+                if nm_c in _USER_FUNC_RETURN_RANK:
+                    return _USER_FUNC_RETURN_RANK.get(nm_c, 0)
                 if nm_c in _USER_FUNC_ELEMENTAL:
                     ranks: list[int] = []
                     for a in c[1]:
@@ -16416,7 +16427,7 @@ def emit_function(
         can_be_pure = False
     if ret_expr_src.startswith("c(") or (ret_expr_src.startswith("[") and ret_expr_src.endswith("]")):
         ret_rank = 1
-    elif re.search(r"\b(rowSums|colSums|apply)\s*\(", ret_expr_src):
+    elif re.search(r"\b(rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along)\s*\(", ret_expr_src):
         ret_rank = 1
     elif re.search(r"\b(matrix|array|cbind|cbind2|outer|sweep|r_matmul)\s*\(", ret_expr_src):
         ret_rank = 2
@@ -20256,6 +20267,12 @@ def transpile_r_to_fortran(
                 ret_arg_tail = _return_call_arg(expr_rank_tail)
                 if ret_arg_tail is not None:
                     expr_rank_tail = ret_arg_tail
+                if re.match(
+                    r"^\s*(?:rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along)\s*\(",
+                    expr_rank_tail,
+                    re.IGNORECASE,
+                ):
+                    return 1
                 m_tail = re.match(r"^([A-Za-z]\w*)$", expr_rank_tail)
                 if m_tail is not None:
                     rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
@@ -20330,8 +20347,15 @@ def transpile_r_to_fortran(
         ret_arg = _return_call_arg(ret_expr)
         if ret_arg is not None:
             ret_expr = ret_arg
-        if ret_expr.startswith("c(") or (ret_expr.startswith("[") and ret_expr.endswith("]")):
+        if (
+            ret_expr.startswith("c(")
+            or (ret_expr.startswith("[") and ret_expr.endswith("]"))
+            or re.match(r"^\s*(?:rep|rep_len|numeric|double|seq|seq_len|seq_along)\s*\(", ret_expr, re.IGNORECASE)
+        ):
             fn_return_array_kind[f_ret.name.lower()] = "real"
+            continue
+        if re.match(r"^\s*(?:integer|logical)\s*\(", ret_expr, re.IGNORECASE):
+            fn_return_array_kind[f_ret.name.lower()] = "integer"
             continue
         m_ret = re.match(r"^([A-Za-z]\w*)$", ret_expr)
         if not m_ret:
