@@ -29723,6 +29723,7 @@ def main() -> int:
     f90_lines = fscan.propagate_array_size_aliases(f90_lines)
     f90_lines = fscan.propagate_cached_size_values(f90_lines)
     f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
+    f90_lines = fpost.simplify_unit_ceiling_divisions(f90_lines)
     f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
     f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
     f90_lines = fpost.simplify_norm2_patterns(f90_lines)
