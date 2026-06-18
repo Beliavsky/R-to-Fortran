@@ -10,10 +10,10 @@ implicit none
 private
 public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
-   & pmax, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, count_ws_tokens, &
+   & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -33,8 +33,8 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, cut, outer, &
-   & cumsum, cumprod, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
-   & nchar, char_join, list_files, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
+   & nchar, char_join, list_files, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
@@ -218,6 +218,14 @@ type :: nlm_result_t
    integer :: iterations = 0
 end type nlm_result_t
 
+type :: integrate_result_t
+! Container for R-like integrate result values.
+   real(kind=dp) :: value = 0.0_dp
+   real(kind=dp) :: abs_error = 0.0_dp
+   integer :: subdivisions = 0
+   integer :: message = 0
+end type integrate_result_t
+
 abstract interface
    function nlm_objective_scalar(x) result(v)
 ! Support nlm-style optimization for objective scalar.
@@ -231,6 +239,12 @@ abstract interface
       real(kind=dp), intent(in) :: p(:)
       real(kind=dp) :: v
    end function nlm_objective_vec
+   function integrate_objective(x) result(v)
+! Support integrate-style scalar objective functions.
+      import :: dp
+      real(kind=dp), intent(in) :: x
+      real(kind=dp) :: v
+   end function integrate_objective
 end interface
 
 type :: decompose_result_t
@@ -666,6 +680,11 @@ interface cumprod
    module procedure cumprod_int
 end interface cumprod
 
+interface cummax
+   module procedure cummax_real
+   module procedure cummax_int
+end interface cummax
+
 interface diff
    module procedure diff_real
    module procedure diff_mat_real
@@ -902,6 +921,158 @@ end interface r_typeof
 
 contains
 
+function integrate(fn, lower, upper, rel_tol, subdivisions) result(out)
+! Approximate R integrate() for smooth scalar functions using composite Simpson rules.
+procedure(integrate_objective) :: fn
+real(kind=dp), intent(in) :: lower
+real(kind=dp), intent(in) :: upper
+real(kind=dp), intent(in), optional :: rel_tol
+integer, intent(in), optional :: subdivisions
+type(integrate_result_t) :: out
+integer :: n, nmax
+real(kind=dp) :: prev, curr, tol, scale, inf_threshold
+integer :: mode
+
+if (present(rel_tol)) then
+   tol = rel_tol
+else
+   tol = sqrt(epsilon(1.0_dp))
+end if
+if (present(subdivisions)) then
+   nmax = max(2, subdivisions)
+else
+   nmax = 100
+end if
+if (mod(nmax, 2) /= 0) nmax = nmax + 1
+inf_threshold = sqrt(huge(1.0_dp))
+if (abs(lower) > inf_threshold .and. abs(upper) > inf_threshold) then
+   mode = 3
+else if (abs(upper) > inf_threshold) then
+   mode = 1
+else if (abs(lower) > inf_threshold) then
+   mode = 2
+else
+   mode = 0
+end if
+n = 2
+prev = simpson_integral_mapped(fn, lower, upper, n, mode)
+do
+   n = min(2 * n, nmax)
+   curr = simpson_integral_mapped(fn, lower, upper, n, mode)
+   scale = max(1.0_dp, abs(curr))
+   if (abs(curr - prev) <= tol * scale .or. n >= nmax) exit
+   prev = curr
+end do
+out%value = curr
+out%abs_error = abs(curr - prev) / 15.0_dp
+out%subdivisions = n
+out%message = 0
+end function integrate
+
+function simpson_integral_mapped(fn, a, b, n_in, mode) result(out)
+! Composite Simpson integral, applying finite transforms for improper bounds.
+procedure(integrate_objective) :: fn
+real(kind=dp), intent(in) :: a
+real(kind=dp), intent(in) :: b
+integer, intent(in) :: n_in
+integer, intent(in) :: mode
+real(kind=dp) :: out
+integer :: i, n
+real(kind=dp) :: h, t, s
+n = max(2, n_in)
+if (mod(n, 2) /= 0) n = n + 1
+if (mode == 0) then
+   out = simpson_integral(fn, a, b, n)
+   return
+end if
+h = 1.0_dp / real(n, kind=dp)
+s = integrate_mapped_value(fn, a, b, mode, 0.0_dp) + integrate_mapped_value(fn, a, b, mode, 1.0_dp)
+do i = 1, n - 1
+   t = h * real(i, kind=dp)
+   if (mod(i, 2) == 0) then
+      s = s + 2.0_dp * integrate_mapped_value(fn, a, b, mode, t)
+   else
+      s = s + 4.0_dp * integrate_mapped_value(fn, a, b, mode, t)
+   end if
+end do
+out = s * h / 3.0_dp
+end function simpson_integral_mapped
+
+function integrate_mapped_value(fn, a, b, mode, t) result(out)
+! Mapped integrand value on t in [0, 1] for improper intervals.
+procedure(integrate_objective) :: fn
+real(kind=dp), intent(in) :: a
+real(kind=dp), intent(in) :: b
+integer, intent(in) :: mode
+real(kind=dp), intent(in) :: t
+real(kind=dp) :: out
+real(kind=dp) :: x, jac, tt, pi
+pi = acos(-1.0_dp)
+select case (mode)
+case (1)
+   if (t <= 0.0_dp) then
+      tt = 0.0_dp
+   else if (t >= 1.0_dp) then
+      out = 0.0_dp
+      return
+   else
+      tt = t
+   end if
+   x = a + tt / (1.0_dp - tt)
+   jac = 1.0_dp / (1.0_dp - tt)**2
+case (2)
+   if (t <= 0.0_dp) then
+      out = 0.0_dp
+      return
+   else if (t >= 1.0_dp) then
+      tt = 1.0_dp
+   else
+      tt = t
+   end if
+   x = b - (1.0_dp - tt) / tt
+   jac = 1.0_dp / tt**2
+case default
+   if (t <= 0.0_dp .or. t >= 1.0_dp) then
+      out = 0.0_dp
+      return
+   end if
+   x = tan(pi * (t - 0.5_dp))
+   jac = pi / cos(pi * (t - 0.5_dp))**2
+end select
+out = fn(x) * jac
+if (.not. ieee_is_finite(out)) out = 0.0_dp
+end function integrate_mapped_value
+
+function simpson_integral(fn, a, b, n_in) result(out)
+! Composite Simpson integral with an even number of panels.
+procedure(integrate_objective) :: fn
+real(kind=dp), intent(in) :: a
+real(kind=dp), intent(in) :: b
+integer, intent(in) :: n_in
+real(kind=dp) :: out
+integer :: i, n
+real(kind=dp) :: h, x, s
+n = max(2, n_in)
+if (mod(n, 2) /= 0) n = n + 1
+h = (b - a) / real(n, kind=dp)
+s = fn(a) + fn(b)
+do i = 1, n - 1
+   x = a + h * real(i, kind=dp)
+   if (mod(i, 2) == 0) then
+      s = s + 2.0_dp * fn(x)
+   else
+      s = s + 4.0_dp * fn(x)
+   end if
+end do
+out = s * h / 3.0_dp
+end function simpson_integral
+
+subroutine print_integrate_result(fit)
+! Print an integrate result in a compact R-like form.
+type(integrate_result_t), intent(in) :: fit
+write(*,"(g0,a,g0,a,i0)") fit%value, " with absolute error < ", fit%abs_error, ", subdivisions = ", fit%subdivisions
+end subroutine print_integrate_result
+
 real(kind=dp) function r_elapsed() result(out)
 ! Wall-clock elapsed time in seconds.
 integer :: count, rate
@@ -1053,6 +1224,8 @@ call date_civil_from_days(x, y, m, d)
 select case (trim(fmt))
 case ("%Y")
    write(out, "(i4.4)") y
+case ("%Y-%m")
+   write(out, "(i4.4, '-', i2.2)") y, m
 case ("%m")
    write(out, "(i2.2)") m
 case ("%d")
@@ -2932,14 +3105,21 @@ else
 end if
 end subroutine print_real_scalar
 
-subroutine print_real_vector(x, int_like)
+subroutine print_real_vector(x, int_like, digits)
 ! Print one real vector; use integer format when all values are integer-like.
 real(kind=dp), intent(in) :: x(:) ! values to print
 logical, intent(in), optional :: int_like ! force integer-like formatting
+integer, intent(in), optional :: digits ! digits after decimal point for display
 logical :: use_int_like, all_int
 integer :: i
 integer(kind=int64) :: k
 real(kind=dp) :: r, tol
+character(len=32) :: fmt
+if (present(digits)) then
+   write(fmt, '("(*(f0.",i0,",1x))")') max(0, digits)
+   write(*,fmt) x
+   return
+end if
 use_int_like = print_int_like_default
 if (present(int_like)) use_int_like = int_like
 all_int = .false.
@@ -2997,12 +3177,13 @@ end do
 write(*,*)
 end subroutine print_char_vector
 
-subroutine print_named_real_vector(x, names)
+subroutine print_named_real_vector(x, names, digits)
 ! Print named real vector values in an R-like format.
 real(kind=dp), intent(in) :: x(:) ! input vector
 character(len=*), intent(in) :: names(:) ! display names
+integer, intent(in), optional :: digits ! digits after decimal point for display
 call print_char_vector(names)
-call print_real_vector(x)
+call print_real_vector(x, digits=digits)
 end subroutine print_named_real_vector
 
 function nlm_stub(p, hessian) result(out)
@@ -3230,57 +3411,85 @@ end do
 write(*,*)
 end subroutine print_table1
 
-subroutine print_table2_int(x, row_names, col_names)
+subroutine print_table2_int(x, row_names, col_names, digits)
 ! Print table2 int values in an R-like format.
 integer, intent(in) :: x(:,:) ! input matrix
 character(len=*), intent(in) :: row_names(:) ! display names
 character(len=*), intent(in) :: col_names(:) ! display names
-integer :: i, j
-write(*,'(12x)', advance='no')
+integer, intent(in), optional :: digits ! accepted for generic compatibility
+integer :: i, j, row_w, col_w
+character(len=32) :: row_fmt, col_fmt, int_fmt
+row_w = 12
+do i = 1, size(row_names)
+   row_w = max(row_w, len_trim(row_names(i)))
+end do
+col_w = 12
+do j = 1, size(col_names)
+   col_w = max(col_w, len_trim(col_names(j)))
+end do
+write(row_fmt, '("(a", i0, ",1x)")') row_w
+write(col_fmt, '("(a", i0, ",1x)")') col_w
+write(int_fmt, '("(i", i0, ",1x)")') col_w
+write(*,'(a)', advance='no') repeat(" ", row_w + 1)
 do j = 1, size(x, 2)
    if (j <= size(col_names)) then
-      write(*,'(a12,1x)', advance='no') trim(col_names(j))
+      write(*,col_fmt, advance='no') trim(col_names(j))
    else
-      write(*,'(i12,1x)', advance='no') j
+      write(*,int_fmt, advance='no') j
    end if
 end do
 write(*,*)
 do i = 1, size(x, 1)
    if (i <= size(row_names)) then
-      write(*,'(a12,1x)', advance='no') trim(row_names(i))
+      write(*,row_fmt, advance='no') trim(row_names(i))
    else
-      write(*,'(i12,1x)', advance='no') i
+      write(*,'(i0,1x)', advance='no') i
    end if
    do j = 1, size(x, 2)
-      write(*,'(i12,1x)', advance='no') x(i, j)
+      write(*,int_fmt, advance='no') x(i, j)
    end do
    write(*,*)
 end do
 end subroutine print_table2_int
 
-subroutine print_table2_real(x, row_names, col_names)
+subroutine print_table2_real(x, row_names, col_names, digits)
 ! Print table2 real values in an R-like format.
 real(kind=dp), intent(in) :: x(:,:) ! input matrix
 character(len=*), intent(in) :: row_names(:) ! display names
 character(len=*), intent(in) :: col_names(:) ! display names
-integer :: i, j
-write(*,'(12x)', advance='no')
+integer, intent(in), optional :: digits ! number of digits after decimal
+integer :: i, j, row_w, col_w, digits_use
+character(len=32) :: row_fmt, col_fmt, real_fmt
+digits_use = 4
+if (present(digits)) digits_use = max(0, min(15, digits))
+row_w = 12
+do i = 1, size(row_names)
+   row_w = max(row_w, len_trim(row_names(i)))
+end do
+col_w = max(12, digits_use + 8)
+do j = 1, size(col_names)
+   col_w = max(col_w, len_trim(col_names(j)))
+end do
+write(row_fmt, '("(a", i0, ",1x)")') row_w
+write(col_fmt, '("(a", i0, ",1x)")') col_w
+write(real_fmt, '("(f", i0, ".", i0, ",1x)")') col_w, digits_use
+write(*,'(a)', advance='no') repeat(" ", row_w + 1)
 do j = 1, size(x, 2)
    if (j <= size(col_names)) then
-      write(*,'(a12,1x)', advance='no') trim(col_names(j))
+      write(*,col_fmt, advance='no') trim(col_names(j))
    else
-      write(*,'(i12,1x)', advance='no') j
+      write(*,'(i0,1x)', advance='no') j
    end if
 end do
 write(*,*)
 do i = 1, size(x, 1)
    if (i <= size(row_names)) then
-      write(*,'(a12,1x)', advance='no') trim(row_names(i))
+      write(*,row_fmt, advance='no') trim(row_names(i))
    else
-      write(*,'(i12,1x)', advance='no') i
+      write(*,'(i0,1x)', advance='no') i
    end if
    do j = 1, size(x, 2)
-      write(*,'(f12.4,1x)', advance='no') x(i, j)
+      write(*,real_fmt, advance='no') x(i, j)
    end do
    write(*,*)
 end do
@@ -6166,6 +6375,32 @@ do i = 2, size(x)
 end do
 end function cumprod_int
 
+pure function cummax_real(x) result(out)
+! Return cumulative maxima of a real vector.
+real(kind=dp), intent(in) :: x(:) ! input vector
+real(kind=dp), allocatable :: out(:)
+integer :: i
+allocate(out(size(x)))
+if (size(x) <= 0) return
+out(1) = x(1)
+do i = 2, size(x)
+   out(i) = max(out(i - 1), x(i))
+end do
+end function cummax_real
+
+pure function cummax_int(x) result(out)
+! Return cumulative maxima of an integer vector.
+integer, intent(in) :: x(:) ! input vector
+integer, allocatable :: out(:)
+integer :: i
+allocate(out(size(x)))
+if (size(x) <= 0) return
+out(1) = x(1)
+do i = 2, size(x)
+   out(i) = max(out(i - 1), x(i))
+end do
+end function cummax_int
+
 pure function diff_real(x) result(out)
 ! First differences of a real vector.
 real(kind=dp), intent(in) :: x(:) ! input vector
@@ -7101,6 +7336,34 @@ do i = 1, size(x)
    end if
 end do
 end function which_logical
+
+pure function which_first(x) result(out)
+! Return the first R-style which() index, or 0 when no element is true.
+logical, intent(in) :: x(:) ! selection mask
+integer :: out
+integer :: i
+out = 0
+do i = 1, size(x)
+   if (x(i)) then
+      out = i
+      return
+   end if
+end do
+end function which_first
+
+pure function which_last(x) result(out)
+! Return the last R-style which() index, or 0 when no element is true.
+logical, intent(in) :: x(:) ! selection mask
+integer :: out
+integer :: i
+out = 0
+do i = size(x), 1, -1
+   if (x(i)) then
+      out = i
+      return
+   end if
+end do
+end function which_last
 
 pure function which_arr_ind(x) result(out)
 ! Return R-like matrix index helper which_arr_ind.
@@ -8505,6 +8768,16 @@ real(kind=dp) :: out
 out = max(a, b)
 end function pmax
 
+pure elemental function r_round(x, digits) result(out)
+! Round to the requested number of decimal digits using xr2f's current semantics.
+real(kind=dp), intent(in) :: x
+integer, intent(in) :: digits
+real(kind=dp) :: out
+real(kind=dp) :: scale
+scale = 10.0_dp ** digits
+out = anint(x * scale) / scale
+end function r_round
+
 pure function sd_vec(x) result(out)
 ! Sample standard deviation (n-1 denominator).
 real(kind=dp), intent(in) :: x(:) ! sample values
@@ -9283,35 +9556,42 @@ else
 end if
 end subroutine print_matrix_real
 
-subroutine print_matrix_rstyle_real(x)
+subroutine print_matrix_rstyle_real(x, digits)
 ! Print a real matrix with R-like column and row labels.
 real(kind=dp), intent(in) :: x(:,:) ! matrix to print
+integer, intent(in), optional :: digits ! digits after decimal point for display
 integer :: i, j
 integer(kind=int64) :: k
 logical :: all_int
 real(kind=dp) :: r, tol
 character(len=12) :: col_label
+character(len=32) :: fmt
 all_int = .true.
-do i = 1, size(x, 1)
-   do j = 1, size(x, 2)
-      r = x(i, j)
-      if (.not. ieee_is_finite(r)) then
-         all_int = .false.
-         exit
-      end if
-      if (abs(r) > real(huge(0_int64), kind=dp)) then
-         all_int = .false.
-         exit
-      end if
-      k = nint(r, kind=int64)
-      tol = print_int_like_tol * max(1.0_dp, abs(r))
-      if (abs(r - real(k, kind=dp)) > tol) then
-         all_int = .false.
-         exit
-      end if
+if (present(digits)) then
+   all_int = .false.
+   write(fmt, '("(f12.",i0,",1x)")') max(0, digits)
+else
+   do i = 1, size(x, 1)
+      do j = 1, size(x, 2)
+         r = x(i, j)
+         if (.not. ieee_is_finite(r)) then
+            all_int = .false.
+            exit
+         end if
+         if (abs(r) > real(huge(0_int64), kind=dp)) then
+            all_int = .false.
+            exit
+         end if
+         k = nint(r, kind=int64)
+         tol = print_int_like_tol * max(1.0_dp, abs(r))
+         if (abs(r - real(k, kind=dp)) > tol) then
+            all_int = .false.
+            exit
+         end if
+      end do
+      if (.not. all_int) exit
    end do
-   if (.not. all_int) exit
-end do
+end if
 write(*,'(7x)', advance='no')
 do i = 1, size(x, 2)
    write(col_label, '("[,",i0,"]")') i
@@ -9323,6 +9603,8 @@ do i = 1, size(x, 1)
    do j = 1, size(x, 2)
       if (all_int) then
          write(*,'(i12,1x)', advance='no') nint(x(i, j), kind=int64)
+      else if (present(digits)) then
+         write(*,fmt, advance='no') x(i, j)
       else if (x(i, j) == 0.0_dp .or. (abs(x(i, j)) >= 1.0e-4_dp .and. abs(x(i, j)) < 1.0e6_dp)) then
          write(*,'(f12.4,1x)', advance='no') x(i, j)
       else
@@ -9333,14 +9615,17 @@ do i = 1, size(x, 1)
 end do
 end subroutine print_matrix_rstyle_real
 
-subroutine print_matrix_rstyle_named_real(x, names, int_cols, row_names)
+subroutine print_matrix_rstyle_named_real(x, names, int_cols, row_names, digits)
 ! Print a real matrix with R-like row labels and provided column names.
 real(kind=dp), intent(in) :: x(:,:) ! matrix to print
 character(len=*), intent(in) :: names(:) ! column names
 logical, intent(in), optional :: int_cols(:) ! columns to print as integers
 character(len=*), intent(in), optional :: row_names(:) ! row names
+integer, intent(in), optional :: digits ! digits after decimal point for display
 integer :: i, j
 logical :: as_int_col
+character(len=32) :: fmt
+if (present(digits)) write(fmt, '("(f12.",i0,",1x)")') max(0, digits)
 write(*,'(7x)', advance='no')
 do i = 1, size(x, 2)
    if (i <= size(names)) then
@@ -9363,6 +9648,8 @@ do i = 1, size(x, 1)
       end if
       if (as_int_col .and. ieee_is_finite(x(i, j))) then
          write(*,'(i12,1x)', advance='no') nint(x(i, j))
+      else if (present(digits)) then
+         write(*,fmt, advance='no') x(i, j)
       else
          write(*,'(f12.4,1x)', advance='no') x(i, j)
       end if
