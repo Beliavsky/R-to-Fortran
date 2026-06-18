@@ -267,8 +267,14 @@ def _infer_function_free_names(fn: FuncDef) -> set[str]:
     locals_l.update(_collect_stmt_assigned_names(fn.body))
     refs_l: set[str] = set()
     for txt in _collect_stmt_expr_texts(fn.body):
-        for t in re.findall(r"\b[A-Za-z]\w*\b", txt):
-            refs_l.add(t.lower())
+        dotted_spans: list[tuple[int, int]] = []
+        for m_dot in re.finditer(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)+\b", txt):
+            refs_l.add(m_dot.group(0).lower())
+            dotted_spans.append(m_dot.span())
+        for m_name in re.finditer(r"\b[A-Za-z]\w*\b", txt):
+            if any(a <= m_name.start() and m_name.end() <= b for a, b in dotted_spans):
+                continue
+            refs_l.add(m_name.group(0).lower())
     # Conservative filter of obvious non-variable tokens.
     ignore = {
         "true", "false", "na", "nan", "null", "inf",
@@ -335,16 +341,27 @@ def _lift_nested_functions(stmts: list[object]) -> list[object]:
         parent_names = list(st.args)
         parent_names.extend(sorted(_collect_stmt_assigned_names(body)))
         parent_by_lower = {nm.lower(): nm for nm in parent_names}
+        for nm in parent_names:
+            if "_" in nm:
+                parent_by_lower.setdefault(nm.replace("_", ".").lower(), nm)
         nested_names = {nf.name.lower() for nf in nested}
         call_map: dict[str, tuple[str, list[str]]] = {}
         lifted: list[object] = []
         for nf in nested:
             free = _infer_function_free_names(nf)
-            captures = [
-                parent_by_lower[nm_l]
+            capture_matches = [
+                (nm_l, parent_by_lower[nm_l])
                 for nm_l in parent_by_lower
                 if nm_l in free and nm_l not in nested_names
             ]
+            raw_captures = [parent_nm for _free_nm, parent_nm in capture_matches]
+            captures = [_sanitize_fortran_kwarg_name(nm) for nm in raw_captures]
+            capture_rename: dict[str, str] = {}
+            for (free_nm, parent_nm), san in zip(capture_matches, captures):
+                if free_nm != san:
+                    capture_rename[free_nm] = san
+                if parent_nm != san:
+                    capture_rename[parent_nm] = san
             new_name = f"{st.name}_{nf.name}"
             call_map[nf.name] = (new_name, captures)
             lifted.append(
@@ -352,7 +369,7 @@ def _lift_nested_functions(stmts: list[object]) -> list[object]:
                     name=new_name,
                     args=list(nf.args) + captures,
                     defaults=dict(nf.defaults),
-                    body=list(nf.body),
+                    body=[_rename_stmt_obj(b, capture_rename) for b in nf.body] if capture_rename else list(nf.body),
                     leading_comments=nf.leading_comments,
                 )
             )
@@ -4809,7 +4826,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\blength\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bsize\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bsum\s*\(\s*{re.escape(arg)}\b"),
-        re.compile(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\bsum\s*\([^)]*(?:\*|/)\s*\(?\s*\b{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b\s*(?:\*|/)", re.IGNORECASE),
         re.compile(rf"\bmean\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bmax\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bmin\s*\(\s*{re.escape(arg)}\s*\)"),
@@ -4845,6 +4863,14 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             else:
                 txt = ""
             txt = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', txt)
+            if (
+                re.search(r"\bsum\s*\(", txt, re.IGNORECASE)
+                and (
+                    re.search(rf"\bsum\s*\([^)]*(?:\*|/)\s*\(?\s*\b{re.escape(arg)}\b", txt, re.IGNORECASE)
+                    or re.search(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b\s*(?:\*|/)", txt, re.IGNORECASE)
+                )
+            ):
+                rank = max(rank, 1)
             if any(p.search(txt) for p in pats_rank2):
                 rank = max(rank, 2)
             if any(p.search(txt) for p in pats_rank4):
@@ -4865,7 +4891,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 rank = max(rank, 2)
             if re.search(rf"\blist\s*\(.*\b(?:pi|weights|means|sds|vars|nk)\s*=\s*{re.escape(arg)}\b", txt, re.IGNORECASE):
                 rank = max(rank, 1)
-            elif any(p.search(txt) for p in pats_rank1):
+            if any(p.search(txt) for p in pats_rank1):
                 rank = max(rank, 1)
             for callee_l_nested, ranks_nested in _USER_FUNC_ARG_RANK.items():
                 if not any(v >= 1 for v in ranks_nested.values()):
@@ -4928,6 +4954,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rf"\b{re.escape(arg)}\s*\[",
             rf"\bas\.(?:numeric|vector)\s*\(\s*{re.escape(arg)}\b",
             rf"\b(?:sum|mean|max|min|sd|r_sd)\s*\(\s*{re.escape(arg)}\b",
+            rf"\bsum\s*\([^)]*(?:\*|/)\s*\(?\s*\b{re.escape(arg)}\b",
+            rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b\s*(?:\*|/)",
             rf"\bt\s*\(\s*{re.escape(arg)}\s*\)",
             rf"%\*%\s*{re.escape(arg)}\b",
             rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b",
