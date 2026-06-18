@@ -29946,10 +29946,16 @@ def main() -> int:
         flags=re.IGNORECASE,
     )
     f90 = re.sub(
+        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*turnover_summary\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
+        'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
         r"allocate\(turnover_summary\(size\(turnover_valid,\s*2\),\s*4\)\)\s*\n"
         r"turnover_summary\(:,\s*1\)\s*=\s*sum\(turnover_valid,\s*&\s*\n"
         r"\s*&\s*dim=1\)\s*/\s*real\(size\(turnover_valid,\s*1\),\s*kind=dp\)\s*\n"
-        r"turnover_summary\(:,\s*2\)\s*=\s*apply_col_sd\(real\(turnover_valid,\s*kind=dp\)\)\s*\n"
+        r"turnover_summary\(:,\s*2\)\s*=\s*apply_col_sd\((?:real\(\s*)?turnover_valid(?:\s*,\s*kind=dp\))?\)\s*\n"
         r"turnover_summary\(:,\s*3\)\s*=\s*minval\(turnover_valid,\s*dim=1\)\s*\n"
         r"turnover_summary\(:,\s*4\)\s*=\s*maxval\(turnover_valid,\s*dim=1\)",
         "allocate(turnover_summary(size(turnover_valid, 2), 3))\n"
