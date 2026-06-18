@@ -3603,6 +3603,78 @@ def add_missing_iso_fortran_env_dp_imports(lines: list[str]) -> list[str]:
     return out
 
 
+def remove_redundant_procedure_iso_fortran_env_dp_imports(lines: list[str]) -> list[str]:
+    """Remove procedure-local dp imports already provided by the enclosing module."""
+    out = list(lines)
+    remove: set[int] = set()
+
+    def code_only(ln: str) -> str:
+        return ln.split("!", 1)[0]
+
+    module_re = re.compile(r"^\s*module\s+[A-Za-z]\w*\b(?!\s*procedure\b)", re.IGNORECASE)
+    end_module_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
+    contains_re = re.compile(r"^\s*contains\s*$", re.IGNORECASE)
+    proc_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    end_proc_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    iso_dp_re = re.compile(
+        r"^\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\s*,\s*only\s*:\s*dp\s*=>\s*real64\s*$",
+        re.IGNORECASE,
+    )
+    iso_any_dp_re = re.compile(
+        r"^\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\s*,\s*only\s*:\s*(?P<imports>.+)$",
+        re.IGNORECASE,
+    )
+
+    i = 0
+    while i < len(out):
+        if module_re.match(code_only(out[i]).strip()) is None:
+            i += 1
+            continue
+        mod_start = i
+        j = i + 1
+        contains_idx = -1
+        mod_end = len(out)
+        while j < len(out):
+            txt = code_only(out[j]).strip()
+            if contains_re.match(txt):
+                contains_idx = j
+            if end_module_re.match(txt):
+                mod_end = j
+                break
+            j += 1
+        if contains_idx < 0:
+            i = mod_end + 1
+            continue
+
+        module_has_dp = False
+        for k in range(mod_start + 1, contains_idx):
+            m_use = iso_any_dp_re.match(code_only(out[k]).strip())
+            if m_use is not None and re.search(r"\bdp\s*=>\s*real64\b|\bdp\b", m_use.group("imports"), re.IGNORECASE):
+                module_has_dp = True
+                break
+        if not module_has_dp:
+            i = mod_end + 1
+            continue
+
+        k = contains_idx + 1
+        while k < mod_end:
+            if proc_re.match(code_only(out[k]).strip()) is None:
+                k += 1
+                continue
+            p = k + 1
+            while p < mod_end and end_proc_re.match(code_only(out[p]).strip()) is None:
+                if iso_dp_re.match(code_only(out[p]).strip()) is not None:
+                    remove.add(p)
+                p += 1
+            k = p + 1
+        i = mod_end + 1
+
+    return [ln for idx, ln in enumerate(out) if idx not in remove]
+
+
 def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
     """Coerce simple integer scalar actuals passed to real user-function dummies."""
     out = list(lines)
@@ -30261,8 +30333,11 @@ def main() -> int:
     f90_lines = rewrite_sum_logical_arrays(f90_lines)
     f90_lines = promote_character_constructor_assignments(f90_lines)
     f90_lines = add_missing_iso_fortran_env_dp_imports(f90_lines)
+    f90_lines = remove_redundant_procedure_iso_fortran_env_dp_imports(f90_lines)
     f90_lines = remove_unused_iso_fortran_env_dp_imports(f90_lines)
-    f90 = "\n".join(add_missing_iso_fortran_env_dp_imports(f90_lines))
+    f90_lines = add_missing_iso_fortran_env_dp_imports(f90_lines)
+    f90_lines = remove_redundant_procedure_iso_fortran_env_dp_imports(f90_lines)
+    f90 = "\n".join(f90_lines)
     f90 = re.sub(
         r"(real\(kind=dp\),\s*allocatable\s*::[^\n]*&)\n(character\(len=:\),\s*allocatable\s*::[^\n]+)\n&\s*([^\n]+)",
         r"\1\n& \3\n\2",
