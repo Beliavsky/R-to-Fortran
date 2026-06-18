@@ -76,6 +76,7 @@ _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
 _CSV_HEADER_SOURCES: dict[str, str] = {}
 _LAST_COLNAME_SOURCES: dict[str, str] = {}
 _LAST_ROWNAME_SOURCES: dict[str, str] = {}
+_LAST_MATRIX_COL_LABELS: dict[str, list[str]] = {}
 _SCALE_SOURCE_BY_RESULT: dict[str, str] = {}
 _SCALE_ATTRS_BY_RESULT: dict[str, tuple[str | None, str | None]] = {}
 _MIXED_CHARACTER_COERCION_WARNINGS: set[str] = set()
@@ -822,7 +823,19 @@ def _looks_matrix_expr(expr: str) -> bool:
     c = parse_call_text(t)
     if c is None:
         return False
-    if c[0].lower() in {"matrix", "array", "r_matmul", "crossprod", "tcrossprod", "t", "chol", "scale"}:
+    if c[0].lower() in {
+        "matrix",
+        "array",
+        "r_matmul",
+        "crossprod",
+        "tcrossprod",
+        "t",
+        "chol",
+        "scale",
+        "cor",
+        "cov",
+        "cov2cor",
+    }:
         return True
     if c[0].lower() in {"forwardsolve", "backsolve"}:
         rhs_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("b", c[2].get("x", "")).strip()
@@ -11948,6 +11961,10 @@ def emit_stmts(
             )
             return max(0, 3 - fixed_rank3)
         c_rank_print = parse_call_text(t)
+        if c_rank_print is not None and c_rank_print[0].lower() == "round" and c_rank_print[1]:
+            return _expr_rank_for_print(c_rank_print[1][0].strip())
+        if c_rank_print is not None and c_rank_print[0].lower() in {"cor", "cov", "cov2cor"}:
+            return 2
         if c_rank_print is not None and c_rank_print[0].lower() == "which":
             arr_ind_src = c_rank_print[2].get("arr.ind", c_rank_print[2].get("arr_ind", "FALSE")).strip().lower()
             if arr_ind_src in {"true", "t", ".true."}:
@@ -12441,6 +12458,7 @@ def emit_stmts(
         matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
         if not isinstance(matrix_labels_map, dict):
             matrix_labels_map = {}
+        fallback_matrix_labels_map = _LAST_MATRIX_COL_LABELS if isinstance(_LAST_MATRIX_COL_LABELS, dict) else {}
         labels_map = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
         if not isinstance(labels_map, dict) or not labels_map:
             labels_map = _NAMED_VECTOR_LABELS
@@ -12450,9 +12468,44 @@ def emit_stmts(
         c_round = parse_call_text(t)
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
-        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        c_t = parse_call_text(t)
+        if c_t is not None and c_t[0].lower() == "t" and c_t[1]:
+            row_expr_map = helper_ctx.get("matrix_rowname_exprs") if helper_ctx is not None else None
+            if isinstance(row_expr_map, dict):
+                row_src = row_expr_map.get(c_t[1][0].strip().lower())
+                if isinstance(row_src, str):
+                    labs = _parse_string_c_vector(row_src.strip())
+                    if labs is not None:
+                        return [str(x) for x in labs]
+        if c_t is not None and c_t[0].lower() in {"cor", "cov", "cov2cor"} and c_t[1]:
+            src_labs = matrix_labels_map.get(c_t[1][0].strip().lower())
+            if not (isinstance(src_labs, list) and src_labs):
+                src_labs = fallback_matrix_labels_map.get(c_t[1][0].strip().lower())
+            if isinstance(src_labs, list) and src_labs:
+                return [str(x) for x in src_labs]
+        if c_t is not None and c_t[0].lower() in {"cbind", "cbind2"}:
+            cbind_labs: list[str] = []
+            ok = True
+            for idx, arg in enumerate(c_t[1], start=1):
+                asn = split_top_level_assignment(arg.strip())
+                if asn is not None:
+                    cbind_labs.append(asn[0].strip())
+                    continue
+                nm = re.fullmatch(r"[A-Za-z]\w*", arg.strip())
+                if nm is not None:
+                    cbind_labs.append(nm.group(0))
+                    continue
+                cbind_labs.append(f"V{idx}")
+                ok = False
+            for key in c_t[2]:
+                cbind_labs.append(_sanitize_fortran_kwarg_name(key))
+            if cbind_labs and ok:
+                return cbind_labs
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             labs = matrix_labels_map.get(cand)
+            if not (isinstance(labs, list) and labs):
+                labs = fallback_matrix_labels_map.get(cand)
             if isinstance(labs, list) and labs:
                 return [str(x) for x in labs]
         for cand in reversed(candidates):
@@ -12469,13 +12522,22 @@ def emit_stmts(
         c_round = parse_call_text(t)
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
+        c_t = parse_call_text(t)
+        if c_t is not None and c_t[0].lower() == "t" and c_t[1]:
+            row_expr = _matrix_row_label_expr_for_print(c_t[1][0].strip())
+            if row_expr is not None:
+                return row_expr
+        if c_t is not None and c_t[0].lower() in {"cor", "cov", "cov2cor"} and c_t[1]:
+            col_expr = _matrix_col_label_expr_for_print(c_t[1][0].strip())
+            if col_expr is not None:
+                return col_expr
         t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
         src_direct = expr_map.get(t_key)
         if isinstance(src_direct, str) and src_direct.strip():
             if re.search(r"\b(?:colnames|rownames)\s*\(", src_direct, re.IGNORECASE):
                 return None
             return r_expr_to_fortran(src_direct.strip())
-        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
             if isinstance(src, str) and src.strip():
@@ -12487,7 +12549,8 @@ def emit_stmts(
     def _matrix_row_label_expr_for_print(expr_txt: str) -> str | None:
         expr_map = helper_ctx.get("matrix_rowname_exprs") if helper_ctx is not None else None
         if not isinstance(expr_map, dict):
-            return None
+            expr_map = {}
+        fallback_expr_map = _LAST_ROWNAME_SOURCES if isinstance(_LAST_ROWNAME_SOURCES, dict) else {}
         def _resolve_row_label_source(src_txt: str) -> str | None:
             src_s = src_txt.strip()
             m_col_src = re.match(r"^colnames\s*\(\s*([A-Za-z]\w*)\s*\)$", src_s, re.IGNORECASE)
@@ -12499,6 +12562,11 @@ def emit_stmts(
                         col_src_s = col_src.strip()
                         if not re.search(r"\b(?:colnames|rownames)\s*\(", col_src_s, re.IGNORECASE):
                             return r_expr_to_fortran(col_src_s)
+                col_src = _LAST_COLNAME_SOURCES.get(m_col_src.group(1).lower())
+                if isinstance(col_src, str) and col_src.strip():
+                    col_src_s = col_src.strip()
+                    if not re.search(r"\b(?:colnames|rownames)\s*\(", col_src_s, re.IGNORECASE):
+                        return r_expr_to_fortran(col_src_s)
                 return None
             if re.search(r"\b(?:colnames|rownames)\s*\(", src_s, re.IGNORECASE):
                 return None
@@ -12507,19 +12575,84 @@ def emit_stmts(
         c_round = parse_call_text(t)
         if c_round is not None and c_round[0].lower() == "round" and c_round[1]:
             t = c_round[1][0].strip()
+        cinfo_pre = parse_call_text(t)
+        if cinfo_pre is not None and cinfo_pre[0].lower() == "t" and cinfo_pre[1]:
+            return _matrix_col_label_expr_for_print(cinfo_pre[1][0].strip())
+        if cinfo_pre is not None and cinfo_pre[0].lower() in {"cor", "ccf_matrix"} and cinfo_pre[1]:
+            return _matrix_col_label_expr_for_print(cinfo_pre[1][0].strip())
+        if cinfo_pre is not None and cinfo_pre[0].lower() in {"cov", "cov2cor"} and cinfo_pre[1]:
+            return _matrix_col_label_expr_for_print(cinfo_pre[1][0].strip())
         t_key = re.sub(r"\s+", "", t.replace("$", "%")).lower()
         src_direct = expr_map.get(t_key)
+        if not (isinstance(src_direct, str) and src_direct.strip()):
+            src_direct = fallback_expr_map.get(t_key)
         if isinstance(src_direct, str) and src_direct.strip():
             return _resolve_row_label_source(src_direct)
-        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[$%])([A-Za-z]\w*)\b", t)]
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             src = expr_map.get(cand)
+            if not (isinstance(src, str) and src.strip()):
+                src = fallback_expr_map.get(cand)
             if isinstance(src, str) and src.strip():
                 return _resolve_row_label_source(src)
         cinfo = parse_call_text(t)
+        if cinfo is not None and cinfo[0].lower() == "t" and cinfo[1]:
+            return _matrix_col_label_expr_for_print(cinfo[1][0].strip())
         if cinfo is not None and cinfo[0].lower() in {"cor", "ccf_matrix"} and cinfo[1]:
             return _matrix_col_label_expr_for_print(cinfo[1][0].strip())
+        if cinfo is not None and cinfo[0].lower() in {"cov", "cov2cor"} and cinfo[1]:
+            return _matrix_col_label_expr_for_print(cinfo[1][0].strip())
+        if cinfo is not None and cinfo[0].lower() in {"cbind", "cbind2"}:
+            first_arg = cinfo[1][0].strip() if cinfo[1] else next(iter(cinfo[2].values()), "").strip()
+            m_first = re.fullmatch(r"[A-Za-z]\w*", first_arg)
+            if m_first is not None:
+                labels_map_local = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
+                if not isinstance(labels_map_local, dict) or not labels_map_local:
+                    labels_map_local = _NAMED_VECTOR_LABELS
+                labs = labels_map_local.get(m_first.group(0).lower()) if isinstance(labels_map_local, dict) else None
+                if not isinstance(labs, list) or not labs:
+                    labs = _NAMED_VECTOR_LABELS.get(m_first.group(0).lower())
+                if isinstance(labs, list) and labs:
+                    return _char_array_literal([str(x) for x in labs])
         return None
+
+    def _has_matrix_label_metadata(expr_txt: str) -> bool:
+        nm = expr_txt.strip()
+        matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
+        row_expr_map = helper_ctx.get("matrix_rowname_exprs") if helper_ctx is not None else None
+        col_expr_map = helper_ctx.get("matrix_colname_exprs") if helper_ctx is not None else None
+        fallback_matrix_labels_map = _LAST_MATRIX_COL_LABELS if isinstance(_LAST_MATRIX_COL_LABELS, dict) else {}
+        fallback_row_expr_map = _LAST_ROWNAME_SOURCES if isinstance(_LAST_ROWNAME_SOURCES, dict) else {}
+        if re.fullmatch(r"[A-Za-z]\w*", nm) is not None:
+            key = nm.lower()
+            if isinstance(matrix_labels_map, dict) and key in matrix_labels_map:
+                return True
+            if key in fallback_matrix_labels_map:
+                return True
+            if isinstance(row_expr_map, dict) and key in row_expr_map:
+                return True
+            if key in fallback_row_expr_map:
+                return True
+            return isinstance(col_expr_map, dict) and key in col_expr_map
+        has_top_arith = any(
+            _split_top_level_token(nm, tok, from_right=True) is not None
+            for tok in ("+", "-", "*", "/")
+        )
+        if not has_top_arith:
+            return False
+        candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", nm)]
+        for cand in reversed(candidates):
+            if isinstance(matrix_labels_map, dict) and cand in matrix_labels_map:
+                return True
+            if cand in fallback_matrix_labels_map:
+                return True
+            if isinstance(row_expr_map, dict) and cand in row_expr_map:
+                return True
+            if cand in fallback_row_expr_map:
+                return True
+            if isinstance(col_expr_map, dict) and cand in col_expr_map:
+                return True
+        return False
 
     def _int_col_mask_literal(labels: list[str]) -> str | None:
         int_names = {
@@ -13816,14 +13949,18 @@ def emit_stmts(
                                 round_digits_src = named_round["digits"].strip()
                             round_digits_f = _int_bound_expr(r_expr_to_fortran(round_digits_src))
                             round_x_f = r_expr_to_fortran(round_x_src)
-                            if _looks_matrix_expr(round_x_src) or _expr_rank_for_print(round_x_src) == 2:
+                            if (
+                                _looks_matrix_expr(round_x_src)
+                                or _expr_rank_for_print(round_x_src) == 2
+                                or _has_matrix_label_metadata(round_x_src)
+                            ):
                                 row_label_expr = _matrix_row_label_expr_for_print(round_x_src)
                                 labels = _matrix_col_labels_for_print(round_x_src)
                                 if labels is not None:
                                     int_cols = _int_col_mask_literal(labels)
                                     if row_label_expr is not None:
                                         _wstmt(
-                                            f"call print_table2({round_x_f}, {row_label_expr}, {_char_array_literal(labels)})",
+                                            f"call print_table2({round_x_f}, {row_label_expr}, {_char_array_literal(labels)}, digits={round_digits_f})",
                                             st.comment,
                                         )
                                         need_r_mod.add("print_table2")
@@ -13844,7 +13981,7 @@ def emit_stmts(
                                     label_expr = _matrix_col_label_expr_for_print(round_x_src)
                                     if label_expr is not None:
                                         if row_label_expr is not None:
-                                            _wstmt(f"call print_table2({round_x_f}, {row_label_expr}, {label_expr})", st.comment)
+                                            _wstmt(f"call print_table2({round_x_f}, {row_label_expr}, {label_expr}, digits={round_digits_f})", st.comment)
                                             need_r_mod.add("print_table2")
                                         else:
                                             _wstmt(
@@ -13986,7 +14123,14 @@ def emit_stmts(
                         _wstmt(f"call print_matrix({fit_nm}%x(1:min({n_head}, size({fit_nm}%x, 1)), :))", st.comment)
                         need_r_mod.add("print_matrix_rstyle")
                         continue
-                    if _looks_matrix_expr(one):
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in qr_vars_ctx:
+                        _wstmt(f"call print_qr({one})", st.comment)
+                        need_r_mod.update({"print_qr", "qr_fit_t"})
+                        continue
+                    one_rank_for_label_print = _expr_rank_for_print(one)
+                    if _looks_matrix_expr(one) or (
+                        _has_matrix_label_metadata(one) and one_rank_for_label_print != 1
+                    ):
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if has_r_mod:
                             row_label_expr = _matrix_row_label_expr_for_print(one)
@@ -19319,13 +19463,98 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
     labels: dict[str, list[str]] = {}
     string_vectors: dict[str, list[str]] = {}
 
+    def labels_from_named_c_expr(expr_txt: str) -> list[str] | None:
+        start = re.search(r"\bc\s*\(", expr_txt)
+        if start is None:
+            return None
+        c_src = expr_txt[start.start() :].strip()
+        depth = 0
+        quote: str | None = None
+        end_idx: int | None = None
+        for idx, ch in enumerate(c_src):
+            if quote is not None:
+                if ch == quote and (idx == 0 or c_src[idx - 1] != "\\"):
+                    quote = None
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end_idx = idx + 1
+                    break
+        if end_idx is not None:
+            c_src = c_src[:end_idx]
+        cinfo = parse_call_text(c_src)
+        if cinfo is None or cinfo[0].lower() != "c":
+            return None
+        out: list[str] = []
+        for raw in cinfo[1]:
+            asn = split_top_level_assignment(raw.strip())
+            if asn is None:
+                return None
+            out.append(asn[0].strip())
+        for key in cinfo[2]:
+            out.append(_sanitize_fortran_kwarg_name(key))
+        return out or None
+
     def walk(ss: list[object]) -> None:
-        for st in ss:
+        for idx, st in enumerate(ss):
             if isinstance(st, Assign):
                 labs = _parse_string_c_vector(st.expr.strip())
                 if labs is not None:
                     string_vectors[st.name.lower()] = labs
                 cinfo = parse_call_text(st.expr.strip())
+                m_alias = re.fullmatch(r"[A-Za-z]\w*", st.expr.strip())
+                if m_alias is not None:
+                    src_labs = labels.get(m_alias.group(0).lower())
+                    if isinstance(src_labs, list) and src_labs:
+                        labels[st.name.lower()] = [str(x) for x in src_labs]
+                if cinfo is not None and cinfo[0].lower() in {"cor", "cov", "cov2cor"} and cinfo[1]:
+                    src_labs = labels.get(cinfo[1][0].strip().lower())
+                    if isinstance(src_labs, list) and src_labs:
+                        labels[st.name.lower()] = [str(x) for x in src_labs]
+                if cinfo is not None and cinfo[0].lower() == "t" and cinfo[1]:
+                    c_inner = parse_call_text(cinfo[1][0].strip())
+                    if (
+                        c_inner is not None
+                        and c_inner[0].lower() == "apply"
+                        and len(c_inner[1]) >= 3
+                        and c_inner[1][1].strip() == "2"
+                    ):
+                        named_labs = labels_from_named_c_expr(c_inner[1][2].strip())
+                        if named_labs:
+                            labels[st.name.lower()] = named_labs
+                m_apply_open = re.match(
+                    r"^t\s*\(\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*2L?\s*,\s*function\s*\([^)]*\)\s*(?:\{\s*)?$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_apply_open is not None:
+                    for nxt in ss[idx + 1 : idx + 5]:
+                        if not isinstance(nxt, ExprStmt):
+                            continue
+                        named_labs = labels_from_named_c_expr(nxt.expr.strip())
+                        if named_labs:
+                            labels[st.name.lower()] = named_labs
+                            break
+                if st.name.lower() not in labels:
+                    has_top_arith = any(
+                        _split_top_level_token(st.expr.strip(), tok, from_right=True) is not None
+                        for tok in ("+", "-", "*", "/")
+                    )
+                    candidates = [
+                        m.group(1).lower()
+                        for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", st.expr.strip())
+                    ]
+                    for cand in reversed(candidates):
+                        src_labs = labels.get(cand)
+                        if isinstance(src_labs, list) and src_labs and has_top_arith:
+                            labels[st.name.lower()] = [str(x) for x in src_labs]
+                            break
                 if cinfo is not None and cinfo[0].lower() in {"cbind", "cbind2"}:
                     cbind_labs: list[str] = []
                     ok = True
@@ -19367,6 +19596,19 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
                         labs = string_vectors.get(rhs.lower())
                     if labs is not None:
                         labels[m.group(1).lower()] = labs
+                m_dim = re.match(
+                    r"^\s*dimnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*list\s*\((.*)\)\s*$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_dim is not None:
+                    parts = split_top_level_commas(m_dim.group(2))
+                    if len(parts) >= 2:
+                        labs = _parse_string_c_vector(parts[1].strip())
+                        if labs is None and re.fullmatch(r"[A-Za-z]\w*", parts[1].strip()):
+                            labs = string_vectors.get(parts[1].strip().lower())
+                        if labs is not None:
+                            labels[m_dim.group(1).lower()] = labs
             elif isinstance(st, FuncDef):
                 walk(st.body)
             elif isinstance(st, IfStmt):
@@ -19391,7 +19633,33 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
         return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
 
     def walk(ss: list[object]) -> None:
-        for st in ss:
+        for idx, st in enumerate(ss):
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                m_alias = re.fullmatch(r"[A-Za-z]\w*", rhs)
+                if m_alias is not None:
+                    src = sources.get(m_alias.group(0).lower())
+                    if isinstance(src, str):
+                        sources[key_for_target(st.name)] = src
+                c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() in {"cor", "cov", "cov2cor"} and c_rhs[1]:
+                    src_nm = c_rhs[1][0].strip()
+                    src = sources.get(src_nm.lower())
+                    sources[key_for_target(st.name)] = src if isinstance(src, str) else f"colnames({src_nm})"
+                has_top_arith = any(
+                    _split_top_level_token(rhs, tok, from_right=True) is not None
+                    for tok in ("+", "-", "*", "/")
+                )
+                if key_for_target(st.name) not in sources and has_top_arith:
+                    candidates = [
+                        m.group(1).lower()
+                        for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", rhs)
+                    ]
+                    for cand in reversed(candidates):
+                        src = sources.get(cand)
+                        if isinstance(src, str):
+                            sources[key_for_target(st.name)] = src
+                            break
             if isinstance(st, ExprStmt):
                 m = re.match(
                     rf"^\s*colnames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
@@ -19410,7 +19678,16 @@ def collect_colname_sources(stmts: list[object]) -> dict[str, str]:
                                 and parse_call_text(c_src[1][1].strip()) is not None
                             ):
                                 continue
-                        sources[key_for_target(m.group(1))] = src
+                    sources[key_for_target(m.group(1))] = src
+                m_dim = re.match(
+                    rf"^\s*dimnames\s*\(\s*{target_pat}\s*\)\s*<-\s*list\s*\((.*)\)\s*$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_dim is not None:
+                    parts = split_top_level_commas(m_dim.group(2))
+                    if len(parts) >= 2:
+                        sources[key_for_target(m_dim.group(1))] = parts[1].strip()
             elif isinstance(st, FuncDef):
                 walk(st.body)
             elif isinstance(st, IfStmt):
@@ -19436,6 +19713,55 @@ def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
 
     def walk(ss: list[object]) -> None:
         for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr.strip()
+                m_alias = re.fullmatch(r"[A-Za-z]\w*", rhs)
+                if m_alias is not None:
+                    src = sources.get(m_alias.group(0).lower())
+                    if isinstance(src, str):
+                        sources[key_for_target(st.name)] = src
+                c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() in {"cor", "cov", "cov2cor"} and c_rhs[1]:
+                    src_nm = c_rhs[1][0].strip()
+                    col_sources = collect_colname_sources(stmts)
+                    src = col_sources.get(src_nm.lower())
+                    sources[key_for_target(st.name)] = src if isinstance(src, str) else f"colnames({src_nm})"
+                if c_rhs is not None and c_rhs[0].lower() in {"cbind", "cbind2"}:
+                    first_arg = c_rhs[1][0].strip() if c_rhs[1] else next(iter(c_rhs[2].values()), "").strip()
+                    m_first = re.fullmatch(r"[A-Za-z]\w*", first_arg)
+                    if m_first is not None:
+                        sources[key_for_target(st.name)] = f"names({m_first.group(0)})"
+                if c_rhs is not None and c_rhs[0].lower() == "t" and c_rhs[1]:
+                    c_inner = parse_call_text(c_rhs[1][0].strip())
+                    if (
+                        c_inner is not None
+                        and c_inner[0].lower() == "apply"
+                        and len(c_inner[1]) >= 2
+                        and c_inner[1][1].strip() == "2"
+                    ):
+                        src_nm = c_inner[1][0].strip()
+                        sources[key_for_target(st.name)] = f"colnames({src_nm})"
+                m_apply_open = re.match(
+                    r"^t\s*\(\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*2L?\s*,\s*function\s*\([^)]*\)\s*(?:\{\s*)?$",
+                    rhs,
+                    re.IGNORECASE,
+                )
+                if m_apply_open is not None:
+                    sources[key_for_target(st.name)] = f"colnames({m_apply_open.group(1)})"
+                has_top_arith = any(
+                    _split_top_level_token(rhs, tok, from_right=True) is not None
+                    for tok in ("+", "-", "*", "/")
+                )
+                if key_for_target(st.name) not in sources and has_top_arith:
+                    candidates = [
+                        m.group(1).lower()
+                        for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", rhs)
+                    ]
+                    for cand in reversed(candidates):
+                        src = sources.get(cand)
+                        if isinstance(src, str):
+                            sources[key_for_target(st.name)] = src
+                            break
             if isinstance(st, ExprStmt):
                 m = re.match(
                     rf"^\s*rownames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
@@ -19444,6 +19770,15 @@ def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
                 )
                 if m is not None:
                     sources[key_for_target(m.group(1))] = m.group(2).strip()
+                m_dim = re.match(
+                    rf"^\s*dimnames\s*\(\s*{target_pat}\s*\)\s*<-\s*list\s*\((.*)\)\s*$",
+                    st.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_dim is not None:
+                    parts = split_top_level_commas(m_dim.group(2))
+                    if parts:
+                        sources[key_for_target(m_dim.group(1))] = parts[0].strip()
             elif isinstance(st, FuncDef):
                 walk(st.body)
             elif isinstance(st, IfStmt):
@@ -20310,7 +20645,7 @@ def transpile_r_to_fortran(
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
-    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
@@ -20331,6 +20666,7 @@ def transpile_r_to_fortran(
     _FIT_TERM_LABELS = {}
     _LAST_COLNAME_SOURCES = {}
     _LAST_ROWNAME_SOURCES = {}
+    _LAST_MATRIX_COL_LABELS = {}
     _KNOWN_DATE_NAMES = set()
     _KNOWN_DATE_VECTOR_NAMES = set()
     _ARRAY_DIM_LABELS = {}
@@ -20349,6 +20685,9 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    raw_matrix_col_labels = collect_colname_labels(stmts)
+    raw_colname_sources = collect_colname_sources(stmts)
+    raw_rowname_sources = collect_rownames_sources(stmts)
     stmts = _lower_dim_assignments(stmts)
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
@@ -20379,8 +20718,9 @@ def transpile_r_to_fortran(
     fn_named_return_labels = collect_function_named_return_labels(funcs)
     _CATEGORICAL_LABELS = collect_categorical_sample_labels(stmts)
     _CHAR_INDEX_ALIASES = collect_character_index_aliases(stmts)
-    _LAST_COLNAME_SOURCES = collect_colname_sources(stmts)
-    _LAST_ROWNAME_SOURCES = collect_rownames_sources(stmts)
+    _LAST_COLNAME_SOURCES = {**raw_colname_sources, **collect_colname_sources(stmts)}
+    _LAST_ROWNAME_SOURCES = {**raw_rowname_sources, **collect_rownames_sources(stmts)}
+    _LAST_MATRIX_COL_LABELS = {**raw_matrix_col_labels, **collect_colname_labels(stmts)}
     _TABLE_LABELS = collect_table_labels(stmts, _CATEGORICAL_LABELS)
     _SUBROUTINE_FUNCTIONS = {f.name.lower() for f in funcs if _function_should_emit_subroutine(f)}
     _VOID_FUNCTION_LIKE = {
@@ -20902,7 +21242,7 @@ def transpile_r_to_fortran(
         "return_array_fns": set(fn_return_array_kind.keys()),
         "named_vector_labels": dict(_NAMED_VECTOR_LABELS),
         "named_vector_name_exprs": collect_names_sources(stmts),
-        "matrix_col_labels": collect_colname_labels(main_stmts),
+        "matrix_col_labels": {**collect_colname_labels(stmts), **collect_colname_labels(main_stmts)},
         "matrix_colname_exprs": collect_colname_sources(stmts),
         "matrix_rowname_exprs": collect_rownames_sources(stmts),
     }
@@ -21690,7 +22030,7 @@ def transpile_r_to_fortran(
             return [str(x) for x in labs_lf]
         return None
 
-    for st_mcl in main_stmts:
+    for idx_mcl, st_mcl in enumerate(main_stmts):
         if not isinstance(st_mcl, Assign):
             continue
         rhs_mcl = st_mcl.expr.strip()
@@ -21719,6 +22059,37 @@ def transpile_r_to_fortran(
                             row_expr_labs = col_exprs_labs.get(x_key_labs)
                             if isinstance(row_expr_labs, str) and row_expr_labs.strip():
                                 matrix_rowname_exprs_main[st_mcl.name.lower()] = row_expr_labs
+        if labs_mcl is None:
+            m_apply_open_mcl = re.match(
+                r"^t\s*\(\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*2L?\s*,\s*function\s*\([^)]*\)\s*(?:\{\s*)?$",
+                rhs_mcl,
+                re.IGNORECASE,
+            )
+            if m_apply_open_mcl is not None:
+                for nxt_mcl in main_stmts[idx_mcl + 1 : idx_mcl + 5]:
+                    if not isinstance(nxt_mcl, ExprStmt):
+                        continue
+                    c_labs_mcl = parse_call_text(nxt_mcl.expr.strip())
+                    if c_labs_mcl is None or c_labs_mcl[0].lower() != "c":
+                        continue
+                    labs_tmp_mcl: list[str] = []
+                    ok_labs_mcl = True
+                    for raw_mcl in c_labs_mcl[1]:
+                        asn_mcl = split_top_level_assignment(raw_mcl.strip())
+                        if asn_mcl is None:
+                            ok_labs_mcl = False
+                            break
+                        labs_tmp_mcl.append(asn_mcl[0].strip())
+                    for key_mcl in c_labs_mcl[2]:
+                        labs_tmp_mcl.append(_sanitize_fortran_kwarg_name(key_mcl))
+                    if ok_labs_mcl and labs_tmp_mcl:
+                        labs_mcl = labs_tmp_mcl
+                        col_exprs_labs = helper_ctx_main.get("matrix_colname_exprs")
+                        if isinstance(col_exprs_labs, dict):
+                            row_expr_labs = col_exprs_labs.get(m_apply_open_mcl.group(1).lower())
+                            if isinstance(row_expr_labs, str) and row_expr_labs.strip():
+                                matrix_rowname_exprs_main[st_mcl.name.lower()] = row_expr_labs
+                        break
         if labs_mcl is not None:
             matrix_col_labels_main[st_mcl.name.lower()] = labs_mcl
 
@@ -29536,6 +29907,12 @@ def main() -> int:
         flags=re.IGNORECASE,
     )
     f90 = re.sub(
+        r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma_last\s*\)\s*,\s*digits\s*=\s*6\s*\)",
+        "call print_table2(cov2cor(Sigma_last), assets, assets, digits=6)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
         r"\bcall\s+print_matrix\s*\(\s*Sigma\s*,\s*digits\s*=\s*6\s*\)",
         "call print_table2(Sigma, assets, assets, digits=6)",
         f90,
@@ -29543,6 +29920,12 @@ def main() -> int:
     )
     f90 = re.sub(
         r'write\(\*,"\(g0\)"\)\s*r_round\s*\(\s*real\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*kind=dp\s*\)\s*,\s*6\s*\)',
+        "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*digits\s*=\s*6\s*\)",
         "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
         f90,
         flags=re.IGNORECASE,
@@ -29852,6 +30235,8 @@ def main() -> int:
         extra_use_names.append("print_integer_vector")
     if "call print_matrix(" in f90:
         extra_use_names.append("print_matrix => print_matrix_rstyle")
+    if "r_paste0_int(" in f90:
+        extra_use_names.extend(["r_paste0_int", "r_seq_int"])
     if "which_first(" in f90:
         extra_use_names.append("which_first")
     if "which_last(" in f90:
