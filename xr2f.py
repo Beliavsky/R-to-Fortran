@@ -29797,6 +29797,7 @@ def main() -> int:
     f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
     f90_lines = fpost.simplify_unit_ceiling_divisions(f90_lines)
     f90_lines = fpost.remove_redundant_real_dp_casts(f90_lines)
+    f90_lines = fpost.remove_redundant_int_casts_of_integer_intrinsics(f90_lines)
     f90_lines = fpost.simplify_atomic_parentheses(f90_lines)
     f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
     f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
@@ -29815,6 +29816,7 @@ def main() -> int:
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     f90_lines = fpost.simplify_do_while_true(f90_lines)
     f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
+    f90_lines = fpost.consolidate_use_only_imports(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = hoist_repeated_numeric_array_literals(f90_lines)
     f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
@@ -30320,7 +30322,9 @@ def main() -> int:
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90_had_trailing_newline = f90.endswith("\n")
-    f90_lines = coerce_user_call_integer_actuals_by_decl(f90.splitlines())
+    f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
+    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
+    f90_lines = coerce_user_call_integer_actuals_by_decl(f90_lines)
     for _ in range(4):
         next_lines = promote_size_dim2_dummy_arguments(f90_lines)
         if next_lines == f90_lines:
