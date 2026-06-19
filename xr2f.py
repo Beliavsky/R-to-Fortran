@@ -26555,6 +26555,22 @@ def _diff_numeric_tokens_equal(a: str, b: str) -> bool:
     return abs(av - bv) <= tol
 
 
+def _parse_diff_logical_token(tok: str) -> str | None:
+    t = tok.strip().strip(",;")
+    tl = t.lower()
+    if tl in {"true", "t", ".true."}:
+        return "T"
+    if tl in {"false", "f", ".false."}:
+        return "F"
+    return None
+
+
+def _diff_logical_tokens_equal(a: str, b: str) -> bool:
+    av = _parse_diff_logical_token(a)
+    bv = _parse_diff_logical_token(b)
+    return av is not None and av == bv
+
+
 def _diff_output_lines_equal(a: str, b: str) -> bool:
     if a == b:
         return True
@@ -26564,6 +26580,8 @@ def _diff_output_lines_equal(a: str, b: str) -> bool:
         return False
     for x, y in zip(at, bt):
         if x == y:
+            continue
+        if _diff_logical_tokens_equal(x, y):
             continue
         if _diff_numeric_tokens_equal(x, y):
             continue
@@ -29832,6 +29850,78 @@ def promote_logical_pack_result_decls_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def promote_logical_comparison_result_decls_text(f90: str) -> str:
+    def _has_top_level_comparison(rhs: str) -> bool:
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(rhs):
+            ch = rhs[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0:
+                two = rhs[i : i + 2]
+                if two in {"==", "/=", "<=", ">="}:
+                    return True
+                if ch in {"<", ">"}:
+                    prev = rhs[i - 1] if i > 0 else ""
+                    nxt = rhs[i + 1] if i + 1 < len(rhs) else ""
+                    if prev not in "=<>" and nxt != "=":
+                        return True
+            i += 1
+        return False
+
+    normalized = re.sub(r"&\s*\n\s*&\s*", " ", f90)
+    names: set[str] = set()
+    for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", normalized):
+        lhs = m.group(1)
+        rhs = m.group(2)
+        if _has_top_level_comparison(rhs):
+            names.add(lhs)
+    if not names:
+        return f90
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None:
+            out.append(line)
+            continue
+        real_parts: list[str] = []
+        logical_parts: list[str] = []
+        for p in split_top_level_commas(m_decl.group(2)):
+            p_s = p.strip()
+            base = re.sub(r"\s*\(.*\)\s*$", "", p_s).strip()
+            if base in names:
+                logical_parts.append(p_s)
+            elif p_s:
+                real_parts.append(p_s)
+        if logical_parts:
+            out.append(f"{m_decl.group(1)}logical, allocatable :: " + ", ".join(logical_parts))
+            if real_parts:
+                out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: " + ", ".join(real_parts))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def promote_integer_sequence_result_decls_text(f90: str) -> str:
     names = set(re.findall(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*r_seq_int\s*\(", f90))
     if not names:
@@ -30270,6 +30360,72 @@ def rewrite_allocatable_array_merge_assignments_text(f90: str) -> str:
         repl,
         f90,
     )
+
+
+def rewrite_recursive_io_function_args_text(f90: str) -> str:
+    side_effect_funcs: dict[str, str] = {}
+    for m in re.finditer(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b.*?$",
+        f90,
+    ):
+        block = m.group(0)
+        name = m.group(1)
+        if not re.search(r"(?im)^\s*(?:write\s*\(\s*\*|call\s+print_)", block):
+            continue
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        res = m_res.group(1) if m_res is not None else name
+        decl_type = ""
+        if re.search(rf"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::[^\n]*\b{re.escape(res)}\b", block, re.IGNORECASE):
+            decl_type = "real(kind=dp)"
+        elif re.search(rf"(?m)^\s*integer\s*::[^\n]*\b{re.escape(res)}\b", block, re.IGNORECASE):
+            decl_type = "integer"
+        elif re.search(rf"(?m)^\s*logical\s*::[^\n]*\b{re.escape(res)}\b", block, re.IGNORECASE):
+            decl_type = "logical"
+        if decl_type:
+            side_effect_funcs[name.lower()] = decl_type
+    if not side_effect_funcs:
+        return f90
+
+    out: list[str] = []
+    tmp_i = 0
+    for line in f90.splitlines():
+        if not re.match(r"\s*write\s*\(\s*\*", line, re.IGNORECASE):
+            out.append(line)
+            continue
+        rewritten = False
+        for fn_l, decl_type in side_effect_funcs.items():
+            m_call = re.search(rf"\b({re.escape(fn_l)})\s*\(", line, re.IGNORECASE)
+            if m_call is None:
+                continue
+            start = m_call.start()
+            i = m_call.end()
+            depth = 1
+            while i < len(line) and depth > 0:
+                if line[i] == "(":
+                    depth += 1
+                elif line[i] == ")":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            call_txt = line[start:i]
+            tmp_i += 1
+            tmp = f"xr2f_io_tmp_{tmp_i}"
+            indent = re.match(r"^(\s*)", line).group(1)
+            out.extend(
+                [
+                    f"{indent}block",
+                    f"{indent}   {decl_type} :: {tmp}",
+                    f"{indent}   {tmp} = {call_txt}",
+                    f"{indent}   {line[:start]}{tmp}{line[i:]}",
+                    f"{indent}end block",
+                ]
+            )
+            rewritten = True
+            break
+        if not rewritten:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def demote_literal_index_scalar_assignments_text(f90: str) -> str:
@@ -32804,6 +32960,7 @@ def main() -> int:
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90 = promote_logical_pack_result_decls_text(f90)
+    f90 = promote_logical_comparison_result_decls_text(f90)
     f90 = promote_integer_sequence_result_decls_text(f90)
     f90 = demote_real_element_scalar_locals_text(f90)
     f90 = promote_integer_maxval_locals_text(f90)
@@ -32813,6 +32970,7 @@ def main() -> int:
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = restore_matrix_row_seq_index_text(f90)
     f90 = rewrite_allocatable_array_merge_assignments_text(f90)
+    f90 = rewrite_recursive_io_function_args_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
