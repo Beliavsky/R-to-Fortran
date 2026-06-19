@@ -3194,11 +3194,11 @@ def _is_integerish_expr_with_names(txt: str) -> bool:
     t = txt.strip()
     if not t:
         return False
-    if "." in t:
+    if re.search(r"(?<![A-Za-z_])(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?", t):
         return False
     if re.search(r"\d[eE][+-]?\d", t):
         return False
-    if re.search(r"[^A-Za-z0-9_\+\-\*/\^\(\)\s]", t):
+    if re.search(r"[^A-Za-z0-9_\.\+\-\*/\^\(\)\s]", t):
         return False
     return re.search(r"[A-Za-z0-9_]", t) is not None
 
@@ -3230,8 +3230,8 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
         if parse_call_text(t) is not None:
             return
         if _is_integerish_expr_with_names(t):
-            for nm in re.findall(r"\b[A-Za-z]\w*\b", t):
-                out.add(nm)
+            for nm in re.findall(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\b", t):
+                out.add(_sanitize_r_var_name(nm))
 
     def mark_call_args(txt: str) -> None:
         for m in re.finditer(r"\bseq_len\s*\(\s*([^()]+)\s*\)", txt, re.IGNORECASE):
@@ -3267,7 +3267,14 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
             for src in [kw.get("times"), kw.get("each"), kw.get("length.out"), kw.get("length_out")]:
                 if src is not None:
                     mark_expr(src)
-        elif key in {"sample", "sample.int"}:
+        elif key == "sample.int":
+            src = kw.get("n") or pos_arg(0)
+            if src is not None:
+                mark_expr(src)
+            src = kw.get("size") or pos_arg(1)
+            if src is not None:
+                mark_expr(src)
+        elif key == "sample":
             src = kw.get("size") or pos_arg(1)
             if src is not None:
                 mark_expr(src)
@@ -4769,6 +4776,36 @@ def classify_vars(
                         return None
         return kind if seen else None
 
+    def assigned_from_integerish_expr(target: str, ss: list[object]) -> bool:
+        for st in ss:
+            if isinstance(st, Assign):
+                if st.name != target:
+                    continue
+                rhs_txt = st.expr.strip()
+                if not _is_integerish_expr_with_names(rhs_txt):
+                    continue
+                names = {
+                    _sanitize_r_var_name(nm)
+                    for nm in re.findall(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\b", rhs_txt)
+                }
+                if names and names <= (ints | integer_context_names | int_arrays):
+                    return True
+                if not names and re.fullmatch(r"[+\-*/()\s\d]+", rhs_txt):
+                    return True
+            elif isinstance(st, ForStmt):
+                if assigned_from_integerish_expr(target, st.body):
+                    return True
+            elif isinstance(st, IfStmt):
+                if assigned_from_integerish_expr(target, st.then_body) or assigned_from_integerish_expr(target, st.else_body):
+                    return True
+            elif isinstance(st, WhileStmt):
+                if assigned_from_integerish_expr(target, st.body):
+                    return True
+            elif isinstance(st, RepeatStmt):
+                if assigned_from_integerish_expr(target, st.body):
+                    return True
+        return False
+
     for nm in list(integer_context_names):
         if nm in int_arrays and assigned_from_scalar_int_index(nm, stmts):
             int_arrays.discard(nm)
@@ -4776,6 +4813,14 @@ def classify_vars(
             known_arrays.discard(nm)
             params.pop(nm, None)
     for nm in integer_context_names:
+        if nm in real_scalars and assigned_from_integerish_expr(nm, stmts):
+            ints.add(nm)
+            real_scalars.discard(nm)
+            real_arrays.discard(nm)
+            int_arrays.discard(nm)
+            known_arrays.discard(nm)
+            params.pop(nm, None)
+            continue
         if nm in real_scalars or nm in real_arrays or nm in int_arrays:
             continue
         ints.add(nm)
@@ -10716,6 +10761,7 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
     s = _replace_balanced_func_calls(s, "is.nan", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
+    s = _replace_balanced_func_calls(s, "is.numeric", lambda inner: ".true.")
     def _is_character_to_fortran(inner: str) -> str:
         txt = inner.strip()
         if _dequote_string_literal(txt) is not None:
@@ -14471,12 +14517,20 @@ def emit_stmts(
                 size_f = _int_bound_expr(r_expr_to_fortran(size_src))
                 rep_f = r_expr_to_fortran(kw.get("replace", "FALSE"))
                 prob_src = kw.get("prob")
-                if prob_src is not None:
+                if size_f == "1" and prob_src is not None:
+                    prob_f = r_expr_to_fortran(prob_src)
+                    o.w(f"{st.name} = sample_int1({n_f}, replace={rep_f}, prob={prob_f})")
+                    need_r_mod.add("sample_int1")
+                elif size_f == "1":
+                    o.w(f"{st.name} = sample_int1({n_f}, replace={rep_f})")
+                    need_r_mod.add("sample_int1")
+                elif prob_src is not None:
                     prob_f = r_expr_to_fortran(prob_src)
                     o.w(f"{st.name} = sample_int({n_f}, size_={size_f}, replace={rep_f}, prob={prob_f})")
+                    need_r_mod.add("sample_int")
                 else:
                     o.w(f"{st.name} = sample_int({n_f}, size_={size_f}, replace={rep_f})")
-                need_r_mod.add("sample_int")
+                    need_r_mod.add("sample_int")
                 continue
             if cinfo is not None and cinfo[0].lower() in {"t.test", "t_test"}:
                 _wstmt(f"{st.name} = {rhs_f}", st.comment)
@@ -27664,6 +27718,110 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
     return "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
 
 
+def promote_sample_int_bound_scalars_text(f90: str) -> str:
+    needed = {
+        m.group(1).lower()
+        for m in re.finditer(r"\bsample_int(?:1)?\s*\(\s*([A-Za-z]\w*)\s*,", f90, re.IGNORECASE)
+    }
+    sample1_scalars = {
+        m.group(1).lower()
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*sample_int1\s*\(", f90, re.IGNORECASE)
+    }
+    if not needed and not sample1_scalars:
+        return f90
+    int_names: set[str] = set()
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_decl = re.match(r"^\s*integer\s*(?:,[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        attrs = code.split("::", 1)[0].lower()
+        if "allocatable" in attrs or "pointer" in attrs:
+            continue
+        for item in split_top_level_commas(m_decl.group(1)):
+            lhs = item.split("=", 1)[0].strip()
+            if "(" in lhs:
+                continue
+            m_name = re.match(r"^([A-Za-z]\w*)$", lhs)
+            if m_name is not None:
+                int_names.add(m_name.group(1).lower())
+
+    promote: set[str] = set()
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_asn = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", code)
+        if m_asn is None:
+            continue
+        target = m_asn.group(1).lower()
+        if target not in needed:
+            continue
+        rhs = m_asn.group(2).strip()
+        if not _is_integerish_expr_with_names(rhs):
+            continue
+        names = {nm.lower() for nm in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
+        if names <= (int_names | needed | promote):
+            promote.add(target)
+            int_names.add(target)
+    if not promote and not sample1_scalars:
+        return f90
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        code, bang, comment = line.partition("!")
+        m_int_decl = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+)$", code, re.IGNORECASE)
+        if m_int_decl is not None and sample1_scalars:
+            keep_i: list[str] = []
+            moved_i: list[str] = []
+            for item in split_top_level_commas(m_int_decl.group(2)):
+                item_s = item.strip()
+                lhs = item_s.split("=", 1)[0].strip()
+                m_name = re.match(r"^([A-Za-z]\w*)\s*\(:\)\s*$", lhs)
+                if m_name is not None and m_name.group(1).lower() in sample1_scalars:
+                    moved_i.append(m_name.group(1))
+                else:
+                    keep_i.append(item_s)
+            indent_i = m_int_decl.group(1)
+            if keep_i:
+                new_i = f"{indent_i}integer, allocatable :: {', '.join(keep_i)}"
+                if bang:
+                    new_i += " !" + comment
+                out.append(new_i)
+            elif bang and comment.strip():
+                out.append(f"{indent_i}!{comment}")
+            for name_i in moved_i:
+                out.append(f"{indent_i}integer :: {name_i}")
+            continue
+        m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*(?:,[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            out.append(line)
+            continue
+        attrs = code.split("::", 1)[0].lower()
+        if "allocatable" in attrs or "parameter" in attrs or "pointer" in attrs:
+            out.append(line)
+            continue
+        keep: list[str] = []
+        moved: list[str] = []
+        for item in split_top_level_commas(m_decl.group(2)):
+            item_s = item.strip()
+            lhs = item_s.split("=", 1)[0].strip()
+            m_name = re.match(r"^([A-Za-z]\w*)$", lhs)
+            if m_name is not None and m_name.group(1).lower() in promote:
+                moved.append(item_s)
+            else:
+                keep.append(item_s)
+        indent = m_decl.group(1)
+        if keep:
+            new_line = f"{indent}real(kind=dp) :: {', '.join(keep)}"
+            if bang:
+                new_line += " !" + comment
+            out.append(new_line)
+        elif bang and comment.strip():
+            out.append(f"{indent}!{comment}")
+        for item_s in moved:
+            out.append(f"{indent}integer :: {item_s}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def restore_renamed_hmm_list_fields(lines: list[str]) -> list[str]:
     """Keep selected R list field names stable when local variables were renamed."""
     out: list[str] = []
@@ -33215,6 +33373,7 @@ def main() -> int:
     f90 = rewrite_recursive_io_function_args_text(f90)
     f90 = repair_vector_call_scalar_index_assignments_text(f90)
     f90 = coerce_user_call_integer_actuals_text(f90)
+    f90 = promote_sample_int_bound_scalars_text(f90)
     f90 = demote_literal_index_scalar_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
