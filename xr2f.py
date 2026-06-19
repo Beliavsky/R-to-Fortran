@@ -27453,6 +27453,217 @@ def repair_rank3_call_slice_assignments(lines: list[str]) -> list[str]:
     return out2
 
 
+def repair_vector_call_scalar_index_assignments_text(f90: str) -> str:
+    def _split_call_index(rhs: str) -> tuple[str, str] | None:
+        rhs = rhs.strip()
+        m = re.match(r"^([A-Za-z]\w*)\s*\(", rhs)
+        if m is None:
+            return None
+        depth = 1
+        i = m.end()
+        in_single = False
+        in_double = False
+        while i < len(rhs) and depth > 0:
+            ch = rhs[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            i += 1
+        if depth != 0:
+            return None
+        call_txt = rhs[:i].strip()
+        rest = rhs[i:].strip()
+        if not (rest.startswith("[") and rest.endswith("]")):
+            return None
+        idx = rest[1:-1].strip()
+        if not idx or "," in idx:
+            return None
+        return call_txt, idx
+
+    out: list[str] = []
+    tmp_i = 0
+    for line in f90.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z]\w*(?:%[A-Za-z]\w*)?)\s*=\s*(.+)$", line)
+        if m is None:
+            out.append(line)
+            continue
+        split = _split_call_index(m.group(3))
+        if split is None:
+            out.append(line)
+            continue
+        call_txt, idx = split
+        tmp_i += 1
+        tmp = f"xr2f_call_idx_tmp_{tmp_i}"
+        indent, target = m.group(1), m.group(2)
+        out.extend(
+            [
+                f"{indent}block",
+                f"{indent}   real(kind=dp), allocatable :: {tmp}(:)",
+                f"{indent}   {tmp} = {call_txt}",
+                f"{indent}   {target} = {tmp}({r_expr_to_fortran(idx)})",
+                f"{indent}end block",
+            ]
+        )
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def coerce_user_call_integer_actuals_text(f90: str) -> str:
+    real_scalar_names: set[str] = set()
+    for decl_line in f90.splitlines():
+        code_decl = decl_line.split("!", 1)[0]
+        m_decl = re.match(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*(?:,[^:]*)?::\s*(.+)$", code_decl, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        attrs = code_decl.split("::", 1)[0].lower()
+        if "allocatable" in attrs or "parameter" in attrs or "pointer" in attrs:
+            continue
+        for item in split_top_level_commas(m_decl.group(1)):
+            name = item.split("=", 1)[0].strip()
+            if "(" in name:
+                continue
+            m_name = re.match(r"^([A-Za-z]\w*)\s*$", name)
+            if m_name is not None:
+                real_scalar_names.add(m_name.group(1).lower())
+
+    def _replace_func_calls_outside_strings(code: str, fn_name: str, repl_fn) -> str:
+        pieces: list[tuple[str, bool]] = []
+        start = 0
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch not in {"'", '"'}:
+                i += 1
+                continue
+            if start < i:
+                pieces.append((code[start:i], False))
+            quote = ch
+            j = i + 1
+            while j < n:
+                if code[j] == quote:
+                    if j + 1 < n and code[j + 1] == quote:
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            pieces.append((code[i:j], True))
+            i = j
+            start = i
+        if start < n:
+            pieces.append((code[start:], False))
+        if not pieces:
+            return code
+        out: list[str] = []
+        for piece, is_string in pieces:
+            if is_string:
+                out.append(piece)
+            else:
+                out.append(_replace_balanced_func_calls(piece, fn_name, repl_fn))
+        return "".join(out)
+
+    def _is_real_literal(t: str) -> bool:
+        return bool(
+            re.fullmatch(
+                r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+(?:[eEdD][+-]?\d+)))(?:_dp)?",
+                t.strip(),
+            )
+        )
+
+    def _needs_int_wrap(v: str) -> bool:
+        t = v.strip()
+        tl = t.lower()
+        if re.fullmatch(r"int\s*\(.+\)", t, re.IGNORECASE):
+            return False
+        if re.fullmatch(r"[+-]?\d+", t):
+            return False
+        if tl in _KNOWN_INT_NAMES or tl in _KNOWN_INT_VECTOR_NAMES or tl in _CURRENT_INT_ARRAY_NAMES:
+            return False
+        if re.match(r"^(?:size|len|length|count|maxloc|minloc|which_first|which_last)\s*\(", t, re.IGNORECASE):
+            return False
+        if _is_real_literal(t):
+            return True
+        if re.fullmatch(r"[A-Za-z]\w*", t) and tl in real_scalar_names:
+            return True
+        if re.fullmatch(r"real\s*\(.+\)", t, re.IGNORECASE):
+            return True
+        return False
+
+    def _coerce_real_actual(v: str) -> str:
+        t = v.strip()
+        tl = t.lower()
+        if re.fullmatch(r"[+-]?\d+", t):
+            return f"{int(t)}.0_dp"
+        if (
+            tl in _KNOWN_INT_NAMES
+            or tl in _KNOWN_INT_VECTOR_NAMES
+            or tl in _CURRENT_INT_ARRAY_NAMES
+            or re.fullmatch(r"int\s*\(.+\)", t, re.IGNORECASE)
+        ):
+            return f"real({t}, kind=dp)"
+        return t
+
+    def _coerce_call(fn_name: str, inner: str) -> str:
+        kinds = _USER_FUNC_ARG_KIND.get(fn_name.lower())
+        if not kinds or ("integer" not in kinds and "real" not in kinds):
+            return f"{fn_name}({inner})"
+        idx_map = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
+        parts = split_top_level_commas(inner)
+        out_parts: list[str] = []
+        pos_i = 0
+        for p in parts:
+            ps = p.strip()
+            m_kw = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", ps, re.DOTALL)
+            if m_kw is not None:
+                key = _sanitize_fortran_kwarg_name(m_kw.group(1)).lower()
+                val = m_kw.group(2).strip()
+                idx = idx_map.get(key, -1)
+                if idx >= 0 and idx < len(kinds):
+                    if kinds[idx] == "integer" and _needs_int_wrap(val):
+                        val = f"int({val})"
+                    elif kinds[idx] == "real":
+                        val = _coerce_real_actual(val)
+                out_parts.append(f"{m_kw.group(1)}={val}")
+                continue
+            if pos_i < len(kinds):
+                if kinds[pos_i] == "integer" and _needs_int_wrap(ps):
+                    ps = f"int({ps})"
+                elif kinds[pos_i] == "real":
+                    ps = _coerce_real_actual(ps)
+            out_parts.append(ps)
+            pos_i += 1
+        return f"{fn_name}({', '.join(out_parts)})"
+
+    out_lines: list[str] = []
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        if re.match(
+            r"^\s*(?:(?:pure|elemental|recursive)\s+)*(?:function|subroutine)\b|"
+            r"^\s*(?:use\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|end\b)",
+            code,
+            re.IGNORECASE,
+        ):
+            out_lines.append(line)
+            continue
+        new_code = code
+        for fn_name in sorted(_USER_FUNC_ARG_KIND, key=len, reverse=True):
+            new_code = _replace_func_calls_outside_strings(
+                new_code,
+                fn_name,
+                lambda inner, fn_name=fn_name: _coerce_call(fn_name, inner),
+            )
+        if new_code != code and "!" in line:
+            new_code = new_code.rstrip() + " !" + line.split("!", 1)[1]
+        out_lines.append(new_code if new_code != code else line)
+    return "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
+
+
 def restore_renamed_hmm_list_fields(lines: list[str]) -> list[str]:
     """Keep selected R list field names stable when local variables were renamed."""
     out: list[str] = []
@@ -30567,6 +30778,37 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
         f90,
     )
 
+def remove_allocatable_result_entry_deallocate_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(
+            rf"(?m)^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\))\s*,\s*allocatable\s*::[^\n]*\b{re.escape(res)}\b",
+            block,
+            re.IGNORECASE,
+        ) is None:
+            return block
+        block = re.sub(
+            rf"(?im)^\s*if\s*\(\s*allocated\s*\(\s*{re.escape(res)}\s*\)\s*\)\s*&\s*\n\s*&\s*deallocate\s*\(\s*{re.escape(res)}\s*\)\s*\n?",
+            "",
+            block,
+        )
+        block = re.sub(
+            rf"(?im)^\s*if\s*\(\s*allocated\s*\(\s*{re.escape(res)}\s*\)\s*\)\s*deallocate\s*\(\s*{re.escape(res)}\s*\)\s*\n?",
+            "",
+            block,
+        )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
 
 def rewrite_same_rank_self_update_aliases_text(f90: str) -> str:
     """Collapse narrow recursive arithmetic aliases back to the base variable."""
@@ -32971,6 +33213,9 @@ def main() -> int:
     f90 = restore_matrix_row_seq_index_text(f90)
     f90 = rewrite_allocatable_array_merge_assignments_text(f90)
     f90 = rewrite_recursive_io_function_args_text(f90)
+    f90 = repair_vector_call_scalar_index_assignments_text(f90)
+    f90 = coerce_user_call_integer_actuals_text(f90)
+    f90 = demote_literal_index_scalar_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
@@ -32992,6 +33237,7 @@ def main() -> int:
     f90_lines = add_missing_iso_fortran_env_dp_imports(f90_lines)
     f90_lines = remove_redundant_procedure_iso_fortran_env_dp_imports(f90_lines)
     f90 = "\n".join(f90_lines)
+    f90 = demote_literal_index_scalar_assignments_text(f90)
     f90 = re.sub(
         r"(real\(kind=dp\),\s*allocatable\s*::[^\n]*&)\n(character\(len=:\),\s*allocatable\s*::[^\n]+)\n&\s*([^\n]+)",
         r"\1\n& \3\n\2",
@@ -33003,6 +33249,7 @@ def main() -> int:
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = add_missing_derived_type_fields_from_assignments_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
+    f90 = remove_allocatable_result_entry_deallocate_text(f90)
     f90 = f90.replace(
         "real(kind=dp), allocatable :: qnorm_scalar_result(:)",
         "real(kind=dp) :: qnorm_scalar_result",
