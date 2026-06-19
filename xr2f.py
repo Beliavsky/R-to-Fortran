@@ -7391,6 +7391,111 @@ def _collect_nested_types(fn_name: str, fields: dict[str, object], path: tuple[s
     return out
 
 
+def _static_list_field_kind(expr: object, list_vars: dict[str, dict[str, str]] | None = None) -> str:
+    if isinstance(expr, dict):
+        return "list"
+    txt = str(expr).strip()
+    if re.fullmatch(r"[A-Za-z]\w*", txt) and list_vars is not None and txt in list_vars:
+        return "list"
+    if _dequote_string_literal(txt) is not None:
+        return "character"
+    if txt.upper() in {"TRUE", "FALSE"}:
+        return "logical"
+    if _is_int_literal(txt):
+        return "integer"
+    if _is_real_literal(txt):
+        return "real"
+    if re.match(r"^(?:c|seq|seq_len|numeric|integer|logical|character|double|rep|rnorm|runif)\s*\(", txt, re.IGNORECASE):
+        c = parse_call_text(txt)
+        nm = c[0].lower() if c is not None else ""
+        if nm in {"integer", "seq", "seq_len"}:
+            return "integer-array"
+        if nm in {"logical"}:
+            return "logical-array"
+        if nm in {"character"}:
+            return "character-array"
+        return "real-array"
+    return "unknown"
+
+
+def validate_static_list_field_updates(stmts: list[object]) -> None:
+    def walk(ss: list[object], scope_lists: dict[str, dict[str, str]], allow_new_fields: bool = False) -> None:
+        for st in ss:
+            lhs_rhs: tuple[str, str] | None = None
+            if isinstance(st, Assign):
+                lhs_rhs = (st.name.strip(), st.expr.strip())
+            elif isinstance(st, ExprStmt):
+                asn = split_top_level_assignment(st.expr.strip())
+                if asn is not None:
+                    lhs_rhs = (asn[0].strip(), asn[1].strip())
+            if lhs_rhs is not None:
+                lhs, rhs = lhs_rhs
+                fields = _parse_list_constructor(rhs)
+                if fields is not None:
+                    scope_lists[lhs] = {
+                        str(k): _static_list_field_kind(v, scope_lists)
+                        for k, v in fields.items()
+                    }
+                    continue
+                m_alias = re.match(r"^([A-Za-z]\w*)$", rhs)
+                if m_alias is not None and m_alias.group(1) in scope_lists:
+                    scope_lists[lhs] = dict(scope_lists[m_alias.group(1)])
+                    continue
+                m_field = re.match(r"^([A-Za-z]\w*)[\$%]([A-Za-z]\w*)$", lhs)
+                if m_field is not None and m_field.group(1) in scope_lists:
+                    base, fld = m_field.group(1), m_field.group(2)
+                    if fld not in scope_lists[base]:
+                        if allow_new_fields:
+                            scope_lists[base][fld] = _static_list_field_kind(rhs, scope_lists)
+                            continue
+                        raise NotImplementedError(
+                            f"dynamic R list field `{base}${fld}` is not supported; "
+                            "static Fortran derived-type lists require fields to be present in the original list(...) constructor"
+                        )
+                    old_kind = scope_lists[base][fld]
+                    new_kind = _static_list_field_kind(rhs, scope_lists)
+                    if old_kind != "unknown" and new_kind != "unknown" and old_kind != new_kind:
+                        raise NotImplementedError(
+                            f"R list field `{base}${fld}` changes kind from {old_kind} to {new_kind}; "
+                            "dynamic list field types are not currently supported"
+                        )
+                    if old_kind == "unknown":
+                        scope_lists[base][fld] = new_kind
+            elif isinstance(st, FuncDef):
+                walk(st.body, {})
+            elif isinstance(st, IfStmt):
+                then_lists = {k: dict(v) for k, v in scope_lists.items()}
+                else_lists = {k: dict(v) for k, v in scope_lists.items()}
+                walk(st.then_body, then_lists, allow_new_fields=True)
+                walk(st.else_body, else_lists, allow_new_fields=True)
+                for base in set(then_lists) | set(else_lists):
+                    before = scope_lists.get(base, {})
+                    then_fields = then_lists.get(base, before)
+                    else_fields = else_lists.get(base, before)
+                    merged = dict(before)
+                    for fld in set(then_fields) | set(else_fields):
+                        if fld in before:
+                            merged[fld] = before[fld]
+                            continue
+                        if fld in then_fields and fld in else_fields and then_fields[fld] == else_fields[fld]:
+                            merged[fld] = then_fields[fld]
+                        elif fld in then_fields or fld in else_fields:
+                            raise NotImplementedError(
+                                f"dynamic R list field `{base}${fld}` is not supported; "
+                                "fields added in branches must be assigned in both branches with the same kind"
+                            )
+                    if merged:
+                        scope_lists[base] = merged
+            elif isinstance(st, ForStmt):
+                walk(st.body, dict(scope_lists), allow_new_fields=allow_new_fields)
+            elif isinstance(st, WhileStmt):
+                walk(st.body, dict(scope_lists), allow_new_fields=allow_new_fields)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body, dict(scope_lists), allow_new_fields=allow_new_fields)
+
+    walk(stmts, {})
+
+
 def _type_name_for_path(fn_name: str, path: tuple[str, ...]) -> str:
     if not path:
         return f"{fn_name}_result_t"
@@ -21810,6 +21915,7 @@ def transpile_r_to_fortran(
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
+    validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
         print(
@@ -27980,12 +28086,9 @@ def rewrite_raw_list_constructor_writes_text(f90: str) -> str:
             lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
             if re.fullmatch(r"[A-Za-z]\w*", lhs):
                 derived_vars[lhs.lower()] = type_name
-    if not derived_vars:
-        return f90
-
     out: list[str] = []
     for line in f90.splitlines():
-        m_write = re.match(r'^(\s*)write\s*\(\s*\*\s*,\s*"\(g0\)"\s*\)\s*(list\s*\(.+\))\s*(?:!(.*))?$', line, re.IGNORECASE)
+        m_write = re.match(r'^(\s*)write\s*\(\s*\*\s*,\s*"[^"]*"\s*\)\s*(list\s*\(.+\))\s*(?:!(.*))?$', line, re.IGNORECASE)
         if m_write is None:
             out.append(line)
             continue
