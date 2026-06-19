@@ -29864,6 +29864,30 @@ def promote_integer_sequence_result_decls_text(f90: str) -> str:
 
 
 def demote_scalar_allocatable_function_results_text(f90: str) -> str:
+    def _strip_scalar_reduction_calls(txt: str) -> str:
+        out = txt
+        for _ in range(20):
+            changed = False
+            for name in ("sum", "size", "count", "maxval", "minval"):
+                m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
+                while m is not None:
+                    depth = 1
+                    i = m.end()
+                    while i < len(out) and depth > 0:
+                        if out[i] == "(":
+                            depth += 1
+                        elif out[i] == ")":
+                            depth -= 1
+                        i += 1
+                    if depth != 0:
+                        break
+                    out = out[:m.start()] + "0.0_dp" + out[i:]
+                    changed = True
+                    m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
+            if not changed:
+                break
+        return out
+
     def repl(block_m: re.Match[str]) -> str:
         block = block_m.group(0)
         m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
@@ -29903,8 +29927,9 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             rhs_s = rhs.strip()
             if re.search(r"\[[^\]]*\]|\b(?:pack|r_rep_real|r_seq_int|matrix|reshape|spread)\s*\(", rhs_s, re.IGNORECASE):
                 return block
+            rhs_check = _strip_scalar_reduction_calls(rhs_s)
             for nm in array_names:
-                if re.search(rf"\b{re.escape(nm)}\b", rhs_s, re.IGNORECASE):
+                if re.search(rf"\b{re.escape(nm)}\b", rhs_check, re.IGNORECASE):
                     return block
         def decl_repl(dm_res: re.Match[str]) -> str:
             if dm_res.start() != decl_match.start():
@@ -30104,6 +30129,30 @@ def rewrite_default_label_count_from_matrix_shape_text(f90: str) -> str:
 
 
 def promote_array_rhs_function_results_text(f90: str) -> str:
+    def _strip_scalar_reduction_calls(txt: str) -> str:
+        out = txt
+        for _ in range(20):
+            changed = False
+            for name in ("sum", "size", "count", "maxval", "minval"):
+                m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
+                while m is not None:
+                    depth = 1
+                    i = m.end()
+                    while i < len(out) and depth > 0:
+                        if out[i] == "(":
+                            depth += 1
+                        elif out[i] == ")":
+                            depth -= 1
+                        i += 1
+                    if depth != 0:
+                        break
+                    out = out[:m.start()] + "0.0_dp" + out[i:]
+                    changed = True
+                    m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
+            if not changed:
+                break
+        return out
+
     def repl(block_m: re.Match[str]) -> str:
         block = block_m.group(0)
         m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
@@ -30135,9 +30184,10 @@ def promote_array_rhs_function_results_text(f90: str) -> str:
                     array_names.add(m_item.group(1).lower())
         if not array_names:
             return block
-        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block)
+        block_for_assigns = re.sub(r"&\s*\n\s*&\s*", " ", block)
+        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block_for_assigns)
         if not any(
-            re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE)
+            re.search(rf"\b{re.escape(nm)}\b", _strip_scalar_reduction_calls(rhs), re.IGNORECASE)
             for rhs in assigns
             for nm in array_names
         ):
@@ -30167,6 +30217,57 @@ def restore_matrix_row_seq_index_text(f90: str) -> str:
     return re.sub(
         r"(?m)^(\s*[A-Za-z]\w*\s*=\s*[A-Za-z]\w*\s*)\(\s*1\s*:\s*([A-Za-z]\w*)\s*-\s*1\s*,\s*:\s*\)",
         r"\1(r_seq_int(1, \2 - 1), :)",
+        f90,
+    )
+
+
+def rewrite_allocatable_array_merge_assignments_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        array_names: set[str] = set()
+        for dm in re.finditer(
+            r"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)\s*,\s*allocatable\s*::\s*(.+)$",
+            block,
+            re.IGNORECASE,
+        ):
+            for item in split_top_level_commas(dm.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:", item)
+                if m_item is not None:
+                    array_names.add(m_item.group(1))
+        if not array_names:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*merge\s*\((.*)\)\s*$", line, re.IGNORECASE)
+            if m is None or m.group(2) not in array_names:
+                out.append(line)
+                continue
+            args = split_top_level_commas(m.group(3))
+            if len(args) != 3:
+                out.append(line)
+                continue
+            indent, target = m.group(1), m.group(2)
+            yes, no, cond = (a.strip() for a in args)
+            if not (
+                re.fullmatch(r"[A-Za-z]\w*(?:\([^)]*\))?", yes)
+                and re.fullmatch(r"[A-Za-z]\w*(?:\([^)]*\))?", no)
+            ):
+                out.append(line)
+                continue
+            out.extend(
+                [
+                    f"{indent}if ({cond}) then",
+                    f"{indent}   {target} = {yes}",
+                    f"{indent}else",
+                    f"{indent}   {target} = {no}",
+                    f"{indent}end if",
+                ]
+            )
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:program|module|subroutine|(?:pure\s+|recursive\s+|elemental\s+)*function)\b.*?^\s*end\s+(?:program|module|subroutine|function)\b.*?$",
+        repl,
         f90,
     )
 
@@ -32711,6 +32812,7 @@ def main() -> int:
     f90 = promote_scalar_pure_functions_to_elemental_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = restore_matrix_row_seq_index_text(f90)
+    f90 = rewrite_allocatable_array_merge_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
