@@ -28425,6 +28425,44 @@ def rewrite_same_rank_self_update_aliases_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
+    """Repair stale renamed local aliases that are declared but never assigned."""
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*"
+        r"(?:function|subroutine)\s+[A-Za-z]\w*\b.*?^\s*end\s+"
+        r"(?:function|subroutine)\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        assigned = {
+            ma.group(1).lower()
+            for ma in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=", block)
+        }
+        if not assigned:
+            return block
+
+        def repl_alias(ma: re.Match[str]) -> str:
+            base = ma.group(1)
+            alias = ma.group(0)
+            if alias.lower() in assigned:
+                return alias
+            if base.lower() not in assigned:
+                return alias
+            return base
+
+        out_lines: list[str] = []
+        for ln in block.splitlines():
+            if "::" in ln or "=" not in ln:
+                out_lines.append(ln)
+                continue
+            lhs, rhs = ln.split("=", 1)
+            out_lines.append(lhs + "=" + re.sub(r"\b([A-Za-z]\w*)_2\b", repl_alias, rhs))
+        return "\n".join(out_lines) + ("\n" if block.endswith("\n") else "")
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def keyword_print_helper_actuals_after_named_text(f90: str) -> str:
     """For known print helpers, keyword positional actuals after a named actual."""
     specs = {
@@ -29177,6 +29215,29 @@ def _build_exe_cache_path(
     ])
     key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
     return Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key / "program.exe"
+
+
+def _cleanup_runtime_cache_exe(exe_path: Path | None) -> None:
+    if exe_path is None:
+        return
+    try:
+        cache_root = (Path(tempfile.gettempdir()) / "xr2f_runtime_cache").resolve()
+        resolved = Path(exe_path).resolve()
+        if resolved.name.lower() == "program.exe" and cache_root in resolved.parents:
+            resolved.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cleanup_runtime_cache_program_exes() -> None:
+    try:
+        cache_root = Path(tempfile.gettempdir()) / "xr2f_runtime_cache"
+        if not cache_root.is_dir():
+            return
+        for exe_path in cache_root.glob("*/program.exe"):
+            _cleanup_runtime_cache_exe(exe_path)
+    except OSError:
+        pass
 
 
 def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
@@ -30136,6 +30197,7 @@ def main() -> int:
     f90 = simplify_real_dp_casts_text(f90)
     f90 = rewrite_user_call_dotted_keyword_aliases_text(f90)
     f90 = rewrite_same_rank_self_update_aliases_text(f90)
+    f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
         r"\b([A-Za-z]\w*)\s*\[\s*which\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*1\s*\]\s*\]",
@@ -30160,9 +30222,22 @@ def main() -> int:
         f90,
         flags=re.IGNORECASE,
     )
+    if re.search(r"\blast_t\s*=\s*maxval\s*\(\s*which\s*\(", f90, re.IGNORECASE):
+        f90 = re.sub(
+            r"(?m)^(\s*)real\(kind=dp\)\s*::\s*([^\n&]*?)\blast_t\s*,\s*([^\n&]*(?:&\s*\n\s*&[^\n]*)?)$",
+            lambda m: (
+                f"{m.group(1)}integer :: last_t\n"
+                f"{m.group(1)}real(kind=dp) :: "
+                f"{(m.group(2) + m.group(3)).strip().strip(',')}"
+            ),
+            f90,
+            count=1,
+            flags=re.IGNORECASE,
+        )
     f90 = f90.replace("transpose(r_matrix_col(weight_array(:, j, valid), 1))", "transpose(weight_array(:, j, which(valid)))")
     f90 = f90.replace("turnover_summary(:,:), wj(:)", "turnover_summary(:,:), wj(:,:)")
     f90 = f90.replace("turnover_summary(:), wj(:)", "turnover_summary(:,:), wj(:)")
+    f90 = re.sub(r"\bwj\s*\(:\s*\)(?=\s*[,])", "wj(:,:)", f90)
     f90 = re.sub(
         r"turnover_summary\s*\(:\s*\),\s*wj\s*\(:\s*&\s*\n\s*&\s*\)",
         "turnover_summary(:,:), wj(:,:)",
@@ -30718,6 +30793,7 @@ def main() -> int:
         t0 = time.perf_counter()
         build_helpers: list[str] = []
         include_dirs: list[str] = []
+        _cleanup_runtime_cache_program_exes()
         using_cached_runtime = False
         if args.r_rng:
             shim_obj, r_rng_ldflags, shim_cp, shim_cmd = _compile_r_rng_shim(args.rscript)
@@ -30850,26 +30926,15 @@ def main() -> int:
             cmd += ["-o", str(exe)]
         if args.time:
             print("Compile options:", " ".join(cparts[1:]) if len(cparts) > 1 else "<none>")
-        exe_cache = _build_exe_cache_path(out_path, cparts, include_dirs, build_helpers, r_rng_ldflags) if args.run else None
-        if exe_cache is not None and exe_cache.exists():
-            exe.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(exe_cache, exe)
-            timings["compile"] = time.perf_counter() - t0
-            print("Build: cached", str(exe_cache))
-            print("Build: PASS")
-        else:
-            print("Build:", " ".join(cmd))
-            cp = _run_capture(cmd, cwd=artifact_dir)
-            timings["compile"] = time.perf_counter() - t0
-            if cp.returncode != 0:
-                print(f"Build: FAIL (exit {cp.returncode})")
-                _print_captured(cp)
-                _explain_compile_failure(cp, out_path, src)
-                return cp.returncode
-            if exe_cache is not None and exe.exists():
-                exe_cache.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(exe, exe_cache)
-            print("Build: PASS")
+        print("Build:", " ".join(cmd))
+        cp = _run_capture(cmd, cwd=artifact_dir)
+        timings["compile"] = time.perf_counter() - t0
+        if cp.returncode != 0:
+            print(f"Build: FAIL (exit {cp.returncode})")
+            _print_captured(cp)
+            _explain_compile_failure(cp, out_path, src)
+            return cp.returncode
+        print("Build: PASS")
 
         if args.run:
             t0 = time.perf_counter()
