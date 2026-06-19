@@ -29895,7 +29895,8 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
                     continue
                 if "(" in base and re.fullmatch(r"[A-Za-z]\w*", nm):
                     array_names.add(nm.lower())
-        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block)
+        block_for_assigns = re.sub(r"&\s*\n\s*&\s*", " ", block)
+        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block_for_assigns)
         if not assigns:
             return block
         for rhs in assigns:
@@ -30098,6 +30099,74 @@ def rewrite_default_label_count_from_matrix_shape_text(f90: str) -> str:
     return re.sub(
         r"(?ims)^\s*(?:program|module|subroutine|(?:pure\s+|recursive\s+|elemental\s+)*function)\b.*?^\s*end\s+(?:program|module|subroutine|function)\b.*?$",
         repl_unit,
+        f90,
+    )
+
+
+def promote_array_rhs_function_results_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(
+            rf"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::[^\n]*\b{re.escape(res)}\s*\(:\)",
+            block,
+            re.IGNORECASE,
+        ):
+            return block
+        decl_pat = re.compile(
+            rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*([^\n]*\b{re.escape(res)}\b[^\n]*)$",
+            re.IGNORECASE,
+        )
+        decl_m = decl_pat.search(block)
+        if decl_m is None:
+            return block
+        array_names: set[str] = set()
+        for dm in re.finditer(
+            r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            block,
+            re.IGNORECASE,
+        ):
+            for item in split_top_level_commas(dm.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", item)
+                if m_item is not None:
+                    array_names.add(m_item.group(1).lower())
+        if not array_names:
+            return block
+        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block)
+        if not any(
+            re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE)
+            for rhs in assigns
+            for nm in array_names
+        ):
+            return block
+
+        def decl_repl(dm_res: re.Match[str]) -> str:
+            kept: list[str] = []
+            for item in split_top_level_commas(dm_res.group(2)):
+                item_s = item.strip()
+                if not re.fullmatch(re.escape(res), item_s, re.IGNORECASE):
+                    kept.append(item_s)
+            lines = [f"{dm_res.group(1)}real(kind=dp), allocatable :: {res}(:)"]
+            if kept:
+                lines.append(f"{dm_res.group(1)}real(kind=dp) :: " + ", ".join(kept))
+            return "\n".join(lines)
+
+        return decl_pat.sub(decl_repl, block, count=1)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def restore_matrix_row_seq_index_text(f90: str) -> str:
+    return re.sub(
+        r"(?m)^(\s*[A-Za-z]\w*\s*=\s*[A-Za-z]\w*\s*)\(\s*1\s*:\s*([A-Za-z]\w*)\s*-\s*1\s*,\s*:\s*\)",
+        r"\1(r_seq_int(1, \2 - 1), :)",
         f90,
     )
 
@@ -32638,8 +32707,10 @@ def main() -> int:
     f90 = demote_real_element_scalar_locals_text(f90)
     f90 = promote_integer_maxval_locals_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
+    f90 = promote_array_rhs_function_results_text(f90)
     f90 = promote_scalar_pure_functions_to_elemental_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
+    f90 = restore_matrix_row_seq_index_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
