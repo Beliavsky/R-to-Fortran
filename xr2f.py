@@ -6332,6 +6332,15 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
         return _infer_assignment_kind_hint(pipe_expr, inferred_kinds)
     if not expr:
         return "unknown"
+    trailing_subset = _split_trailing_r_subset(expr)
+    if trailing_subset is not None:
+        base_subset, idx_subset = trailing_subset
+        dims_subset = _split_index_dims(idx_subset)
+        if len(dims_subset) == 1 and _split_top_level_colon(dims_subset[0].strip()) is None:
+            base_call = parse_call_text(fscan.strip_redundant_outer_parens_expr(base_subset.strip()))
+            if base_call is not None and base_call[0].lower() in {"which", "seq", "seq_len", "seq_along"}:
+                return "integer"
+            return _infer_assignment_kind_hint(base_subset, inferred_kinds)
     expr_l = expr.lower()
     if expr_l.startswith(("+", "-")) and len(expr_l) > 1 and expr_l[1].isalnum():
         return _infer_assignment_kind_hint(expr[1:].strip(), inferred_kinds)
@@ -12815,6 +12824,97 @@ def emit_stmts(
         vals = ", ".join('"' + x.replace('"', '""') + '"' for x in labels)
         return f"[character(len={width}) :: {vals}]"
 
+    def _array_expr_scalar_subset(src: str) -> tuple[str, str] | None:
+        split = _split_trailing_r_subset(src)
+        if split is None:
+            return None
+        base_src, idx_src = split
+        base_txt = base_src.strip()
+        if re.fullmatch(r"[A-Za-z]\w*(?:\$[A-Za-z]\w*)?", base_txt):
+            return None
+        if "$" in base_txt or "%" in base_txt or "[[" in src or "]]" in src:
+            return None
+        dims = _split_index_dims(idx_src)
+        if len(dims) != 1:
+            return None
+        idx_one = dims[0].strip()
+        if not idx_one:
+            return None
+        if (
+            _split_top_level_colon(idx_one) is not None
+            or "," in idx_one
+            or "[" in idx_one
+            or "]" in idx_one
+            or re.search(r"['\"]", idx_one)
+            or re.match(r"^[A-Za-z]\w*\s*\(", idx_one)
+        ):
+            return None
+        base_unwrapped = fscan.strip_redundant_outer_parens_expr(base_txt)
+        base_call = parse_call_text(base_unwrapped)
+        if base_call is not None and base_call[0].lower() in {
+            "which",
+            "sort",
+            "c",
+            "seq",
+            "seq.int",
+            "seq_len",
+            "seq_along",
+            "rep",
+            "rep.int",
+        }:
+            return base_txt, idx_one
+        has_parenthesized_arith = (
+            base_txt.startswith("(")
+            and base_txt.endswith(")")
+            and any(_split_top_level_token(base_unwrapped, op, from_right=True) is not None for op in ["+", "-", "*", "/"])
+        )
+        if has_parenthesized_arith:
+            return base_txt, idx_one
+        return None
+
+    def _emit_print_array_expr_scalar_subset(src: str, comment: str) -> bool:
+        split = _array_expr_scalar_subset(src)
+        if split is None:
+            return False
+        base_src, idx_src = split
+        base_f = r_expr_to_fortran(_rewrite_predict_expr(base_src))
+        idx_f = _int_bound_expr(r_expr_to_fortran(idx_src))
+        kind_src = _expr_kind_simple(base_src)
+        o.w("block")
+        o.push()
+        o.w(f"associate(xr2f_idx_vec => {base_f})")
+        o.push()
+        if kind_src == "int" or re.match(r"^\s*(?:which|seq_len|seq_along|seq)\s*\(", base_src, re.IGNORECASE):
+            _wstmt(f'write(*,"(g0)") xr2f_idx_vec({idx_f})', comment)
+        elif kind_src == "logical":
+            _wstmt(f'write(*,"(g0)") xr2f_idx_vec({idx_f})', comment)
+        else:
+            _wstmt(f"call print_real_scalar(real(xr2f_idx_vec({idx_f}), kind=dp))", comment)
+            need_r_mod.add("print_real_scalar")
+        o.pop()
+        o.w("end associate")
+        o.pop()
+        o.w("end block")
+        return True
+
+    def _emit_assign_array_expr_scalar_subset(name: str, src: str, comment: str) -> bool:
+        split = _array_expr_scalar_subset(src)
+        if split is None:
+            return False
+        base_src, idx_src = split
+        base_f = r_expr_to_fortran(_rewrite_predict_expr(base_src))
+        idx_f = _int_bound_expr(r_expr_to_fortran(idx_src))
+        o.w("block")
+        o.push()
+        o.w(f"associate(xr2f_idx_vec => {base_f})")
+        o.push()
+        _wstmt(f"{name} = xr2f_idx_vec({idx_f})", comment)
+        o.pop()
+        o.w("end associate")
+        o.pop()
+        o.w("end block")
+        return True
+
     def _matrix_vector_subset_label_expr_for_print(expr_txt: str) -> str | None:
         t_subset_lbl = expr_txt.strip()
         c_subset_round = parse_call_text(t_subset_lbl)
@@ -12999,6 +13099,8 @@ def emit_stmts(
             if re.match(r"^\s*(?:[A-Za-z]\w*::)?mark\s*\(", st.expr.strip(), re.IGNORECASE):
                 benchmark_vars.add(st.name)
                 _wcomment(f"bench::mark assignment `{st.name}` omitted")
+                continue
+            if _emit_assign_array_expr_scalar_subset(st.name, st.expr.strip(), st.comment):
                 continue
             c_scale_track = parse_call_text(st.expr.strip())
             if c_scale_track is not None and c_scale_track[0].lower() == "scale":
@@ -14056,6 +14158,8 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if _emit_print_array_expr_scalar_subset(one, st.comment):
+                        continue
                     if one in benchmark_vars:
                         _wcomment(f"print({one}) omitted: bench::mark output is not translated")
                         continue
@@ -16163,6 +16267,15 @@ def emit_stmts(
 
 def _expr_kind_simple(expr: str) -> str:
     t = expr.strip()
+    trailing_subset = _split_trailing_r_subset(t)
+    if trailing_subset is not None:
+        base_subset, idx_subset = trailing_subset
+        dims_subset = _split_index_dims(idx_subset)
+        if len(dims_subset) == 1 and _split_top_level_colon(dims_subset[0].strip()) is None:
+            base_call = parse_call_text(fscan.strip_redundant_outer_parens_expr(base_subset.strip()))
+            if base_call is not None and base_call[0].lower() in {"which", "seq", "seq_len", "seq_along"}:
+                return "int"
+            return _expr_kind_simple(base_subset)
     if _is_int_literal(t):
         return "int"
     if _is_real_literal(t):
