@@ -14667,7 +14667,16 @@ def emit_stmts(
                         _wcomment(f"print({one}) omitted: bench::mark output is not translated")
                         continue
                     if one in list_locals:
-                        _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
+                        fields_print = [
+                            k
+                            for k, v in list_locals[one].items()
+                            if re.fullmatch(r"[A-Za-z]\w*", str(k)) and not isinstance(v, dict)
+                        ]
+                        if fields_print:
+                            field_items = ", ".join(f"{_sanitize_r_var_name(one)}%{_sanitize_r_var_name(k)}" for k in fields_print)
+                            _wstmt(f'write(*,"(*(g0,:,1x))") {field_items}', st.comment)
+                        else:
+                            _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
                         continue
                     if has_r_mod and one.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
@@ -26398,6 +26407,8 @@ def transpile_r_to_fortran(
                         o.w(f"real(kind=dp) :: {k}")
                     elif k == "lm_fit" or (re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_lms):
                         o.w(f"type(lm_fit_t) :: {k}")
+                    elif re.match(r"^[A-Za-z]\w*$", txt) and txt in list_vars:
+                        o.w(f"type({list_vars[txt]}) :: {k}")
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_ints:
                         o.w(f"integer :: {k}")
                     elif re.match(r"^[A-Za-z]\w*$", txt) and txt in fn_int_arrays:
@@ -27819,6 +27830,184 @@ def promote_sample_int_bound_scalars_text(f90: str) -> str:
             out.append(f"{indent}!{comment}")
         for item_s in moved:
             out.append(f"{indent}integer :: {item_s}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_raw_derived_type_writes_text(f90: str) -> str:
+    type_fields: dict[str, list[str]] = {}
+    type_component_types: dict[str, dict[str, str]] = {}
+    cur_type: str | None = None
+    cur_fields: list[str] = []
+    cur_component_types: dict[str, str] = {}
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\s*$", code, re.IGNORECASE)
+        if m_type is not None:
+            cur_type = m_type.group(1).lower()
+            cur_fields = []
+            cur_component_types = {}
+            continue
+        if cur_type is not None:
+            if re.match(r"^\s*end\s+type\b", code, re.IGNORECASE):
+                type_fields[cur_type] = cur_fields
+                type_component_types[cur_type] = cur_component_types
+                cur_type = None
+                cur_fields = []
+                cur_component_types = {}
+                continue
+            m_derived_comp = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\).*::\s*(.+)$", code, re.IGNORECASE)
+            m_comp = re.match(
+                r"^\s*(?:integer|logical|complex\b|real\s*\(|character\b)"
+                r".*::\s*(.+)$",
+                code,
+                re.IGNORECASE,
+            )
+            if m_derived_comp is not None or m_comp is not None:
+                comp_src = m_derived_comp.group(2) if m_derived_comp is not None else m_comp.group(1)
+                comp_type = m_derived_comp.group(1).lower() if m_derived_comp is not None else ""
+                for item in split_top_level_commas(comp_src):
+                    lhs = item.split("=", 1)[0].strip()
+                    lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+                    if re.fullmatch(r"[A-Za-z]\w*", lhs):
+                        cur_fields.append(lhs)
+                        if comp_type:
+                            cur_component_types[lhs.lower()] = comp_type
+            continue
+    derived_vars: dict[str, str] = {}
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_decl = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        type_name = m_decl.group(1).lower()
+        for item in split_top_level_commas(m_decl.group(2)):
+            lhs = item.split("=", 1)[0].strip()
+            lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", lhs):
+                derived_vars[lhs.lower()] = type_name
+    if not derived_vars:
+        return f90
+
+    def _expand_derived_items(prefix: str, type_name: str) -> list[str]:
+        out_items: list[str] = []
+        for fld in type_fields.get(type_name.lower(), []):
+            fld_type = type_component_types.get(type_name.lower(), {}).get(fld.lower())
+            if fld_type:
+                out_items.extend(_expand_derived_items(f"{prefix}%{fld}", fld_type))
+            else:
+                out_items.append(f"{prefix}%{fld}")
+        return out_items
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_write = re.match(r'^(\s*)write\s*\(\s*\*\s*,\s*"\(g0\)"\s*\)\s*([A-Za-z]\w*)\s*(?:!(.*))?$', line, re.IGNORECASE)
+        if m_write is not None and m_write.group(2).lower() in derived_vars:
+            var_name = m_write.group(2)
+            items_expanded = _expand_derived_items(var_name, derived_vars[var_name.lower()])
+            if items_expanded:
+                items = ", ".join(items_expanded)
+                new_line = f'{m_write.group(1)}write(*,"(*(g0,:,1x))") {items}'
+            else:
+                new_line = f'{m_write.group(1)}write(*,"(a)") "[list print not translated]"'
+            if m_write.group(3) is not None:
+                new_line += " !" + m_write.group(3)
+            out.append(new_line)
+        else:
+            m_any_write = re.match(r'^(\s*write\s*\(.+\)\s*)(.+?)(\s*(?:!.*)?)$', line, re.IGNORECASE)
+            if m_any_write is None:
+                out.append(line)
+                continue
+            changed = False
+            new_items: list[str] = []
+            for item in split_top_level_commas(m_any_write.group(2)):
+                item_s = item.strip()
+                m_item = re.match(r"^([A-Za-z]\w*)%([A-Za-z]\w*)$", item_s)
+                if m_item is not None and m_item.group(1).lower() in derived_vars:
+                    base_type = derived_vars[m_item.group(1).lower()]
+                    comp_type = type_component_types.get(base_type.lower(), {}).get(m_item.group(2).lower())
+                    if comp_type:
+                        new_items.extend(_expand_derived_items(item_s, comp_type))
+                        changed = True
+                        continue
+                new_items.append(item_s)
+            if changed:
+                out.append(f"{m_any_write.group(1)}{', '.join(new_items)}{m_any_write.group(3)}")
+            else:
+                out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_raw_list_constructor_writes_text(f90: str) -> str:
+    type_fields: dict[str, list[str]] = {}
+    cur_type: str | None = None
+    cur_fields: list[str] = []
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\s*$", code, re.IGNORECASE)
+        if m_type is not None:
+            cur_type = m_type.group(1).lower()
+            cur_fields = []
+            continue
+        if cur_type is not None:
+            if re.match(r"^\s*end\s+type\b", code, re.IGNORECASE):
+                type_fields[cur_type] = cur_fields
+                cur_type = None
+                cur_fields = []
+                continue
+            m_comp = re.match(
+                r"^\s*(?:integer|logical|complex\b|real\s*\(|character\b|type\s*\()"
+                r".*::\s*(.+)$",
+                code,
+                re.IGNORECASE,
+            )
+            if m_comp is not None:
+                for item in split_top_level_commas(m_comp.group(1)):
+                    lhs = item.split("=", 1)[0].strip()
+                    lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+                    if re.fullmatch(r"[A-Za-z]\w*", lhs):
+                        cur_fields.append(lhs)
+            continue
+
+    derived_vars: dict[str, str] = {}
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_decl = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        type_name = m_decl.group(1).lower()
+        for item in split_top_level_commas(m_decl.group(2)):
+            lhs = item.split("=", 1)[0].strip()
+            lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", lhs):
+                derived_vars[lhs.lower()] = type_name
+    if not derived_vars:
+        return f90
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_write = re.match(r'^(\s*)write\s*\(\s*\*\s*,\s*"\(g0\)"\s*\)\s*(list\s*\(.+\))\s*(?:!(.*))?$', line, re.IGNORECASE)
+        if m_write is None:
+            out.append(line)
+            continue
+        fields = _parse_list_constructor(m_write.group(2))
+        if fields is None:
+            out.append(line)
+            continue
+        items: list[str] = []
+        for v in fields.values():
+            vtxt = str(v).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", vtxt) and vtxt.lower() in derived_vars:
+                for fld in type_fields.get(derived_vars[vtxt.lower()], []):
+                    items.append(f"{vtxt}%{fld}")
+            else:
+                items.append(r_expr_to_fortran(vtxt))
+        if not items:
+            out.append(line)
+            continue
+        new_line = f'{m_write.group(1)}write(*,"(*(g0,:,1x))") {", ".join(items)}'
+        if m_write.group(3) is not None:
+            new_line += " !" + m_write.group(3)
+        out.append(new_line)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -33374,6 +33563,8 @@ def main() -> int:
     f90 = repair_vector_call_scalar_index_assignments_text(f90)
     f90 = coerce_user_call_integer_actuals_text(f90)
     f90 = promote_sample_int_bound_scalars_text(f90)
+    f90 = rewrite_raw_derived_type_writes_text(f90)
+    f90 = rewrite_raw_list_constructor_writes_text(f90)
     f90 = demote_literal_index_scalar_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
