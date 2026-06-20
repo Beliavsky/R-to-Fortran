@@ -14,6 +14,7 @@ import argparse
 import difflib
 import glob
 import hashlib
+import json
 import math
 import os
 import re
@@ -4916,6 +4917,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
     if arg_aliases:
         body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
         for alias_arg in arg_aliases:
+            if re.search(rf"\b{re.escape(alias_arg)}\s*\[[^\]\n]*,[^\]\n]*\]", body_text_all):
+                return max(forced_rank or 0, 2)
             if re.search(
                 rf"\b(?:quantile|sort|order|rank|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b",
                 body_text_all,
@@ -4934,7 +4937,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\b(?:chol|sweep|det|diag)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b(?:fit_var|fit_var_orders|make_var_design)\s*\(\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b{re.escape(arg)}\s*\[\s*,"),
-        re.compile(rf"\b{re.escape(arg)}\s*\[[^,\[\]\(\)]+,\s*[^,\[\]\(\)]+\]"),
+        re.compile(rf"\b{re.escape(arg)}\s*\[[^\]\n]*,[^\]\n]*\]"),
         re.compile(rf"\b{re.escape(arg)}\s*%\*%"),
     ]
     pats_rank1 = [
@@ -27447,7 +27450,8 @@ def transpile_r_functions_to_fortran_module(
 def _r_unparse_stmt(st: object, indent: int = 0) -> list[str]:
     pad = "  " * indent
     if isinstance(st, CommentStmt):
-        return []
+        ct = st.text.strip()
+        return [pad + (ct if ct.startswith("#") else "# " + ct)]
     if isinstance(st, Assign):
         return [pad + f"{st.name} <- {st.expr}"]
     if isinstance(st, PrintStmt):
@@ -27708,6 +27712,225 @@ def transpile_r_partial_to_fortran_module(
     insert_at = 1 if lines and re.match(r"^\s*module\b", lines[0], re.IGNORECASE) else 0
     lines[insert_at:insert_at] = report
     return "\n".join(lines) + "\n", translated_names, skipped_items
+
+
+_PARTIAL_MAIN_IGNORE_NAMES = {
+    "true", "false", "na", "nan", "null", "inf",
+    "if", "else", "for", "while", "function", "in", "return",
+    "sum", "mean", "sd", "var", "sqrt", "log", "exp", "abs",
+    "sin", "cos", "tan", "min", "max", "pmin", "pmax",
+    "length", "nrow", "ncol", "dim", "matrix", "array", "c",
+    "cbind", "rbind", "crossprod", "tcrossprod", "t", "diag",
+    "seq", "seq_len", "seq_along", "rep", "numeric", "integer",
+    "logical", "as.numeric", "as.integer", "as.matrix", "as.vector",
+    "list", "data.frame", "print", "cat", "paste", "paste0",
+    "round", "sort", "order", "which", "which.max", "which.min",
+    "is.null", "is.na", "is.finite", "is.nan", "is.infinite",
+    "set.seed", "runif", "rnorm", "rt", "dt", "dnorm", "qnorm",
+    "quantile", "optim", "lm", "lm.fit", "coef", "resid",
+    "colnames", "rownames", "names", "tail", "head",
+}
+
+
+def _partial_main_stmt_calls(st: object) -> set[str]:
+    texts = _collect_stmt_expr_texts([st])
+    if isinstance(st, CallStmt):
+        texts.append(st.name + "(")
+    calls: set[str] = set()
+    for txt in texts:
+        for m in re.finditer(r"\b([A-Za-z]\w*(?:\.[A-Za-z]\w*)?)\s*\(", txt):
+            calls.add(m.group(1).lower())
+    return calls
+
+
+def _partial_main_stmt_refs(st: object) -> set[str]:
+    refs: set[str] = set()
+    for txt in _collect_stmt_expr_texts([st]):
+        clean = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', txt)
+        dotted_spans: list[tuple[int, int]] = []
+        for m_dot in re.finditer(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)+\b", clean):
+            refs.add(m_dot.group(0).lower())
+            dotted_spans.append(m_dot.span())
+        for m in re.finditer(r"\b[A-Za-z]\w*\b", clean):
+            if any(a <= m.start() and m.end() <= b for a, b in dotted_spans):
+                continue
+            refs.add(m.group(0).lower())
+    return {r for r in refs if r not in _PARTIAL_MAIN_IGNORE_NAMES}
+
+
+def _partial_main_unsupported_stmt_reason(st: object) -> str | None:
+    for txt in _collect_stmt_expr_texts([st]):
+        if re.search(r"\bfunction\s*\(", txt):
+            return "contains an anonymous function expression"
+    return None
+
+
+def _partial_main_is_deferred_header_stmt(st: object) -> bool:
+    if not isinstance(st, CallStmt):
+        return False
+    if st.name.lower() != "cat" or not st.args:
+        return False
+    first = st.args[0].strip()
+    m = re.match(r"""^(['"])(.*)\1$""", first, re.DOTALL)
+    if m is None:
+        return False
+    text = m.group(2)
+    return text.startswith("\\n") or text.startswith("\n")
+
+
+def _partial_main_is_visible_output_stmt(st: object) -> bool:
+    return isinstance(st, PrintStmt)
+
+
+def _partial_main_statement_report_label(st: object) -> str:
+    if isinstance(st, Assign):
+        return st.name
+    if isinstance(st, CallStmt):
+        return st.name + "(...)"
+    if isinstance(st, PrintStmt):
+        return "print(...)"
+    if isinstance(st, ForStmt):
+        return f"for ({st.var} in ...)"
+    if isinstance(st, IfStmt):
+        return "if (...)"
+    if isinstance(st, WhileStmt):
+        return "while (...)"
+    if isinstance(st, ExprStmt):
+        return st.expr[:60]
+    return st.__class__.__name__
+
+
+def build_partial_main_source(
+    src: str,
+    stem: str,
+    helper_modules: set[str] | None = None,
+    fortran_comments: bool = True,
+    verbose: bool = False,
+    forced_function_skips: dict[str, str] | None = None,
+) -> tuple[str, list[str], list[tuple[str, str]], int, list[tuple[str, str]]]:
+    funcs = _parse_r_functions_for_partial(src)
+    partial_module, translated_names, skipped_funcs = transpile_r_partial_to_fortran_module(
+        src,
+        stem=stem,
+        helper_modules=helper_modules,
+        fortran_comments=fortran_comments,
+        verbose=verbose,
+        forced_skips=forced_function_skips,
+    )
+    del partial_module
+    translated_l = {n.lower() for n in translated_names}
+    skipped_func_l = {n.lower() for n, _ in skipped_funcs}
+    translated_funcs = [fn for fn in funcs if fn.name.lower() in translated_l]
+
+    comment_lookup = build_r_comment_lookup(src)
+    lines = preprocess_r_lines(src)
+    stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+    if i != len(lines):
+        raise NotImplementedError("could not parse full source for partial-main translation")
+    stmts = _lower_dim_assignments(stmts)
+    stmts = attach_function_adjacent_comments(stmts)
+    stmts = _rename_duplicate_function_defs(stmts)
+    stmts = rename_conflicting_loop_vars(stmts)
+    stmts = rename_conflicting_reused_vars(stmts)
+    stmts = rename_case_conflicting_names(stmts)
+    main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+
+    kept_main: list[object] = []
+    skipped_main: list[tuple[str, str]] = []
+    unavailable_vars: set[str] = set()
+    skipping_anonymous_function_fragments = False
+    pending_headers: list[object] = []
+
+    def _drop_pending_headers(reason: str) -> None:
+        nonlocal pending_headers
+        for h in pending_headers:
+            skipped_main.append((_partial_main_statement_report_label(h), reason))
+            if verbose:
+                print(
+                    f"Partial-main: skipped top-level {_partial_main_statement_report_label(h)} - {reason}",
+                    flush=True,
+                )
+        pending_headers = []
+
+    def _flush_pending_headers() -> None:
+        nonlocal pending_headers
+        for h in pending_headers:
+            kept_main.append(h)
+            if verbose:
+                print(f"Partial-main: kept top-level {_partial_main_statement_report_label(h)}", flush=True)
+        pending_headers = []
+
+    for st in main_stmts:
+        assigned = _collect_stmt_assigned_names([st])
+        calls = _partial_main_stmt_calls(st)
+        refs = _partial_main_stmt_refs(st)
+        bad_calls = sorted(c for c in calls if c in skipped_func_l)
+        bad_refs = sorted(r for r in refs if r in unavailable_vars)
+        label = _partial_main_statement_report_label(st)
+        if skipping_anonymous_function_fragments and isinstance(st, ExprStmt):
+            reason = "continuation of skipped anonymous function expression"
+            skipped_main.append((label, reason))
+            if any(t.strip().endswith("))") or t.strip().endswith("})") for t in _collect_stmt_expr_texts([st])):
+                skipping_anonymous_function_fragments = False
+            if verbose:
+                print(f"Partial-main: skipped top-level {label} - {reason}", flush=True)
+            continue
+        if skipping_anonymous_function_fragments:
+            skipping_anonymous_function_fragments = False
+        if pending_headers and isinstance(st, (CallStmt, CommentStmt)) and (
+            isinstance(st, CommentStmt) or st.name.lower() == "cat"
+        ):
+            pending_headers.append(st)
+            if verbose:
+                print(f"Partial-main: deferred top-level {label}", flush=True)
+            continue
+        if _partial_main_is_deferred_header_stmt(st):
+            pending_headers.append(st)
+            if verbose:
+                print(f"Partial-main: deferred top-level {label}", flush=True)
+            continue
+        unsupported_reason = _partial_main_unsupported_stmt_reason(st)
+        if unsupported_reason is not None:
+            _drop_pending_headers("header for skipped top-level section")
+            skipped_main.append((label, unsupported_reason))
+            unavailable_vars.update(assigned)
+            if isinstance(st, Assign):
+                skipping_anonymous_function_fragments = True
+            if verbose:
+                print(f"Partial-main: skipped top-level {label} - {unsupported_reason}", flush=True)
+            continue
+        if bad_calls:
+            reason = "calls skipped function(s): " + ", ".join(bad_calls)
+            _drop_pending_headers("header for skipped top-level section")
+            skipped_main.append((label, reason))
+            unavailable_vars.update(assigned)
+            if verbose:
+                print(f"Partial-main: skipped top-level {label} - {reason}", flush=True)
+            continue
+        if bad_refs:
+            reason = "depends on skipped top-level value(s): " + ", ".join(bad_refs)
+            _drop_pending_headers("header for skipped top-level section")
+            skipped_main.append((label, reason))
+            unavailable_vars.update(assigned)
+            if verbose:
+                print(f"Partial-main: skipped top-level {label} - {reason}", flush=True)
+            continue
+        if pending_headers and _partial_main_is_visible_output_stmt(st):
+            _flush_pending_headers()
+        kept_main.append(st)
+        if verbose:
+            print(f"Partial-main: kept top-level {label}", flush=True)
+    _drop_pending_headers("trailing header with no kept top-level section")
+
+    out_lines: list[str] = []
+    out_lines.extend(_r_unparse_functions(translated_funcs).splitlines())
+    if kept_main:
+        if out_lines:
+            out_lines.append("")
+        for st in kept_main:
+            out_lines.extend(_r_unparse_stmt(st))
+    reduced = "\n".join(out_lines) + ("\n" if out_lines else "")
+    return reduced, translated_names, skipped_funcs, len(kept_main), skipped_main
 
 
 def _norm_output(s: str) -> list[str]:
@@ -33866,6 +34089,11 @@ def main() -> int:
         help="translate the R functions that can be translated into one Fortran module and report skipped functions",
     )
     ap.add_argument(
+        "--partial-main",
+        action="store_true",
+        help="translate a reduced runnable program using translated functions and safe top-level statements",
+    )
+    ap.add_argument(
         "--annotate-r",
         nargs="?",
         const="",
@@ -34103,11 +34331,20 @@ def main() -> int:
     if args.out_python and not args.via_python:
         print("Option --out-python requires --via-python (or --run-all/--tee-all).")
         return 1
+    if args.partial and args.partial_main:
+        print("Options conflict: --partial and --partial-main cannot be used together.")
+        return 1
     if args.partial and (args.run or args.run_both or args.run_diff or args.run_all or args.time or args.time_both):
         print("Option error: --partial emits a module only and cannot be used with run/time modes.")
         return 1
     if args.partial and args.via_python:
         print("Option error: --partial is only supported by direct R-to-Fortran transpilation.")
+        return 1
+    if args.partial_main and (args.run_both or args.run_diff or args.run_all or args.time_both):
+        print("Option error: --partial-main cannot be used with run-both/run-diff/run-all/time-both.")
+        return 1
+    if args.partial_main and args.via_python:
+        print("Option error: --partial-main is only supported by direct R-to-Fortran transpilation.")
         return 1
     if len(compiler_selectors) > 1:
         args.compile = True
@@ -34398,6 +34635,49 @@ def main() -> int:
             print("Build:", " ".join(cparts_partial + include_dirs_partial + ["-c", str(out_path), "-o", str(out_path.with_suffix(".o"))]))
             print("Build: PASS")
         return 0
+    if args.partial_main:
+        if args.verbose:
+            print("Partial-main: building reduced source", flush=True)
+        partial_main_forced_skips: dict[str, str] = {}
+        forced_env = os.environ.get("XR2F_PARTIAL_MAIN_FORCED_SKIPS", "").strip()
+        if forced_env:
+            try:
+                forced_obj = json.loads(forced_env)
+                if isinstance(forced_obj, dict):
+                    partial_main_forced_skips = {str(k): str(v) for k, v in forced_obj.items()}
+            except json.JSONDecodeError:
+                partial_main_forced_skips = {}
+        if args.via_core_r:
+            core_src, err = _run_xr2r_prepass(in_path)
+            if err is not None or core_src is None:
+                print(f"Transpile: FAIL ({err or 'Core-R prepass failed'})")
+                return 1
+            src = core_src
+            print("note: via-core-r prepass applied")
+        try:
+            src, pm_translated, pm_skipped_funcs, pm_kept_main, pm_skipped_main = build_partial_main_source(
+                src,
+                in_path.stem,
+                helper_modules=helper_modules,
+                fortran_comments=not args.no_fortran_comments,
+                verbose=args.verbose,
+                forced_function_skips=partial_main_forced_skips,
+            )
+        except NotImplementedError as e:
+            print(f"Partial-main: FAIL ({e})")
+            return 1
+        print(
+            f"Partial-main: {len(pm_translated)} functions translated, "
+            f"{len(pm_skipped_funcs)} functions skipped, "
+            f"{pm_kept_main} top-level statements kept, "
+            f"{len(pm_skipped_main)} top-level statements skipped"
+        )
+        if args.verbose:
+            for name, reason in pm_skipped_funcs:
+                print(f"Partial-main: skipped function {name} - {reason}", flush=True)
+            for label, reason in pm_skipped_main:
+                print(f"Partial-main: skipped top-level {label} - {reason}", flush=True)
+        args.via_core_r = False
     direct_mode = (not args.via_python)
     if args.via_python:
         assert py_out_path is not None
@@ -35247,6 +35527,13 @@ def main() -> int:
         "real(kind=dp), allocatable :: qnorm_scalar_result(:)",
         "real(kind=dp) :: qnorm_scalar_result",
     )
+    f90 = re.sub(
+        r"(?m)^(\s*pure\s+elemental\s+function\s+qnorm_scalar\s*\(\s*p\s*\)[\s\S]*?\n)\s*real\(kind=dp\)\s*::\s*p\s*$",
+        r"\1real(kind=dp), intent(in) :: p",
+        f90,
+        count=1,
+        flags=re.IGNORECASE,
+    )
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)
     migrated_block = ""
@@ -35438,6 +35725,37 @@ def main() -> int:
         cp = _run_capture(cmd, cwd=artifact_dir)
         timings["compile"] = time.perf_counter() - t0
         if cp.returncode != 0:
+            if args.partial_main:
+                compile_text = (cp.stdout or "") + (cp.stderr or "")
+                err_line, err_msg = _first_fortran_compile_error_line(compile_text, out_path)
+                proc_name = _enclosing_fortran_procedure_at_line(f90, err_line)
+                forced_now: dict[str, str] = {}
+                forced_env = os.environ.get("XR2F_PARTIAL_MAIN_FORCED_SKIPS", "").strip()
+                if forced_env:
+                    try:
+                        forced_obj = json.loads(forced_env)
+                        if isinstance(forced_obj, dict):
+                            forced_now = {str(k): str(v) for k, v in forced_obj.items()}
+                    except json.JSONDecodeError:
+                        forced_now = {}
+                if proc_name is not None and proc_name.lower() not in {k.lower() for k in forced_now} and len(forced_now) < 25:
+                    reason = f"Fortran compile failed: {err_msg}"
+                    print(f"Partial-main compile: skipping {proc_name} - {reason}", flush=True)
+                    forced_now[proc_name.lower()] = reason
+                    env_retry = os.environ.copy()
+                    env_retry["XR2F_PARTIAL_MAIN_FORCED_SKIPS"] = json.dumps(forced_now)
+                    retry_cp = subprocess.run(
+                        [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:],
+                        cwd=run_cwd,
+                        capture_output=True,
+                        text=True,
+                        env=env_retry,
+                    )
+                    if retry_cp.stdout:
+                        print(retry_cp.stdout, end="" if retry_cp.stdout.endswith("\n") else "\n")
+                    if retry_cp.stderr:
+                        print(retry_cp.stderr, end="" if retry_cp.stderr.endswith("\n") else "\n")
+                    return retry_cp.returncode
             print(f"Build: FAIL (exit {cp.returncode})")
             _print_captured(cp)
             _explain_compile_failure(cp, out_path, src)
