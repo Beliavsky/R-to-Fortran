@@ -10844,8 +10844,8 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"merge(1, 0, {pred_i})"
         return f"int({pred_i})"
     s = _replace_balanced_func_calls(s, "as.integer", _as_integer_to_fortran)
-    s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: inner.strip())
-    s = _replace_balanced_func_calls(s, "as.double", lambda inner: inner.strip())
+    s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: r_expr_to_fortran(inner.strip()))
+    s = _replace_balanced_func_calls(s, "as.double", lambda inner: r_expr_to_fortran(inner.strip()))
     s = _replace_balanced_func_calls(s, "as.character", lambda inner: inner.strip())
     s = _replace_balanced_func_calls(
         s,
