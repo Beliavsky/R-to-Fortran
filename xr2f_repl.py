@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,9 +16,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_XR2F = ROOT / "xr2f.py"
+DEFAULT_R_HELPER = ROOT / "r.f90"
+DEFAULT_OFORT = Path(r"c:\c\ofort\ofort.exe")
 DEFAULT_SESSION_R = "xr2f_repl_session.R"
 DEFAULT_SESSION_FORTRAN = "xr2f_repl_session.f90"
-COMPILER_NAMES = {"gfortran", "ifx"}
+COMPILER_NAMES = {"gfortran", "ifx", "ofort"}
 
 
 @dataclass
@@ -78,6 +81,9 @@ def default_compiler_command(name: str) -> str:
         return "gfortran -O3 -march=native"
     if name == "ifx":
         return "ifx /O2" if sys.platform.startswith("win") else "ifx -O2"
+    if name == "ofort":
+        exe = str(DEFAULT_OFORT).replace("\\", "/") if DEFAULT_OFORT.exists() else "ofort"
+        return f"{exe} --fast"
     return name
 
 
@@ -191,6 +197,145 @@ def build_rscript_command(args: argparse.Namespace, source_path: Path) -> list[s
     return [args.rscript, str(source_path)]
 
 
+def is_ofort_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    return Path(parts[0]).name.lower() in {"ofort", "ofort.exe"}
+
+
+def build_translate_command(args: argparse.Namespace, source_path: Path, fortran_path: Path) -> list[str]:
+    cmd = [sys.executable, str(Path(args.xr2f)), str(source_path), "--out", str(fortran_path)]
+    if args.no_fortran_comments:
+        cmd.append("--no-fortran-comments")
+    return cmd
+
+
+def build_ofort_command(compiler_command: str, fortran_path: Path) -> list[str]:
+    parts = shlex.split(compiler_command)
+    sources: list[str] = []
+    text = fortran_path.read_text(encoding="utf-8", errors="replace") if fortran_path.exists() else ""
+    if re.search(r"(?im)^\s*use\s+r_mod\b", text) and DEFAULT_R_HELPER.exists():
+        sources.append(str(DEFAULT_R_HELPER))
+    sources.append(str(fortran_path))
+    return [*parts, *sources]
+
+
+def run_ofort_spec(
+    source_path: Path,
+    fortran_path: Path,
+    args: argparse.Namespace,
+    mode: str,
+    label: str,
+    compiler_command: str,
+    repeat: int,
+    verbose_runs: bool,
+) -> SessionResult:
+    t0 = time.perf_counter()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    r_run_times: list[float] = []
+    if mode in {"run-both", "time-both"}:
+        r_cmd = build_rscript_command(args, source_path)
+        stdout_parts.append("Run (r): " + " ".join(r_cmd) + "\n")
+        r_runs: list[subprocess.CompletedProcess[str]] = []
+        try:
+            for _ in range(repeat):
+                tr = time.perf_counter()
+                r_runs.append(subprocess.run(r_cmd, text=True, capture_output=True, timeout=args.timeout))
+                r_run_times.append(time.perf_counter() - tr)
+        except subprocess.TimeoutExpired as exc:
+            return SessionResult(False, message=f"{r_cmd[0]} timed out after {exc.timeout} seconds")
+        failed_r = next((rr for rr in r_runs if rr.returncode != 0), None)
+        r_show = failed_r or r_runs[0]
+        if failed_r is not None:
+            stdout_parts.append(f"Run (r): FAIL (exit {failed_r.returncode})\n")
+            return SessionResult(False, stdout="".join(stdout_parts), stderr=failed_r.stderr or "", message=(failed_r.stdout or "") + (failed_r.stderr or ""), seconds=time.perf_counter() - t0)
+        stdout_parts.append("Run (r): PASS\n")
+        if repeat != 1:
+            stdout_parts.append(f"Run (r) repeat: {repeat} ({'showing all runs' if verbose_runs else 'showing first run output'})\n")
+        r_print_runs = r_runs if verbose_runs else [r_show]
+        for i_rep, rr in enumerate(r_print_runs, 1):
+            if verbose_runs and repeat != 1:
+                stdout_parts.append(f"Run (r) output {i_rep}/{repeat}:\n")
+            stdout_parts.append(rr.stdout or "")
+            if rr.stdout and not rr.stdout.endswith("\n"):
+                stdout_parts.append("\n")
+            if rr.stderr:
+                stderr_parts.append(rr.stderr)
+                if not rr.stderr.endswith("\n"):
+                    stderr_parts.append("\n")
+        stdout_parts.append("\n")
+
+    translate_cmd = build_translate_command(args, source_path, fortran_path)
+    try:
+        translate = subprocess.run(translate_cmd, text=True, capture_output=True, timeout=args.timeout)
+    except subprocess.TimeoutExpired as exc:
+        return SessionResult(False, message=f"{translate_cmd[0]} timed out after {exc.timeout} seconds")
+    translate_seconds = time.perf_counter() - t0
+    fortran = fortran_path.read_text(encoding="utf-8", errors="replace") if fortran_path.exists() else ""
+    if translate.returncode != 0:
+        message = "\n".join(part.rstrip() for part in (translate.stdout, translate.stderr) if part and part.strip())
+        return SessionResult(False, stdout=translate.stdout, stderr=translate.stderr, fortran=fortran, message=message, seconds=translate_seconds)
+
+    cmd = build_ofort_command(compiler_command, fortran_path)
+    runs: list[subprocess.CompletedProcess[str]] = []
+    run_times: list[float] = []
+    try:
+        for _ in range(repeat):
+            tr = time.perf_counter()
+            runs.append(subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout))
+            run_times.append(time.perf_counter() - tr)
+    except FileNotFoundError:
+        return SessionResult(False, fortran=fortran, message=f"{cmd[0]} was not found", seconds=time.perf_counter() - t0)
+    except subprocess.TimeoutExpired as exc:
+        return SessionResult(False, fortran=fortran, message=f"{cmd[0]} timed out after {exc.timeout} seconds", seconds=time.perf_counter() - t0)
+    failed = next((rr for rr in runs if rr.returncode != 0), None)
+    representative = failed or runs[0]
+    stdout_parts.append("Run: PASS\n" if failed is None else f"Run: FAIL (exit {failed.returncode})\n")
+    if repeat != 1:
+        stdout_parts.append(f"Run repeat: {repeat} ({'showing all runs' if verbose_runs else 'showing first run output'})\n")
+    shown = runs if verbose_runs else [representative]
+    for i_rep, rr in enumerate(shown, 1):
+        if verbose_runs and repeat != 1:
+            stdout_parts.append(f"Run output {i_rep}/{repeat}:\n")
+        stdout_parts.append(rr.stdout or "")
+        if rr.stdout and not rr.stdout.endswith("\n"):
+            stdout_parts.append("\n")
+    run_total = sum(run_times)
+    run_mean = run_total / float(len(run_times)) if run_times else 0.0
+    if len(run_times) > 1:
+        run_sd = (sum((x - run_mean) ** 2 for x in run_times) / float(len(run_times) - 1)) ** 0.5
+    else:
+        run_sd = 0.0
+    if mode in {"time", "time-both"} or args.time:
+        stdout_parts.append("\nTiming summary (seconds):\n")
+        stdout_parts.append("  stage             seconds\n")
+        if r_run_times:
+            r_total = sum(r_run_times)
+            r_mean = r_total / float(len(r_run_times))
+            if len(r_run_times) > 1:
+                r_sd = (sum((x - r_mean) ** 2 for x in r_run_times) / float(len(r_run_times) - 1)) ** 0.5
+                stdout_parts.append(f"  r run mean        {r_mean:.4f}\n")
+                stdout_parts.append(f"  r run sd          {r_sd:.4f}\n")
+            else:
+                stdout_parts.append(f"  r run             {r_total:.4f}\n")
+        stdout_parts.append(f"  transpile          {translate_seconds:.4f}\n")
+        if repeat == 1:
+            stdout_parts.append(f"  ofort run          {run_total:.4f}\n")
+        else:
+            stdout_parts.append(f"  ofort run mean     {run_mean:.4f}\n")
+            stdout_parts.append(f"  ofort run sd       {run_sd:.4f}\n")
+        stdout_parts.append(f"  ofort total        {(translate_seconds + run_total):.4f}\n")
+    stderr = representative.stderr or ""
+    ok = failed is None
+    message = "\n".join(part.rstrip() for part in ("".join(stdout_parts), stderr) if part and part.strip()) if not ok else ""
+    return SessionResult(ok, stdout="".join(stdout_parts), stderr=stderr, fortran=fortran, message=message, seconds=time.perf_counter() - t0)
+
+
 def run_session(
     lines: list[str],
     args: argparse.Namespace,
@@ -207,7 +352,12 @@ def run_session(
         source_path = tmpdir / source_name
         fortran_path = tmpdir / DEFAULT_SESSION_FORTRAN
         source_path.write_text(source, encoding="utf-8")
+        if mode not in {"run-r", "time-r"} and getattr(args, "ofort", False) and not compilers:
+            command = default_compiler_command("ofort")
+            return run_ofort_spec(source_path, fortran_path, args, mode, command, command, repeat, verbose_runs)
         if mode not in {"run-r", "time-r"} and compilers:
+            if len(compilers) == 1 and is_ofort_command(compilers[0][1]):
+                return run_ofort_spec(source_path, fortran_path, args, mode, compilers[0][0], compilers[0][1], repeat, verbose_runs)
             return run_compiler_specs(source_path, fortran_path, args, mode, compilers, repeat, verbose_runs)
         cmd = (
             build_rscript_command(args, source_path)
@@ -262,6 +412,23 @@ def run_compiler_specs(
     last_fortran = ""
     for label, compiler_command in compilers:
         stdout_parts.append(f"=== Compiler: {label} ===\n")
+        if is_ofort_command(compiler_command):
+            result = run_ofort_spec(source_path, fortran_path, args, mode, label, compiler_command, repeat, verbose_runs)
+            stdout_parts.append(result.stdout)
+            if result.stdout and not result.stdout.endswith("\n"):
+                stdout_parts.append("\n")
+            if result.stderr:
+                stderr_parts.append(result.stderr)
+                if not result.stderr.endswith("\n"):
+                    stderr_parts.append("\n")
+            parsed = parse_timing_summary(result.stdout + "\n" + result.stderr)
+            if parsed:
+                timings.append((label, parsed))
+            if result.fortran:
+                last_fortran = result.fortran
+            if not result.ok:
+                ok = False
+            continue
         cmd = build_xr2f_command(args, source_path, fortran_path, mode, compiler_command, repeat, verbose_runs)
         try:
             cp = subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout)
@@ -307,7 +474,7 @@ def parse_timing_summary(text: str) -> dict[str, float]:
             continue
         if stripped.startswith("stage "):
             continue
-        m = re.match(r"^(.+?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+(?:\S+)\s*$", stripped)
+        m = re.match(r"^(.+?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?:\s+\S+)?\s*$", stripped)
         if m:
             rows[m.group(1).strip()] = float(m.group(2))
     return rows
@@ -369,7 +536,7 @@ def run_file(args: argparse.Namespace) -> int:
 def run_repl(args: argparse.Namespace, initial_source: Path | None = None) -> int:
     print("xr2f interactive mode")
     print("Commands: run, time, run-r, time-r, run-both, time-both, fortran, list, clear, quit")
-    print("Run commands accept: [N] [verbose] [gfortran|ifx options...]")
+    print("Run commands accept: [N] [verbose] [gfortran|ifx|ofort options...]")
     lines: list[str] = []
     if initial_source is not None:
         lines = initial_source.read_text(encoding="utf-8-sig").splitlines()
@@ -475,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trim-zero-decimals", "--trim-zd", action="store_true", help="trim trailing .0 output")
     parser.add_argument("--r-rng", action="store_true", help="use R RNG shim")
     parser.add_argument("--no-fortran-comments", action="store_true", help="treat #f and #fortran comments as ordinary comments")
+    parser.add_argument("--ofort", action="store_true", help="run generated Fortran directly with ofort")
     parser.add_argument("--ifx", action="store_true", help="compile with ifx")
     parser.add_argument("--gfortran", action="store_true", help="compile with gfortran")
     parser.add_argument("--save-r", default=DEFAULT_SESSION_R, help="REPL session R file written on exit")
@@ -483,6 +651,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.repeat < 1:
         print("xr2f_repl: --repeat must be positive", file=sys.stderr)
+        return 2
+    if args.ofort and (args.gfortran or args.ifx or args.compiler):
+        print("xr2f_repl: --ofort cannot be combined with --gfortran, --ifx, or --compiler", file=sys.stderr)
         return 2
 
     xr2f = Path(args.xr2f)

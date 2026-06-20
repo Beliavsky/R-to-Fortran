@@ -16,6 +16,9 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+import xr2f
+import xr2f_bridge
+
 
 @dataclass
 class CaseResult:
@@ -53,12 +56,16 @@ class Tee:
 
 
 _STAGE_RE = re.compile(
-    r"^\s*(r run|transpile|compile|fortran run|fortran total)\s+([0-9]+(?:\.[0-9]+)?)\b",
+    r"^\s*(r run|transpile|compile|fortran run|fortran total|original R run|bridge transpile|bridge compile|bridge run|bridge total|speedup vs R run)\s+([0-9]+(?:\.[0-9]+)?)\b",
     flags=re.IGNORECASE,
 )
 _WROTE_F90_RE = re.compile(r"^\s*wrote\s+(.+?\.f90)\s*$", flags=re.IGNORECASE | re.MULTILINE)
 _TRANSPILE_FAIL_RE = re.compile(r"^\s*(?:Transpile|Transpile \(R->Python\)):\s*FAIL\s*(?:\((.*)\))?\s*$", flags=re.IGNORECASE)
 _PROCESSED_LINE_RE = re.compile(r"^\s*\[\d+/\d+\]\s+(.+?)\s*$")
+_R_FUNCTION_DEF_RE = re.compile(
+    r"(?:<-|=)\s*function\s*\(",
+    flags=re.IGNORECASE,
+)
 
 
 def _has_glob_meta(s: str) -> bool:
@@ -217,6 +224,50 @@ def _classify_outcome(ok: bool, stdout: str, stderr: str) -> str:
     return "other_fail"
 
 
+def _is_bridge_no_functions(stdout: str, stderr: str) -> bool:
+    txt = f"{stdout or ''}\n{stderr or ''}"
+    return bool(re.search(r"^\s*no top-level R functions found\s*$", txt, flags=re.IGNORECASE | re.MULTILINE))
+
+
+def _source_has_function_def(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return True
+    return bool(_R_FUNCTION_DEF_RE.search(text))
+
+
+def _is_generated_bridge_source(path: Path) -> bool:
+    if "_bridge" not in path.stem.lower():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(r'\.(?:C|Fortran)\s*\(\s*"[^"]+_bridge"', text))
+
+
+def _bridge_free_variable_names(path: Path) -> set[str]:
+    try:
+        src = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return set()
+    try:
+        functions = xr2f_bridge.extract_top_level_function_sources(src)
+    except Exception:
+        return set()
+    if not functions:
+        return set()
+    try:
+        funcs = xr2f_bridge._parse_functions("\n".join(functions.values()))
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for fn in funcs:
+        out.update(xr2f._infer_function_free_names(fn))
+    return out
+
+
 def _count_file_lines(path: str) -> int:
     if not path:
         return 0
@@ -258,6 +309,25 @@ def main() -> int:
     ap.add_argument("--helpers", nargs="*", default=[], help="Optional helper .f90 files passed to xr2f.py.")
     ap.add_argument("--compiler", default="gfortran -O3 -march=native -Wfatal-errors", help="Compiler command forwarded to xr2f.py.")
     ap.add_argument("--rscript", default="rscript", help="Rscript command forwarded to xr2f.py.")
+    ap.add_argument("--bridge", action="store_true", help="Run xr2f_bridge.py instead of xr2f.py.")
+    ap.add_argument(
+        "--bridge-skip-no-functions",
+        action="store_true",
+        help="With --bridge, cheaply skip sources with no apparent R function definitions before running xr2f_bridge.py.",
+    )
+    ap.add_argument(
+        "--bridge-include-generated",
+        action="store_true",
+        help="With --bridge, include generated *_bridge.R wrapper files instead of filtering them out.",
+    )
+    ap.add_argument(
+        "--bridge-include-free-vars",
+        action="store_true",
+        help="With --bridge, try functions that reference non-argument variables from surrounding R scope.",
+    )
+    ap.add_argument("--bridge-functions", help="Comma-separated functions forwarded as xr2f_bridge.py --functions.")
+    ap.add_argument("--bridge-ifx", action="store_true", help="Forward --ifx to xr2f_bridge.py.")
+    ap.add_argument("--bridge-only-selected", action="store_true", help="Forward --only-selected to xr2f_bridge.py.")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--compile", action="store_true", help="Compile transpiled Fortran (default).")
     mode.add_argument("--run", action="store_true", help="Compile and run transpiled Fortran.")
@@ -335,6 +405,15 @@ def main() -> int:
     if args.resume_after and args.resume_with:
         print("Invalid options: --resume-after and --resume-with are mutually exclusive.")
         return 1
+    if args.bridge_skip_no_functions and not args.bridge:
+        print("Invalid options: --bridge-skip-no-functions requires --bridge.")
+        return 1
+    if args.bridge_include_generated and not args.bridge:
+        print("Invalid options: --bridge-include-generated requires --bridge.")
+        return 1
+    if args.bridge_include_free_vars and not args.bridge:
+        print("Invalid options: --bridge-include-free-vars requires --bridge.")
+        return 1
 
     r_files, input_errors = _expand_inputs(args.inputs, skip_lines=args.skip_lines)
     if input_errors:
@@ -346,6 +425,11 @@ def main() -> int:
     if not r_files:
         print("No R files matched the provided inputs.")
         return 1
+    if args.bridge and not args.bridge_include_generated:
+        r_files = [p for p in r_files if not _is_generated_bridge_source(p)]
+        if not r_files:
+            print("No non-generated R files matched the provided inputs.")
+            return 1
 
     if args.resume:
         resume_path = Path(args.resume)
@@ -390,15 +474,29 @@ def main() -> int:
     tee = Tee(tee_path)
 
     xr2f_path = Path(__file__).with_name("xr2f.py")
-    if not xr2f_path.exists():
-        tee.print(f"Missing script: {xr2f_path}")
+    bridge_path = Path(__file__).with_name("xr2f_bridge.py")
+    driver_path = bridge_path if args.bridge else xr2f_path
+    if not driver_path.exists():
+        tee.print(f"Missing script: {driver_path}")
         tee.close()
         return 1
 
     total = len(r_files)
     results: list[CaseResult] = []
     failures = 0
-    timing_sum = {"r run": 0.0, "transpile": 0.0, "compile": 0.0, "fortran run": 0.0, "fortran total": 0.0}
+    timing_sum = {
+        "r run": 0.0,
+        "transpile": 0.0,
+        "compile": 0.0,
+        "fortran run": 0.0,
+        "fortran total": 0.0,
+        "original r run": 0.0,
+        "bridge transpile": 0.0,
+        "bridge compile": 0.0,
+        "bridge run": 0.0,
+        "bridge total": 0.0,
+        "speedup vs r run": 0.0,
+    }
     timing_count = {k: 0 for k in timing_sum}
 
     tee.print("Command:", _command_line([sys.executable, str(Path(__file__).name), *sys.argv[1:]]))
@@ -409,41 +507,83 @@ def main() -> int:
 
     def _run_case(i: int, rf: Path) -> CaseResult:
         rel = str(rf)
-        cmd = [sys.executable, str(xr2f_path), rel, *args.helpers]
-        mode_flag = "--compile"
-        if args.run:
+        if args.bridge and args.bridge_skip_no_functions and not _source_has_function_def(rf):
+            return CaseResult(
+                index=i,
+                source=rel,
+                ok=True,
+                rc=0,
+                status="SKIP",
+                outcome="skipped",
+                source_loc=_count_file_lines(rel),
+                fail_reason="no apparent R function definitions",
+            )
+        if args.bridge and not args.bridge_include_free_vars:
+            free_names = _bridge_free_variable_names(rf)
+            if free_names:
+                return CaseResult(
+                    index=i,
+                    source=rel,
+                    ok=True,
+                    rc=0,
+                    status="SKIP",
+                    outcome="skipped",
+                    source_loc=_count_file_lines(rel),
+                    fail_reason="bridge function free variable(s): " + ", ".join(sorted(free_names)),
+                )
+        if args.bridge:
+            cmd = [sys.executable, str(bridge_path), rel]
             mode_flag = "--run"
-        elif args.run_both:
-            mode_flag = "--run-both"
-        elif args.run_diff:
-            mode_flag = "--run-diff"
-        elif args.time:
-            mode_flag = "--time"
-        elif args.time_both:
-            mode_flag = "--time-both"
-        cmd.append(mode_flag)
-        cmd.extend(["--compiler", args.compiler, "--rscript", args.rscript])
-        for flag, enabled in (
-            ("--self-contained", args.self_contained),
-            ("--via-python", args.via_python),
-            ("--via-core-r", args.via_core_r),
-            ("--allow-library", args.allow_library),
-            ("--disp-real", args.disp_real),
-            ("--no-recycle", args.no_recycle),
-            ("--recycle-warn", args.recycle_warn),
-            ("--recycle-stop", args.recycle_stop),
-            ("--normalize-num-output", args.normalize_num_output),
-            ("--no-format-print", args.no_format_print),
-            ("--if-const-aggressive", args.if_const_aggressive),
-        ):
-            if enabled:
-                cmd.append(flag)
-        if args.tee_source:
-            cmd.append("--tee")
-        if args.tee_both_source:
-            cmd.append("--tee-both")
-        if args.real_print_fmt:
-            cmd.extend(["--real-print-fmt", args.real_print_fmt])
+            if args.time:
+                mode_flag = "--time"
+            elif args.time_both or args.run_both or args.run_diff:
+                mode_flag = "--time-both"
+            elif args.compile:
+                mode_flag = "--compile"
+            cmd.append(mode_flag)
+            cmd.extend(["--compiler", args.compiler, "--rscript", args.rscript])
+            if args.bridge_functions:
+                cmd.extend(["--functions", args.bridge_functions])
+            if args.bridge_ifx:
+                cmd.append("--ifx")
+            if args.bridge_only_selected:
+                cmd.append("--only-selected")
+        else:
+            cmd = [sys.executable, str(xr2f_path), rel, *args.helpers]
+            mode_flag = "--compile"
+            if args.run:
+                mode_flag = "--run"
+            elif args.run_both:
+                mode_flag = "--run-both"
+            elif args.run_diff:
+                mode_flag = "--run-diff"
+            elif args.time:
+                mode_flag = "--time"
+            elif args.time_both:
+                mode_flag = "--time-both"
+            cmd.append(mode_flag)
+            cmd.extend(["--compiler", args.compiler, "--rscript", args.rscript])
+            for flag, enabled in (
+                ("--self-contained", args.self_contained),
+                ("--via-python", args.via_python),
+                ("--via-core-r", args.via_core_r),
+                ("--allow-library", args.allow_library),
+                ("--disp-real", args.disp_real),
+                ("--no-recycle", args.no_recycle),
+                ("--recycle-warn", args.recycle_warn),
+                ("--recycle-stop", args.recycle_stop),
+                ("--normalize-num-output", args.normalize_num_output),
+                ("--no-format-print", args.no_format_print),
+                ("--if-const-aggressive", args.if_const_aggressive),
+            ):
+                if enabled:
+                    cmd.append(flag)
+            if args.tee_source:
+                cmd.append("--tee")
+            if args.tee_both_source:
+                cmd.append("--tee-both")
+            if args.real_print_fmt:
+                cmd.extend(["--real-print-fmt", args.real_print_fmt])
 
         try:
             cp = subprocess.run(
@@ -464,11 +604,16 @@ def main() -> int:
             stderr = (stderr.rstrip() + "\n" + f"TIMEOUT after {args.timeout:g} seconds: {_command_line(cmd)}").lstrip()
             cp = subprocess.CompletedProcess(cmd, 124, stdout, stderr)
 
-        ok = cp.returncode == 0
+        bridge_no_functions = args.bridge and cp.returncode != 0 and _is_bridge_no_functions(cp.stdout or "", cp.stderr or "")
+        ok = cp.returncode == 0 or bridge_no_functions
         outcome = _classify_outcome(ok, cp.stdout or "", cp.stderr or "")
+        if bridge_no_functions:
+            outcome = "skipped"
         fortran_source = _extract_written_fortran(cp.stdout or "")
         out_lines: list[str] = []
-        if ok:
+        if bridge_no_functions:
+            status = "SKIP"
+        elif ok:
             status = "PASS"
             if args.verbose and cp.stdout.strip():
                 out_lines.append(cp.stdout.rstrip())
@@ -489,7 +634,7 @@ def main() -> int:
             index=i,
             source=rel,
             ok=ok,
-            rc=cp.returncode,
+            rc=(0 if bridge_no_functions else cp.returncode),
             status=status,
             outcome=outcome,
             source_loc=_count_file_lines(rel),
@@ -524,7 +669,7 @@ def main() -> int:
                 if _record_result(_run_case(i, rf)):
                     break
         else:
-            tee.print(f"Jobs: running up to {args.jobs} xr2f.py subprocesses concurrently.")
+            tee.print(f"Jobs: running up to {args.jobs} {driver_path.name} subprocesses concurrently.")
             pending = {}
             next_idx = 1
             with ThreadPoolExecutor(max_workers=args.jobs) as executor:
@@ -576,11 +721,14 @@ def main() -> int:
                     f"{r.source_loc:>{loc_w}}  {r.fortran_loc:>{f90loc_w}}  {(r.fortran_source or ''):<{f90src_w}}"
                 )
 
-        n_pass = sum(1 for r in results if r.ok)
-        n_fail = len(results) - n_pass
-        tee.print(f"Totals: {len(results)} files, {n_pass} pass, {n_fail} fail")
+        n_skip = sum(1 for r in results if r.outcome == "skipped")
+        n_pass = sum(1 for r in results if r.ok and r.outcome != "skipped")
+        n_fail = len(results) - n_pass - n_skip
+        skip_part = f", {n_skip} skipped" if n_skip else ""
+        tee.print(f"Totals: {len(results)} files, {n_pass} pass, {n_fail} fail{skip_part}")
         outcomes = {
             "full_pass": sum(1 for r in results if r.outcome == "full_pass"),
+            "skipped": sum(1 for r in results if r.outcome == "skipped"),
             "r_fail": sum(1 for r in results if r.outcome == "r_fail"),
             "transpile_fail": sum(1 for r in results if r.outcome == "transpile_fail"),
             "compile_fail": sum(1 for r in results if r.outcome == "compile_fail"),
@@ -590,6 +738,7 @@ def main() -> int:
         tee.print(
             "Outcomes: "
             f"full_pass={outcomes['full_pass']}  "
+            f"skipped={outcomes['skipped']}  "
             f"r_fail={outcomes['r_fail']}  "
             f"transpile_fail={outcomes['transpile_fail']}  "
             f"compile_fail={outcomes['compile_fail']}  "
@@ -600,19 +749,35 @@ def main() -> int:
             tee.print("")
             tee.print("Timing breakdown:")
             rows = []
-            for k in ("r run", "transpile", "compile", "fortran run", "fortran total"):
+            if args.bridge:
+                timing_order = (
+                    "original r run",
+                    "bridge transpile",
+                    "bridge compile",
+                    "bridge run",
+                    "bridge total",
+                    "speedup vs r run",
+                )
+            else:
+                timing_order = ("r run", "transpile", "compile", "fortran run", "fortran total")
+            display_names = {
+                "original r run": "original R run",
+                "speedup vs r run": "speedup vs R run",
+            }
+            for k in timing_order:
                 cnt = timing_count[k]
                 if cnt == 0:
                     continue
                 s = timing_sum[k]
-                rows.append((k, cnt, s, s / cnt))
-            stage_w = max(len("stage"), *(len(r[0]) for r in rows))
-            files_w = max(len("files"), *(len(str(r[1])) for r in rows))
-            sum_w = max(len("sum_s"), *(len(f"{r[2]:.3f}") for r in rows))
-            avg_w = max(len("per_file_s"), *(len(f"{r[3]:.3f}") for r in rows))
-            tee.print(f"  {'stage':<{stage_w}}  {'files':>{files_w}}  {'sum_s':>{sum_w}}  {'per_file_s':>{avg_w}}")
-            for stage, cnt, s, avg in rows:
-                tee.print(f"  {stage:<{stage_w}}  {cnt:>{files_w}}  {s:>{sum_w}.3f}  {avg:>{avg_w}.3f}")
+                rows.append((display_names.get(k, k), cnt, s, s / cnt))
+            if rows:
+                stage_w = max(len("stage"), *(len(r[0]) for r in rows))
+                files_w = max(len("files"), *(len(str(r[1])) for r in rows))
+                sum_w = max(len("sum_s"), *(len(f"{r[2]:.3f}") for r in rows))
+                avg_w = max(len("per_file_s"), *(len(f"{r[3]:.3f}") for r in rows))
+                tee.print(f"  {'stage':<{stage_w}}  {'files':>{files_w}}  {'sum_s':>{sum_w}}  {'per_file_s':>{avg_w}}")
+                for stage, cnt, s, avg in rows:
+                    tee.print(f"  {stage:<{stage_w}}  {cnt:>{files_w}}  {s:>{sum_w}.3f}  {avg:>{avg_w}.3f}")
         elapsed = time.perf_counter() - t0
         tee.print(f"Elapsed: {elapsed:.3f} s at {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}")
         return 0 if n_fail == 0 else 1

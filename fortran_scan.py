@@ -4421,6 +4421,8 @@ def simplify_size_expressions(lines: List[str]) -> List[str]:
         exec_start = k
 
         array_names: Set[str] = set()
+        char_array_names: Set[str] = set()
+        char_array_names: Set[str] = set()
         for di in range(u_start + 1, exec_start):
             code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
             if "::" not in code:
@@ -4428,6 +4430,7 @@ def simplify_size_expressions(lines: List[str]) -> List[str]:
             lhs, rhs = code.split("::", 1)
             lhs_low = lhs.lower()
             lhs_has_dimension = "dimension" in lhs_low
+            lhs_is_character = "character" in lhs_low
             for ent in _split_top_level_commas(rhs):
                 mname = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
                 if not mname:
@@ -4435,6 +4438,8 @@ def simplify_size_expressions(lines: List[str]) -> List[str]:
                 nm = mname.group(1).lower()
                 if lhs_has_dimension or re.match(r"^\s*[a-z_]\w*\s*\(", ent, re.IGNORECASE):
                     array_names.add(nm)
+                    if lhs_is_character:
+                        char_array_names.add(nm)
 
         if array_names:
             for li in range(exec_start, u_end):
@@ -4446,6 +4451,26 @@ def simplify_size_expressions(lines: List[str]) -> List[str]:
 
         i = u_end + 1
     return out
+
+def _size_expr_for_array_expr_dim(expr: str, dim: str) -> str | None:
+    expr_s = strip_redundant_outer_parens_expr(expr.strip())
+    if re.fullmatch(r"[a-z_]\w*(?:%[a-z_]\w*)?", expr_s, re.IGNORECASE):
+        return f"size({expr_s},{dim})"
+    c = re.fullmatch(r"([a-z_]\w*)\s*\((.*)\)", expr_s, re.IGNORECASE)
+    if c is None:
+        return None
+    name = c.group(1).lower()
+    args = _split_top_level_commas(c.group(2).strip())
+    if not args:
+        return None
+    if name in {"real", "int", "dble", "abs", "sqrt", "exp", "log"}:
+        return _size_expr_for_array_expr_dim(args[0], dim)
+    if name in {"chol", "cov2cor"}:
+        return _size_expr_for_array_expr_dim(args[0], dim)
+    if name == "transpose":
+        return _size_expr_for_array_expr_dim(args[0], "2" if dim == "1" else "1")
+    return None
+
 
 def _simplify_size_expr_in_stmt(stmt: str, array_names: Set[str]) -> str:
     """Simplify `size(expr)` to `size(array)` for safe elementwise-power cases."""
@@ -4495,12 +4520,28 @@ def _simplify_size_expr_in_stmt(stmt: str, array_names: Set[str]) -> str:
             break
         inner = stmt[k + 1 : close_idx]
         inner_new = _simplify_size_expr_in_stmt(inner, array_names).strip()
-        inner_s = strip_redundant_outer_parens_expr(inner_new)
+        size_args = _split_top_level_commas(inner_new)
+        inner_s = strip_redundant_outer_parens_expr(size_args[0].strip()) if size_args else strip_redundant_outer_parens_expr(inner_new)
+        dim_s = size_args[1].strip() if len(size_args) >= 2 else ""
         mpow = re.fullmatch(r"([a-z_]\w*)\s*\*\*\s*[+-]?\d+", inner_s, re.IGNORECASE)
-        if mpow is not None:
+        mmatmul = re.fullmatch(r"r_matmul\s*\((.*)\)", inner_s, re.IGNORECASE)
+        if mmatmul is not None and dim_s in {"1", "2"}:
+            mm_args = _split_top_level_commas(mmatmul.group(1).strip())
+            if len(mm_args) >= 2:
+                simplified = _size_expr_for_array_expr_dim(mm_args[0 if dim_s == "1" else 1], dim_s)
+                if dim_s == "1":
+                    out_parts.append(simplified or f"size({mm_args[0].strip()},1)")
+                else:
+                    out_parts.append(simplified or f"size({mm_args[1].strip()},2)")
+            else:
+                out_parts.append(f"size({inner_new})")
+        elif mpow is not None:
             nm = mpow.group(1).lower()
             if nm in array_names:
-                out_parts.append(f"size({nm})")
+                if dim_s:
+                    out_parts.append(f"size({nm},{dim_s})")
+                else:
+                    out_parts.append(f"size({nm})")
             else:
                 out_parts.append(f"size({inner_new})")
         else:
@@ -4549,6 +4590,7 @@ def propagate_array_size_aliases(lines: List[str]) -> List[str]:
         exec_start = k
 
         array_names: Set[str] = set()
+        char_array_names: Set[str] = set()
         for di in range(u_start + 1, exec_start):
             code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
             if "::" not in code:
@@ -4556,6 +4598,7 @@ def propagate_array_size_aliases(lines: List[str]) -> List[str]:
             lhs, rhs = code.split("::", 1)
             lhs_low = lhs.lower()
             lhs_has_dimension = "dimension" in lhs_low
+            lhs_is_character = "character" in lhs_low
             for ent in _split_top_level_commas(rhs):
                 mname = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
                 if not mname:
@@ -4563,6 +4606,8 @@ def propagate_array_size_aliases(lines: List[str]) -> List[str]:
                 nm = mname.group(1).lower()
                 if lhs_has_dimension or re.match(r"^\s*[a-z_]\w*\s*\(", ent, re.IGNORECASE):
                     array_names.add(nm)
+                    if lhs_is_character:
+                        char_array_names.add(nm)
 
         alias: Dict[str, str] = {}
         for li in range(exec_start, u_end):
@@ -4584,8 +4629,10 @@ def propagate_array_size_aliases(lines: List[str]) -> List[str]:
                 lhs = m_as.group(1).lower()
                 rhs = m_as.group(2).strip()
                 alias.pop(lhs, None)
-                if lhs in array_names:
+                if lhs in array_names and lhs not in char_array_names:
                     for arr in array_names:
+                        if arr in char_array_names:
+                            continue
                         base = alias.get(arr, arr)
                         if _rhs_preserves_array_size_of(rhs, arr, array_names):
                             alias[lhs] = base

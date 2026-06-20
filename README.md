@@ -136,13 +136,28 @@ The supported subset is intentionally focused on numerical scripts:
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
 - Optional use of R's RNG through an R-linked shim with `--r-rng`.
 - Basic named vectors: construction with names, `names(v)`, `unname(v)`, named printing, positional indexing, literal-name indexing, and name-preserving printed arithmetic.
+- Static R lists with fixed fields for selected cases.  Named fields become Fortran derived-type components; unnamed fields use generated component names `item1`, `item2`, and so on.  Scalar, vector/array, character, logical, and nested static-list components are supported for common `$`, `[[...]]`, indexing, assignment, and printing patterns.
+- Homogeneous positional numeric lists such as `list(c(...), c(...))` or `list(matrix(...), matrix(...))` are kept as numerical array/list-of-matrix structures where the numerical examples expect array semantics.
 - Selected data-frame and file-reading patterns such as `read.table(..., header = TRUE)` into numeric matrices.
 - Statistical distributions and tests such as normal/exponential/gamma/beta-related helpers, `t.test`, empirical CDF/KS-style helpers, and related summaries.
 - Linear-model helpers including selected `lm`, prediction, coefficients, summaries, confidence intervals, and simple stepwise model selection support.
 - Smoothing and time-series helpers such as moving filters, running medians, lowess/loess-style approximations, spline/decomposition helpers, `acf`/`pacf`-style routines, AR/ARMA/ARIMA-related subsets, and VAR/VARMA example support.
 - Clustering and multivariate helpers such as distance matrices, hierarchical clustering/cutting, `kmeans`, covariance/correlation helpers, Cholesky/QR helpers, and selected mixture-model routines.
 
-Unsupported or incomplete areas include general R objects, packages, data frames beyond narrow patterns, formulas beyond simple cases, S3/S4 dispatch, closures with general lexical scoping, environments, complex string processing, and arbitrary list manipulation.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
+### Static list support
+
+Static list support is intended for list shapes that can be known at translation time:
+
+```r
+x <- list(a = 10.0, b = c(20.0, 30.0), tag = "fit")
+y <- list(10.0, c(4.0, 9.0, 16.0), "abc")
+print(x$b)
+print(y[[2]][-1])
+```
+
+The generated Fortran uses static derived types for heterogeneous lists, so field names and field kinds must be stable.  Adding a field in all branches with the same inferred kind is allowed in selected cases, but unconditional dynamic field creation or changing a field's kind after construction is rejected with a transpile error.  General R list concatenation and fully dynamic list mutation are not complete R-compatible object semantics.
+
+Unsupported or incomplete areas include general R objects, packages, data frames beyond narrow patterns, formulas beyond simple cases, S3/S4 dispatch, closures with general lexical scoping, environments, complex string processing, and dynamic or arbitrary list manipulation where field sets or field kinds change at runtime.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
 
 ## Runtime Modes
 

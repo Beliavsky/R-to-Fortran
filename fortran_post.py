@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import List
 
@@ -228,6 +229,621 @@ def fold_simple_integer_intrinsics(lines: List[str]) -> List[str]:
         code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
         eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
         out.append(f"{_fold_code(code)}{comment}{eol}")
+    return out
+
+
+def simplify_unit_ceiling_divisions(lines: List[str]) -> List[str]:
+    """Simplify unit-stride ceiling-size arithmetic emitted for matrix extents.
+
+    Conservative rewrite:
+    - `((size(...) + (1) - 1) / (1))` -> `size(...)`
+
+    This intentionally handles only balanced `size(...)` expressions.  Broader
+    algebraic simplification is avoided because integer-division expressions can
+    encode nontrivial shape calculations when the stride is not exactly one.
+    """
+
+    def _matching_paren(text: str, open_idx: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    if quote == '"' and i + 1 < len(text) and text[i + 1] == '"':
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    suffix_re = re.compile(
+        r"\s*\+\s*\(\s*1\s*\)\s*-\s*1\s*\)\s*/\s*\(\s*1\s*\)\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _rewrite_code(code: str) -> str:
+        out_parts: List[str] = []
+        i = 0
+        n = len(code)
+        while i < n:
+            start = code.find("((", i)
+            if start < 0:
+                out_parts.append(code[i:])
+                break
+            out_parts.append(code[i:start])
+            expr_start = start + 2
+            m_size = re.match(r"\s*size\s*\(", code[expr_start:], re.IGNORECASE)
+            if m_size is None:
+                out_parts.append("((")
+                i = expr_start
+                continue
+            size_start = expr_start + m_size.start()
+            paren_idx = code.find("(", size_start)
+            if paren_idx < 0:
+                out_parts.append("((")
+                i = expr_start
+                continue
+            size_end = _matching_paren(code, paren_idx)
+            if size_end is None:
+                out_parts.append("((")
+                i = expr_start
+                continue
+            expr = code[size_start : size_end + 1]
+            m_suffix = suffix_re.match(code[size_end + 1 :])
+            if m_suffix is None:
+                out_parts.append(code[start : size_end + 1])
+                i = size_end + 1
+                continue
+            out_parts.append(expr)
+            i = size_end + 1 + m_suffix.end()
+        return "".join(out_parts)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_code(code)}{comment}{eol}")
+    return out
+
+
+def remove_redundant_real_dp_casts(lines: List[str]) -> List[str]:
+    """Remove `real(x, kind=dp)` when `x` is already declared `real(kind=dp)`.
+
+    This is intentionally type-aware and narrow:
+    - collect declarations per program/function/subroutine/module procedure unit
+    - only names declared on `real(kind=dp)` lines are eligible
+    - only simple identifier arguments are rewritten
+
+    Integer expressions such as `real(size(x), kind=dp)` and conversions from
+    other real kinds are left untouched.
+    """
+
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^\s*(?P<lhs>[^!]*?)::\s*(?P<rhs>.+)$", re.IGNORECASE)
+    real_call_re = re.compile(r"\breal\s*\(", re.IGNORECASE)
+
+    def _split_decl_entities(rhs: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote: str | None = None
+        for ch in rhs:
+            if quote is not None:
+                cur.append(ch)
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return [p for p in parts if p]
+
+    def _declared_real_dp_names(code: str) -> set[str]:
+        m = decl_re.match(code.strip())
+        if m is None:
+            return set()
+        lhs = m.group("lhs").lower()
+        if not re.match(r"^\s*real\b", lhs, re.IGNORECASE):
+            return set()
+        if not re.search(r"\bkind\s*=\s*dp\b", lhs, re.IGNORECASE):
+            return set()
+        names: set[str] = set()
+        for ent in _split_decl_entities(m.group("rhs")):
+            m_name = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", ent)
+            if m_name is not None:
+                names.add(m_name.group(1).lower())
+        return names
+
+    def _matching_paren(text: str, open_idx: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    def _split_top_level_args(text: str) -> List[str]:
+        args: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        quote: str | None = None
+        for ch in text:
+            if quote is not None:
+                cur.append(ch)
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            if ch == "," and depth == 0:
+                args.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur or text.strip():
+            args.append("".join(cur).strip())
+        return args
+
+    def _real_dp_expr_base(expr: str) -> str | None:
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(.*)\s*$", expr)
+        if m is None:
+            return None
+        base = m.group(1).lower()
+        suffix = m.group(2).strip()
+        if base not in real_dp_names:
+            return None
+        if not suffix:
+            return base
+        if not suffix.startswith("("):
+            return None
+        if _matching_paren(suffix, 0) != len(suffix) - 1:
+            return None
+        return base
+
+    # These elemental/reduction intrinsics return a result with the same
+    # real kind as their first numeric argument. Keep this list conservative;
+    # set XR2F_DISABLE_REAL_INTRINSIC_CAST_CLEANUP=1 to disable this branch
+    # without disabling simple real(dp) identifier/section cast cleanup.
+    same_kind_real_intrinsics = {
+        "abs",
+        "acos",
+        "acosh",
+        "aimag",
+        "asin",
+        "asinh",
+        "atan",
+        "atan2",
+        "atanh",
+        "cos",
+        "cosh",
+        "dim",
+        "dot_product",
+        "erf",
+        "erfc",
+        "erfc_scaled",
+        "exp",
+        "fraction",
+        "gamma",
+        "hypot",
+        "log",
+        "log10",
+        "log_gamma",
+        "max",
+        "maxval",
+        "merge",
+        "min",
+        "minval",
+        "mod",
+        "modulo",
+        "nearest",
+        "norm2",
+        "product",
+        "rrspacing",
+        "scale",
+        "set_exponent",
+        "sign",
+        "sin",
+        "sinh",
+        "spacing",
+        "sqrt",
+        "sum",
+        "tan",
+        "tanh",
+    }
+    enable_real_intrinsic_cleanup = (
+        os.environ.get("XR2F_DISABLE_REAL_INTRINSIC_CAST_CLEANUP", "").strip().lower()
+        not in {"1", "true", "yes", "on"}
+    )
+
+    def _real_dp_expr_kind_follows_first_arg(expr: str) -> bool:
+        if _real_dp_expr_base(expr) is not None:
+            return True
+        if not enable_real_intrinsic_cleanup:
+            return False
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", expr)
+        if m is None:
+            return False
+        intrinsic = m.group(1).lower()
+        if intrinsic not in same_kind_real_intrinsics:
+            return False
+        open_idx = expr.find("(", m.end() - 1)
+        close_idx = _matching_paren(expr, open_idx)
+        if close_idx != len(expr.rstrip()) - 1:
+            return False
+        args = _split_top_level_args(expr[open_idx + 1 : close_idx])
+        if not args:
+            return False
+        return _real_dp_expr_base(args[0]) is not None
+
+    def _rewrite_code(code: str, real_dp_names: set[str]) -> str:
+        if not real_dp_names:
+            return code
+
+        out_parts: List[str] = []
+        pos = 0
+        while True:
+            m = real_call_re.search(code, pos)
+            if m is None:
+                out_parts.append(code[pos:])
+                break
+            open_idx = code.find("(", m.start())
+            close_idx = _matching_paren(code, open_idx)
+            if close_idx is None:
+                out_parts.append(code[pos:])
+                break
+            out_parts.append(code[pos : m.start()])
+            inner = code[open_idx + 1 : close_idx]
+            args = _split_top_level_args(inner)
+            if (
+                len(args) == 2
+                and re.fullmatch(r"kind\s*=\s*dp", args[1], re.IGNORECASE)
+                and _real_dp_expr_kind_follows_first_arg(args[0])
+            ):
+                out_parts.append(args[0])
+            else:
+                out_parts.append(code[m.start() : close_idx + 1])
+            pos = close_idx + 1
+        return "".join(out_parts)
+
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        code_i = fscan.strip_comment(out[i]).strip()
+        if not unit_start_re.match(code_i):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(out):
+            if unit_end_re.match(fscan.strip_comment(out[j]).strip()):
+                break
+            j += 1
+        if j >= len(out):
+            break
+
+        real_dp_names: set[str] = set()
+        for k in range(i + 1, j):
+            code_k = fscan.strip_comment(out[k]).strip()
+            if "::" not in code_k:
+                continue
+            real_dp_names.update(_declared_real_dp_names(code_k))
+
+        if real_dp_names:
+            for k in range(i + 1, j):
+                raw = out[k]
+                code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+                if "::" in code:
+                    continue
+                new_code = _rewrite_code(code, real_dp_names)
+                if new_code != code:
+                    eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+                    out[k] = f"{new_code}{comment}{eol}"
+        i = j + 1
+    return out
+
+
+def simplify_atomic_parentheses(lines: List[str]) -> List[str]:
+    """Remove parentheses around atomic identifiers and literals in expressions.
+
+    Examples:
+    - `(w) / (s)` -> `w / s`
+    - `(1.0_dp)` -> `1.0_dp`
+
+    Parentheses are preserved in likely call/index contexts such as `f(x)` and
+    `a(i)`.
+    """
+
+    atom_re = re.compile(
+        r"^\s*(?P<atom>"
+        r"[A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*|"
+        r"(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+\-]?\d+)?(?:_[A-Za-z_][A-Za-z0-9_]*)?|"
+        r"\.(?:true|false)\."
+        r")\s*$",
+        re.IGNORECASE,
+    )
+    ref_re = re.compile(
+        r"^\s*(?P<ref>[A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*)\s*\(",
+        re.IGNORECASE,
+    )
+
+    def _matching_paren(text: str, open_idx: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    def _removable_operand(inner: str) -> str | None:
+        m_atom = atom_re.match(inner)
+        if m_atom is not None:
+            return m_atom.group("atom")
+        m_ref = ref_re.match(inner)
+        if m_ref is None:
+            return None
+        stripped = inner.strip()
+        open_idx = stripped.find("(", len(m_ref.group("ref")))
+        close_idx = _matching_paren(stripped, open_idx)
+        if close_idx != len(stripped) - 1:
+            return None
+        return stripped
+
+    def _rewrite_code(code: str) -> str:
+        s = code
+        while True:
+            changed = False
+            stack: List[int] = []
+            pairs: List[tuple[int, int]] = []
+            in_single = False
+            in_double = False
+            i = 0
+            while i < len(s):
+                ch = s[i]
+                if ch == "'" and not in_double:
+                    if in_single and i + 1 < len(s) and s[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = not in_single
+                    i += 1
+                    continue
+                if ch == '"' and not in_single:
+                    if in_double and i + 1 < len(s) and s[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_double = not in_double
+                    i += 1
+                    continue
+                if in_single or in_double:
+                    i += 1
+                    continue
+                if ch == "(":
+                    stack.append(i)
+                elif ch == ")" and stack:
+                    pairs.append((stack.pop(), i))
+                i += 1
+            for lpos, rpos in reversed(pairs):
+                inner = s[lpos + 1 : rpos]
+                replacement = _removable_operand(inner)
+                if replacement is None:
+                    continue
+                before = s[:lpos].rstrip()
+                after = s[rpos + 1 :].lstrip()
+                prev = before[-1] if before else ""
+                next_ch = after[0] if after else ""
+                if before.lower().endswith(".not."):
+                    continue
+                if prev.isalnum() or prev in "_%)]":
+                    continue
+                if next_ch and (next_ch.isalnum() or next_ch in "_%"):
+                    continue
+                s = s[:lpos] + replacement + s[rpos + 1 :]
+                changed = True
+                break
+            if not changed:
+                return s
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_code(code)}{comment}{eol}")
+    return out
+
+
+def remove_redundant_int_casts_of_integer_intrinsics(lines: List[str]) -> List[str]:
+    """Remove `int(f(...))` when intrinsic `f` already returns integer.
+
+    This pass is intentionally conservative:
+    - only rewrites `int(<known-integer-intrinsic>(...))`
+    - does not rewrite `int(..., kind=...)`, since that can be a kind conversion
+    - handles nested parentheses inside the intrinsic call arguments
+    """
+
+    integer_intrinsics = {
+        "bit_size",
+        "count",
+        "digits",
+        "iachar",
+        "ichar",
+        "index",
+        "kind",
+        "lbound",
+        "len",
+        "len_trim",
+        "maxexponent",
+        "maxloc",
+        "minexponent",
+        "minloc",
+        "radix",
+        "range",
+        "scan",
+        "selected_char_kind",
+        "selected_int_kind",
+        "selected_real_kind",
+        "shape",
+        "size",
+        "storage_size",
+        "ubound",
+        "verify",
+    }
+
+    def _matching_paren(text: str, open_idx: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    if quote == '"' and i + 1 < len(text) and text[i + 1] == '"':
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    def _top_level_has_comma(text: str) -> bool:
+        depth = 0
+        quote: str | None = None
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return True
+            i += 1
+        return False
+
+    def _rewrite_code(code: str) -> str:
+        out_parts: List[str] = []
+        i = 0
+        int_call_re = re.compile(r"\bint\s*\(", re.IGNORECASE)
+        while i < len(code):
+            m = int_call_re.search(code, i)
+            if m is None:
+                out_parts.append(code[i:])
+                break
+            out_parts.append(code[i : m.start()])
+            int_open = code.find("(", m.start())
+            int_close = _matching_paren(code, int_open)
+            if int_close is None:
+                out_parts.append(code[m.start() :])
+                break
+            inner = code[int_open + 1 : int_close].strip()
+            if _top_level_has_comma(inner):
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            c_intr = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", inner)
+            if c_intr is None or c_intr.group(1).lower() not in integer_intrinsics:
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            intr_open = inner.find("(", c_intr.start())
+            intr_close = _matching_paren(inner, intr_open)
+            if intr_close is None or inner[intr_close + 1 :].strip():
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            out_parts.append(inner)
+            i = int_close + 1
+        return "".join(out_parts)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_code(code)}{comment}{eol}")
     return out
 
 
@@ -494,6 +1110,179 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
     return out
 
 
+def consolidate_use_only_imports(lines: List[str]) -> List[str]:
+    """Merge repeated `use mod, only: ...` statements within each spec part.
+
+    Intrinsic/non-intrinsic forms are kept separate, and the rewrite is scoped
+    to a single program/module/function/subroutine specification part.
+    """
+
+    out: List[str] = []
+    i_join = 0
+    while i_join < len(lines):
+        raw = lines[i_join]
+        code = fscan.strip_comment(raw).rstrip("\r\n")
+        if re.match(r"^\s*use\b", code, re.IGNORECASE) and code.rstrip().endswith("&"):
+            eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+            merged = code.rstrip()[:-1].rstrip()
+            j_join = i_join + 1
+            while j_join < len(lines):
+                cont_code = fscan.strip_comment(lines[j_join]).strip().rstrip("\r\n")
+                if cont_code.startswith("&"):
+                    cont_code = cont_code[1:].lstrip()
+                more = cont_code.rstrip().endswith("&")
+                if more:
+                    cont_code = cont_code.rstrip()[:-1].rstrip()
+                merged = f"{merged} {cont_code}".rstrip()
+                j_join += 1
+                if not more:
+                    break
+            out.append(f"{merged}{eol}")
+            i_join = j_join
+            continue
+        out.append(raw)
+        i_join += 1
+    unit_start_re = re.compile(
+        r"^\s*(?:module\s+[A-Za-z]\w*\b(?!\s*procedure\b)|program\s+[A-Za-z]\w*\b|"
+        r"(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b)",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:module|program|function|subroutine)\b", re.IGNORECASE)
+    spec_stop_re = re.compile(
+        r"^\s*(?:contains\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|"
+        r"type\s*\(|class\s*\(|procedure\b|parameter\b|save\b|dimension\b|external\b|"
+        r"intrinsic\b|data\b|common\b|equivalence\b)",
+        re.IGNORECASE,
+    )
+    use_only_re = re.compile(
+        r"^(?P<indent>\s*)use\s*(?P<attr>,\s*(?P<intrinsic>intrinsic|non_intrinsic)\s*)?"
+        r"(?:::)?\s*(?P<mod>[A-Za-z]\w*)\s*,\s*only\s*:\s*(?P<syms>.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    def _split_syms(s: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        in_s = False
+        in_d = False
+        for ch in s:
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            elif not in_s and not in_d:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")" and depth > 0:
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    part = "".join(cur).strip()
+                    if part:
+                        parts.append(part)
+                    cur = []
+                    continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _sym_key(sym: str) -> str:
+        return re.sub(r"\s+", "", sym).lower()
+
+    def _format_use(indent: str, intrinsic: str | None, mod: str, syms: List[str], eol: str) -> str:
+        if intrinsic:
+            return f"{indent}use, {intrinsic} :: {mod}, only: {', '.join(syms)}{eol}"
+        return f"{indent}use {mod}, only: {', '.join(syms)}{eol}"
+
+    i = 0
+    while i < len(out):
+        if unit_start_re.match(fscan.strip_comment(out[i]).strip()) is None:
+            i += 1
+            continue
+        unit_start = i
+        unit_end = len(out)
+        j = i + 1
+        while j < len(out):
+            if unit_end_re.match(fscan.strip_comment(out[j]).strip()):
+                unit_end = j
+                break
+            j += 1
+
+        spec_end = unit_end
+        k = unit_start + 1
+        while k < unit_end:
+            code_k = fscan.strip_comment(out[k]).strip()
+            if not code_k:
+                k += 1
+                continue
+            if use_only_re.match(code_k):
+                k += 1
+                continue
+            if spec_stop_re.match(code_k):
+                spec_end = k
+            break
+
+        groups: dict[tuple[str | None, str], dict[str, object]] = {}
+        remove: set[int] = set()
+        for k in range(unit_start + 1, spec_end):
+            code, _comment = xunused.split_code_comment(out[k].rstrip("\r\n"))
+            m = use_only_re.match(code)
+            if m is None:
+                continue
+            intrinsic = m.group("intrinsic")
+            intrinsic_key = intrinsic.lower() if intrinsic else None
+            mod = m.group("mod")
+            key = (intrinsic_key, mod.lower())
+            syms = _split_syms(m.group("syms"))
+            if not syms:
+                continue
+            if key not in groups:
+                groups[key] = {
+                    "line": k,
+                    "indent": m.group("indent"),
+                    "intrinsic": intrinsic_key,
+                    "mod": mod,
+                    "syms": [],
+                    "seen": set(),
+                }
+            else:
+                remove.add(k)
+            g = groups[key]
+            seen = g["seen"]
+            assert isinstance(seen, set)
+            out_syms = g["syms"]
+            assert isinstance(out_syms, list)
+            for sym in syms:
+                sk = _sym_key(sym)
+                if sk in seen:
+                    continue
+                seen.add(sk)
+                out_syms.append(sym)
+
+        for g in groups.values():
+            line = g["line"]
+            assert isinstance(line, int)
+            if not any(idx in remove for idx in range(unit_start + 1, spec_end)):
+                continue
+            eol = xunused.get_eol(out[line]) or ("\n" if out[line].endswith("\n") else "")
+            out[line] = _format_use(
+                str(g["indent"]),
+                g["intrinsic"] if isinstance(g["intrinsic"], str) else None,
+                str(g["mod"]),
+                g["syms"] if isinstance(g["syms"], list) else [],
+                eol,
+            )
+
+        if remove:
+            out = [ln for idx, ln in enumerate(out) if idx not in remove]
+            i = unit_start + 1
+        else:
+            i = unit_end + 1
+    return out
+
+
 def apply_xindent_defaults(lines: List[str], *, max_len: int = 80) -> List[str]:
     """Apply xindent.py default indentation/wrapping policy to emitted lines."""
     eol = "\n" if any(("\n" in ln) or ("\r" in ln) for ln in lines) else ""
@@ -738,6 +1527,12 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
         # Remove grouping parens only when the inner expression has no top-level
         # binary +/- and no top-level comma, and context is not a call/index.
         s = expr
+        atom_re = re.compile(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*|"
+            r"(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+\-]?\d+)?(?:_[A-Za-z_][A-Za-z0-9_]*)?|"
+            r"\.(?:true|false)\.)$",
+            re.IGNORECASE,
+        )
         while True:
             changed = False
             stack: List[int] = []
@@ -786,6 +1581,10 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
                 # likely call/index context: name(...), arr(...), dt%comp(...)
                 if prev.isalnum() or prev in "_%)]":
                     continue
+                if atom_re.match(inner):
+                    s = s[:lpos] + inner + s[rpos + 1 :]
+                    changed = True
+                    break
                 # Keep denominator grouping: a / (b*c) must not become a / b*c.
                 if (("*" in inner) or ("/" in inner)) and (prev == "/" or next_ch == "/"):
                     continue

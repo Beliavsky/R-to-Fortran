@@ -6863,7 +6863,14 @@ do i = 1, size(x)
       if (abs(x(i) - real(k, kind=dp)) <= tol) then
          write(buf, "(i0)") k
       else
-         write(buf, "(g0)") x(i)
+         write(buf, "(f0.10)") x(i)
+         do while (index(buf, ".") > 0 .and. buf(len_trim(buf):len_trim(buf)) == "0")
+            buf(len_trim(buf):len_trim(buf)) = " "
+         end do
+         if (buf(len_trim(buf):len_trim(buf)) == ".") buf(len_trim(buf):len_trim(buf)) = " "
+         buf = adjustl(buf)
+         if (len_trim(buf) >= 1 .and. buf(1:1) == ".") buf = "0" // trim(buf)
+         if (len_trim(buf) >= 2 .and. buf(1:2) == "-.") buf = "-0" // trim(buf(2:))
       end if
    else
       write(buf, "(g0)") x(i)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +35,37 @@ SUPPORTED_R_COMPILE_CASES = [
     "xt.r",
     "xtf.r",
 ]
+
+STRESS_R_COMPILE_CASES = [
+    "xarma.r",
+    "xsolve.r",
+    "xvar.r",
+    "xvar_ic.r",
+    "xxarray.r",
+    "xgarch_dcc_t.r",
+    "xreturns_mv_mix.r",
+    "xreturns_var_yw.r",
+    "xvarma_returns.r",
+]
+
+FULL_EXAMPLE_DIRS = [
+    "r_examples",
+    "r_stat_examples",
+]
+
+
+def _full_example_sources() -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for dirname in FULL_EXAMPLE_DIRS:
+        for pattern in ("*.r", "*.R"):
+            for path in sorted((REPO_ROOT / dirname).glob(pattern)):
+                key = path.resolve()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(path)
+    return out
 
 
 def _run_xr2f_compile(tmp_path: Path, example_name: str) -> subprocess.CompletedProcess[str]:
@@ -154,6 +186,53 @@ def test_xr2f_annotate_r_writes_inferred_declares(tmp_path: Path) -> None:
     assert "max.iter = integer()" in ann_text
     assert "max_iter = integer()" not in ann_text
     assert ann_text.index("f <- function") < ann_text.index("  declare(type(") < ann_text.index("  y <- numeric")
+
+
+def test_xr2f_annotate_r_args_writes_only_argument_declares(tmp_path: Path) -> None:
+    local_input = tmp_path / "xannotate_args_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(x, max.iter = 3) {",
+                "  y <- numeric(length(x))",
+                "  for (i in 1:max.iter) y[i] <- x[i]",
+                "  return(y)",
+                "}",
+                "n <- 2",
+                "z <- f(c(1.0, 2.0), max.iter = n)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xannotate_args_probe.f90"
+    ann_path = tmp_path / "xannotate_args_probe_typed.r"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XR2F_PATH),
+            str(local_input),
+            "--out",
+            str(out_path),
+            "--annotate-r-args",
+            str(ann_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    ann_text = ann_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"wrote {ann_path}" in proc.stdout
+    assert "x = double()" in ann_text
+    assert "max.iter = integer()" in ann_text
+    assert "y = double()" not in ann_text
+    assert "i = integer()" not in ann_text
+    assert "n = integer()" not in ann_text
+    assert "z = double()" not in ann_text
 
 
 def test_xr2f_dotted_for_loop_variable_compile(tmp_path: Path) -> None:
@@ -627,7 +706,7 @@ def test_xr2f_replace_vectors_compile_and_run(tmp_path: Path) -> None:
     assert "first first a first b a" in proc.stdout
     assert "10 100 30 200 50 100" in proc.stdout
     assert "integer" in proc.stdout
-    assert " 1 20 3 40 5 6" in proc.stdout
+    assert "1 20 3 40 5 6" in proc.stdout
     assert "T T T T" in proc.stdout
 
 
@@ -685,11 +764,50 @@ def test_xr2f_sweep_matrix_scale_apply_and_rank3_compile_and_run(tmp_path: Path)
     assert "my_fun(real(x, kind=dp), real(spread(stats, dim=1, ncopies=size(x,1)), kind=dp))" in flat_out
     assert "spread(spread(stats1, dim=2, ncopies=size(a,2)), dim=3, ncopies=size(a,3))" in flat_out
     assert "dim=3" in flat_out and "ncopies=size(a,3)" in flat_out
-    assert "-1.50000E+01" in proc.stdout
+    assert "-15" in proc.stdout
     assert "21.213203435596427" in proc.stdout
-    assert "2.40000E+01" in proc.stdout
+    assert "24" in proc.stdout
     assert "-99 -198" in proc.stdout
     assert "-594" in proc.stdout
+
+
+def test_xr2f_user_function_rep_return_is_vector_not_elemental(tmp_path: Path) -> None:
+    local_input = tmp_path / "xelem_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_weights <- function(k) {",
+                "  rep(1.0 / k, k)",
+                "}",
+                "k <- 3",
+                "w <- make_weights(k)",
+                "print(w)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xelem_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "elemental function make_weights" not in out_text
+    assert "function make_weights(k) result(make_weights_result)" in out_text
+    assert "make_weights_result(:)" in out_text
+    assert "times=int(k)" in flat_out
+    assert "call print_real_vector(make_weights(real(k, kind=dp)))" in out_text
+    assert proc.stdout.count("0.33333333333333331") == 3
 
 
 def test_xr2f_acf_plot_false_and_plot_true_warning(tmp_path: Path) -> None:
@@ -903,6 +1021,25 @@ def test_xr2f_pretty_strips_r_vector_indices_in_run_both(tmp_path: Path) -> None
     assert "\n1 2 3" in proc.stdout
 
 
+def test_xr2f_run_diff_accepts_numeric_format_differences(tmp_path: Path) -> None:
+    local_input = tmp_path / "xrun_diff_numeric_probe.r"
+    local_input.write_text("cat(0, 21.692781522776912, \"\\n\")\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out-dir", str(tmp_path), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run (r): PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "Run diff: MATCH" in proc.stdout
+    assert "Run diff: DIFF" not in proc.stdout
+
+
 def test_xr2f_round_formats_fortran_runtime_output(tmp_path: Path) -> None:
     local_input = tmp_path / "xround_probe.r"
     local_input.write_text('cat("x:", 1 / 3, 2.34567, -0.0049, "\\n")\n', encoding="utf-8")
@@ -1104,8 +1241,45 @@ def test_xr2f_round_matrix_print_uses_matrix_printer(tmp_path: Path) -> None:
     out_text = out_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
-    assert "call print_matrix(" in out_text
+    assert "call print_matrix(m, digits=4)" in out_text
+    assert "r_round(" not in out_text
     assert "call print_real_vector" not in out_text
+
+
+def test_xr2f_round_vector_uses_runtime_helper_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xround_vector.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.23456, -2.34567)",
+                "y <- round(x, digits = 3)",
+                "print(y[1])",
+                "print(y)",
+                "print(round(x, 3))",
+                "print(round(1.23456))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xround_vector.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "r_round(x, 3)" in out_text
+    assert "r_round(1.23456_dp, 0)" in out_text
+    assert "call print_real_vector(x, digits=3)" in out_text
+    assert "real(r_round(" not in out_text
 
 
 def test_xr2f_ignores_declare_and_lowers_double_constructor(tmp_path: Path) -> None:
@@ -1355,8 +1529,8 @@ def test_xr2f_s4_inheritance_slots_and_inherited_methods(tmp_path: Path) -> None
     assert "real(kind=dp), allocatable :: x(:), weight(:)" in out_text
     assert "pure elemental function spread_weighted_point" in out_text
     assert "type(weighted_point_result_t), intent(in) :: object" in out_text
-    assert 'write(*,*) "weighted class: ", "weighted_point"' in out_text
-    assert 'write(*,*) "weighted is stat: ", .true.' in out_text
+    assert 'write(*,"(*(g0,:,1x))") "weighted class: ", "weighted_point"' in out_text
+    assert 'write(*,"(*(g0,:,1x))") "weighted is stat: ", .true.' in out_text
     assert "center_weighted_point(w)" in out_text
     assert "spread_weighted_point(w)" in out_text
 
@@ -1426,7 +1600,8 @@ def test_xr2f_quickr_gap_helpers_compile(tmp_path: Path) -> None:
     assert "m(:, 2)" in out_text
     assert "abs(-3)" in out_text
     assert "0.0_dp * real(3, kind=dp)" in out_text
-    assert "merge(acos(-1.0_dp), 0.0_dp, real(-3, kind=dp) < 0.0_dp)" in out_text
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert "merge(acos(-1.0_dp), 0.0_dp, real(-3, kind=dp) < 0.0_dp)" in flat_out
 
 
 def test_xr2f_colnames_variable_drives_integer_table_columns(tmp_path: Path) -> None:
@@ -2081,6 +2256,151 @@ def test_xr2f_paste0_numeric_vector_names_compile(tmp_path: Path) -> None:
     assert "print_named_real_vector" in out_text
 
 
+def test_xr2f_proc_time_elapsed_checkpoints_are_not_inlined(tmp_path: Path) -> None:
+    local_input = tmp_path / "xtiming_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                't0 <- proc.time()[["elapsed"]]',
+                "x <- sum(1:10)",
+                't1 <- proc.time()[["elapsed"]]',
+                'cat("elapsed:", t1 - t0, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xtiming_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _run_xr2f_compile_source(tmp_path: Path, source_path: Path) -> subprocess.CompletedProcess[str]:
+    local_input = tmp_path / source_path.name
+    local_input.write_text(source_path.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    out_path = tmp_path / f"{source_path.stem}.f90"
+    return subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "t0 = r_elapsed()" in out_text
+    assert "t1 = r_elapsed()" in out_text
+    assert "t1 - t0" in flat_out
+    assert "r_elapsed() - r_elapsed()" not in flat_out
+
+
+def test_xr2f_recent_r_semantics_regression_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xrecent_semantics_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "# f controls the smoothing fraction and should remain a comment.",
+                "# Fortran counterpart: this should also remain a comment.",
+                "x <- matrix(1:6, nrow = 3)",
+                "print(x[c(1, 6)])",
+                "print(x[-c(1, 3)])",
+                "print(x[x > 2])",
+                "x[6] <- 99",
+                "x[c(4, 5)] <- -1",
+                "x[c(2, 3)] <- c(10, 20)",
+                "print(x)",
+                "print(x[, 1, drop = FALSE])",
+                "print(matrix(1:6, nrow = 3)[, 1])",
+                "print(matrix(1:6, nrow = 3)[c(1, 6)])",
+                "print(matrix(1:6, nrow = 3)[-c(1, 3)])",
+                "print(matrix(1:6, nrow = 3) + c(10, 20, 30))",
+                "a1 <- array(1:5, dim = 5)",
+                "print(a1)",
+                "a3 <- array(1:8, dim = c(2, 2, 2))",
+                "print(a3[1, , 1, drop = FALSE])",
+                "print(a3 + a3)",
+                "g <- c(1, 2, 1, 2)",
+                "idx <- which(g == 1)",
+                    "m <- matrix(1:8, nrow = 4)",
+                    "print(m[1, ])",
+                    "print(colMeans(m[idx, , drop = FALSE]))",
+                'names <- c("r1", "r2")',
+                "print(names)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xrecent_semantics_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "controls the smoothing fraction" in out_text
+    assert "! Fortran counterpart" in out_text
+    assert "controls the smoothing fraction" in out_text
+    assert "\ncontrols the smoothing fraction." not in out_text
+    assert "r_matrix_index" in out_text
+    assert "print_integer_vector(a1)" in out_text
+    assert "print_real_vector(real(reshape(a3 + a3" in flat_out
+    assert "r_seq_int(idx, idx)" not in out_text
+    assert "idx:idx" not in out_text
+
+
+def test_xr2f_matrix_dimnames_vector_subsets_run_both(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmatrix_dimnames_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(1:4, 2, 2)",
+                'rownames(x) <- c("r1", "r2")',
+                'colnames(x) <- c("c1", "c2")',
+                "print(x[1, ])",
+                "print(x[, 1])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmatrix_dimnames_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert "call print_named_real_vector(real(x(1, :), kind=dp)" in flat_out
+    assert "call print_named_real_vector(real(x(:, 1), kind=dp)" in flat_out
+    assert "c1 c2" in proc.stdout
+    assert "r1 r2" in proc.stdout
+
+
 @pytest.mark.parametrize("example_name", SUPPORTED_R_COMPILE_CASES)
 def test_xr2f_compiles_supported_local_r_examples(tmp_path: Path, example_name: str) -> None:
     proc = _run_xr2f_compile(tmp_path, example_name)
@@ -2088,3 +2408,620 @@ def test_xr2f_compiles_supported_local_r_examples(tmp_path: Path, example_name: 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert (tmp_path / "r.f90").exists()
+
+
+@pytest.mark.parametrize("example_name", STRESS_R_COMPILE_CASES)
+def test_xr2f_compiles_recent_regression_stress_examples(tmp_path: Path, example_name: str) -> None:
+    proc = _run_xr2f_compile(tmp_path, example_name)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert (tmp_path / "r.f90").exists()
+
+
+@pytest.mark.parametrize(
+    ("example_name", "required_fragments", "forbidden_fragments"),
+    [
+        ("xgarch_dcc_t.r", ["call read_csv_real_matrix(price_file, dat)", "dat(:,:)"], ["dat(:), garch_fit"]),
+        ("xvar.r", ["xlag(:,:)", "xlag = x(r_seq_int(1, n - 1), :)"], ["xlag(:), y(:,:)"]),
+        ("xvar_ic.r", ["integer :: aic_order, bic_order"], ["aic_order(:)", "bic_order(:)"]),
+        ("xxarray.r", ["b(:,:)", "b = r_array_real([10.0_dp, 20.0_dp], [3, 4])"], ["b(:,:,:)"]),
+        ("xsolve.r", ["complex(kind=dp), allocatable :: A_2(:,:)"], ["real(kind=dp), allocatable :: A_2(:,:)"]),
+    ],
+)
+def test_xr2f_recent_regression_generated_fragments(
+    tmp_path: Path,
+    example_name: str,
+    required_fragments: list[str],
+    forbidden_fragments: list[str],
+) -> None:
+    proc = _run_xr2f_compile(tmp_path, example_name)
+
+    out_text = (tmp_path / "r.f90").read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    for fragment in required_fragments:
+        assert fragment in flat_out
+    for fragment in forbidden_fragments:
+        assert fragment not in flat_out
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "required_stdout", "forbidden_stdout"),
+    [
+        (
+            "02_matrix_rownames_colnames.R",
+            ["labeled matrix:", "SPY", "EFA", "EEM", "mean", "sd"],
+            ["[,1]"],
+        ),
+        (
+            "05_transpose_labels.R",
+            ["transpose labels:", "mean", "sd", "SPY", "EFA", "EEM"],
+            ["[1,]"],
+        ),
+        (
+            "06_cor_cov2cor_labels.R",
+            ["cor labels:", "cov labels via assignment:", "cov2cor labels:", "SPY", "EFA", "EEM"],
+            ["[,1]"],
+        ),
+        (
+            "07_apply_t_named_columns.R",
+            ["apply stats labels:", "SPY", "EFA", "EEM", "mean", "sd", "min", "max"],
+            ["[,1]"],
+        ),
+        (
+            "09_matrix_no_labels_control.R",
+            ["unlabeled matrix control:", "[,1]", "[1,]"],
+            [],
+        ),
+    ],
+)
+def test_xr2f_preserves_matrix_and_vector_labels_in_prints(
+    tmp_path: Path,
+    fixture_name: str,
+    required_stdout: list[str],
+    forbidden_stdout: list[str],
+) -> None:
+    source_path = REPO_ROOT / "label_tests" / fixture_name
+    local_input = tmp_path / fixture_name
+    local_input.write_text(source_path.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    out_path = tmp_path / f"{source_path.stem}.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    for fragment in required_stdout:
+        assert fragment in proc.stdout
+    for fragment in forbidden_stdout:
+        assert fragment not in proc.stdout
+
+
+def test_xr2f_coerces_local_integer_actuals_for_real_function_formals(tmp_path: Path) -> None:
+    local_input = tmp_path / "xconvolve_no_decl_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "slow_convolve <- function(a, b) {",
+                "  ab <- double(length(a) + length(b) - 1)",
+                "  for (i in seq_along(a)) {",
+                "    for (j in seq_along(b)) {",
+                "      ab[i+j-1] <- ab[i+j-1] + a[i] * b[j]",
+                "    }",
+                "  }",
+                "  ab",
+                "}",
+                "na <- 10",
+                "nb <- 3",
+                "a <- 1:na",
+                "b <- 1:nb",
+                "r <- slow_convolve(a, b)",
+                "nr <- length(r)",
+                "cat(length(r), r[nr], \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xconvolve_no_decl_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "slow_convolve(real(a, kind=dp), real(b, kind=dp))" in flat_out
+    assert "12 30" in proc.stdout
+
+
+def test_xr2f_lifts_nested_helpers_and_lowers_native_pipe(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdiffuse_no_decl_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "diffuse_heat <- function(nx, ny, dx, dy, dt, k, steps) {",
+                "  temp <- matrix(0, nx, ny)",
+                "  temp[nx %/% 2L, ny %/% 2L] <- 100",
+                "  apply_boundary_conditions <- function(temp) {",
+                "    temp[1, ] <- 0",
+                "    temp[nx, ] <- 0",
+                "    temp[, 1] <- 0",
+                "    temp[, ny] <- 0",
+                "    temp",
+                "  }",
+                "  update_temperature <- function(temp) {",
+                "    temp_new <- temp",
+                "    i <- 2:(nx - 1)",
+                "    j <- 2:(ny - 1)",
+                "    laplacian <-",
+                "      (temp[i + 1, j] - 2 * temp[i, j] + temp[i - 1, j]) / dx ^ 2 +",
+                "      (temp[i, j + 1] - 2 * temp[i, j] + temp[i, j - 1]) / dy ^ 2",
+                "    temp_new[i, j] <- temp[i, j] + k * dt * laplacian",
+                "    temp_new",
+                "  }",
+                "  for (step in seq_len(steps)) {",
+                "    temp <- temp |> ",
+                "      apply_boundary_conditions() |> ",
+                "      update_temperature()",
+                "  }",
+                "  temp",
+                "}",
+                "nx <- 20L",
+                "ny <- 20L",
+                "dx <- 1L",
+                "dy <- 1L",
+                "dt <- 0.01",
+                "k <- 0.1",
+                "steps <- 20L",
+                "diffuse_heat <- diffuse_heat(nx, ny, dx, dy, dt, k, steps)",
+                "cat(diffuse_heat[1,1], diffuse_heat[1, ny], diffuse_heat[nx, 1], diffuse_heat[nx, ny])",
+                'cat("\\n")',
+                "cat(round(min(diffuse_heat), 4), round(max(diffuse_heat), 4))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdiffuse_no_decl_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "function diffuse_heat_apply_boundary_conditions" in out_text
+    assert "function diffuse_heat_update_temperature" in out_text
+    assert "|>" not in out_text
+    assert "diffuse_heat_r = diffuse_heat(" in flat_out
+    assert "0.0000000000000000 0.0000000000000000 0.0000000000000000 0.0000000000000000" in proc.stdout
+    assert "92.3675" in proc.stdout
+
+
+def test_xr2f_infers_integer_formal_for_integer_modulus(tmp_path: Path) -> None:
+    local_input = tmp_path / "xoddcount_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "oddcount <- function(x) {",
+                "  return(sum(x%%2 != 0))",
+                "}",
+                "v <- 2:7",
+                "print(oddcount(v))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xoddcount_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "integer, intent(in) :: x(:)" in flat_out
+    assert "integer :: oddcount_result" in flat_out
+    assert "iso_fortran_env" not in out_text
+    assert "oddcount(v)" in flat_out
+    assert "real(v, kind=dp)" not in flat_out
+    assert "\n3\n" in proc.stdout
+
+
+def test_xr2f_sum_logical_vector_lowers_to_count(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsum_logical_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(TRUE, FALSE, TRUE)",
+                "print(sum(x))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsum_logical_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert 'write(*,"(g0)") count(x)' in out_text
+    assert "sum(merge(1, 0, x))" not in out_text
+    assert "\n2\n" in proc.stdout
+
+
+def test_xr2f_integrate_result_object_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xintegrate_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(x) {",
+                "  x^2",
+                "}",
+                "result <- integrate(f, lower = 0, upper = 10)",
+                "print(result)",
+                'cat("value =", result$value, "\\n")',
+                'cat("absolute error =", result$abs.error, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xintegrate_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "pure function f(x) result(f_result)" in out_text
+    assert "pure elemental function f" not in out_text
+    assert "type(integrate_result_t) :: result" in flat_out
+    assert "result = integrate(f, lower=real(0, kind=dp), upper=real(10, kind=dp))" in flat_out
+    assert "call print_integrate_result(result)" in out_text
+    assert "result%value" in out_text
+    assert "result%abs_error" in out_text
+    assert "333.333" in proc.stdout
+
+
+def test_xr2f_integrate_handles_two_sided_improper_integral(tmp_path: Path) -> None:
+    local_input = tmp_path / "ximproper_integral_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(x) {",
+                "  exp(-x^2)",
+                "}",
+                "result <- integrate(f, lower = -Inf, upper = Inf)",
+                'cat("value =", result$value, "\\n")',
+                'cat("absolute error =", result$abs.error, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "ximproper_integral_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(integrate_result_t) :: result" in flat_out
+    assert "lower=real(-huge(1.0_dp), kind=dp)" in flat_out
+    assert "upper=real(huge(1.0_dp), kind=dp)" in flat_out
+    assert "NaN" not in proc.stdout
+    assert "1.77245" in proc.stdout
+
+
+def test_xr2f_symbolic_derivative_eval_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xderivative_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(x) {",
+                "  x^2",
+                "}",
+                'expr <- expression(x^2)',
+                'dexpr <- D(expr, "x")',
+                "fprime <- function(x) {",
+                "  eval(dexpr)",
+                "}",
+                'cat("f(3)  =", f(3), "\\n")',
+                'cat("fprime(3) =", fprime(3), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xderivative_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "eval(" not in out_text
+    assert "D(" not in out_text
+    assert "fprime_result =" in out_text
+    assert "fprime(3) =" in proc.stdout
+    assert "6" in proc.stdout
+
+
+def test_xr2f_symbolic_derivative_reports_unsupported_expression(tmp_path: Path) -> None:
+    local_input = tmp_path / "xderivative_unsupported_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'expr <- expression(besselJ(x, 1))',
+                'dexpr <- D(expr, "x")',
+                "fprime <- function(x) {",
+                "  eval(dexpr)",
+                "}",
+                "print(fprime(2))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xderivative_unsupported_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "unsupported D() expression" in proc.stdout + proc.stderr
+    assert "besselJ" in proc.stdout + proc.stderr
+
+
+def test_xr2f_symbolic_derivative_special_functions_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xderivative_special_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "fprime <- function(x) {",
+                "  d_tan <- D(expression(tan(x)), \"x\")",
+                "  d_gamma <- D(expression(gamma(x)), \"x\")",
+                "  d_lgamma <- D(expression(lgamma(x)), \"x\")",
+                "  d_erf <- D(expression(erf(x)), \"x\")",
+                "  d_erfc <- D(expression(erfc(x)), \"x\")",
+                "  d_cospi <- D(expression(cospi(x)), \"x\")",
+                "  d_sinpi <- D(expression(sinpi(x)), \"x\")",
+                "  d_tanpi <- D(expression(tanpi(x)), \"x\")",
+                "  c(eval(d_tan), eval(d_gamma), eval(d_lgamma), eval(d_erf),",
+                "    eval(d_erfc), eval(d_cospi), eval(d_sinpi), eval(d_tanpi))",
+                "}",
+                "print(round(fprime(0.5), 4))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xderivative_special_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "r_digamma" in out_text
+    assert "eval(" not in out_text
+    assert "D(" not in out_text
+    assert "NaN" not in proc.stdout
+
+
+def test_xr2f_viterbi_no_decl_benchmark_wrapper_compiles(tmp_path: Path) -> None:
+    local_input = tmp_path / "xviterbi_no_decl_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "slow_viterbi <- function(observations, states, initial_probs, transition_probs, emission_probs) {",
+                "  trellis <- matrix(0, nrow = length(states), ncol = length(observations))",
+                "  backpointer <- matrix(0L, nrow = length(states), ncol = length(observations))",
+                "  trellis[, 1] <- initial_probs * emission_probs[, observations[1]]",
+                "  for (step in 2:length(observations)) {",
+                "    for (current_state in 1:length(states)) {",
+                "      probabilities <- trellis[, step - 1] * transition_probs[, current_state]",
+                "      trellis[current_state, step] <- max(probabilities) * emission_probs[current_state, observations[step]]",
+                "      backpointer[current_state, step] <- which.max(probabilities)",
+                "    }",
+                "  }",
+                "  path <- integer(length(observations))",
+                "  path[length(observations)] <- which.max(trellis[, length(observations)])",
+                "  for (step in seq(length(observations) - 1, 1)) {",
+                "    path[step] <- backpointer[path[step + 1], step + 1]",
+                "  }",
+                "  states[path]",
+                "}",
+                "set.seed(1234)",
+                "num_steps <- 8",
+                "num_states <- 4",
+                "num_obs <- 5",
+                "observations <- sample(1:num_obs, num_steps, replace = TRUE)",
+                "states <- 1:num_states",
+                "initial_probs <- runif (num_states)",
+                "initial_probs <- initial_probs / sum(initial_probs)",
+                "transition_probs <- matrix(runif (num_states * num_states), nrow = num_states)",
+                "transition_probs <- transition_probs / rowSums(transition_probs)",
+                "emission_probs <- matrix(runif (num_states * num_obs), nrow = num_states)",
+                "emission_probs <- emission_probs / rowSums(emission_probs)",
+                "timings <- bench::mark(",
+                "  slow_viterbi = slow_viterbi(observations, states, initial_probs, transition_probs, emission_probs),",
+                ")",
+                "print(timings)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xviterbi_no_decl_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "integer, allocatable :: observations(:), states(:)" in out_text
+    assert "real(kind=dp), allocatable :: slow_viterbi_result(:)" in out_text
+    assert 'write(*,"(g0)") mark(' not in out_text
+
+
+def test_xr2f_read_csv_result_stays_matrix_rank(tmp_path: Path) -> None:
+    (tmp_path / "prices.csv").write_text("Date,SPY,EFA\n1,10,20\n2,11,21\n", encoding="utf-8")
+    local_input = tmp_path / "xread_csv_rank_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'dat <- read.csv("prices.csv", stringsAsFactors = FALSE)',
+                "x <- dat[, 2:3]",
+                "print(dim(x))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xread_csv_rank_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call read_csv_real_matrix" in out_text
+    assert "dat(:,:)" in " ".join(out_text.replace("&", " ").split())
+
+
+def test_xr2f_prints_integer_vector_expressions_as_integers(tmp_path: Path) -> None:
+    local_input = tmp_path / "xinteger_vector_prints.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(1:6, c(2, 3))",
+                "print(dim(x))",
+                "print(seq_len(3))",
+                "print(which(c(TRUE, FALSE, TRUE)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xinteger_vector_prints.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_integer_vector(shape(" in out_text
+    assert 'write(*,"(*(g0,1x))") r_seq_len(3)' in out_text or "call print_integer_vector(r_seq_len(3))" in out_text
+    assert "call print_integer_vector(which([" in out_text
+    assert "print_real_vector(real(shape(x)" not in out_text
+
+
+@pytest.mark.skipif(
+    os.environ.get("XR2F_FULL_EXAMPLES", "").strip() != "1",
+    reason="set XR2F_FULL_EXAMPLES=1 to compile the full example corpus",
+)
+@pytest.mark.parametrize(
+    "source_path",
+    _full_example_sources(),
+    ids=lambda p: str(p.relative_to(REPO_ROOT)),
+)
+def test_xr2f_compiles_full_example_corpus_when_enabled(tmp_path: Path, source_path: Path) -> None:
+    proc = _run_xr2f_compile_source(tmp_path, source_path)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout

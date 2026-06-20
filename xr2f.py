@@ -7367,16 +7367,24 @@ def _parse_list_constructor(expr: str) -> dict[str, object] | None:
     s = expr.strip()
     if not (s.startswith("list(") and s.endswith(")")):
         return None
+    c_probe = parse_call_text(s)
+    if c_probe is not None and c_probe[0].lower() == "list" and c_probe[1] and not c_probe[2]:
+        if _numeric_list_array_expr(s) is not None or _numeric_nested_matrix_list_array_expr(s) is not None:
+            return None
     inner = s[len("list(") : -1].strip()
     out: dict[str, object] = {}
     if not inner:
         return out
-    for p in split_top_level_commas(inner):
+    for idx, p in enumerate(split_top_level_commas(inner), start=1):
         m = re.match(r"^([A-Za-z]\w*)\s*=\s*(.+)$", p.strip())
-        if not m:
-            return None
-        k = m.group(1)
-        vtxt = m.group(2).strip()
+        if m:
+            k = m.group(1)
+            vtxt = m.group(2).strip()
+        else:
+            k = f"item{idx}"
+            vtxt = p.strip()
+            if not vtxt:
+                return None
         nested = _parse_list_constructor(vtxt)
         out[k] = nested if nested is not None else vtxt
     return out
@@ -28114,6 +28122,134 @@ def rewrite_raw_list_constructor_writes_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_unnamed_list_positional_fields_text(f90: str) -> str:
+    type_item_fields: dict[str, set[int]] = {}
+    cur_type: str | None = None
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\s*$", code, re.IGNORECASE)
+        if m_type is not None:
+            cur_type = m_type.group(1).lower()
+            type_item_fields[cur_type] = set()
+            continue
+        if cur_type is not None:
+            if re.match(r"^\s*end\s+type\b", code, re.IGNORECASE):
+                cur_type = None
+                continue
+            m_comp = re.match(r"^\s*(?:integer|logical|complex\b|real\s*\(|character\b|type\s*\().*::\s*(.+)$", code, re.IGNORECASE)
+            if m_comp is not None:
+                for item in split_top_level_commas(m_comp.group(1)):
+                    lhs = item.split("=", 1)[0].strip()
+                    lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+                    m_item = re.fullmatch(r"item(\d+)", lhs, re.IGNORECASE)
+                    if m_item is not None:
+                        type_item_fields[cur_type].add(int(m_item.group(1)))
+    if not any(type_item_fields.values()):
+        return f90
+    list_vars: dict[str, set[int]] = {}
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_decl = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        items = type_item_fields.get(m_decl.group(1).lower(), set())
+        if not items:
+            continue
+        for item in split_top_level_commas(m_decl.group(2)):
+            lhs = item.split("=", 1)[0].strip()
+            lhs = re.sub(r"\s*\(.*\)\s*$", "", lhs).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", lhs):
+                list_vars[lhs.lower()] = items
+    if not list_vars:
+        return f90
+
+    pat = re.compile(r"\b([A-Za-z]\w*)\s*\(\s*(\d+)\s*\)")
+    chained_pat = re.compile(r"\b([A-Za-z]\w*)\s*\(:,\s*(\d+)\s*\)\s*\[\s*([^\]]+)\s*\]")
+    section_pat = re.compile(r"\b([A-Za-z]\w*)\s*\(:,\s*(\d+)\s*\)")
+    neg_item_pat = re.compile(r"\b([A-Za-z]\w*%item\d+)\s*\(\s*-\s*(\d+)\s*\)")
+    neg_items_pat = re.compile(
+        r"\b([A-Za-z]\w*%item\d+)\s*\(\s*\[\s*"
+        r"((?:-\s*\d+(?:\.0*_dp)?\s*,\s*)*-\s*\d+(?:\.0*_dp)?\s*)"
+        r"(?:\]\s*\)|\)\s*\])"
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        base = m.group(1)
+        idx = int(m.group(2))
+        if idx in list_vars.get(base.lower(), set()):
+            return f"{base}%item{idx}"
+        return m.group(0)
+
+    def repl_chained(m: re.Match[str]) -> str:
+        base = m.group(1)
+        idx = int(m.group(2))
+        inner = m.group(3).strip()
+        if idx in list_vars.get(base.lower(), set()):
+            return f"{base}%item{idx}({inner})"
+        return m.group(0)
+
+    def repl_section(m: re.Match[str]) -> str:
+        base = m.group(1)
+        idx = int(m.group(2))
+        if idx in list_vars.get(base.lower(), set()):
+            return f"{base}%item{idx}"
+        return m.group(0)
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        code, bang, comment = line.partition("!")
+        new_code = chained_pat.sub(repl_chained, code)
+        new_code = section_pat.sub(repl_section, new_code)
+        new_code = pat.sub(repl, new_code)
+        new_code = neg_items_pat.sub(
+            lambda m: "xr2f_drop_real_indices("
+            + m.group(1)
+            + ", ["
+            + ", ".join(str(abs(int(float(p.strip().replace("_dp", "").replace(" ", ""))))) for p in split_top_level_commas(m.group(2)))
+            + "])",
+            new_code,
+        )
+        new_code = neg_item_pat.sub(r"xr2f_drop_real_index(\1, \2)", new_code)
+        out.append(new_code + (bang + comment if bang else ""))
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def inject_xr2f_drop_real_index_text(f90: str) -> str:
+    need_one = "xr2f_drop_real_index(" in f90 and not re.search(r"\bfunction\s+xr2f_drop_real_index\b", f90, re.IGNORECASE)
+    need_many = "xr2f_drop_real_indices(" in f90 and not re.search(r"\bfunction\s+xr2f_drop_real_indices\b", f90, re.IGNORECASE)
+    if not need_one and not need_many:
+        return f90
+    helper_lines: list[str] = []
+    if need_one:
+        helper_lines.extend([
+            "",
+            "pure function xr2f_drop_real_index(x, k) result(out)",
+            "real(kind=dp), intent(in) :: x(:)",
+            "integer, intent(in) :: k",
+            "real(kind=dp), allocatable :: out(:)",
+            "integer :: i",
+            "out = pack(x, [(i /= k, i=1,size(x))])",
+            "end function xr2f_drop_real_index",
+            "",
+        ])
+    if need_many:
+        helper_lines.extend([
+            "",
+            "pure function xr2f_drop_real_indices(x, k) result(out)",
+            "real(kind=dp), intent(in) :: x(:)",
+            "integer, intent(in) :: k(:)",
+            "real(kind=dp), allocatable :: out(:)",
+            "integer :: i",
+            "out = pack(x, [(.not. any(i == k), i=1,size(x))])",
+            "end function xr2f_drop_real_indices",
+            "",
+        ])
+    helper = "\n".join(helper_lines)
+    if re.search(r"(?m)^\s*contains\s*$", f90):
+        return re.sub(r"(?m)^(\s*contains\s*)$", r"\1" + helper, f90, count=1)
+    return re.sub(r"(?m)^(\s*end\s+module\s+[A-Za-z]\w*\s*)$", "contains\n" + helper + r"\1", f90, count=1)
+
+
 def restore_renamed_hmm_list_fields(lines: list[str]) -> list[str]:
     """Keep selected R list field names stable when local variables were renamed."""
     out: list[str] = []
@@ -33668,6 +33804,8 @@ def main() -> int:
     f90 = promote_sample_int_bound_scalars_text(f90)
     f90 = rewrite_raw_derived_type_writes_text(f90)
     f90 = rewrite_raw_list_constructor_writes_text(f90)
+    f90 = rewrite_unnamed_list_positional_fields_text(f90)
+    f90 = inject_xr2f_drop_real_index_text(f90)
     f90 = demote_literal_index_scalar_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
