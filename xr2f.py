@@ -4883,6 +4883,45 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         return 2
     if fn.name.lower() == "print_vec" and arg == "x":
         return 1
+    arg_aliases: set[str] = set()
+
+    def _collect_arg_aliases(ss_alias: list[object]) -> None:
+        changed = True
+        while changed:
+            changed = False
+            for st_alias in ss_alias:
+                if isinstance(st_alias, Assign):
+                    expr_alias = st_alias.expr.strip()
+                    if (
+                        re.fullmatch(rf"{re.escape(arg)}", expr_alias)
+                        or re.fullmatch(rf"[-+]\s*{re.escape(arg)}", expr_alias)
+                        or re.fullmatch(rf"(?:as\.numeric|as\.vector)\s*\(\s*{re.escape(arg)}\s*\)", expr_alias, re.IGNORECASE)
+                        or any(re.fullmatch(rf"{re.escape(a)}", expr_alias) for a in arg_aliases)
+                        or any(re.fullmatch(rf"[-+]\s*{re.escape(a)}", expr_alias) for a in arg_aliases)
+                    ):
+                        if st_alias.name not in arg_aliases:
+                            arg_aliases.add(st_alias.name)
+                            changed = True
+                elif isinstance(st_alias, ForStmt):
+                    _collect_arg_aliases(st_alias.body)
+                elif isinstance(st_alias, WhileStmt):
+                    _collect_arg_aliases(st_alias.body)
+                elif isinstance(st_alias, RepeatStmt):
+                    _collect_arg_aliases(st_alias.body)
+                elif isinstance(st_alias, IfStmt):
+                    _collect_arg_aliases(st_alias.then_body)
+                    _collect_arg_aliases(st_alias.else_body)
+
+    _collect_arg_aliases(fn.body)
+    if arg_aliases:
+        body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
+        for alias_arg in arg_aliases:
+            if re.search(
+                rf"\b(?:quantile|sort|order|rank|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b",
+                body_text_all,
+                re.IGNORECASE,
+            ) or re.search(rf"\b{re.escape(alias_arg)}\s*\[", body_text_all):
+                return max(forced_rank or 0, 1)
     pats_rank4 = [
         re.compile(rf"\b{re.escape(arg)}\s*\[\[[^\]]+\]\]\s*\[\[", re.IGNORECASE),
     ]
@@ -4939,6 +4978,9 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             else:
                 txt = ""
             txt = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', txt)
+            for alias_arg in arg_aliases:
+                if re.search(rf"\b(?:quantile|sort|order|rank|pack|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b", txt, re.IGNORECASE):
+                    rank = max(rank, 1)
             if (
                 re.search(r"\bsum\s*\(", txt, re.IGNORECASE)
                 and (
@@ -27402,6 +27444,272 @@ def transpile_r_functions_to_fortran_module(
     return extract_fortran_module_text(f90, module_name=module_name)
 
 
+def _r_unparse_stmt(st: object, indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    if isinstance(st, CommentStmt):
+        return []
+    if isinstance(st, Assign):
+        return [pad + f"{st.name} <- {st.expr}"]
+    if isinstance(st, PrintStmt):
+        return [pad + "print(" + ", ".join(st.args) + ")"]
+    if isinstance(st, CallStmt):
+        return [pad + st.name + "(" + ", ".join(st.args) + ")"]
+    if isinstance(st, ExprStmt):
+        return [pad + st.expr]
+    if isinstance(st, ForStmt):
+        out = [pad + f"for ({st.var} in {st.iter_expr}) {{"]
+        for child in st.body:
+            out.extend(_r_unparse_stmt(child, indent + 1))
+        out.append(pad + "}")
+        return out
+    if isinstance(st, WhileStmt):
+        out = [pad + f"while ({st.cond}) {{"]
+        for child in st.body:
+            out.extend(_r_unparse_stmt(child, indent + 1))
+        out.append(pad + "}")
+        return out
+    if isinstance(st, RepeatStmt):
+        out = [pad + "repeat {"]
+        for child in st.body:
+            out.extend(_r_unparse_stmt(child, indent + 1))
+        out.append(pad + "}")
+        return out
+    if isinstance(st, IfStmt):
+        out = [pad + f"if ({st.cond}) {{"]
+        for child in st.then_body:
+            out.extend(_r_unparse_stmt(child, indent + 1))
+        if st.else_body:
+            out.append(pad + "} else {")
+            for child in st.else_body:
+                out.extend(_r_unparse_stmt(child, indent + 1))
+        out.append(pad + "}")
+        return out
+    if isinstance(st, FuncDef):
+        return _r_unparse_function(st, indent)
+    return [pad + "# xr2f: unsupported statement in partial unparser"]
+
+
+def _r_unparse_function(fn: FuncDef, indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    out: list[str] = []
+    for cmt in fn.leading_comments:
+        ct = cmt.strip()
+        out.append(pad + (ct if ct.startswith("#") else "# " + ct))
+    args: list[str] = []
+    for arg in fn.args:
+        if arg in fn.defaults:
+            args.append(f"{arg} = {fn.defaults[arg]}")
+        else:
+            args.append(arg)
+    out.append(pad + f"{fn.name} <- function(" + ", ".join(args) + ") {")
+    for st in fn.body:
+        out.extend(_r_unparse_stmt(st, indent + 1))
+    out.append(pad + "}")
+    return out
+
+
+def _r_unparse_functions(funcs: list[FuncDef]) -> str:
+    lines: list[str] = []
+    for fn in funcs:
+        if lines:
+            lines.append("")
+        lines.extend(_r_unparse_function(fn))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _parse_r_functions_for_partial(src: str) -> list[FuncDef]:
+    comment_lookup = build_r_comment_lookup(src)
+    lines = preprocess_r_lines(src)
+    stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+    if i != len(lines):
+        raise NotImplementedError("could not parse full source for partial translation")
+    stmts = _lower_dim_assignments(stmts)
+    stmts = attach_function_adjacent_comments(stmts)
+    stmts = _rename_duplicate_function_defs(stmts)
+    stmts = rename_conflicting_loop_vars(stmts)
+    stmts = rename_conflicting_reused_vars(stmts)
+    stmts = rename_case_conflicting_names(stmts)
+    return [s for s in stmts if isinstance(s, FuncDef)]
+
+
+def _partial_skip_reason(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    if not msg:
+        msg = exc.__class__.__name__
+    msg = " ".join(msg.split())
+    if msg == "generated Fortran does not contain a module":
+        return "function could not be translated as a standalone Fortran module"
+    return msg[:220]
+
+
+def _validate_partial_module_text(f90: str, fn_name: str) -> None:
+    m_bad_dotted = re.search(r"\b([A-Za-z]\w*\.[A-Za-z]\w*)\s*\(", f90)
+    if m_bad_dotted is not None:
+        raise NotImplementedError(f"unresolved R call `{m_bad_dotted.group(1)}(...)` in generated Fortran")
+    if not re.search(rf"(?im)^\s*(?:pure\s+|elemental\s+|recursive\s+)*\s*(?:function|subroutine)\s+{re.escape(fn_name)}\b", f90):
+        raise NotImplementedError(f"generated module does not contain procedure `{fn_name}`")
+
+
+def _first_fortran_compile_error_line(output: str, source_path: Path) -> tuple[int | None, str]:
+    src_name = re.escape(source_path.name)
+    src_full = re.escape(str(source_path))
+    line_no: int | None = None
+    lines = output.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.search(rf"(?:{src_full}|{src_name}):(\d+):\d+:", ln)
+        if m is not None:
+            try:
+                line_no = int(m.group(1))
+            except ValueError:
+                line_no = None
+            msg = ""
+            for nxt in lines[i + 1 : i + 8]:
+                if re.search(r"\b(Error|Fatal Error):", nxt):
+                    msg = nxt.strip()
+                    break
+            return line_no, msg or "Fortran compile error"
+    for ln in lines:
+        if re.search(r"\b(Error|Fatal Error):", ln):
+            return None, ln.strip()
+    return None, "Fortran compile error"
+
+
+def _enclosing_fortran_procedure_at_line(f90: str, line_no: int | None) -> str | None:
+    if line_no is None or line_no <= 0:
+        return None
+    current: str | None = None
+    for i, ln in enumerate(f90.splitlines(), start=1):
+        m = re.match(r"\s*(?:pure\s+|elemental\s+|recursive\s+)*\s*(?:function|subroutine)\s+([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m is not None:
+            current = m.group(1)
+        if re.match(r"\s*end\s+(?:function|subroutine)\b", ln, re.IGNORECASE):
+            if i >= line_no:
+                return current
+            current = None
+        if i >= line_no:
+            return current
+    return current
+
+
+def transpile_r_partial_to_fortran_module(
+    src: str,
+    stem: str,
+    helper_modules: set[str] | None = None,
+    fortran_comments: bool = True,
+    forced_skips: dict[str, str] | None = None,
+    verbose: bool = False,
+) -> tuple[str, list[str], list[tuple[str, str]]]:
+    funcs = _parse_r_functions_for_partial(src)
+    if not funcs:
+        raise NotImplementedError("no R functions found for partial translation")
+    if verbose:
+        print(f"Partial: found {len(funcs)} function(s)", flush=True)
+    funcs_by_l = {fn.name.lower(): fn for fn in funcs}
+    translated: list[FuncDef] = []
+    translated_l: set[str] = set()
+    translated_by_l: dict[str, FuncDef] = {}
+    skipped: dict[str, str] = {}
+    forced_skips_l = {k.lower(): v for k, v in (forced_skips or {}).items()}
+
+    def dependency_closure(fn: FuncDef) -> list[FuncDef]:
+        seen: set[str] = set()
+        ordered: list[FuncDef] = []
+
+        def visit(cur: FuncDef) -> None:
+            deps = sorted(
+                d
+                for d in _infer_function_free_names(cur)
+                if d in translated_by_l and d not in seen
+            )
+            for dep in deps:
+                seen.add(dep)
+                dep_fn = translated_by_l[dep]
+                visit(dep_fn)
+                ordered.append(dep_fn)
+
+        visit(fn)
+        return ordered
+
+    pending = list(funcs)
+    made_progress = True
+    while pending and made_progress:
+        made_progress = False
+        next_pending: list[FuncDef] = []
+        for fn in pending:
+            if verbose:
+                print(f"Partial: testing {fn.name}", flush=True)
+            forced_reason = forced_skips_l.get(fn.name.lower())
+            if forced_reason is not None:
+                skipped[fn.name] = forced_reason
+                if verbose:
+                    print(f"Partial: skipped {fn.name} - {forced_reason}", flush=True)
+                continue
+            deps = {d for d in _infer_function_free_names(fn) if d in funcs_by_l and d != fn.name.lower()}
+            missing = sorted(d for d in deps if d not in translated_l)
+            if missing:
+                if any(d in skipped for d in missing):
+                    skipped[fn.name] = "depends on skipped function(s): " + ", ".join(missing)
+                    if verbose:
+                        print(f"Partial: skipped {fn.name} - {skipped[fn.name]}", flush=True)
+                else:
+                    next_pending.append(fn)
+                    if verbose:
+                        print(f"Partial: deferred {fn.name} - waiting for {', '.join(missing)}", flush=True)
+                continue
+            candidate_funcs = dependency_closure(fn) + [fn]
+            candidate_src = _r_unparse_functions(candidate_funcs)
+            try:
+                candidate_module = transpile_r_functions_to_fortran_module(
+                    candidate_src,
+                    stem=stem,
+                    helper_modules=helper_modules,
+                    fortran_comments=fortran_comments,
+                )
+                _validate_partial_module_text(candidate_module, fn.name)
+            except Exception as exc:
+                skipped[fn.name] = _partial_skip_reason(exc)
+                if verbose:
+                    print(f"Partial: skipped {fn.name} - {skipped[fn.name]}", flush=True)
+                continue
+            translated.append(fn)
+            translated_l.add(fn.name.lower())
+            translated_by_l[fn.name.lower()] = fn
+            if verbose:
+                print(f"Partial: accepted {fn.name}", flush=True)
+            made_progress = True
+        pending = next_pending
+    for fn in pending:
+        deps = {d for d in _infer_function_free_names(fn) if d in funcs_by_l and d != fn.name.lower()}
+        missing = sorted(d for d in deps if d not in translated_l)
+        skipped[fn.name] = "unresolved function dependency/dependencies: " + ", ".join(missing)
+    if not translated:
+        skipped_items = [(fn.name, skipped.get(fn.name, "not translated")) for fn in funcs]
+        report = ["! Partial translation report:", "! translated: <none>"]
+        for name, reason in skipped_items:
+            report.append(f"! skipped: {name} - {reason}")
+        raise NotImplementedError("\n".join(report))
+    final_src = _r_unparse_functions(translated)
+    module = transpile_r_functions_to_fortran_module(
+        final_src,
+        stem=stem,
+        helper_modules=helper_modules,
+        fortran_comments=fortran_comments,
+    )
+    translated_names = [fn.name for fn in translated]
+    skipped_items = [(fn.name, skipped[fn.name]) for fn in funcs if fn.name in skipped]
+    report = ["! Partial translation report:"]
+    report.append("! translated: " + (", ".join(translated_names) if translated_names else "<none>"))
+    if skipped_items:
+        for name, reason in skipped_items:
+            report.append(f"! skipped: {name} - {reason}")
+    else:
+        report.append("! skipped: <none>")
+    lines = module.splitlines()
+    insert_at = 1 if lines and re.match(r"^\s*module\b", lines[0], re.IGNORECASE) else 0
+    lines[insert_at:insert_at] = report
+    return "\n".join(lines) + "\n", translated_names, skipped_items
+
+
 def _norm_output(s: str) -> list[str]:
     lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines = [" ".join(ln.split()) for ln in lines]
@@ -33553,6 +33861,11 @@ def main() -> int:
     ap.add_argument("--out", help="output .f90 path (default: <input>_r.f90)")
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
     ap.add_argument(
+        "--partial",
+        action="store_true",
+        help="translate the R functions that can be translated into one Fortran module and report skipped functions",
+    )
+    ap.add_argument(
         "--annotate-r",
         nargs="?",
         const="",
@@ -33590,6 +33903,7 @@ def main() -> int:
     ap.add_argument("--time-both", action="store_true", help="time both original R and transpiled Fortran (implies --run-diff)")
     ap.add_argument("--run-repeat", type=int, default=1, help="run R/Fortran programs this many times after one transpile/build")
     ap.add_argument("--verbose-runs", action="store_true", help="with --run-repeat, print output from every repeated run")
+    ap.add_argument("--verbose", action="store_true", help="print progress information for longer translation/build workflows")
     ap.add_argument("--tee", action="store_true", help="print transpiled source; in run mode also prints transformed output")
     ap.add_argument("--tee-both", action="store_true", help="print original + transpiled source; in run-both mode prints both outputs")
     ap.add_argument("--run-all", action="store_true", help="run original R, translated Python, and translated Fortran (implies --via-python)")
@@ -33789,6 +34103,12 @@ def main() -> int:
     if args.out_python and not args.via_python:
         print("Option --out-python requires --via-python (or --run-all/--tee-all).")
         return 1
+    if args.partial and (args.run or args.run_both or args.run_diff or args.run_all or args.time or args.time_both):
+        print("Option error: --partial emits a module only and cannot be used with run/time modes.")
+        return 1
+    if args.partial and args.via_python:
+        print("Option error: --partial is only supported by direct R-to-Fortran transpilation.")
+        return 1
     if len(compiler_selectors) > 1:
         args.compile = True
         return _run_selected_compilers(sys.argv[1:], compiler_selectors)
@@ -33948,7 +34268,136 @@ def main() -> int:
             print()
 
     t0 = time.perf_counter()
-    src = in_path.read_text(encoding="utf-8")
+    src = in_path.read_text(encoding="utf-8-sig")
+    if args.partial:
+        if args.verbose:
+            print("Partial: parsing input", flush=True)
+        if args.via_core_r:
+            core_src, err = _run_xr2r_prepass(in_path)
+            if err is not None or core_src is None:
+                print(f"Transpile: FAIL ({err or 'Core-R prepass failed'})")
+                return 1
+            src = core_src
+            print("note: via-core-r prepass applied")
+        lib_calls = _find_r_library_calls(src)
+        if lib_calls:
+            if not args.allow_library:
+                ln, stmt = lib_calls[0]
+                print(f"Transpile: FAIL (unsupported package import at line {ln}: {stmt})")
+                print("Hint: rerun with --allow-library for best-effort partial transpilation.")
+                return 1
+            print("Warning: package import detected; continuing with best-effort partial translation:")
+            for ln, stmt in lib_calls:
+                print(f"  line {ln}: {stmt}")
+        if args.warn_approx:
+            _warn_approximate_r_function_calls(src)
+        forced_skips: dict[str, str] = {}
+        compile_guided_skip_limit = 25
+        cparts_partial = _with_fortran_cpp_flag(shlex.split(args.compiler)) if args.compile else []
+        include_dirs_partial: list[str] = []
+        helpers_built = False
+        t_compile = time.perf_counter()
+        while True:
+            try:
+                f90, translated_names, skipped_items = transpile_r_partial_to_fortran_module(
+                    src,
+                    in_path.stem,
+                    helper_modules=helper_modules,
+                    fortran_comments=not args.no_fortran_comments,
+                    forced_skips=forced_skips,
+                    verbose=args.verbose,
+                )
+            except NotImplementedError as e:
+                print(f"Transpile: FAIL ({e})")
+                return 1
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f90 = f"! partially transpiled by xr2f.py from {in_path.name} on {stamp}\n" + f90
+            uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
+            compile_helper_paths = [
+                hp for hp in helper_paths
+                if hp.name.lower() != "r.f90" or uses_r_mod
+            ]
+            if args.self_contained:
+                f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
+                compile_helper_paths = []
+            out_path.write_text(f90, encoding="utf-8")
+            timings["transpile"] = time.perf_counter() - t0
+            if not args.compile:
+                break
+            if args.verbose:
+                print(
+                    "Partial: compiling module"
+                    + (f" (compile-guided skips: {len(forced_skips)})" if forced_skips else ""),
+                    flush=True,
+                )
+            if not helpers_built:
+                compiler_name = Path(cparts_partial[0]).name.lower() if cparts_partial else ""
+                use_runtime_cache = bool(cparts_partial) and ("gfortran" in compiler_name or "ifx" in compiler_name)
+                for hp in compile_helper_paths:
+                    if use_runtime_cache and hp.name.lower() == "r.f90":
+                        obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts_partial)
+                        if helper_cp is not None and helper_cp.returncode != 0:
+                            print("Build helper:", " ".join(cparts_partial + ["-c", str(hp.resolve()), "-o", str(obj)]))
+                            print(f"Build: FAIL (exit {helper_cp.returncode})")
+                            _print_captured(helper_cp)
+                            return helper_cp.returncode
+                        include_dirs_partial.extend(_fortran_module_include_flags(cparts_partial, inc_dir))
+                    elif hp.exists():
+                        mod_obj = artifact_dir / f"{hp.stem}_partial_helper.o"
+                        helper_cmd = cparts_partial + ["-c", str(hp.resolve()), "-o", str(mod_obj)]
+                        print("Build helper:", " ".join(helper_cmd))
+                        helper_cp = _run_capture(helper_cmd, cwd=artifact_dir)
+                        if helper_cp.returncode != 0:
+                            print(f"Build: FAIL (exit {helper_cp.returncode})")
+                            _print_captured(helper_cp)
+                            return helper_cp.returncode
+                helpers_built = True
+            for mod_name in _module_names_in_source(out_path):
+                for stale_mod in (artifact_dir / f"{mod_name.lower()}.mod", artifact_dir / f"{mod_name.upper()}.mod"):
+                    try:
+                        stale_mod.unlink()
+                    except FileNotFoundError:
+                        pass
+            obj_out = out_path.with_suffix(".o")
+            cmd = cparts_partial + include_dirs_partial + ["-c", str(out_path), "-o", str(obj_out)]
+            cp = _run_capture(cmd, cwd=artifact_dir)
+            if cp.returncode == 0:
+                timings["compile"] = time.perf_counter() - t_compile
+                if args.verbose:
+                    print("Partial: compile passed", flush=True)
+                break
+            compile_text = (cp.stdout or "") + (cp.stderr or "")
+            err_line, err_msg = _first_fortran_compile_error_line(compile_text, out_path)
+            proc_name = _enclosing_fortran_procedure_at_line(f90, err_line)
+            if proc_name is None or proc_name.lower() in forced_skips:
+                print("Build:", " ".join(cmd))
+                print(f"Build: FAIL (exit {cp.returncode})")
+                _print_captured(cp)
+                return cp.returncode
+            forced_skips[proc_name.lower()] = f"Fortran compile failed: {err_msg}"
+            print(f"Partial compile: skipping {proc_name} - {forced_skips[proc_name.lower()]}", flush=True)
+            if len(forced_skips) >= compile_guided_skip_limit:
+                print("Build:", " ".join(cmd))
+                print(f"Build: FAIL (partial compile skip limit {compile_guided_skip_limit} reached)")
+                _print_captured(cp)
+                return cp.returncode
+            if args.verbose:
+                print("Partial: rebuilding module after compile-guided skip", flush=True)
+        print(f"wrote {out_path}")
+        print(f"Partial translation: {len(translated_names)} translated, {len(skipped_items)} skipped")
+        print("  translated: " + (", ".join(translated_names) if translated_names else "<none>"))
+        if skipped_items:
+            for name, reason in skipped_items:
+                print(f"  skipped: {name} - {reason}")
+        else:
+            print("  skipped: <none>")
+        if args.tee:
+            print(f"--- transpiled: {out_path} ---")
+            print(f90.rstrip())
+        if args.compile:
+            print("Build:", " ".join(cparts_partial + include_dirs_partial + ["-c", str(out_path), "-o", str(out_path.with_suffix(".o"))]))
+            print("Build: PASS")
+        return 0
     direct_mode = (not args.via_python)
     if args.via_python:
         assert py_out_path is not None
