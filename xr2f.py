@@ -59,6 +59,7 @@ _KNOWN_DATE_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_MATRIX_NAMES: set[str] = set()
 _KNOWN_COMPLEX_SCALAR_NAMES: set[str] = set()
+_KNOWN_NULL_NAMES: set[str] = set()
 _NULL_ARRAY_SENTINELS: dict[str, str] = {}
 _NAMED_VECTOR_NAMES: dict[str, str] = {}
 _NAMED_VECTOR_LABELS: dict[str, list[str]] = {}
@@ -7800,6 +7801,13 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"{base_dbl}(:, :, {idx_dbl})"
         if base_dbl.lower() in _KNOWN_MATRIX_NAMES:
             return f"{base_dbl}(:, {idx_dbl})"
+    m_vec_pred_subset = re.match(
+        r"^([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*((?:is\.finite|is_finite|ieee_is_finite|is\.na|is_na)\s*\(.+\))\s*\]$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_vec_pred_subset is not None:
+        return f"pack({r_expr_to_fortran(m_vec_pred_subset.group(1))}, {r_expr_to_fortran(m_vec_pred_subset.group(2).strip())})"
     trailing_subset = _split_trailing_r_subset(s)
     if trailing_subset is not None:
         base_subset, idx_subset = trailing_subset
@@ -10872,9 +10880,271 @@ def r_expr_to_fortran(expr: str) -> str:
         "as.Date",
         lambda inner: split_top_level_commas(inner.strip())[0].strip() if split_top_level_commas(inner.strip()) else inner.strip(),
     )
-    s = _replace_balanced_func_calls(s, "is.na", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
-    s = _replace_balanced_func_calls(s, "is.nan", lambda inner: f"is_na({r_expr_to_fortran(inner)})")
-    s = _replace_balanced_func_calls(s, "is.numeric", lambda inner: ".true.")
+    def _is_predicate_static_to_fortran(pred: str, inner: str) -> str:
+        txt = inner.strip()
+        txt_l = txt.lower()
+        txt_f = r_expr_to_fortran(txt)
+        txt_f_l = txt_f.strip().lower()
+        simple = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
+        simple_name = _sanitize_r_var_name(txt).lower() if simple else ""
+        call = parse_call_text(txt)
+        call_name = call[0].lower() if call is not None else ""
+
+        def _truth(v: bool) -> str:
+            return ".true." if v else ".false."
+
+        def _is_known_list_expr() -> bool:
+            if call_name == "list":
+                return True
+            if simple_name and simple_name in _KNOWN_OBJECT_LIST_NAMES:
+                return True
+            return bool(simple_name and re.fullmatch(r"[A-Za-z]\w*", txt) and simple_name.endswith("_list"))
+
+        def _is_known_data_frame_expr() -> bool:
+            return call_name == "data.frame" or call_name == "read.table" or call_name == "read.csv"
+
+        def _is_known_matrix_expr() -> bool:
+            if call_name == "array" or simple_name in _KNOWN_RANK3_NAMES:
+                return False
+            return _looks_matrix_expr(txt) or (simple_name in _KNOWN_MATRIX_NAMES) or (simple_name in _KNOWN_COMPLEX_MATRIX_NAMES)
+
+        def _is_known_array_expr() -> bool:
+            return _is_known_matrix_expr() or call_name == "array" or simple_name in _KNOWN_RANK3_NAMES
+
+        def _is_known_vector_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES:
+                return False
+            if _is_known_list_expr():
+                return True
+            if _is_known_array_expr() or _is_known_data_frame_expr():
+                return False
+            if call_name in {
+                "c",
+                "numeric",
+                "integer",
+                "logical",
+                "character",
+                "complex",
+                "seq",
+                "seq.int",
+                "seq_len",
+                "rep",
+                "rep.int",
+                "runif",
+                "rnorm",
+            }:
+                return True
+            return simple_name in (
+                _KNOWN_VECTOR_NAMES
+                | _KNOWN_INT_VECTOR_NAMES
+                | _KNOWN_LOGICAL_VECTOR_NAMES
+                | _KNOWN_CHAR_VECTOR_NAMES
+                | _KNOWN_COMPLEX_VECTOR_NAMES
+            )
+
+        def _is_known_integer_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES or _is_known_list_expr():
+                return False
+            if _is_int_literal(txt):
+                return True
+            if call_name in {"integer", "seq.int", "seq_len"}:
+                return True
+            return bool(simple_name and simple_name in (_KNOWN_INT_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES))
+
+        def _is_known_logical_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES or _is_known_list_expr():
+                return False
+            if txt.upper() in {"TRUE", "FALSE", "T", "F"}:
+                return True
+            if call_name == "logical":
+                return True
+            if simple_name and simple_name in (_KNOWN_LOGICAL_VECTOR_NAMES | _KNOWN_LOGICAL_MATRIX_NAMES):
+                return True
+            return any(_split_top_level_token(txt, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"])
+
+        def _is_known_character_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES or _is_known_list_expr():
+                return False
+            if _dequote_string_literal(txt) is not None:
+                return True
+            if call_name == "character":
+                return True
+            return bool(simple_name and simple_name in _KNOWN_CHAR_VECTOR_NAMES)
+
+        def _is_known_complex_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES or _is_known_list_expr():
+                return False
+            if _is_complex_expr_source(txt):
+                return True
+            if call_name in {"complex", "as.complex"}:
+                return True
+            return bool(
+                simple_name
+                and simple_name in (_KNOWN_COMPLEX_SCALAR_NAMES | _KNOWN_COMPLEX_VECTOR_NAMES | _KNOWN_COMPLEX_MATRIX_NAMES)
+            )
+
+        def _is_known_double_expr() -> bool:
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES or _is_known_list_expr():
+                return False
+            if _is_real_literal(txt):
+                return True
+            if call_name in {"numeric", "runif", "rnorm"}:
+                return True
+            if _is_known_integer_expr() or _is_known_logical_expr() or _is_known_character_expr() or _is_known_complex_expr():
+                return False
+            if _is_known_matrix_expr() or _is_known_vector_expr():
+                return True
+            return bool(simple_name and simple_name in _KNOWN_VECTOR_NAMES)
+
+        if pred == "list":
+            return _truth(_is_known_list_expr())
+        if pred == "data.frame":
+            return _truth(_is_known_data_frame_expr())
+        if pred == "matrix":
+            return _truth(_is_known_matrix_expr())
+        if pred == "array":
+            return _truth(_is_known_array_expr())
+        if pred == "vector":
+            return _truth(_is_known_vector_expr())
+        if pred == "atomic":
+            if txt_l == "null" or simple_name in _KNOWN_NULL_NAMES:
+                return ".false."
+            return _truth(
+                not _is_known_list_expr()
+                and not _is_known_data_frame_expr()
+                and not (simple_name and simple_name in _USER_FUNC_ARG_KIND)
+                and (
+                    _is_known_integer_expr()
+                    or _is_known_double_expr()
+                    or _is_known_logical_expr()
+                    or _is_known_character_expr()
+                    or _is_known_complex_expr()
+                    or _is_known_vector_expr()
+                    or _is_known_matrix_expr()
+                )
+            )
+        if pred == "numeric":
+            return _truth(_is_known_integer_expr() or _is_known_double_expr())
+        if pred == "integer":
+            return _truth(_is_known_integer_expr())
+        if pred == "double":
+            return _truth(_is_known_double_expr())
+        if pred == "character":
+            return _truth(_is_known_character_expr())
+        if pred == "logical":
+            return _truth(_is_known_logical_expr())
+        if pred == "complex":
+            return _truth(_is_known_complex_expr())
+        if pred == "factor":
+            return ".false."
+        if pred == "function":
+            return _truth(bool(simple_name and simple_name in _USER_FUNC_ARG_KIND))
+        if pred == "null":
+            sentinel = _NULL_ARRAY_SENTINELS.get(txt_l)
+            if sentinel is None and re.match(r"^[A-Za-z]\w*$", txt):
+                sentinel = _NULL_ARRAY_SENTINELS.get(f"{txt}_def".lower())
+            if sentinel is not None:
+                return f"(size({sentinel}) == 0)"
+            if txt_l == "null":
+                return ".true."
+            if simple_name in _KNOWN_NULL_NAMES:
+                return ".true."
+            if (
+                _is_known_list_expr()
+                or _is_known_data_frame_expr()
+                or _is_known_vector_expr()
+                or _is_known_matrix_expr()
+                or _is_known_integer_expr()
+                or _is_known_double_expr()
+                or _is_known_logical_expr()
+                or _is_known_character_expr()
+                or _is_known_complex_expr()
+            ):
+                return ".false."
+            if "$out" in txt or "%out" in txt:
+                return f"(len_trim({txt_f}) == 0)"
+            return f"({txt} == -1)"
+        raise AssertionError(pred)
+
+    def _logical_constant_like(inner: str, value: bool) -> str:
+        x_src = inner.strip()
+        x_f = r_expr_to_fortran(x_src)
+        val = ".true." if value else ".false."
+        x_simple = _sanitize_r_var_name(x_src).lower() if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", x_src) else ""
+        if x_simple in _KNOWN_RANK3_NAMES or re.match(r"^array\s*\(", x_src, re.IGNORECASE):
+            return f"reshape(spread({val}, dim=1, ncopies=size({x_f})), shape({x_f}))"
+        if _looks_matrix_expr(x_src) or x_simple in (_KNOWN_MATRIX_NAMES | _KNOWN_LOGICAL_MATRIX_NAMES):
+            return f"reshape(spread({val}, dim=1, ncopies=size({x_f})), shape({x_f}))"
+        if (
+            re.match(r"^(?:c|integer|logical|numeric|seq|seq\.int|seq_len|rep|rep\.int)\s*\(", x_src, re.IGNORECASE)
+            or x_simple in (_KNOWN_VECTOR_NAMES | _KNOWN_INT_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES | _KNOWN_CHAR_VECTOR_NAMES)
+        ):
+            return f"spread({val}, dim=1, ncopies=size({x_f}))"
+        return val
+
+    def _is_na_to_fortran(inner: str) -> str:
+        x_src = inner.strip()
+        if _is_predicate_static_to_fortran("logical", x_src) == ".true.":
+            return _logical_constant_like(x_src, False)
+        if _is_predicate_static_to_fortran("list", x_src) == ".true.":
+            return ".false."
+        return f"is_na({r_expr_to_fortran(x_src)})"
+
+    s = _replace_balanced_func_calls(s, "is.na", _is_na_to_fortran)
+
+    def _is_nan_to_fortran(inner: str) -> str:
+        x_src = inner.strip()
+        x_f = r_expr_to_fortran(x_src)
+        if _is_predicate_static_to_fortran("integer", x_src) == ".true." or _is_predicate_static_to_fortran("logical", x_src) == ".true.":
+            return _logical_constant_like(x_src, False)
+        if _is_predicate_static_to_fortran("complex", x_src) == ".true.":
+            return f"((real({x_f}, kind=dp) /= real({x_f}, kind=dp)) .or. (aimag({x_f}) /= aimag({x_f})))"
+        return f"is_na({x_f})"
+
+    def _is_finite_to_fortran(inner: str) -> str:
+        x_src = inner.strip()
+        x_f = r_expr_to_fortran(x_src)
+        if _is_predicate_static_to_fortran("integer", x_src) == ".true." or _is_predicate_static_to_fortran("logical", x_src) == ".true.":
+            return _logical_constant_like(x_src, True)
+        if _is_predicate_static_to_fortran("complex", x_src) == ".true.":
+            return f"(ieee_is_finite(real({x_f}, kind=dp)) .and. ieee_is_finite(aimag({x_f})))"
+        return f"ieee_is_finite(real({x_f}, kind=dp))"
+
+    def _is_infinite_to_fortran(inner: str) -> str:
+        x_src = inner.strip()
+        x_f = r_expr_to_fortran(x_src)
+        if _is_predicate_static_to_fortran("integer", x_src) == ".true." or _is_predicate_static_to_fortran("logical", x_src) == ".true.":
+            return _logical_constant_like(x_src, False)
+        if _is_predicate_static_to_fortran("complex", x_src) == ".true.":
+            return (
+                f"((.not. ieee_is_finite(real({x_f}, kind=dp)) .and. (real({x_f}, kind=dp) == real({x_f}, kind=dp))) "
+                f".or. (.not. ieee_is_finite(aimag({x_f})) .and. (aimag({x_f}) == aimag({x_f}))))"
+            )
+        return f"(.not. ieee_is_finite(real({x_f}, kind=dp)) .and. .not. is_na({x_f}))"
+
+    s = _replace_balanced_func_calls(s, "is.nan", _is_nan_to_fortran)
+    s = _replace_balanced_func_calls(s, "is.infinite", _is_infinite_to_fortran)
+    for _pred_name in [
+        "list",
+        "data.frame",
+        "matrix",
+        "array",
+        "vector",
+        "atomic",
+        "numeric",
+        "integer",
+        "double",
+        "character",
+        "logical",
+        "complex",
+        "factor",
+        "function",
+    ]:
+        s = _replace_balanced_func_calls(
+            s,
+            f"is.{_pred_name}",
+            lambda inner, pred=_pred_name: _is_predicate_static_to_fortran(pred, inner),
+        )
     def _is_character_to_fortran(inner: str) -> str:
         txt = inner.strip()
         if _dequote_string_literal(txt) is not None:
@@ -11000,7 +11270,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"substr({inner})"
     s = _replace_balanced_func_calls(s, "substr", _substr_to_fortran)
     s = _replace_balanced_func_calls(s, "substring", _substr_to_fortran)
-    s = _replace_balanced_func_calls(s, "is.finite", lambda inner: f"ieee_is_finite({inner.strip()})")
+    s = _replace_balanced_func_calls(s, "is.finite", _is_finite_to_fortran)
     def _dt_to_fortran(inner: str) -> str:
         parts = split_top_level_commas(inner)
         pos_dt: list[str] = []
@@ -11052,7 +11322,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if "$out" in txt or "%out" in txt:
             return f"(len_trim({txt_f}) == 0)"
         return f"({txt} == -1)"
-    s = _replace_balanced_func_calls(s, "is.null", _is_null_to_fortran)
+    s = _replace_balanced_func_calls(s, "is.null", lambda inner: _is_predicate_static_to_fortran("null", inner))
     s = re.sub(r"\bNULL\b", "-1", s)
     s = re.sub(r"\bNaN\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
     s = re.sub(r"\bNA_integer_\b", "-huge(0.0_dp)", s)
@@ -11738,6 +12008,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 il in _KNOWN_LOGICAL_VECTOR_NAMES
                 or re.match(r"^is_na\s*\(", il)
                 or re.match(r"^is\.na\s*\(", il)
+                or re.match(r"^is_finite\s*\(", il)
+                or re.match(r"^is\.finite\s*\(", il)
                 or re.match(r"^ieee_is_finite\s*\(", il)
                 or re.match(r"^complete\.cases\s*\(", il)
                 or re.match(r"^all\s*\(.+\bdim\s*=\s*2\s*\)\s*$", il)
@@ -11758,6 +12030,8 @@ def r_expr_to_fortran(expr: str) -> str:
                     il in _KNOWN_LOGICAL_VECTOR_NAMES
                     or re.match(r"^is_na\s*\(", il)
                     or re.match(r"^is\.na\s*\(", il)
+                    or re.match(r"^is_finite\s*\(", il)
+                    or re.match(r"^is\.finite\s*\(", il)
                     or re.match(r"^ieee_is_finite\s*\(", il)
                     or re.match(r"^complete\.cases\s*\(", il)
                     or re.match(r"^all\s*\(.+\bdim\s*=\s*2\s*\)\s*$", il)
@@ -12365,6 +12639,7 @@ def emit_stmts(
             or t in logical_vector_vars
             or t.lower() in _KNOWN_CHAR_VECTOR_NAMES
             or t.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+            or t.lower() in _KNOWN_COMPLEX_VECTOR_NAMES
         ):
             return 1
         if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in _KNOWN_RANK3_NAMES:
@@ -12395,6 +12670,19 @@ def emit_stmts(
             )
             return max(0, 3 - fixed_rank3)
         c_rank_print = parse_call_text(t)
+        if c_rank_print is not None and c_rank_print[0].lower() in {
+            "is.na",
+            "is_nan",
+            "is.nan",
+            "is_na",
+            "is.finite",
+            "is_finite",
+            "ieee_is_finite",
+            "is.infinite",
+            "is_infinite",
+        }:
+            arg_rank_print = c_rank_print[1][0].strip() if c_rank_print[1] else c_rank_print[2].get("x", "").strip()
+            return _expr_rank_for_print(arg_rank_print) if arg_rank_print else 0
         if c_rank_print is not None and c_rank_print[0].lower() == "round" and c_rank_print[1]:
             return _expr_rank_for_print(c_rank_print[1][0].strip())
         if c_rank_print is not None and c_rank_print[0].lower() in {"cor", "cov", "cov2cor"}:
@@ -15445,8 +15733,15 @@ def emit_stmts(
                     rank_one = _expr_rank_for_print(one)
                     if rank_one == 3:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
-                        _wstmt(f"call print_real_vector(real(reshape({one_f}, [size({one_f})]), kind=dp))", st.comment)
-                        need_r_mod.add("print_real_vector")
+                        if (
+                            re.match(r"^(?:is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE)
+                            or one_f.strip().lower().startswith("reshape(spread(.")
+                            or one_f.strip().lower().startswith("(.not. ieee_is_finite(")
+                        ):
+                            _wstmt(f'write(*,"(*(g0,1x))") reshape({one_f}, [size({one_f})])', st.comment)
+                        else:
+                            _wstmt(f"call print_real_vector(real(reshape({one_f}, [size({one_f})]), kind=dp))", st.comment)
+                            need_r_mod.add("print_real_vector")
                         continue
                     if rank_one == 2:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
@@ -15525,6 +15820,10 @@ def emit_stmts(
                             need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
                             continue
                         if re.match(r"^(?:r_in|setequal|all|any|is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE):
+                            m_scalar_logical_vec = re.match(r"^(?:is_na|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
+                            if m_scalar_logical_vec is not None and m_scalar_logical_vec.group(1).lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
+                                _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                                continue
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
                         if re.match(r"^anyDuplicated\s*\(", one_f.strip(), re.IGNORECASE):
@@ -15535,6 +15834,10 @@ def emit_stmts(
                             _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
                             continue
                         if scalar_kind_one == "logical":
+                            m_scalar_logical_vec = re.match(r"^(?:is_na|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
+                            if m_scalar_logical_vec is not None and m_scalar_logical_vec.group(1).lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
+                                _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                                continue
                             _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
                             continue
                         if _emit_print_user_vector_call_scalar(one, st.comment):
@@ -15600,7 +15903,9 @@ def emit_stmts(
                                 one_f_simple in logical_vector_vars
                                 or one_f_simple.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
                             )
-                        ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple)\s*\(", one_f_simple, re.IGNORECASE):
+                        ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple|is_na|ieee_is_finite)\s*\(", one_f_simple, re.IGNORECASE) or re.match(r"^spread\s*\(\s*\.(?:true|false)\.", one_f_simple, re.IGNORECASE) or (
+                            one_f_simple.lower().startswith("(.not. ieee_is_finite(")
+                        ):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
                         if _is_integer_rank1_expr_for_print(one, one_f):
@@ -21864,7 +22169,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
@@ -21894,6 +22199,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_VECTOR_NAMES = set()
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
+    _KNOWN_NULL_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
@@ -21960,6 +22266,11 @@ def transpile_r_to_fortran(
     _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts, {fn.name for fn in funcs})
+    _KNOWN_NULL_NAMES.update(
+        st.name.lower()
+        for st in main_stmts
+        if isinstance(st, Assign) and st.expr.strip().lower() == "null"
+    )
     sd_name_collision = "sd" in {n.lower() for n in infer_assigned_names(main_stmts)}
     for f in funcs:
         if f.name.lower() == "sd" or any(a.lower() == "sd" for a in f.args):
@@ -22367,6 +22678,59 @@ def transpile_r_to_fortran(
     _collect_integrate_objectives(stmts)
     for f in funcs:
         _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
+    fn_char_args_from_calls: dict[str, set[str]] = {}
+
+    def _register_string_literal_user_call(expr_user_call: str) -> None:
+        c_user_call = parse_call_text(expr_user_call.strip())
+        if c_user_call is None:
+            return
+        callee_l = c_user_call[0].lower()
+        arg_index = _USER_FUNC_ARG_INDEX.get(callee_l)
+        fn_def = _FUNC_DEFS_BY_NAME.get(callee_l)
+        if arg_index is None or fn_def is None:
+            return
+        out_args = fn_char_args_from_calls.setdefault(callee_l, set())
+        for i_actual, actual in enumerate(c_user_call[1]):
+            if i_actual >= len(fn_def.args):
+                continue
+            if _dequote_string_literal(actual.strip()) is not None:
+                out_args.add(fn_def.args[i_actual])
+        for k_actual, actual in c_user_call[2].items():
+            k_idx = arg_index.get(k_actual.lower())
+            if k_idx is None or k_idx >= len(fn_def.args):
+                continue
+            if _dequote_string_literal(actual.strip()) is not None:
+                out_args.add(fn_def.args[k_idx])
+
+    def _walk_register_string_literal_user_calls(ss_user_call: list[object]) -> None:
+        for st_user_call in ss_user_call:
+            if isinstance(st_user_call, CallStmt):
+                _register_string_literal_user_call(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
+            elif isinstance(st_user_call, Assign):
+                _register_string_literal_user_call(st_user_call.expr)
+            elif isinstance(st_user_call, ExprStmt):
+                expr_user_call = st_user_call.expr.strip()
+                asn_user_call = split_top_level_assignment(expr_user_call)
+                _register_string_literal_user_call(asn_user_call[1] if asn_user_call is not None else expr_user_call)
+            elif isinstance(st_user_call, PrintStmt):
+                for arg_user_call in st_user_call.args:
+                    _register_string_literal_user_call(arg_user_call)
+            elif isinstance(st_user_call, IfStmt):
+                _register_string_literal_user_call(st_user_call.cond)
+                _walk_register_string_literal_user_calls(st_user_call.then_body)
+                _walk_register_string_literal_user_calls(st_user_call.else_body)
+            elif isinstance(st_user_call, ForStmt):
+                _register_string_literal_user_call(st_user_call.iter_expr)
+                _walk_register_string_literal_user_calls(st_user_call.body)
+            elif isinstance(st_user_call, WhileStmt):
+                _register_string_literal_user_call(st_user_call.cond)
+                _walk_register_string_literal_user_calls(st_user_call.body)
+            elif isinstance(st_user_call, RepeatStmt):
+                _walk_register_string_literal_user_calls(st_user_call.body)
+            elif isinstance(st_user_call, FuncDef):
+                _walk_register_string_literal_user_calls(st_user_call.body)
+
+    _walk_register_string_literal_user_calls(stmts)
     _USER_FUNC_ARG_RANK = {
         f.name.lower(): {a.lower(): infer_arg_rank(f, a) for a in f.args}
         for f in funcs
@@ -22424,7 +22788,7 @@ def transpile_r_to_fortran(
         fn_declared_double_args = _function_declared_double_args(f)
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
-        fn_chars = fn_char_scalars.get(f.name, set())
+        fn_chars = set(fn_char_scalars.get(f.name, set())) | fn_char_args_from_calls.get(f.name.lower(), set())
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
         if (
             f.name.lower() not in _SUBROUTINE_FUNCTIONS
@@ -24395,6 +24759,7 @@ def transpile_r_to_fortran(
         merged_object_vars = dict(existing_object_vars) if isinstance(existing_object_vars, dict) else {}
         merged_object_vars.update(list_vars)
         helper_ctx_main["object_list_vars"] = merged_object_vars
+        _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in list_vars)
     if main_object_list_vars:
         existing_object_vars = helper_ctx_main.get("object_list_vars")
         merged_object_vars = dict(existing_object_vars) if isinstance(existing_object_vars, dict) else {}
@@ -26872,7 +27237,14 @@ def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
     s = _pretty_logical_tokens(s)
     lines = [" ".join(ln.split()) for ln in s.split("\n")]
     if strip_r_indices:
-        lines = [re.sub(r"^\[\d+(?:,\d+)?\]\s*", "", ln) for ln in lines]
+        stripped_lines: list[str] = []
+        for ln in lines:
+            if re.fullmatch(r"(?:\[,\d+\]\s*)+", ln):
+                continue
+            if re.fullmatch(r",\s*,\s*\d+", ln):
+                continue
+            stripped_lines.append(re.sub(r"^\[\d+(?:,\d*)?\]\s*", "", ln))
+        lines = stripped_lines
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
@@ -28212,6 +28584,32 @@ def rewrite_unnamed_list_positional_fields_text(f90: str) -> str:
         new_code = neg_item_pat.sub(r"xr2f_drop_real_index(\1, \2)", new_code)
         out.append(new_code + (bang + comment if bang else ""))
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_complex_is_na_vector_prints_text(f90: str) -> str:
+    complex_vecs: set[str] = set()
+    for m_decl in re.finditer(
+        r"(?im)^\s*complex\s*\([^)]*\)\s*,\s*allocatable\s*::\s*([^\n]+)$",
+        f90,
+    ):
+        for part in m_decl.group(1).split(","):
+            m_name = re.match(r"\s*([A-Za-z]\w*)\s*\(\s*:\s*\)\s*$", part.strip())
+            if m_name is not None:
+                complex_vecs.add(m_name.group(1).lower())
+    if not complex_vecs:
+        return f90
+
+    def repl(m: re.Match[str]) -> str:
+        indent, fmt, name = m.group(1), m.group(2), m.group(3)
+        if name.lower() not in complex_vecs:
+            return m.group(0)
+        return f'{indent}write(*,"(*(g0,1x))") is_na({name})'
+
+    return re.sub(
+        r'(?im)^(\s*)write\(\*,"(\(g0\))"\)\s+is_na\(\s*([A-Za-z]\w*)\s*\)\s*$',
+        repl,
+        f90,
+    )
 
 
 def inject_xr2f_drop_real_index_text(f90: str) -> str:
@@ -32641,6 +33039,8 @@ def main() -> int:
     )
     ap.add_argument("--run-both", action="store_true", help="run original R and transpiled Fortran")
     ap.add_argument("--run-diff", action="store_true", help="run both and compare outputs")
+    ap.add_argument("--run-diff-all", action="store_true", help="run both and list all normalized output mismatches")
+    ap.add_argument("--run-diff-max", type=int, default=50, help="maximum mismatches printed by --run-diff-all")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original R and transpiled Fortran (implies --run-diff)")
     ap.add_argument("--run-repeat", type=int, default=1, help="run R/Fortran programs this many times after one transpile/build")
@@ -32819,6 +33219,8 @@ def main() -> int:
         args.compile = True
         args.compiler = compiler_selectors[0][1]
     if args.time_both:
+        args.run_diff = True
+    if args.run_diff_all:
         args.run_diff = True
     if args.run_all:
         args.via_python = True
@@ -33805,6 +34207,7 @@ def main() -> int:
     f90 = rewrite_raw_derived_type_writes_text(f90)
     f90 = rewrite_raw_list_constructor_writes_text(f90)
     f90 = rewrite_unnamed_list_positional_fields_text(f90)
+    f90 = rewrite_complex_is_na_vector_prints_text(f90)
     f90 = inject_xr2f_drop_real_index_text(f90)
     f90 = demote_literal_index_scalar_assignments_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
@@ -34121,6 +34524,23 @@ def main() -> int:
                         print(f"  r      : {r_lines[first]}")
                     if first < len(f_lines):
                         print(f"  fortran: {f_lines[first]}")
+                    if args.run_diff_all:
+                        mismatches: list[tuple[int, str | None, str | None]] = []
+                        max_len = max(len(r_lines), len(f_lines))
+                        for i_line in range(max_len):
+                            r_line = r_lines[i_line] if i_line < len(r_lines) else None
+                            f_line = f_lines[i_line] if i_line < len(f_lines) else None
+                            if r_line != f_line:
+                                mismatches.append((i_line, r_line, f_line))
+                        cap = max(0, int(args.run_diff_max))
+                        shown = mismatches if cap == 0 else mismatches[:cap]
+                        print(f"  mismatches: {len(mismatches)}")
+                        if cap != 0 and len(mismatches) > cap:
+                            print(f"  showing first {cap} mismatches")
+                        for i_line, r_line, f_line in shown:
+                            print(f"  line {i_line + 1}")
+                            print(f"    r      : {r_line if r_line is not None else '<missing>'}")
+                            print(f"    fortran: {f_line if f_line is not None else '<missing>'}")
                     for dl in difflib.unified_diff(r_lines, f_lines, fromfile="r", tofile="fortran", n=1):
                         print(dl)
                         if dl.startswith("@@"):
