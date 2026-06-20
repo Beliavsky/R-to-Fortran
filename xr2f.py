@@ -4191,6 +4191,13 @@ def classify_vars(
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^lm\.fit\s*\(.*\)\s*(?:\$|%)\s*residuals\s*$", rhs, re.IGNORECASE):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag|toeplitz|autocov_matrices|read\.csv)\s*\(", rhs, re.IGNORECASE) or re.match(r"^try\s*\(\s*(?:matrix|array|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -5233,11 +5240,13 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             re.IGNORECASE,
         )
         spread_rhs = re.compile(rf"^\s*{v}\s*<-\s*.*\b(?:spread|r_matmul)\s*\(", re.IGNORECASE)
+        lmfit_resid_rhs = re.compile(rf"^\s*{v}\s*<-\s*lm\.fit\s*\(.*\)\s*(?:\$|%)\s*residuals\s*$", re.IGNORECASE)
         return any(
             _has_rank2_index_use(t, var)
             or mat_rhs.search(t)
             or mat_call_rhs.search(t)
             or spread_rhs.search(t)
+            or lmfit_resid_rhs.search(t)
             or (re.search(rf"^\s*{v}\s*<-.*%\*%", t) and "as.numeric" not in t.lower())
             for t in texts
         )
@@ -6047,6 +6056,14 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     expr_l = expr.lower()
     if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)vectors", expr_l):
         return 2
+    m_lmfit_resid_rank = re.match(r"^(lm\.fit\s*\(.*\))\s*(?:\$|%)\s*residuals\s*$", expr, re.IGNORECASE)
+    if m_lmfit_resid_rank is not None:
+        c_lmfit_rank = parse_call_text(m_lmfit_resid_rank.group(1))
+        if c_lmfit_rank is not None and c_lmfit_rank[0].lower() == "lm.fit":
+            y_src_rank = c_lmfit_rank[1][1].strip() if len(c_lmfit_rank[1]) >= 2 else c_lmfit_rank[2].get("y", "").strip()
+            if y_src_rank:
+                return max(1, _infer_assignment_rank_hint(y_src_rank, inferred_ranks))
+        return 1
     if re.fullmatch(r"[A-Za-z]\w*(?:\$|%)(?:values|par|coef|fitted|resid|weights|mu)", expr_l):
         return 1
     if re.match(r"^uniroot\s*\(.*\)\s*(?:\$|%)\s*root\s*$", expr_l, re.IGNORECASE):
@@ -8045,6 +8062,16 @@ def r_expr_to_fortran(expr: str) -> str:
             if x_src_e is None or y_src_e is None:
                 raise NotImplementedError("lm.fit(... )$coefficients requires x and y")
             return f"qr_coef(qr(real({r_expr_to_fortran(x_src_e)}, kind=dp)), {r_expr_to_fortran(y_src_e)})"
+    m_lmfit_resid_early = re.match(r"^(lm\.fit\s*\(.*\))\s*\$\s*residuals\s*$", s, re.IGNORECASE)
+    if m_lmfit_resid_early is not None:
+        c_lmfit_e = parse_call_text(m_lmfit_resid_early.group(1))
+        if c_lmfit_e is not None and c_lmfit_e[0].lower() == "lm.fit":
+            _nm_lm_e, pos_lm_e, kw_lm_e = c_lmfit_e
+            x_src_e = pos_lm_e[0] if pos_lm_e else kw_lm_e.get("x")
+            y_src_e = pos_lm_e[1] if len(pos_lm_e) >= 2 else kw_lm_e.get("y")
+            if x_src_e is None or y_src_e is None:
+                raise NotImplementedError("lm.fit(... )$residuals requires x and y")
+            return f"qr_resid(qr(real({r_expr_to_fortran(x_src_e)}, kind=dp)), real({r_expr_to_fortran(y_src_e)}, kind=dp))"
     m_coef_named_early = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]\s*$", s, re.IGNORECASE)
     if m_coef_named_early is not None:
         fit_nm = m_coef_named_early.group(1)
@@ -8222,7 +8249,16 @@ def r_expr_to_fortran(expr: str) -> str:
             if csv_src is not None:
                 return f"setdiff(read_csv_header_names({r_expr_to_fortran(csv_src)}), [character(len=4) :: \"Date\"])"
             return f"r_seq_int(1, size({base_sd}, 2) - 1)"
-        return f"setdiff({r_expr_to_fortran(c_setdiff[1][0].strip())}, {r_expr_to_fortran(c_setdiff[1][1].strip())})"
+        y_src_sd = c_setdiff[1][1].strip()
+        y_f_sd = r_expr_to_fortran(y_src_sd)
+        y_is_vec_sd = y_f_sd.strip().startswith("[") or re.match(
+            r"^(?:r_seq_int|r_seq_len|r_rep_int|r_rep_real|setdiff|union|intersect|which|pack)\s*\(",
+            y_f_sd.strip(),
+            re.IGNORECASE,
+        ) is not None
+        if not y_is_vec_sd:
+            y_f_sd = f"[{_int_bound_expr(y_f_sd)}]" if (_is_int_literal(y_src_sd) or re.fullmatch(r"[A-Za-z]\w*", y_src_sd)) else f"[{y_f_sd}]"
+        return f"setdiff({r_expr_to_fortran(c_setdiff[1][0].strip())}, {y_f_sd})"
     # Drop namespace qualifiers (e.g., stats::sd -> sd) in this subset.
     s = re.sub(r"\b[A-Za-z]\w*::", "", s)
     s = re.sub(r"(?i)\bsd\s*\(", f"{_R_SD_CALL_NAME}(", s)
@@ -8284,7 +8320,13 @@ def r_expr_to_fortran(expr: str) -> str:
                 args_b.append(f"expon_scaled={r_expr_to_fortran(exp_src)}")
             return f"{c_pre[0]}({', '.join(args_b)})"
         if nm_pre in {"cbind", "cbind2"} and c_pre[2]:
-            arg_srcs = [a.strip() for a in (pos_pre + list(c_pre[2].values()))]
+            arg_srcs = [
+                a.strip()
+                for a in (pos_pre + list(c_pre[2].values()))
+                if a.strip().lower() not in _KNOWN_NULL_NAMES
+            ]
+            if len(arg_srcs) == 1:
+                return r_expr_to_fortran(arg_srcs[0])
             ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
             ref_f = r_expr_to_fortran(ref_src) if ref_src else ""
             args: list[str] = []
@@ -8296,6 +8338,12 @@ def r_expr_to_fortran(expr: str) -> str:
                     args.append(f"spread({af}, dim=1, ncopies=size({ref_f}))")
                 else:
                     args.append(af)
+            args = [
+                f"real({arg}, kind=dp)"
+                if src.strip().lower() in _KNOWN_INT_VECTOR_NAMES or src.strip().lower() in _CURRENT_INT_ARRAY_NAMES
+                else arg
+                for src, arg in zip(arg_srcs, args)
+            ]
             if any(re.search(r"_dp\b|real\s*\(|anint\s*\(|r_acf_values|ARMAacf", a, re.IGNORECASE) for a in args):
                 args = [f"real({a}, kind=dp)" if re.match(r"^(?:r_seq_int|r_seq_len|int\s*\(|\[)", a, re.IGNORECASE) else a for a in args]
             if args:
@@ -8303,7 +8351,9 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
                 return f"{c_pre[0]}({', '.join(args)})"
         if nm_pre in {"cbind", "cbind2"} and len(pos_pre) >= 2 and not c_pre[2]:
-            arg_srcs = [a.strip() for a in pos_pre]
+            arg_srcs = [a.strip() for a in pos_pre if a.strip().lower() not in _KNOWN_NULL_NAMES]
+            if len(arg_srcs) == 1:
+                return r_expr_to_fortran(arg_srcs[0])
             ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
             ref_f = r_expr_to_fortran(ref_src) if ref_src else ""
             args = []
@@ -8315,6 +8365,12 @@ def r_expr_to_fortran(expr: str) -> str:
                     args.append(f"spread({af}, dim=1, ncopies=size({ref_f}))")
                 else:
                     args.append(af)
+            args = [
+                f"real({arg}, kind=dp)"
+                if src.strip().lower() in _KNOWN_INT_VECTOR_NAMES or src.strip().lower() in _CURRENT_INT_ARRAY_NAMES
+                else arg
+                for src, arg in zip(arg_srcs, args)
+            ]
             if any(re.search(r"_dp\b|real\s*\(|anint\s*\(|r_acf_values|ARMAacf", a, re.IGNORECASE) for a in args):
                 args = [f"real({a}, kind=dp)" if re.match(r"^(?:r_seq_int|r_seq_len|int\s*\(|\[)", a, re.IGNORECASE) else a for a in args]
             if nm_pre == "cbind" and len(args) > 3:
@@ -9834,13 +9890,34 @@ def r_expr_to_fortran(expr: str) -> str:
                 form = pos_lm[0].strip() if pos_lm else kw_lm.get("formula", "").strip()
                 m_form = re.match(r"^([A-Za-z]\w*)\s*~\s*(.+)$", form)
                 if m_form:
-                    yv = r_expr_to_fortran(m_form.group(1).strip())
+                    y_src_lm = m_form.group(1).strip()
+                    yv = r_expr_to_fortran(y_src_lm)
                     rhs_terms = m_form.group(2).strip()
-                    terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
+                    data_name = kw_lm.get("data", "").strip()
+                    no_intercept_inline = bool(re.search(r"(^|[+])\s*0\s*([+]|$)", rhs_terms)) or bool(
+                        re.search(r"(^|[+])\s*-?\s*1\s*$", rhs_terms)
+                    )
+                    rhs_clean = re.sub(r"(^|[+])\s*0\s*([+]|$)", "+", rhs_terms)
+                    rhs_clean = re.sub(r"(^|[+])\s*-?\s*1\s*$", "", rhs_clean).strip()
+                    raw_terms = [t.strip() for t in split_top_level_commas(rhs_clean.replace("+", ",")) if t.strip()]
+                    terms: list[str] = []
+                    if raw_terms == ["."] and data_name:
+                        fields = _EXPANDED_DATA_FRAME_FIELDS.get(data_name) or _EXPANDED_DATA_FRAME_FIELDS.get(data_name.lower()) or []
+                        for fld in fields:
+                            if fld == y_src_lm:
+                                continue
+                            terms.append(_expanded_data_frame_col_expr(data_name, fld) or f"{data_name}_{_sanitize_fortran_kwarg_name(fld)}")
+                    else:
+                        terms = raw_terms
                     if terms:
+                        if len(terms) == 1 and _looks_matrix_expr(terms[0]):
+                            xpred_inline = r_expr_to_fortran(terms[0])
+                            return f"lm_coef({yv}, real({xpred_inline}, kind=dp))"
                         p = len(terms)
                         cols = ", ".join(f"real({r_expr_to_fortran(t)}, kind=dp)" for t in terms)
                         first = r_expr_to_fortran(terms[0])
+                        if no_intercept_inline and len(terms) == 1 and not _looks_matrix_expr(terms[0]):
+                            return f"qr_coef(qr(reshape([{cols}], [size({first}), {p}])), {yv})"
                         return f"lm_coef({yv}, reshape([{cols}], [size({first}), {p}]))"
             return f"{r_expr_to_fortran(obj_src)}%coef"
     c_sw = parse_call_text(s)
@@ -12851,6 +12928,12 @@ def emit_stmts(
             if nm_c in {"qr.r", "qr_r", "qr.q", "qr_q"}:
                 return 2
             if nm_c in {"qr.coef", "qr_coef", "qr.fitted", "qr_fitted", "qr.resid", "qr_resid", "qr.qty", "qr_qty", "qr.qy", "qr_qy", "qr.solve", "qr_solve"}:
+                if nm_c in {"qr.resid", "qr_resid", "qr.fitted", "qr_fitted", "qr.qty", "qr_qty", "qr.qy", "qr_qy"}:
+                    y_arg_qr = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("y", "").strip()
+                    if y_arg_qr:
+                        rr_y_qr = _expr_rank_for_print(y_arg_qr)
+                        if rr_y_qr is not None:
+                            return rr_y_qr
                 return 1
             if nm_c in {"predict", "lm_predict_general"}:
                 return 1
@@ -14256,8 +14339,8 @@ def emit_stmts(
                 is_aov = _nm_lm.lower() == "aov"
                 is_glm = _nm_lm.lower() == "glm"
                 form = pos_lm[0].strip() if pos_lm else kw_lm.get("formula", "").strip()
-                m_form = re.match(r"^([A-Za-z]\w*)\s*~\s*(.+)$", form)
-                if not m_form:
+                form_split = _split_top_level_token(form, "~", from_right=False)
+                if form_split is None:
                     raise NotImplementedError("lm/aov/glm requires formula like y ~ x1 + x2 + ... in this subset")
                 if is_glm:
                     fam_src = kw_lm.get("family", "")
@@ -14267,8 +14350,8 @@ def emit_stmts(
                     glm_family = "poisson" if re.match(r"^poisson\s*\(", fam_txt, re.IGNORECASE) else "binomial"
                 else:
                     glm_family = ""
-                yv = r_expr_to_fortran(m_form.group(1).strip())
-                rhs_terms = m_form.group(2).strip()
+                yv = r_expr_to_fortran(form_split[0].strip())
+                rhs_terms = form_split[1].strip()
                 data_name = kw_lm.get("data", "").strip()
                 if rhs_terms == "." and data_name in data_frame_vars:
                     df_y, df_x = data_frame_vars[data_name]
@@ -14321,15 +14404,23 @@ def emit_stmts(
                 lm_design_exprs_by_fit[st.name] = term_exprs
                 lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src)
                 p = len(term_exprs)
+                single_matrix_term = len(terms) == 1 and (
+                    _expr_rank_for_print(terms[0]) == 2
+                    or re.match(r"^[A-Za-z]\w*\s*\[\s*,\s*[A-Za-z]\w*\s*\]$", terms[0].strip()) is not None
+                )
                 o.w("block")
                 o.push()
                 o.w("integer :: n_lm, p_lm")
-                o.w("real(kind=dp), allocatable :: x_lm(:,:)")
+                if single_matrix_term:
+                    pass
+                else:
+                    o.w("real(kind=dp), allocatable :: x_lm(:,:)")
                 o.w(f"n_lm = size({yv})")
-                o.w(f"p_lm = {p}")
-                o.w("allocate(x_lm(n_lm, p_lm))")
-                for j, tv in enumerate(term_exprs, start=1):
-                    o.w(f"x_lm(:, {j}) = {tv}")
+                if not single_matrix_term:
+                    o.w(f"p_lm = {p}")
+                    o.w("allocate(x_lm(n_lm, p_lm))")
+                    for j, tv in enumerate(term_exprs, start=1):
+                        o.w(f"x_lm(:, {j}) = {tv}")
                 if is_glm:
                     if glm_family == "poisson":
                         offset_f = "spread(0.0_dp, dim=1, ncopies=n_lm)"
@@ -14341,7 +14432,7 @@ def emit_stmts(
                     else:
                         o.w(f"{st.name} = glm_binomial_fit({yv}, x_lm)")
                 else:
-                    o.w(f"{st.name} = lm_fit_general({yv}, x_lm)")
+                    o.w(f"{st.name} = lm_fit_general({yv}, {term_exprs[0] if single_matrix_term else 'x_lm'})")
                 o.pop()
                 o.w("end block")
                 if helper_ctx is not None:
@@ -14751,6 +14842,34 @@ def emit_stmts(
                 inner_lhs = m_lhs_mask.group(2).strip()
                 if "," not in inner_lhs:
                     inner_l = inner_lhs.lower()
+                    base_lhs_l = base_lhs.lower()
+                    try:
+                        local_rank_scan_text = "\n".join(_stmt_texts_for_rank_scan(stmts))
+                    except Exception:
+                        try:
+                            local_rank_scan_text = "\n".join(_stmt_texts_for_rank_scan(body_use))
+                        except Exception:
+                            local_rank_scan_text = ""
+                    local_vector_ctor_lhs = bool(
+                        local_rank_scan_text
+                        and re.search(
+                            rf"(?m)^\s*{re.escape(base_lhs)}\s*<-\s*(?:numeric|double|integer|logical|character|complex|c|seq|seq_len|seq_along|rep)\s*\(",
+                            local_rank_scan_text,
+                            re.IGNORECASE,
+                        )
+                    )
+                    base_lhs_is_vector = (
+                        local_vector_ctor_lhs
+                        or base_lhs in (int_vector_vars | real_vector_vars | logical_vector_vars)
+                        or base_lhs_l
+                        in (
+                            _KNOWN_VECTOR_NAMES
+                            | _KNOWN_INT_VECTOR_NAMES
+                            | _KNOWN_LOGICAL_VECTOR_NAMES
+                            | _KNOWN_CHAR_VECTOR_NAMES
+                            | _KNOWN_COMPLEX_VECTOR_NAMES
+                        )
+                    )
                     if (
                         inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
                         or re.match(r"^is\.na\s*\(", inner_l)
@@ -14759,6 +14878,77 @@ def emit_stmts(
                     ):
                         mask_f = r_expr_to_fortran(inner_lhs)
                         _wstmt(f"where ({mask_f}) {base_lhs} = {rhs_f}", st.comment)
+                        continue
+                    if base_lhs_is_vector:
+                        named_lhs_f = _named_subscript_lhs_to_fortran(lhs)
+                        if named_lhs_f is not None:
+                            _wstmt(f"{named_lhs_f} = {rhs_f}", st.comment)
+                            continue
+                        idx_vec_f = _strict_int_vector_literal_from_c(inner_lhs) or r_expr_to_fortran(inner_lhs)
+                        idx_vec_f = idx_vec_f.strip()
+                        idx_is_scalar = _is_int_literal(inner_lhs) or _is_real_literal(inner_lhs) or (
+                            idx_vec_f.lower().startswith("size(")
+                            or idx_vec_f.lower().startswith("len(")
+                        ) or (
+                            re.fullmatch(r"[A-Za-z]\w*", inner_lhs)
+                            and inner_lhs.lower()
+                            not in (
+                                _KNOWN_VECTOR_NAMES
+                                | _KNOWN_INT_VECTOR_NAMES
+                                | _KNOWN_LOGICAL_VECTOR_NAMES
+                            )
+                            and inner_lhs not in vector_vars
+                        )
+                        if idx_is_scalar:
+                            _wstmt(f"{base_lhs}({_int_bound_expr(idx_vec_f)}) = {rhs_f}", st.comment)
+                            continue
+                        rhs_stripped_lin = rhs_f.strip()
+                        rhs_call_lin = parse_call_text(st.expr.strip())
+                        rhs_is_vec_lin = (
+                            rhs_call_lin is not None
+                            and rhs_call_lin[0].lower() in {"c", "seq", "seq_len", "seq_along"}
+                        ) or st.expr.strip() in vector_vars or st.expr.strip().lower() in _KNOWN_VECTOR_NAMES or bool(
+                            re.match(
+                                r"^-?\s*(?:r_drop_index|r_drop_indices|pack|setdiff|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(",
+                                rhs_stripped_lin,
+                            )
+                        )
+                        if rhs_call_lin is not None and rhs_call_lin[0].lower() in {"which.max", "which.min"}:
+                            rhs_is_vec_lin = False
+                        o.w("block")
+                        o.push()
+                        o.w("integer :: i_lin, idx_lin")
+                        o.w("integer, allocatable :: idx_lin_vec(:)")
+                        if rhs_is_vec_lin:
+                            if base_lhs in int_vector_vars or base_lhs_l in _KNOWN_INT_VECTOR_NAMES:
+                                o.w("integer, allocatable :: rhs_lin_vec(:)")
+                            elif base_lhs in logical_vector_vars or base_lhs_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                o.w("logical, allocatable :: rhs_lin_vec(:)")
+                            else:
+                                o.w("real(kind=dp), allocatable :: rhs_lin_vec(:)")
+                        o.w(f"idx_lin_vec = int({idx_vec_f})")
+                        if rhs_is_vec_lin:
+                            if base_lhs in int_vector_vars or base_lhs_l in _KNOWN_INT_VECTOR_NAMES:
+                                o.w(f"rhs_lin_vec = int({rhs_f})")
+                            elif base_lhs in logical_vector_vars or base_lhs_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                o.w(f"rhs_lin_vec = {rhs_f}")
+                            else:
+                                o.w(f"rhs_lin_vec = real({rhs_f}, kind=dp)")
+                        o.w("do i_lin = 1, size(idx_lin_vec)")
+                        o.push()
+                        o.w("idx_lin = idx_lin_vec(i_lin)")
+                        o.w(f"if (idx_lin >= 1 .and. idx_lin <= size({base_lhs})) then")
+                        o.push()
+                        rhs_assign_lin = (
+                            "rhs_lin_vec(mod(i_lin - 1, size(rhs_lin_vec)) + 1)" if rhs_is_vec_lin else rhs_f
+                        )
+                        o.w(f"{base_lhs}(idx_lin) = {rhs_assign_lin}")
+                        o.pop()
+                        o.w("end if")
+                        o.pop()
+                        o.w("end do")
+                        o.pop()
+                        o.w("end block")
                         continue
                     if _index_assignment_needs_replace(inner_lhs):
                         idx_raw = r_expr_to_fortran(inner_lhs)
@@ -16941,6 +17131,115 @@ def emit_stmts(
                     is_tri_mask_lhs = bool(re.match(r"^!?\s*(?:lower\.tri|upper\.tri)\s*\(", inner_lhs, re.IGNORECASE))
                     if "," not in inner_lhs or is_tri_mask_lhs:
                         inner_l = inner_lhs.lower()
+                        base_lhs_l = base_lhs.lower()
+                        try:
+                            local_rank_scan_text = "\n".join(_stmt_texts_for_rank_scan(stmts))
+                        except Exception:
+                            local_rank_scan_text = ""
+                        local_vector_ctor_lhs = bool(
+                            local_rank_scan_text
+                            and re.search(
+                                rf"(?m)^\s*{re.escape(base_lhs)}\s*<-\s*(?:numeric|double|integer|logical|character|complex|c|seq|seq_len|seq_along|rep)\s*\(",
+                                local_rank_scan_text,
+                                re.IGNORECASE,
+                            )
+                        )
+                        base_lhs_is_vector = (
+                            local_vector_ctor_lhs
+                            or
+                            base_lhs in (int_vector_vars | real_vector_vars | logical_vector_vars)
+                            or base_lhs_l
+                            in (
+                                _KNOWN_VECTOR_NAMES
+                                | _KNOWN_INT_VECTOR_NAMES
+                                | _KNOWN_LOGICAL_VECTOR_NAMES
+                                | _KNOWN_CHAR_VECTOR_NAMES
+                                | _KNOWN_COMPLEX_VECTOR_NAMES
+                            )
+                        )
+                        if (
+                            not is_tri_mask_lhs
+                            and base_lhs_is_vector
+                            and not (
+                                inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                                or inner_l in _KNOWN_LOGICAL_MATRIX_NAMES
+                                or re.match(r"^is\.na\s*\(", inner_l)
+                                or re.match(r"^is_na\s*\(", inner_l)
+                                or inner_l.startswith("!")
+                                or any(op in inner_l for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
+                            )
+                        ):
+                            named_lhs_f = _named_subscript_lhs_to_fortran(lhs_src)
+                            if named_lhs_f is not None:
+                                _wstmt(f"{named_lhs_f} = {rhs}", st.comment)
+                                continue
+                            idx_vec_f = _strict_int_vector_literal_from_c(inner_lhs) or r_expr_to_fortran(inner_lhs)
+                            idx_vec_f = idx_vec_f.strip()
+                            idx_is_scalar = _is_int_literal(inner_lhs) or _is_real_literal(inner_lhs) or (
+                                idx_vec_f.lower().startswith("size(")
+                                or idx_vec_f.lower().startswith("len(")
+                            ) or (
+                                re.fullmatch(r"[A-Za-z]\w*", inner_lhs)
+                                and inner_lhs.lower()
+                                not in (
+                                    _KNOWN_VECTOR_NAMES
+                                    | _KNOWN_INT_VECTOR_NAMES
+                                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                                )
+                                and inner_lhs not in vector_vars
+                            )
+                            if idx_is_scalar:
+                                _wstmt(f"{base_lhs_f}({_int_bound_expr(idx_vec_f)}) = {rhs}", st.comment)
+                                continue
+                            rhs_src_lin = asn[1].strip()
+                            rhs_stripped_lin = rhs.strip()
+                            rhs_call_lin = parse_call_text(rhs_src_lin)
+                            rhs_is_vec_lin = (
+                                rhs_call_lin is not None
+                                and rhs_call_lin[0].lower() in {"c", "seq", "seq_len", "seq_along"}
+                            ) or rhs_src_lin in vector_vars or rhs_src_lin.lower() in _KNOWN_VECTOR_NAMES or bool(
+                                re.match(
+                                    r"^-?\s*(?:r_drop_index|r_drop_indices|pack|setdiff|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(",
+                                    rhs_stripped_lin,
+                                )
+                            )
+                            if rhs_call_lin is not None and rhs_call_lin[0].lower() in {"which.max", "which.min"}:
+                                rhs_is_vec_lin = False
+                            o.w("block")
+                            o.push()
+                            o.w("integer :: i_lin, idx_lin")
+                            o.w("integer, allocatable :: idx_lin_vec(:)")
+                            if rhs_is_vec_lin:
+                                if base_lhs in int_vector_vars or base_lhs_l in _KNOWN_INT_VECTOR_NAMES:
+                                    o.w("integer, allocatable :: rhs_lin_vec(:)")
+                                elif base_lhs in logical_vector_vars or base_lhs_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                    o.w("logical, allocatable :: rhs_lin_vec(:)")
+                                else:
+                                    o.w("real(kind=dp), allocatable :: rhs_lin_vec(:)")
+                            o.w(f"idx_lin_vec = int({idx_vec_f})")
+                            if rhs_is_vec_lin:
+                                if base_lhs in int_vector_vars or base_lhs_l in _KNOWN_INT_VECTOR_NAMES:
+                                    o.w(f"rhs_lin_vec = int({rhs})")
+                                elif base_lhs in logical_vector_vars or base_lhs_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+                                    o.w(f"rhs_lin_vec = {rhs}")
+                                else:
+                                    o.w(f"rhs_lin_vec = real({rhs}, kind=dp)")
+                            o.w("do i_lin = 1, size(idx_lin_vec)")
+                            o.push()
+                            o.w("idx_lin = idx_lin_vec(i_lin)")
+                            o.w(f"if (idx_lin >= 1 .and. idx_lin <= size({base_lhs_f})) then")
+                            o.push()
+                            rhs_assign_lin = (
+                                "rhs_lin_vec(mod(i_lin - 1, size(rhs_lin_vec)) + 1)" if rhs_is_vec_lin else rhs
+                            )
+                            o.w(f"{base_lhs_f}(idx_lin) = {rhs_assign_lin}")
+                            o.pop()
+                            o.w("end if")
+                            o.pop()
+                            o.w("end do")
+                            o.pop()
+                            o.w("end block")
+                            continue
                         if (
                             not is_tri_mask_lhs
                             and base_lhs in (int_matrix_vars | real_matrix_vars | logical_matrix_vars)
@@ -17794,6 +18093,8 @@ def emit_function(
     purity_texts = _collect_stmt_expr_texts(body_stmts) + ([last.expr] if isinstance(last, ExprStmt) else [])
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
+    if any(re.search(r"\b(?:lm\.fit|qr|qr\.coef|qr\.resid|qr_coef|qr_resid)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
+        can_be_pure = False
     if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
     for txt_pure in purity_texts:
@@ -18140,6 +18441,17 @@ def emit_function(
             arg_type[a] = "char_array"
             continue
         ar = arg_rank.get(a, 0)
+        dflt_s = dflt.strip()
+        if (
+            dflt_s
+            and _is_real_literal(dflt_s)
+            and a not in fn_int_args
+            and a not in {"n", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
+            and not a.endswith("_order")
+        ):
+            o.w(f"real(kind=dp), intent({intent}){opt} :: {a}")
+            arg_type[a] = "real"
+            continue
         if ar >= 1 and a in fn_int_mod_args:
             dims = "(" + ":," * (ar - 1) + ":)"
             o.w(f"integer, intent({intent}){opt} :: {a}{dims}")
@@ -18394,6 +18706,11 @@ def emit_function(
                 body_use = [_rename_stmt_obj(st, {cand_alias: rname}) for st in body_use]
                 result_alias_source = cand_alias
     if body_no_ret:
+        _KNOWN_NULL_NAMES.update(
+            st2.name.lower()
+            for st2 in body_use
+            if isinstance(st2, Assign) and st2.expr.strip().upper() == "NULL"
+        )
         body_use = [
             st2
             for st2 in body_use
@@ -18631,6 +18948,12 @@ def emit_function(
                                 need_r_mod.add("integrate")
                                 need_r_mod.add("integrate_result_t")
                                 need_r_mod.add("print_integrate_result")
+                            continue
+                        if callee.lower() == "eigen":
+                            local_list_types[lhs_nm] = "eigen_result_t"
+                            if has_r_mod:
+                                need_r_mod.add("eigen")
+                                need_r_mod.add("eigen_result_t")
                             continue
                         if callee.lower() == "max_col" and has_r_mod:
                             need_r_mod.add("max_col")
@@ -22271,6 +22594,22 @@ def transpile_r_to_fortran(
         for st in main_stmts
         if isinstance(st, Assign) and st.expr.strip().lower() == "null"
     )
+    def _collect_null_names_pre(ss_null: list[object]) -> None:
+        for st_null in ss_null:
+            if isinstance(st_null, Assign):
+                if st_null.expr.strip().lower() == "null":
+                    _KNOWN_NULL_NAMES.add(st_null.name.lower())
+            elif isinstance(st_null, IfStmt):
+                _collect_null_names_pre(st_null.then_body)
+                _collect_null_names_pre(st_null.else_body)
+            elif isinstance(st_null, ForStmt):
+                _collect_null_names_pre(st_null.body)
+            elif isinstance(st_null, WhileStmt):
+                _collect_null_names_pre(st_null.body)
+            elif isinstance(st_null, RepeatStmt):
+                _collect_null_names_pre(st_null.body)
+    for f_null in funcs:
+        _collect_null_names_pre(f_null.body)
     sd_name_collision = "sd" in {n.lower() for n in infer_assigned_names(main_stmts)}
     for f in funcs:
         if f.name.lower() == "sd" or any(a.lower() == "sd" for a in f.args):
@@ -27666,20 +28005,18 @@ def rewrite_rank3_print_matrix_calls(lines: list[str]) -> list[str]:
 
 def rewrite_matrix_linear_indices(lines: list[str]) -> list[str]:
     """Lower simple R-style linear indexing of matrices to Fortran row/column indexing."""
-    matrices: dict[str, str] = {}
     decl_re = re.compile(r"\b(?:real\s*\([^)]*\)|integer|logical)\s*,\s*allocatable\s*::\s*(.*)", re.IGNORECASE)
-    for ln in lines:
-        m = decl_re.search(ln)
-        if m is None:
-            continue
-        decl_l = ln.lower()
-        kind = "integer" if re.search(r"\binteger\s*,", decl_l) else ("logical" if re.search(r"\blogical\s*,", decl_l) else "real")
-        for nm in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)", m.group(1)):
-            matrices[nm] = kind
-    if not matrices:
-        return lines
     out: list[str] = []
+    matrices: dict[str, str] = {}
     for ln in lines:
+        if re.match(r"^\s*(?:program|function|subroutine)\b", ln, re.IGNORECASE):
+            matrices = {}
+        m_decl = decl_re.search(ln)
+        if m_decl is not None:
+            decl_l = ln.lower()
+            kind = "integer" if re.search(r"\binteger\s*,", decl_l) else ("logical" if re.search(r"\blogical\s*,", decl_l) else "real")
+            for nm in re.findall(r"\b([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)", m_decl.group(1)):
+                matrices[nm] = kind
         if "::" in ln:
             out.append(ln)
             continue
@@ -30634,7 +30971,7 @@ def add_missing_derived_type_fields_from_assignments_text(f90: str) -> str:
         if field_exists:
             old_rank = type_field_ranks.get((tname, field.lower()), 0)
             new_rank = _rank_from_decl_template(decl_tmpl)
-            if new_rank > old_rank:
+            if new_rank != old_rank:
                 upgrades[(tname, field.lower())] = decl_tmpl.format(field=field)
             continue
         decl = decl_tmpl.format(field=field)
@@ -30658,13 +30995,123 @@ def add_missing_derived_type_fields_from_assignments_text(f90: str) -> str:
             out.append(ln)
             continue
         if current_type is not None:
+            single_decl_line = "::" in ln and len(split_top_level_commas(ln.split("::", 1)[1])) == 1
             m_single_field = re.match(
                 r"^(\s*)(?:type\s*\([^)]+\)|real\(kind=dp\)|integer|logical|character\(len=:\))\s*(?:,[^:]*)?::\s*([A-Za-z]\w*)\s*(?:\(.*\))?\s*$",
                 ln,
                 re.IGNORECASE,
-            )
+            ) if single_decl_line else None
             if m_single_field is not None:
                 replacement = upgrades.get((current_type, m_single_field.group(2).lower()))
+                if replacement is not None:
+                    out.append(m_single_field.group(1) + replacement)
+                    continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
+    """Repair derived-type field ranks from same-procedure component assignments."""
+    lines = f90.splitlines()
+
+    def decl_template_from_line_base(base: str, attrs: str, dims: str) -> tuple[int, str] | None:
+        dims = dims.replace(" ", "")
+        rank = 0
+        if dims:
+            rank = max(1, dims.count(",") + 1, dims.count(":"))
+        alloc = "allocatable" in attrs.lower() or rank > 0
+        base_l = base.lower()
+        if base_l.startswith("real"):
+            if alloc and rank >= 3:
+                return rank, "real(kind=dp), allocatable :: {field}(:,:,:)"
+            if alloc and rank == 2:
+                return rank, "real(kind=dp), allocatable :: {field}(:,:)"
+            if alloc and rank == 1:
+                return rank, "real(kind=dp), allocatable :: {field}(:)"
+            return rank, "real(kind=dp) :: {field}"
+        if base_l == "integer":
+            if alloc and rank >= 2:
+                return rank, "integer, allocatable :: {field}(:,:)"
+            if alloc and rank == 1:
+                return rank, "integer, allocatable :: {field}(:)"
+            return rank, "integer :: {field}"
+        if base_l == "logical":
+            if alloc and rank >= 2:
+                return rank, "logical, allocatable :: {field}(:,:)"
+            if alloc and rank == 1:
+                return rank, "logical, allocatable :: {field}(:)"
+            return rank, "logical :: {field}"
+        return None
+
+    replacements: dict[tuple[str, str], str] = {}
+    local_type_vars: dict[str, str] = {}
+    local_decls: dict[str, tuple[int, str]] = {}
+    in_proc = False
+    decl_re = re.compile(
+        r"^\s*(real\(kind=dp\)|integer|logical)\s*([^:]*)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+
+    for ln in lines:
+        if re.match(r"^\s*(?:program|function|subroutine)\b", ln, re.IGNORECASE):
+            in_proc = True
+            local_type_vars = {}
+            local_decls = {}
+        if not in_proc:
+            continue
+        if re.match(r"^\s*end\s+(?:program|function|subroutine)\b", ln, re.IGNORECASE):
+            in_proc = False
+            continue
+        m_type = type_var_re.match(ln)
+        if m_type is not None:
+            tname = m_type.group(1)
+            for part in split_top_level_commas(m_type.group(2)):
+                mm = re.match(r"\s*([A-Za-z]\w*)", part)
+                if mm is not None:
+                    local_type_vars[mm.group(1)] = tname
+            continue
+        m_decl = decl_re.match(ln)
+        if m_decl is not None:
+            base, attrs, rest = m_decl.groups()
+            for part in split_top_level_commas(rest):
+                mm = re.match(r"\s*([A-Za-z]\w*)\s*(\(.*\))?", part)
+                if mm is None:
+                    continue
+                tmpl = decl_template_from_line_base(base, attrs, mm.group(2) or "")
+                if tmpl is not None:
+                    local_decls[mm.group(1)] = tmpl
+            continue
+        m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$", ln)
+        if m_assign is not None:
+            obj, field, rhs = m_assign.groups()
+            tname = local_type_vars.get(obj)
+            rhs_decl = local_decls.get(rhs)
+            if tname is not None and rhs_decl is not None:
+                replacements[(tname, field.lower())] = rhs_decl[1].format(field=field)
+
+    if not replacements:
+        return f90
+
+    out: list[str] = []
+    current_type: str | None = None
+    for ln in lines:
+        m_begin = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_begin is not None:
+            current_type = m_begin.group(1)
+        if current_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            current_type = None
+            out.append(ln)
+            continue
+        if current_type is not None:
+            single_decl_line = "::" in ln and len(split_top_level_commas(ln.split("::", 1)[1])) == 1
+            m_single_field = re.match(
+                r"^(\s*)(?:type\s*\([^)]+\)|real\(kind=dp\)|integer|logical|character\(len=:\))\s*(?:,[^:]*)?::\s*([A-Za-z]\w*)\s*(?:\(.*\))?\s*$",
+                ln,
+                re.IGNORECASE,
+            ) if single_decl_line else None
+            if m_single_field is not None:
+                replacement = replacements.get((current_type, m_single_field.group(2).lower()))
                 if replacement is not None:
                     out.append(m_single_field.group(1) + replacement)
                     continue
@@ -30738,34 +31185,83 @@ def rewrite_cbind_prints_text(f90: str) -> str:
 
 
 def rewrite_matmul_vector_result_ranks_text(f90: str) -> str:
-    rank1: set[str] = set()
     decl_re = re.compile(r"^\s*(?:real\(kind=dp\)|integer|complex\(kind=dp\))(?:\s*,[^:]*)?::\s*(.+)$", re.IGNORECASE)
-    for ln in f90.splitlines():
-        m = decl_re.match(ln)
-        if m is None:
-            continue
-        for part in split_top_level_commas(m.group(1)):
-            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part)
-            if mm is not None and "," not in mm.group(2):
-                rank1.add(mm.group(1).lower())
-    vec_results: set[str] = set()
-    for ln in f90.splitlines():
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matmul\s*\((.+)\)\s*$", ln, re.IGNORECASE)
-        if m is None:
-            continue
-        args = split_top_level_commas(m.group(2))
-        if len(args) != 2:
-            continue
-        rhs2 = args[1].strip()
-        root2 = re.match(r"^([A-Za-z]\w*)\b", rhs2)
-        if root2 is not None and root2.group(1).lower() in rank1:
-            vec_results.add(m.group(1))
-    if not vec_results:
-        return f90
-    for nm in sorted(vec_results, key=len, reverse=True):
-        f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", f90)
-        f90 = re.sub(rf"\bcall\s+print_matrix\s*\(\s*{re.escape(nm)}\s*\)", f"call print_real_vector({nm})", f90, flags=re.IGNORECASE)
-    return f90
+
+    def matmul_arg_lists(expr: str) -> list[list[str]]:
+        out: list[list[str]] = []
+        for m_call in re.finditer(r"\br_matmul\s*\(", expr, re.IGNORECASE):
+            start = m_call.end()
+            depth = 1
+            i = start
+            while i < len(expr):
+                ch = expr[i]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        out.append(split_top_level_commas(expr[start:i]))
+                        break
+                i += 1
+        return out
+
+    def rewrite_chunk(chunk: list[str]) -> list[str]:
+        rank1: set[str] = set()
+        for ln in chunk:
+            m = decl_re.match(ln)
+            if m is None:
+                continue
+            for part in split_top_level_commas(m.group(1)):
+                mm = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part)
+                if mm is not None and "," not in mm.group(2):
+                    rank1.add(mm.group(1).lower())
+
+        def is_vector_operand(src: str) -> bool:
+            src = src.strip()
+            root = re.match(r"^([A-Za-z]\w*)\b", src)
+            return bool(
+                (root is not None and root.group(1).lower() in rank1)
+                or re.match(r"^[A-Za-z]\w*\s*\([^,]+,\s*:\s*\)$", src)
+                or re.match(r"^[A-Za-z]\w*\s*\(:\s*,\s*[^,]+\)$", src)
+            )
+
+        vec_results: set[str] = set()
+        for ln in chunk:
+            m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", ln, re.IGNORECASE)
+            if m is None:
+                continue
+            rhs_expr = m.group(2)
+            if any(len(args) == 2 and is_vector_operand(args[1]) for args in matmul_arg_lists(rhs_expr)):
+                vec_results.add(m.group(1))
+                rank1.add(m.group(1).lower())
+        if not vec_results:
+            return chunk
+
+        out_chunk: list[str] = []
+        for ln in chunk:
+            new = ln
+            for nm in sorted(vec_results, key=len, reverse=True):
+                new = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*,\s*:\s*\)", f"{nm}(:)", new)
+                new = re.sub(rf"\bcall\s+print_matrix\s*\(\s*{re.escape(nm)}\s*\)", f"call print_real_vector({nm})", new, flags=re.IGNORECASE)
+            out_chunk.append(new)
+        return out_chunk
+
+    lines = f90.splitlines()
+    chunks: list[list[str]] = []
+    cur: list[str] = []
+    for ln in lines:
+        if re.match(r"^\s*(?:program|function|subroutine)\b", ln, re.IGNORECASE) and cur:
+            chunks.append(cur)
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        chunks.append(cur)
+
+    out: list[str] = []
+    for chunk in chunks:
+        out.extend(rewrite_chunk(chunk))
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
@@ -30777,6 +31273,55 @@ def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
     for nm in sorted(names, key=len, reverse=True):
         f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*\)", f"{nm}(:,:)", f90)
     return f90
+
+
+def rewrite_rank1_component_matrix_prints_text(f90: str) -> str:
+    type_field_rank: dict[tuple[str, str], int] = {}
+    var_types: dict[str, str] = {}
+    current_type: str | None = None
+    for ln in f90.splitlines():
+        m_begin = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_begin is not None:
+            current_type = m_begin.group(1)
+            continue
+        if current_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            current_type = None
+            continue
+        if current_type is not None:
+            m_decl = re.match(r"^\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character\(len=:\))\s*(?:,[^:]*)?::\s*(.+)$", ln, re.IGNORECASE)
+            if m_decl is None:
+                continue
+            for part in split_top_level_commas(m_decl.group(1)):
+                mm = re.match(r"\s*([A-Za-z]\w*)\s*(\(.*\))?", part)
+                if mm is None:
+                    continue
+                dims = (mm.group(2) or "").replace(" ", "")
+                rank = max(1, dims.count(",") + 1, dims.count(":")) if dims else 0
+                type_field_rank[(current_type, mm.group(1).lower())] = rank
+            continue
+        m_type_var = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", ln, re.IGNORECASE)
+        if m_type_var is not None:
+            tname = m_type_var.group(1)
+            for part in split_top_level_commas(m_type_var.group(2)):
+                mm = re.match(r"\s*([A-Za-z]\w*)", part)
+                if mm is not None:
+                    var_types[mm.group(1)] = tname
+
+    if not type_field_rank or not var_types:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_print = re.match(r"^(\s*)call\s+print_matrix\s*\(\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*\)\s*$", ln, re.IGNORECASE)
+        if m_print is not None:
+            obj = m_print.group(2)
+            field = m_print.group(3)
+            tname = var_types.get(obj)
+            if tname is not None and type_field_rank.get((tname, field.lower())) == 1:
+                out.append(f"{m_print.group(1)}call print_real_vector({obj}%{field})")
+                continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def simplify_real_dp_casts_text(f90: str) -> str:
@@ -34242,7 +34787,12 @@ def main() -> int:
         f90 += "\n"
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = add_missing_derived_type_fields_from_assignments_text(f90)
+    f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
+    f90 = fix_result_field_ranks_from_local_assignments_text(f90)
+    f90 = rewrite_rank1_component_matrix_prints_text(f90)
+    if "call print_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     f90 = remove_allocatable_result_entry_deallocate_text(f90)
     f90 = f90.replace(
         "real(kind=dp), allocatable :: qnorm_scalar_result(:)",
