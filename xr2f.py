@@ -5608,8 +5608,29 @@ def _replace_idents(expr: str, mapping: dict[str, str]) -> str:
     if not mapping:
         return expr
     out = expr
+    builtin_calls = {
+        "c",
+        "list",
+        "matrix",
+        "array",
+        "data.frame",
+        "sort",
+        "sum",
+        "mean",
+        "min",
+        "max",
+        "prod",
+        "length",
+        "as.integer",
+        "as.numeric",
+        "as.character",
+    }
     for old in sorted(mapping.keys(), key=len, reverse=True):
-        out = re.sub(rf"\b{re.escape(old)}\b", mapping[old], out)
+        if old.lower() in builtin_calls:
+            pat = rf"\b{re.escape(old)}\b(?!\s*\()"
+        else:
+            pat = rf"\b{re.escape(old)}\b"
+        out = re.sub(pat, mapping[old], out)
     return out
 
 
@@ -20419,6 +20440,23 @@ def infer_function_callback_args(fn: FuncDef) -> set[str]:
     """Infer function arguments that appear as callees in this function."""
     out: set[str] = set()
     arg_names = {a.lower(): a for a in fn.args}
+    builtin_calls = {
+        "c",
+        "list",
+        "matrix",
+        "array",
+        "data.frame",
+        "sort",
+        "sum",
+        "mean",
+        "min",
+        "max",
+        "prod",
+        "length",
+        "as.integer",
+        "as.numeric",
+        "as.character",
+    }
 
     def walk_expr(expr: str) -> None:
         txt = expr.strip()
@@ -20428,9 +20466,11 @@ def infer_function_callback_args(fn: FuncDef) -> set[str]:
         if c is None:
             return
         nm, pos, kw = c
-        canon = arg_names.get(nm.lower())
-        if canon is not None:
-            out.add(canon)
+        nm_l = nm.lower()
+        if nm_l not in builtin_calls:
+            canon = arg_names.get(nm_l)
+            if canon is not None:
+                out.add(canon)
         for p in pos:
             walk_expr(p)
         for v in kw.values():
