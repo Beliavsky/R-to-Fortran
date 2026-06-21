@@ -1346,6 +1346,14 @@ def _array_dim_parts(expr: str) -> list[str] | None:
     return [dim_txt] if dim_txt else None
 
 
+def _array_dim_omitted(expr: str) -> bool:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "array":
+        return False
+    _nm, pos, kw = cinfo
+    return "dim" not in {k.lower(): v for k, v in kw.items()} and len(pos) < 2
+
+
 def _warn_mixed_character_coercion(expr: str) -> None:
     key = " ".join(expr.strip().split())
     if key in _MIXED_CHARACTER_COERCION_WARNINGS:
@@ -9802,13 +9810,22 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"[character(len={len_expr}) :: {x_f}, {values_f}]"
             after_f = _int_bound_expr(r_expr_to_fortran(after_src.strip()))
             return f"[character(len={len_expr}) :: {x_f}(:{after_f}), {values_f}, {x_f}({after_f} + 1:)]"
+        promote_numeric_append = False
         if not logicalish:
             if _is_int_literal(values_txt):
                 values_f = f"{_normalize_r_int_literal(values_txt)}.0_dp"
+            if re.search(r"(?:_dp\b|\breal\s*\()", values_f, re.IGNORECASE):
+                promote_numeric_append = True
         if after_src is None:
-            return f"[{x_f}, {values_f}]"
+            x_all_f = f"real({x_f}, kind=dp)" if promote_numeric_append else x_f
+            return f"[{x_all_f}, {values_f}]"
         after_f = _int_bound_expr(r_expr_to_fortran(after_src.strip()))
-        return f"[{x_f}(:{after_f}), {values_f}, {x_f}({after_f} + 1:)]"
+        x_head_f = f"{x_f}(:{after_f})"
+        x_tail_f = f"{x_f}({after_f} + 1:)"
+        if promote_numeric_append:
+            x_head_f = f"real({x_head_f}, kind=dp)"
+            x_tail_f = f"real({x_tail_f}, kind=dp)"
+        return f"[{x_head_f}, {values_f}, {x_tail_f}]"
     c_aperm = parse_call_text(s)
     if c_aperm is not None and c_aperm[0].lower() == "aperm":
         _nap, pos_ap, kw_ap = c_aperm
@@ -10538,6 +10555,7 @@ def r_expr_to_fortran(expr: str) -> str:
         dim_src = kw_a.get("dim")
         if dim_src is None and len(pos_a) >= 2:
             dim_src = pos_a[1]
+        dim_was_omitted = dim_src is None
         if dim_src is None:
             dim_src = "1"
 
@@ -10580,6 +10598,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 or ("'" in dt and dt.startswith("c("))
             )
             dim_parts = _array_dim_parts(s)
+            if dim_was_omitted:
+                return data_f
             if dim_parts is not None and len(dim_parts) == 1:
                 return data_f
             if dim_parts is not None and len(dim_parts) > 2:
@@ -21315,7 +21335,7 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 out.add(st.name)
             if _looks_matrix_expr(rhs) and not (low.startswith("matrix(") and _matrix_has_integer_literal_data(rhs)):
                 out.add(st.name)
-            if low.startswith("array("):
+            if low.startswith("array(") and not _array_dim_omitted(rhs):
                 dim_parts_arr = _array_dim_parts(rhs)
                 if dim_parts_arr is not None and len(dim_parts_arr) == 2 and st.name not in known_int_matrices:
                     out.add(st.name)
@@ -21432,7 +21452,9 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                     if isinstance(b, Assign):
                         rhs_b = b.expr.strip()
                         low_b = rhs_b.lower()
-                        if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or low_b.startswith("array("):
+                        if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or (
+                            low_b.startswith("array(") and not _array_dim_omitted(rhs_b)
+                        ):
                             out.add(b.name)
                     _scan_text(b.expr if isinstance(b, ExprStmt) else (b.name + "(" + ", ".join(b.args) + ")" if isinstance(b, CallStmt) else b.expr))
                 elif isinstance(b, PrintStmt):
@@ -21443,7 +21465,9 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
                 if isinstance(b, Assign):
                     rhs_b = b.expr.strip()
                     low_b = rhs_b.lower()
-                    if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or low_b.startswith("array("):
+                    if (low_b.startswith("matrix(") and not _matrix_has_integer_literal_data(rhs_b)) or (
+                        low_b.startswith("array(") and not _array_dim_omitted(rhs_b)
+                    ):
                         out.add(b.name)
                     _scan_text(rhs_b)
                 elif isinstance(b, (CallStmt, ExprStmt)):
@@ -23948,9 +23972,18 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    omitted_dim_array_names = {
+        st.name
+        for st in main_stmts
+        if isinstance(st, Assign) and _array_dim_omitted(st.expr.strip())
+    }
+    int_matrices.difference_update(omitted_dim_array_names)
+    real_matrices.difference_update(omitted_dim_array_names)
     matrix_rank_ctx = {n.lower(): 2 for n in set(real_matrices) | set(int_matrices)}
     for st_rank_final in main_stmts:
         if not isinstance(st_rank_final, Assign):
+            continue
+        if st_rank_final.name in omitted_dim_array_names:
             continue
         if st_rank_final.name in int_matrices or st_rank_final.name in int_arrays:
             continue
@@ -23961,6 +23994,8 @@ def transpile_r_to_fortran(
             matrix_rank_ctx[st_rank_final.name.lower()] = 2
 
     real_matrices.difference_update(int_matrices)
+    int_matrices.difference_update(omitted_dim_array_names)
+    real_matrices.difference_update(omitted_dim_array_names)
     changed_matrix_aliases = True
     while changed_matrix_aliases:
         changed_matrix_aliases = False
