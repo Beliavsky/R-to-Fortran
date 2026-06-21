@@ -9694,7 +9694,10 @@ def r_expr_to_fortran(expr: str) -> str:
     if mm_mod is not None:
         lhs = r_expr_to_fortran(mm_mod[0])
         rhs = r_expr_to_fortran(mm_mod[1])
-        if _looks_integer_fortran_expr(lhs) and _looks_integer_fortran_expr(rhs):
+        def _mod_operand_is_explicit_int(e_mod: str) -> bool:
+            e_mod = e_mod.strip()
+            return _is_int_literal(e_mod) or re.match(r"^(?:int|size)\s*\(", e_mod, re.IGNORECASE) is not None
+        if _mod_operand_is_explicit_int(lhs) and _mod_operand_is_explicit_int(rhs):
             return f"mod({_int_bound_expr(lhs)}, {_int_bound_expr(rhs)})"
         return f"mod(real({lhs}, kind=dp), real({rhs}, kind=dp))"
     mm = _split_top_level_token(s, "%*%", from_right=True)
@@ -11399,7 +11402,26 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "any", lambda inner: _logical_reduction_to_fortran("any", inner))
     s = _replace_balanced_func_calls(s, "as.matrix", lambda inner: inner.strip())
     def _as_vector_to_fortran(inner: str) -> str:
-        x_f = r_expr_to_fortran(inner.strip())
+        src_v = inner.strip()
+        x_f = r_expr_to_fortran(src_v)
+        src_v_l = src_v.lower()
+        if (
+            _is_int_literal(src_v)
+            or _is_real_literal(src_v)
+            or re.fullmatch(r"(?:true|false)", src_v_l, re.IGNORECASE)
+            or (
+                re.fullmatch(r"[A-Za-z]\w*", src_v)
+                and src_v_l
+                not in (
+                    _KNOWN_VECTOR_NAMES
+                    | _KNOWN_INT_VECTOR_NAMES
+                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                    | _KNOWN_CHAR_VECTOR_NAMES
+                    | _KNOWN_MATRIX_NAMES
+                )
+            )
+        ):
+            return f"[{x_f}]"
         return f"reshape({x_f}, [size({x_f})])"
     s = _replace_balanced_func_calls(s, "as.vector", _as_vector_to_fortran)
     def _as_integer_to_fortran(inner: str) -> str:
@@ -12427,6 +12449,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 if re.fullmatch(r"(?:count|size)\s*\(.+\)", v_s, re.IGNORECASE):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
                     continue
+                if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)*", v_s):
+                    coerced_vals.append(f"real({v_s}, kind=dp)")
+                    continue
                 m_int_ratio = re.fullmatch(
                     r"\(?\s*((?:count|size)\s*\(.+\))\s*/\s*((?:count|size)\s*\(.+\))\s*\)?",
                     v_s,
@@ -12682,7 +12707,16 @@ def r_expr_to_fortran(expr: str) -> str:
     prev_mod = None
     while prev_mod != s:
         prev_mod = s
-        s = mod_pat.sub(r"mod(\1, \2)", s)
+        def _mod_repl(m_mod: re.Match[str]) -> str:
+            lhs_mod = m_mod.group(1)
+            rhs_mod = m_mod.group(2)
+            def _mod_operand_is_explicit_int(e_mod: str) -> bool:
+                e_mod = e_mod.strip()
+                return _is_int_literal(e_mod) or re.match(r"^(?:int|size)\s*\(", e_mod, re.IGNORECASE) is not None
+            if _mod_operand_is_explicit_int(lhs_mod) and _mod_operand_is_explicit_int(rhs_mod):
+                return f"mod({_int_bound_expr(lhs_mod)}, {_int_bound_expr(rhs_mod)})"
+            return f"mod(real({lhs_mod}, kind=dp), real({rhs_mod}, kind=dp))"
+        s = mod_pat.sub(_mod_repl, s)
     s = _strip_variadic_actuals_in_calls(s)
     s = _replace_complex_literals_outside_strings(s)
     return s
@@ -20365,6 +20399,29 @@ def emit_function(
                     changed_scalar = True
         for st_logical_scalar in assign_nodes:
             rhs_logical_scalar = st_logical_scalar.expr.strip()
+            has_elementwise_logical_op = any(
+                _split_top_level_token(rhs_logical_scalar, op, from_right=True) is not None
+                for op in ["&", "|"]
+            ) and not re.search(r"&&|\|\|", rhs_logical_scalar)
+            has_vectorized_comparison_op = any(
+                _split_top_level_token(rhs_logical_scalar, op, from_right=True) is not None
+                for op in ["==", "!=", ">=", "<=", ">", "<"]
+            )
+            if has_elementwise_logical_op or has_vectorized_comparison_op:
+                rhs_logical_names = {m.group(0).lower() for m in re.finditer(r"\b[A-Za-z]\w*\b", rhs_logical_scalar)}
+                ranked_logical_names = {
+                    nm.lower()
+                    for nm, rk in local_ranks.items()
+                    if rk >= 1
+                } | {nm.lower() for nm in known_arrays | real_arrays | int_arrays | logical_arrays}
+                if rhs_logical_names & ranked_logical_names:
+                    logical_arrays.add(st_logical_scalar.name)
+                    logical_scalars.discard(st_logical_scalar.name)
+                    real_scalars.discard(st_logical_scalar.name)
+                    real_arrays.discard(st_logical_scalar.name)
+                    ints.discard(st_logical_scalar.name)
+                    int_arrays.discard(st_logical_scalar.name)
+                    continue
             if (
                 _expr_kind_simple(rhs_logical_scalar) == "logical"
                 or re.search(r"&&|\|\|", rhs_logical_scalar)
