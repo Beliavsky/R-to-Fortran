@@ -1361,7 +1361,7 @@ def _parse_reduce_call(expr: str) -> tuple[str, str] | None:
     _nm, pos, kw = cinfo
     fn_src = pos[0].strip() if pos else kw.get("f", kw.get("FUN", "")).strip()
     x_src = pos[1].strip() if len(pos) >= 2 else kw.get("x", kw.get("init", "")).strip()
-    if not fn_src or not x_src or re.fullmatch(r"[A-Za-z]\w*", fn_src) is None:
+    if not fn_src or not x_src:
         return None
     return fn_src, x_src
 
@@ -1391,6 +1391,20 @@ def _reduce_vector_element_expr(vec_src: str, idx_expr: str) -> str:
     if re.fullmatch(r"[A-Za-z]\w*", t):
         return f"{r_expr_to_fortran(t)}({idx_expr})"
     return f"{r_expr_to_fortran(t)}({idx_expr})"
+
+
+def _reduce_step_expr(fn_src: str, acc_expr: str, item_expr: str) -> str:
+    f = fn_src.strip()
+    m_inline = re.match(
+        r"^function\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
+        f,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_inline is not None:
+        a_nm, b_nm, body_src = m_inline.group(1), m_inline.group(2), m_inline.group(3).strip()
+        body_src = _replace_idents(body_src, {a_nm: acc_expr, b_nm: item_expr})
+        return r_expr_to_fortran(body_src)
+    return f"{r_expr_to_fortran(f)}({acc_expr}, {item_expr})"
 
 
 def _warn_mixed_character_coercion(expr: str) -> None:
@@ -5673,6 +5687,84 @@ def _replace_idents(expr: str, mapping: dict[str, str]) -> str:
             pat = rf"\b{re.escape(old)}\b"
         out = re.sub(pat, mapping[old], out)
     return out
+
+
+def _qualify_lifted_sibling_calls_expr(expr: str, current_fn_name: str) -> str:
+    if "_" not in current_fn_name:
+        return expr
+    parent_prefix = current_fn_name.rsplit("_", 1)[0]
+    if not parent_prefix:
+        return expr
+    out = expr
+    call_names = sorted(set(re.findall(r"\b([A-Za-z]\w*)\s*\(", out)), key=len, reverse=True)
+    builtin_call_names = set(globals().get("_PARTIAL_MAIN_IGNORE_NAMES", set())) | {
+        "chol",
+        "solve",
+        "backsolve",
+        "sweep",
+        "rowsums",
+        "colsums",
+        "rowmeans",
+        "colmeans",
+        "apply",
+        "dexp",
+        "pexp",
+        "qexp",
+        "dpois",
+        "ppois",
+        "qpois",
+        "dbinom",
+        "pbinom",
+        "qbinom",
+        "dt",
+        "pt",
+        "qt",
+    }
+    for call_nm in call_names:
+        if call_nm.lower() in builtin_call_names:
+            continue
+        qualified = f"{parent_prefix}_{call_nm}"
+        if qualified.lower() not in _FUNC_DEFS_BY_NAME:
+            continue
+        if call_nm.lower() == current_fn_name.lower() or qualified.lower() == current_fn_name.lower():
+            continue
+
+        def repl(inner: str, q: str = qualified) -> str:
+            return f"{q}({inner})"
+
+        out = _replace_balanced_func_calls(out, call_nm, repl)
+    return out
+
+
+def _qualify_lifted_sibling_calls_stmt(st: object, current_fn_name: str) -> object:
+    if isinstance(st, Assign):
+        return Assign(st.name, _qualify_lifted_sibling_calls_expr(st.expr, current_fn_name), st.comment)
+    if isinstance(st, ExprStmt):
+        return ExprStmt(_qualify_lifted_sibling_calls_expr(st.expr, current_fn_name), st.comment)
+    if isinstance(st, PrintStmt):
+        return PrintStmt([_qualify_lifted_sibling_calls_expr(a, current_fn_name) for a in st.args], st.comment)
+    if isinstance(st, CallStmt):
+        return CallStmt(st.name, [_qualify_lifted_sibling_calls_expr(a, current_fn_name) for a in st.args], st.comment)
+    if isinstance(st, ForStmt):
+        return ForStmt(
+            st.var,
+            _qualify_lifted_sibling_calls_expr(st.iter_expr, current_fn_name),
+            [_qualify_lifted_sibling_calls_stmt(b, current_fn_name) for b in st.body],
+        )
+    if isinstance(st, WhileStmt):
+        return WhileStmt(
+            _qualify_lifted_sibling_calls_expr(st.cond, current_fn_name),
+            [_qualify_lifted_sibling_calls_stmt(b, current_fn_name) for b in st.body],
+        )
+    if isinstance(st, RepeatStmt):
+        return RepeatStmt([_qualify_lifted_sibling_calls_stmt(b, current_fn_name) for b in st.body])
+    if isinstance(st, IfStmt):
+        return IfStmt(
+            _qualify_lifted_sibling_calls_expr(st.cond, current_fn_name),
+            [_qualify_lifted_sibling_calls_stmt(b, current_fn_name) for b in st.then_body],
+            [_qualify_lifted_sibling_calls_stmt(b, current_fn_name) for b in st.else_body],
+        )
+    return st
 
 
 def _stmt_uses_name(st: object, name: str) -> int:
@@ -18701,6 +18793,32 @@ def emit_function(
                     if ret_rank_hints.get(base_ret, 0) >= 1 and ret_rank_hints.get(idx_ret, 0) >= 1:
                         ret_rank = 1
                 break
+    m_direct_vector_subset_ret = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]$", ret_expr_src)
+    direct_vector_subset_ret = False
+    if m_direct_vector_subset_ret is not None:
+        base_ret_l = m_direct_vector_subset_ret.group(1).lower()
+        idx_ret_l = m_direct_vector_subset_ret.group(2).lower()
+        base_rank_ret = max(ret_rank_hints.get(base_ret_l, 0), infer_arg_rank(fn, base_ret_l))
+        idx_rank_ret = max(ret_rank_hints.get(idx_ret_l, 0), infer_arg_rank(fn, idx_ret_l))
+        direct_vector_subset_ret = base_rank_ret >= 1 and idx_rank_ret >= 1
+    if ret_rank > 0 and not (
+        ret_expr_src.startswith("c(")
+        or (ret_expr_src.startswith("[") and ret_expr_src.endswith("]"))
+        or direct_vector_subset_ret
+        or re.search(
+            r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul)\s*\(",
+            ret_expr_src,
+            re.IGNORECASE,
+        )
+        or _split_top_level_token(ret_expr_src, "%*%", from_right=True) is not None
+    ):
+        ranked_return_names = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
+        has_bare_ranked_name = any(
+            re.search(rf"\b{re.escape(nm_ret_rank)}\b(?!\s*\[)", ret_expr_src)
+            for nm_ret_rank in ranked_return_names
+        )
+        if not has_bare_ranked_name:
+            ret_rank = 0
     ret_ident_m = re.match(r"^[A-Za-z]\w*$", last_expr_for_ret)
     if list_spec is None and ret_ident_m is not None:
         ret_ident = ret_ident_m.group(0)
@@ -19122,6 +19240,7 @@ def emit_function(
 
     body_no_ret = body_stmts
     body_use = [_rename_stmt_obj(st, arg_local_map) for st in body_no_ret] if arg_local_map else body_no_ret
+    body_use = [_qualify_lifted_sibling_calls_stmt(st, fn.name) for st in body_use]
     return_alias_map: dict[str, str] = {}
     if list_spec is not None:
         ret_alias_arg = _return_call_arg(last.expr.strip())
@@ -20388,6 +20507,7 @@ def emit_function(
         ret_arg = _return_call_arg(ret_expr)
         if ret_arg is not None:
             ret_expr = ret_arg if ret_arg else last.expr
+        ret_expr = _qualify_lifted_sibling_calls_expr(ret_expr, fn.name)
         if (
             re.match(r"^[A-Za-z]\w*$", ret_expr.strip())
             and f"{ret_expr.strip()}_list" in locals().get("local_list_types", {})
@@ -20413,7 +20533,7 @@ def emit_function(
             o.w("else")
             o.w(f"   {rname} = {reduce_first}")
             o.w(f"   do xr2f_reduce_i = 2, {reduce_size}")
-            o.w(f"      {rname} = {reduce_fn}({rname}, {reduce_item})")
+            o.w(f"      {rname} = {_reduce_step_expr(reduce_fn, rname, reduce_item)}")
             o.w("   end do")
             o.w("end if")
             o.w(f"end function {fn.name}")
