@@ -1354,6 +1354,45 @@ def _array_dim_omitted(expr: str) -> bool:
     return "dim" not in {k.lower(): v for k, v in kw.items()} and len(pos) < 2
 
 
+def _parse_reduce_call(expr: str) -> tuple[str, str] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "reduce":
+        return None
+    _nm, pos, kw = cinfo
+    fn_src = pos[0].strip() if pos else kw.get("f", kw.get("FUN", "")).strip()
+    x_src = pos[1].strip() if len(pos) >= 2 else kw.get("x", kw.get("init", "")).strip()
+    if not fn_src or not x_src or re.fullmatch(r"[A-Za-z]\w*", fn_src) is None:
+        return None
+    return fn_src, x_src
+
+
+def _reduce_vector_size_expr(vec_src: str) -> str:
+    t = vec_src.strip()
+    cinfo = parse_call_text(t)
+    if cinfo is not None and cinfo[1]:
+        nm = cinfo[0].lower()
+        if nm in {"abs", "as.integer", "as.numeric", "as.double", "int", "real"}:
+            return _reduce_vector_size_expr(cinfo[1][0].strip())
+    return f"size({r_expr_to_fortran(t)})"
+
+
+def _reduce_vector_element_expr(vec_src: str, idx_expr: str) -> str:
+    t = vec_src.strip()
+    cinfo = parse_call_text(t)
+    if cinfo is not None and cinfo[1]:
+        nm = cinfo[0].lower()
+        inner = cinfo[1][0].strip()
+        if nm == "abs":
+            return f"abs({_reduce_vector_element_expr(inner, idx_expr)})"
+        if nm in {"as.integer", "int"}:
+            return f"int({_reduce_vector_element_expr(inner, idx_expr)})"
+        if nm in {"as.numeric", "as.double", "real"}:
+            return f"real({_reduce_vector_element_expr(inner, idx_expr)}, kind=dp)"
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        return f"{r_expr_to_fortran(t)}({idx_expr})"
+    return f"{r_expr_to_fortran(t)}({idx_expr})"
+
+
 def _warn_mixed_character_coercion(expr: str) -> None:
     key = " ".join(expr.strip().split())
     if key in _MIXED_CHARACTER_COERCION_WARNINGS:
@@ -5007,6 +5046,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bsprintf\s*\([^)]*,\s*{re.escape(arg)}\b"),
         re.compile(rf"\bas\.vector\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bas\.numeric\s*\(\s*{re.escape(arg)}\s*\)"),
+        re.compile(rf"\bReduce\s*\([^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b{re.escape(arg)}\s*\["),
     ]
 
@@ -5131,6 +5171,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rf"\bt\s*\(\s*{re.escape(arg)}\s*\)",
             rf"%\*%\s*{re.escape(arg)}\b",
             rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b",
+            rf"\bReduce\s*\([^)]*\b{re.escape(arg)}\b",
         ]
         call_vector_evidence = False
         for txt_call in _stmt_texts_for_rank_scan(fn.body):
@@ -17034,15 +17075,16 @@ def emit_stmts(
                             if kn in {"sep", "file", "fill", "labels", "append"}:
                                 continue
                         lit_at = _dequote_string_literal(at)
-                        if lit_at in {"\\n", "\n"}:
-                            if out_items:
-                                _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
-                                out_items = []
-                                just_flushed_cat_line = True
-                            else:
-                                if not just_flushed_cat_line:
+                        if lit_at is not None and re.fullmatch(r"(?:\\n|\n)+", lit_at):
+                            newline_count = len(re.findall(r"\\n|\n", lit_at))
+                            for _i_newline in range(newline_count):
+                                if out_items:
+                                    _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
+                                    out_items = []
+                                    just_flushed_cat_line = True
+                                else:
                                     _wstmt("write(*,*)", "")
-                                just_flushed_cat_line = False
+                                    just_flushed_cat_line = True
                             continue
                         just_flushed_cat_line = False
                         if out_items and "Asset columns read" in out_items[-1]:
@@ -17966,6 +18008,8 @@ def _expr_kind_simple(expr: str) -> str:
             return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
+    if _split_top_level_token(t, "&&", from_right=True) is not None or _split_top_level_token(t, "||", from_right=True) is not None:
+        return "logical"
     if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
         return "logical"
     return "real"
@@ -18592,6 +18636,7 @@ def emit_function(
         can_be_pure = False
     c_ret_rank_cast = parse_call_text(ret_expr_src)
     ret_is_quadratic_scalar = False
+    ret_is_reduce_scalar = c_ret_rank_cast is not None and c_ret_rank_cast[0].lower() == "reduce"
     if c_ret_rank_cast is not None and c_ret_rank_cast[0].lower() in _USER_FUNC_RETURN_RANK:
         ret_rank = _USER_FUNC_RETURN_RANK.get(c_ret_rank_cast[0].lower(), 0)
     if c_ret_rank_cast is not None and c_ret_rank_cast[0].lower() in {"as.numeric", "as.double"} and c_ret_rank_cast[1]:
@@ -18605,7 +18650,9 @@ def emit_function(
                 fscan.strip_redundant_outer_parens_expr(lhs_mm_ret_rank[0].strip()),
                 re.IGNORECASE,
             ) is not None
-    if ret_is_quadratic_scalar:
+    if ret_is_reduce_scalar:
+        ret_rank = 0
+    elif ret_is_quadratic_scalar:
         ret_rank = 0
     elif ret_rank > 0:
         pass
@@ -18622,7 +18669,7 @@ def emit_function(
         ret_rank = 2
     if tail_if_result_rank is not None:
         ret_rank = max(ret_rank, tail_if_result_rank)
-    if ret_rank == 0:
+    if ret_rank == 0 and not ret_is_reduce_scalar:
         ret_rank_hints: dict[str, int] = {
             a.lower(): infer_arg_rank(fn, a)
             for a in fn.args
@@ -18940,6 +18987,12 @@ def emit_function(
             o.w(f"real(kind=dp), allocatable :: {rname}(" + ":," * (ret_rank - 1) + ":)")
     else:
         o.w(f"{rdecl} :: {rname}")
+    reduce_ret_expr_decl_global = last.expr.strip()
+    reduce_ret_arg_decl_global = _return_call_arg(reduce_ret_expr_decl_global)
+    if reduce_ret_arg_decl_global is not None:
+        reduce_ret_expr_decl_global = reduce_ret_arg_decl_global.strip()
+    if _parse_reduce_call(reduce_ret_expr_decl_global) is not None:
+        o.w("integer :: xr2f_reduce_i")
 
     for a in fn.args:
         dflt = fn.defaults.get(a, "").strip()
@@ -20162,7 +20215,12 @@ def emit_function(
             real_arrays.discard(nm_scalar_call)
             int_arrays.discard(nm_scalar_call)
             logical_arrays.discard(nm_scalar_call)
-            real_scalars.add(nm_scalar_call)
+            if _USER_FUNC_RETURN_KIND.get(c_scalar_call[0].lower()) == "logical":
+                logical_scalars.add(nm_scalar_call)
+                real_scalars.discard(nm_scalar_call)
+                ints.discard(nm_scalar_call)
+            else:
+                real_scalars.add(nm_scalar_call)
             local_ranks[nm_scalar_call] = 0
             params.pop(nm_scalar_call, None)
         for st_scalar_reduction in assign_nodes:
@@ -20186,10 +20244,25 @@ def emit_function(
                 if _rhs_is_scalar_arithmetic(st_scalar_rank.expr, scalar_names_now, array_names_now):
                     _force_real_scalar_local(st_scalar_rank.name)
                     changed_scalar = True
+        for st_logical_scalar in assign_nodes:
+            rhs_logical_scalar = st_logical_scalar.expr.strip()
+            if (
+                _expr_kind_simple(rhs_logical_scalar) == "logical"
+                or re.search(r"&&|\|\|", rhs_logical_scalar)
+            ):
+                logical_scalars.add(st_logical_scalar.name)
+                logical_arrays.discard(st_logical_scalar.name)
+                real_scalars.discard(st_logical_scalar.name)
+                real_arrays.discard(st_logical_scalar.name)
+                ints.discard(st_logical_scalar.name)
+                int_arrays.discard(st_logical_scalar.name)
         real_scalars.difference_update(real_arrays)
         ints.difference_update(int_arrays)
         ints.difference_update(real_arrays)
         real_scalars.difference_update(int_arrays)
+        logical_arrays.difference_update(logical_scalars)
+        real_scalars.difference_update(logical_scalars)
+        ints.difference_update(logical_scalars)
         for ret_decl_set in (ints, real_scalars, int_arrays, real_arrays, logical_arrays, logical_scalars):
             ret_decl_set.discard(rname)
         params.pop(rname, None)
@@ -20329,6 +20402,22 @@ def emit_function(
                 for st_src in body_stmts
             ):
                 ret_expr = f"{ret_nm_src}_list"
+        reduce_call = _parse_reduce_call(ret_expr)
+        if reduce_call is not None:
+            reduce_fn, reduce_vec = reduce_call
+            reduce_size = _reduce_vector_size_expr(reduce_vec)
+            reduce_first = f"real({_reduce_vector_element_expr(reduce_vec, '1')}, kind=dp)"
+            reduce_item = f"real({_reduce_vector_element_expr(reduce_vec, 'xr2f_reduce_i')}, kind=dp)"
+            o.w(f"if ({reduce_size} <= 0) then")
+            o.w(f"   {rname} = 0.0_dp")
+            o.w("else")
+            o.w(f"   {rname} = {reduce_first}")
+            o.w(f"   do xr2f_reduce_i = 2, {reduce_size}")
+            o.w(f"      {rname} = {reduce_fn}({rname}, {reduce_item})")
+            o.w("   end do")
+            o.w("end if")
+            o.w(f"end function {fn.name}")
+            return bool(need_rnorm_local["used"])
         o.w(f"{rname} = {r_expr_to_fortran(ret_expr)}")
     else:
         ret_alias_m = re.match(r"^[A-Za-z]\w*$", last.expr.strip())
@@ -23442,7 +23531,7 @@ def transpile_r_to_fortran(
                     rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
                 else:
                     rr_tail = _infer_assignment_rank_hint(expr_rank_tail, inferred_ret_ranks)
-                if re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", expr_rank_tail, re.IGNORECASE):
+                if re.match(r"^-?\s*(?:sum|mean|prod|min|max|Reduce)\s*\(", expr_rank_tail, re.IGNORECASE):
                     rr_tail = 0
                 return rr_tail
             if isinstance(st_rank_tail, IfStmt):
