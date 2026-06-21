@@ -57,6 +57,7 @@ _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
 _KNOWN_DATE_NAMES: set[str] = set()
 _KNOWN_DATE_VECTOR_NAMES: set[str] = set()
+_KNOWN_POSIXCT_NAMES: set[str] = set()
 _KNOWN_COMPLEX_VECTOR_NAMES: set[str] = set()
 _KNOWN_COMPLEX_MATRIX_NAMES: set[str] = set()
 _KNOWN_COMPLEX_SCALAR_NAMES: set[str] = set()
@@ -7209,6 +7210,8 @@ def _is_complex_expr_source(expr: str) -> bool:
 
 def _is_date_scalar_source(expr: str) -> bool:
     t = expr.strip()
+    while t.startswith("(") and t.endswith(")") and _balanced_parens(t[1:-1]):
+        t = t[1:-1].strip()
     if re.fullmatch(r"[A-Za-z]\w*", t):
         return t.lower() in _KNOWN_DATE_NAMES
     c = parse_call_text(t)
@@ -7229,6 +7232,10 @@ def _is_date_scalar_source(expr: str) -> bool:
             or any(op in idx_txt for op in ["==", "!=", "<=", ">=", "<", ">"])
         )
         return not vectorish
+    for op in ["+", "-"]:
+        parts = _split_top_level_token(t, op, from_right=True)
+        if parts is not None and _is_date_scalar_source(parts[0].strip()):
+            return True
     return False
 
 
@@ -7279,6 +7286,49 @@ def _is_date_vector_source(expr: str) -> bool:
     return False
 
 
+def _is_posixct_source(expr: str) -> bool:
+    t = expr.strip()
+    while t.startswith("(") and t.endswith(")") and _balanced_parens(t[1:-1]):
+        t = t[1:-1].strip()
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        return t.lower() in _KNOWN_POSIXCT_NAMES
+    c = parse_call_text(t)
+    if c is not None and c[0].lower() in {"sys.time", "sys_time"}:
+        return True
+    for op in ["+", "-"]:
+        parts = _split_top_level_token(t, op, from_right=True)
+        if parts is not None and _is_posixct_source(parts[0].strip()):
+            return True
+    return False
+
+
+def collect_posixct_assignments(stmts: list[object]) -> set[str]:
+    out: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for st in stmts:
+            if not isinstance(st, Assign):
+                continue
+            name_l = st.name.lower()
+            rhs = st.expr.strip()
+            rhs_l = rhs.lower()
+            c = parse_call_text(rhs)
+            is_posix = c is not None and c[0].lower() in {"sys.time", "sys_time"}
+            if not is_posix and re.fullmatch(r"[A-Za-z]\w*", rhs) and rhs_l in out:
+                is_posix = True
+            if not is_posix:
+                for op in ["+", "-"]:
+                    parts = _split_top_level_token(rhs, op, from_right=True)
+                    if parts is not None and parts[0].strip().lower() in out:
+                        is_posix = True
+                        break
+            if is_posix and name_l not in out:
+                out.add(name_l)
+                changed = True
+    return out
+
+
 def collect_date_assignments(stmts: list[object]) -> tuple[set[str], set[str]]:
     scalars: set[str] = set()
     vectors: set[str] = set()
@@ -7293,7 +7343,9 @@ def collect_date_assignments(stmts: list[object]) -> tuple[set[str], set[str]]:
             c = parse_call_text(rhs)
             is_vec = False
             is_scalar = False
-            if c is not None and c[0].lower() == "as.date":
+            if c is not None and c[0].lower() in {"sys.date", "sys_date"}:
+                is_scalar = True
+            elif c is not None and c[0].lower() == "as.date":
                 arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
                 arg_call = parse_call_text(arg)
                 fmt_src = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("format", "").strip()
@@ -7361,6 +7413,46 @@ def collect_date_assignments(stmts: list[object]) -> tuple[set[str], set[str]]:
                 scalars.add(name_l)
                 changed = True
     return scalars, vectors
+
+
+def rewrite_sys_display_args(stmts: list[object], date_names: set[str], posix_names: set[str]) -> None:
+    date_l = {x.lower() for x in date_names}
+    posix_l = {x.lower() for x in posix_names}
+
+    def rewrite_arg(arg: str) -> str:
+        c = parse_call_text(arg.strip())
+        if c is None:
+            return arg
+        if c[0].lower() == "as.character":
+            src = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+            if src.lower() in date_l:
+                return f"date_to_char({src})"
+            if src.lower() in posix_l:
+                return f'sys_time_format({src}, "%Y-%m-%d %H:%M:%S")'
+        if c[0].lower() == "format":
+            src = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+            fmt = c[1][1].strip() if len(c[1]) >= 2 else c[2].get("format", c[2].get("fmt", '"%F"')).strip()
+            if src.lower() in posix_l:
+                return f"sys_time_format({src}, {fmt})"
+            if src.lower() in date_l:
+                return f"date_format({src}, {fmt})"
+        return arg
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, CallStmt) and st.name.lower() == "cat":
+                st.args = [rewrite_arg(a) for a in st.args]
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
 
 
 def _replace_complex_literals_outside_strings(expr: str) -> str:
@@ -7894,6 +7986,47 @@ def r_expr_to_fortran(expr: str) -> str:
     c_expr0 = parse_call_text(s)
     if c_expr0 is not None and c_expr0[0].lower() in {"expression", "d"}:
         raise NotImplementedError("unsupported expression/D() object in executable expression; use eval() on a known D() result")
+    c_sys0 = parse_call_text(s)
+    if c_sys0 is not None:
+        sys_nm0 = c_sys0[0].lower()
+        if sys_nm0 in {"sys.time", "sys_time"}:
+            return "sys_time()"
+        if sys_nm0 in {"sys.date", "sys_date"}:
+            return "sys_date()"
+        if sys_nm0 == "date":
+            return "sys_date_string()"
+        if sys_nm0 in {"sys.timezone", "sys_timezone"}:
+            return "sys_timezone()"
+        if sys_nm0 == "proc.time":
+            return "proc_time_vec()"
+        if sys_nm0 == "class":
+            arg_cls = c_sys0[1][0].strip() if c_sys0[1] else c_sys0[2].get("x", "").strip()
+            arg_l = arg_cls.lower()
+            if _is_posixct_source(arg_cls):
+                return '"POSIXct"'
+            if _is_date_scalar_source(arg_cls):
+                return '"Date"'
+            if arg_l in _KNOWN_CHAR_VECTOR_NAMES:
+                return '"character"'
+            if re.fullmatch(r"[A-Za-z]\w*", arg_cls) and arg_l not in _KNOWN_INT_NAMES and arg_l not in _KNOWN_VECTOR_NAMES:
+                return '"character"'
+            return '"numeric"'
+        if sys_nm0 == "difftime":
+            pos_dt, kw_dt = c_sys0[1], c_sys0[2]
+            t1_src = pos_dt[0].strip() if len(pos_dt) >= 1 else kw_dt.get("time1", "").strip()
+            t0_src = pos_dt[1].strip() if len(pos_dt) >= 2 else kw_dt.get("time2", "").strip()
+            units_txt = _dequote_string_literal(kw_dt.get("units", '"auto"').strip()) or "secs"
+            scale = {
+                "secs": "1.0_dp",
+                "sec": "1.0_dp",
+                "seconds": "1.0_dp",
+                "mins": "60.0_dp",
+                "min": "60.0_dp",
+                "minutes": "60.0_dp",
+                "hours": "3600.0_dp",
+                "days": "86400.0_dp",
+            }.get(units_txt.lower(), "1.0_dp")
+            return f"(({r_expr_to_fortran(t1_src)}) - ({r_expr_to_fortran(t0_src)})) / {scale}"
     if re.match(r"^proc\.time\s*\(\s*\)\s*\[\[\s*['\"]elapsed['\"]\s*\]\]\s*$", s, re.IGNORECASE):
         return "r_elapsed()"
     if re.match(r"^proc\.time\s*\(\s*\)\s*\[\s*3(?:L|\.0+)?\s*\]\s*$", s, re.IGNORECASE):
@@ -7931,12 +8064,16 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_date0 is not None and c_date0[0].lower() == "format":
         arg_fmt = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
         fmt_src = c_date0[1][1].strip() if len(c_date0[1]) >= 2 else c_date0[2].get("format", c_date0[2].get("fmt", '"%F"')).strip()
+        if _is_posixct_source(arg_fmt):
+            return f"sys_time_format({r_expr_to_fortran(arg_fmt)}, {r_expr_to_fortran(fmt_src)})"
         if _is_date_vector_source(arg_fmt):
             return f"date_format_vec({r_expr_to_fortran(arg_fmt)}, {r_expr_to_fortran(fmt_src)})"
         if _is_date_scalar_source(arg_fmt):
             return f"date_format({r_expr_to_fortran(arg_fmt)}, {r_expr_to_fortran(fmt_src)})"
     if c_date0 is not None and c_date0[0].lower() == "as.character":
         arg_chr = c_date0[1][0].strip() if c_date0[1] else c_date0[2].get("x", "").strip()
+        if _is_posixct_source(arg_chr):
+            return f"sys_time_format({r_expr_to_fortran(arg_chr)}, " + '"%Y-%m-%d %H:%M:%S")'
         c_tail_date_chr = parse_call_text(arg_chr)
         if c_tail_date_chr is not None and c_tail_date_chr[0].lower() == "tail":
             tail_src_chr = c_tail_date_chr[1][0].strip() if c_tail_date_chr[1] else c_tail_date_chr[2].get("x", "").strip()
@@ -11100,7 +11237,17 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "as.integer", _as_integer_to_fortran)
     s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: r_expr_to_fortran(inner.strip()))
     s = _replace_balanced_func_calls(s, "as.double", lambda inner: r_expr_to_fortran(inner.strip()))
-    s = _replace_balanced_func_calls(s, "as.character", lambda inner: inner.strip())
+    def _as_character_repl(inner: str) -> str:
+        txt = inner.strip()
+        if _is_posixct_source(txt):
+            return f"sys_time_format({r_expr_to_fortran(txt)}, " + '"%Y-%m-%d %H:%M:%S")'
+        if _is_date_scalar_source(txt):
+            return f"date_to_char({r_expr_to_fortran(txt)})"
+        if _is_date_vector_source(txt):
+            return f"date_to_char_vec({r_expr_to_fortran(txt)})"
+        return txt
+
+    s = _replace_balanced_func_calls(s, "as.character", _as_character_repl)
     s = _replace_balanced_func_calls(
         s,
         "na.omit",
@@ -12422,6 +12569,8 @@ def emit_stmts(
     local_ranks_ctx: dict[str, int] = {}
     char_scalar_vars: set[str] = set()
     char_vector_vars_ctx: set[str] = set()
+    date_scalar_vars_ctx: set[str] = set()
+    posixct_vars_ctx: set[str] = set()
     return_array_fns: set[str] = set()
     object_list_vars: dict[str, str] = {}
     t_test_vars_ctx: set[str] = set()
@@ -12509,6 +12658,12 @@ def emit_stmts(
         cvv = helper_ctx.get("char_vector_vars")
         if isinstance(cvv, set):
             char_vector_vars_ctx = cvv
+        dsv = helper_ctx.get("date_scalar_vars")
+        if isinstance(dsv, set):
+            date_scalar_vars_ctx = {str(x).lower() for x in dsv}
+        pxv = helper_ctx.get("posixct_vars")
+        if isinstance(pxv, set):
+            posixct_vars_ctx = {str(x).lower() for x in pxv}
         raf = helper_ctx.get("return_array_fns")
         if isinstance(raf, set):
             return_array_fns = raf
@@ -12543,6 +12698,8 @@ def emit_stmts(
         matrix_vars = set(int_matrix_vars) | set(real_matrix_vars)
     if not vector_vars:
         vector_vars = set(int_vector_vars) | set(real_vector_vars) | set(logical_vector_vars)
+    date_scalar_vars_ctx |= collect_date_assignments(stmts)[0]
+    posixct_vars_ctx |= collect_posixct_assignments(stmts)
     _CURRENT_INT_ARRAY_NAMES = {n.lower() for n in (set(int_vector_vars) | set(int_matrix_vars))}
     list_locals: dict[str, dict[str, object]] = {}
     if helper_ctx is not None:
@@ -15458,6 +15615,20 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in char_scalar_vars:
+                        _wstmt(f'write(*,"(a)") trim({r_expr_to_fortran(one)})', st.comment)
+                        continue
+                    c_char_direct_print0 = parse_call_text(one)
+                    if c_char_direct_print0 is not None and c_char_direct_print0[0].lower() in {
+                        "date",
+                        "sys.timezone",
+                        "sys_timezone",
+                        "class",
+                    }:
+                        _wstmt(f'write(*,"(a)") trim({r_expr_to_fortran(one)})', st.comment)
+                        if c_char_direct_print0[0].lower() in {"date", "sys.timezone", "sys_timezone"}:
+                            need_r_mod.add(r_expr_to_fortran(one).split("(", 1)[0])
+                        continue
                     c_print_round = parse_call_text(one)
                     if has_r_mod and c_print_round is not None and c_print_round[0].lower() == "round":
                         pos_round = c_print_round[1]
@@ -15556,9 +15727,17 @@ def emit_stmts(
                         _wstmt(f"call print_date({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_date")
                         continue
+                    if has_r_mod and _is_posixct_source(one):
+                        _wstmt(f'write(*,"(a)") trim(sys_time_format({r_expr_to_fortran(one)}, "%Y-%m-%d %H:%M:%S"))', st.comment)
+                        need_r_mod.add("sys_time_format")
+                        continue
                     c_date_char_print = parse_call_text(one)
                     if has_r_mod and c_date_char_print is not None and c_date_char_print[0].lower() in {"as.character", "format"}:
                         one_date_char_f = r_expr_to_fortran(one)
+                        if one_date_char_f.startswith("sys_time_format("):
+                            _wstmt(f'write(*,"(a)") trim({one_date_char_f})', st.comment)
+                            need_r_mod.add("sys_time_format")
+                            continue
                         if one_date_char_f.startswith(("date_to_char_vec(", "date_format_vec(")):
                             _wstmt(f"call print_char_vector({one_date_char_f})", st.comment)
                             need_r_mod.update({"print_char_vector", one_date_char_f.split("(", 1)[0]})
@@ -16796,6 +16975,11 @@ def emit_stmts(
                 else:
                     _wstmt("call random_seed()", st.comment)
                 continue
+            if nm in {"sys.sleep", "sys_sleep"}:
+                delay_src = st.args[0] if st.args else "0.0"
+                _wstmt(f"call sys_sleep(real({r_expr_to_fortran(delay_src)}, kind=dp))", st.comment)
+                need_r_mod.add("sys_sleep")
+                continue
             if nm == "cat":
                 if st.args:
                     out_items: list[str] = []
@@ -16863,6 +17047,28 @@ def emit_stmts(
                                         _wstmt("write(*,*)", "")
                                     just_flushed_cat_line = True
                             continue
+                        c_cat_item = parse_call_text(at)
+                        if c_cat_item is not None and c_cat_item[0].lower() == "as.character":
+                            arg_cat = c_cat_item[1][0].strip() if c_cat_item[1] else c_cat_item[2].get("x", "").strip()
+                            if arg_cat.lower() in date_scalar_vars_ctx:
+                                out_items.append(f"date_to_char({r_expr_to_fortran(arg_cat)})")
+                                need_r_mod.add("date_to_char")
+                                continue
+                            if arg_cat.lower() in posixct_vars_ctx:
+                                out_items.append(f'sys_time_format({r_expr_to_fortran(arg_cat)}, "%Y-%m-%d %H:%M:%S")')
+                                need_r_mod.add("sys_time_format")
+                                continue
+                        if c_cat_item is not None and c_cat_item[0].lower() == "format":
+                            arg_cat = c_cat_item[1][0].strip() if c_cat_item[1] else c_cat_item[2].get("x", "").strip()
+                            fmt_cat = c_cat_item[1][1].strip() if len(c_cat_item[1]) >= 2 else c_cat_item[2].get("format", c_cat_item[2].get("fmt", '"%F"')).strip()
+                            if arg_cat.lower() in posixct_vars_ctx:
+                                out_items.append(f"sys_time_format({r_expr_to_fortran(arg_cat)}, {r_expr_to_fortran(fmt_cat)})")
+                                need_r_mod.add("sys_time_format")
+                                continue
+                            if arg_cat.lower() in date_scalar_vars_ctx:
+                                out_items.append(f"date_format({r_expr_to_fortran(arg_cat)}, {r_expr_to_fortran(fmt_cat)})")
+                                need_r_mod.add("date_format")
+                                continue
                         item_f = _display_expr_to_fortran(a)
                         if re.fullmatch(r"[A-Za-z]\w*", item_f.strip()) and item_f.strip() in char_scalar_vars:
                             item_f = f"trim({item_f.strip()})"
@@ -17548,6 +17754,11 @@ def emit_stmts(
             # In R, a bare expression at statement level is evaluated and printed.
             expr_print_src = st.expr.strip()
             c_expr_print = parse_call_text(expr_print_src)
+            if c_expr_print is not None and c_expr_print[0].lower() in {"sys.sleep", "sys_sleep"}:
+                delay_src = c_expr_print[1][0].strip() if c_expr_print[1] else c_expr_print[2].get("time", "0.0").strip()
+                _wstmt(f"call sys_sleep(real({r_expr_to_fortran(delay_src)}, kind=dp))", st.comment)
+                need_r_mod.add("sys_sleep")
+                continue
             if re.fullmatch(r"[A-Za-z]\w*", expr_print_src) and expr_print_src in rle_vars_ctx:
                 _wstmt(f"call print_rle({expr_print_src})", st.comment)
                 need_r_mod.update({"print_rle", rle_vars_ctx[expr_print_src]})
@@ -20466,9 +20677,12 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                     out.add(st.name)
                     continue
                 c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class"}:
+                    out.add(st.name)
+                    continue
                 if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
                     arg = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
-                    if _is_date_scalar_source(arg):
+                    if _is_date_scalar_source(arg) or _is_posixct_source(arg):
                         out.add(st.name)
                         continue
                 m_char_scalar_subset = re.match(r"^([A-Za-z]\w*)\s*\[([^\]]+)\]\s*$", rhs)
@@ -22754,7 +22968,7 @@ def transpile_r_to_fortran(
     global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
-    global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES
+    global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
@@ -22777,6 +22991,7 @@ def transpile_r_to_fortran(
     _LAST_MATRIX_COL_LABELS = {}
     _KNOWN_DATE_NAMES = set()
     _KNOWN_DATE_VECTOR_NAMES = set()
+    _KNOWN_POSIXCT_NAMES = set()
     _ARRAY_DIM_LABELS = {}
     _KNOWN_COMPLEX_VECTOR_NAMES = set()
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
@@ -22901,6 +23116,8 @@ def transpile_r_to_fortran(
             st.expr = _rewrite_named_calls(st.expr, fn_arg_order, fn_arg_defaults, variadic_funcs)
     main_stmts = inline_single_use_temporaries(main_stmts)
     _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES = collect_date_assignments(main_stmts)
+    _KNOWN_POSIXCT_NAMES = collect_posixct_assignments(main_stmts)
+    rewrite_sys_display_args(main_stmts, _KNOWN_DATE_NAMES, _KNOWN_POSIXCT_NAMES)
     named_vectors: dict[str, tuple[list[str], list[str]]] = {}
     for st_nv in main_stmts:
         if not isinstance(st_nv, Assign):
@@ -23692,6 +23909,36 @@ def transpile_r_to_fortran(
         char_scalars.discard(nm_date_vec)
         char_arrays.discard(nm_date_vec)
         params.pop(nm_date_vec, None)
+    for nm_posix in _KNOWN_POSIXCT_NAMES:
+        real_scalars.add(nm_posix)
+        ints.discard(nm_posix)
+        int_arrays.discard(nm_posix)
+        real_arrays.discard(nm_posix)
+        char_scalars.discard(nm_posix)
+        char_arrays.discard(nm_posix)
+        params.pop(nm_posix, None)
+    for st_pt_decl in main_stmts:
+        if not isinstance(st_pt_decl, Assign):
+            continue
+        c_pt_decl = parse_call_text(st_pt_decl.expr.strip())
+        rhs_pt_l = st_pt_decl.expr.strip().lower()
+        if (c_pt_decl is not None and c_pt_decl[0].lower() == "proc.time") or re.match(
+            r"^[A-Za-z]\w*\s*-\s*[A-Za-z]\w*$",
+            rhs_pt_l,
+        ):
+            lhs_rhs_pt = _split_top_level_token(st_pt_decl.expr.strip(), "-", from_right=True)
+            if c_pt_decl is not None or (
+                lhs_rhs_pt is not None
+                and lhs_rhs_pt[0].strip().lower() in real_arrays
+                and lhs_rhs_pt[1].strip().lower() in real_arrays
+            ):
+                real_arrays.add(st_pt_decl.name)
+                real_scalars.discard(st_pt_decl.name)
+                ints.discard(st_pt_decl.name)
+                int_arrays.discard(st_pt_decl.name)
+                char_scalars.discard(st_pt_decl.name)
+                char_arrays.discard(st_pt_decl.name)
+                params.pop(st_pt_decl.name, None)
     for nm in set(char_scalars) | set(char_arrays):
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -24208,6 +24455,8 @@ def transpile_r_to_fortran(
     helper_ctx_main["logical_matrix_vars"] = set(logical_matrices)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
     helper_ctx_main["char_vector_vars"] = set(char_arrays)
+    helper_ctx_main["date_scalar_vars"] = set(_KNOWN_DATE_NAMES)
+    helper_ctx_main["posixct_vars"] = set(_KNOWN_POSIXCT_NAMES)
 
     # Main program declarations/body (without header/footer).
     pbody = FEmit()
@@ -25199,6 +25448,8 @@ def transpile_r_to_fortran(
     helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
     helper_ctx_main["char_vector_vars"] = set(char_arrays)
+    helper_ctx_main["date_scalar_vars"] = set(_KNOWN_DATE_NAMES)
+    helper_ctx_main["posixct_vars"] = set(_KNOWN_POSIXCT_NAMES)
 
     for nm in set(list_vars) | set(main_object_list_vars):
         ints.discard(nm)
@@ -27147,6 +27398,13 @@ def transpile_r_to_fortran(
         "date_seq_length",
         "date_range",
         "r_elapsed",
+        "sys_time",
+        "sys_date",
+        "sys_date_string",
+        "sys_timezone",
+        "sys_time_format",
+        "sys_sleep",
+        "proc_time_vec",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
