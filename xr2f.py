@@ -116,6 +116,7 @@ _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "kruskal.test": {"name": "kruskal.test", "category": "subset_semantics", "reason": "subset implementation"},
 }
 _CALL_COERCION_WARNINGS: set[tuple[str, str, str]] = set()
+_SUPPRESS_WARNINGS = False
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -127,6 +128,11 @@ DEBUG_IFX_COMPILER = "ifx /Od /debug:full /traceback /check:all /warn:all" if sy
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
+
+
+def _emit_warning(msg: str) -> None:
+    if not _SUPPRESS_WARNINGS:
+        print(msg)
 
 
 def _expanded_data_frame_col_expr(obj: str, field: str) -> str | None:
@@ -1343,7 +1349,7 @@ def _warn_mixed_character_coercion(expr: str) -> None:
     if key in _MIXED_CHARACTER_COERCION_WARNINGS:
         return
     _MIXED_CHARACTER_COERCION_WARNINGS.add(key)
-    print(
+    _emit_warning(
         f"Warning: R expression `{key}` mixes character and non-character values; "
         "translating by coercing all elements to character."
     )
@@ -7727,7 +7733,7 @@ def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src:
     if is_int_actual:
         key = (fn_name.lower(), formal.lower(), actual_src.strip())
         if key not in _CALL_COERCION_WARNINGS:
-            print(
+            _emit_warning(
                 f"Warning: call {fn_name}(...): argument `{formal}` is declared double "
                 f"but actual `{actual_src.strip()}` is inferred integer; passing real(..., kind=dp)."
             )
@@ -22600,13 +22606,13 @@ def transpile_r_to_fortran(
     validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
-        print(
+        _emit_warning(
             f"Warning: R loop variable `{old}`{loc} reuses an earlier assigned name; "
             f"translating loop variable as `{new}`."
         )
     for old, new, line_no in reused_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
-        print(
+        _emit_warning(
             f"Warning: R variable `{old}`{loc} is reused with a different inferred shape or kind; "
             f"translating as `{new}`."
         )
@@ -29083,6 +29089,272 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
     return "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
 
 
+def coerce_named_integer_actuals_from_decls_text(f90: str) -> str:
+    real_scalars: set[str] = set()
+    integer_dummies: set[str] = set()
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_real = re.match(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*(?:,\s*[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_real is not None:
+            attrs = code.split("::", 1)[0].lower()
+            if not any(x in attrs for x in ("allocatable", "parameter", "pointer")):
+                for item in split_top_level_commas(m_real.group(1)):
+                    lhs = item.split("=", 1)[0].strip()
+                    if "(" not in lhs and re.fullmatch(r"[A-Za-z]\w*", lhs):
+                        real_scalars.add(lhs.lower())
+        m_int = re.match(r"^\s*integer\s*,\s*[^:]*\bintent\s*\(\s*in\s*\)[^:]*::\s*(.+)$", code, re.IGNORECASE)
+        if m_int is not None:
+            for item in split_top_level_commas(m_int.group(1)):
+                lhs = item.split("=", 1)[0].strip()
+                name_m = re.match(r"([A-Za-z]\w*)\b", lhs)
+                if name_m is not None:
+                    integer_dummies.add(name_m.group(1).lower())
+    if not real_scalars or not integer_dummies:
+        return f90
+
+    dummy_alt = "|".join(re.escape(n) for n in sorted(integer_dummies, key=len, reverse=True))
+    real_alt = "|".join(re.escape(n) for n in sorted(real_scalars, key=len, reverse=True))
+    pat = re.compile(
+        rf"(?<![A-Za-z0-9_%])({dummy_alt})\s*=\s*({real_alt})(?=\s*[,)&])",
+        re.IGNORECASE,
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        val = m.group(2)
+        if re.match(r"^int\s*\(", val, re.IGNORECASE):
+            return m.group(0)
+        return f"{m.group(1)}=int({val})"
+
+    return pat.sub(repl, f90)
+
+
+def rewrite_invalid_rank2_double_spread_text(f90: str) -> str:
+    return re.sub(
+        r"spread\s*\(\s*spread\s*\(\s*reshape\s*\(\s*([A-Za-z]\w*)\s*,\s*\[\s*size\s*\(\s*\1\s*\)\s*\]\s*\)\s*,\s*&?\s*\n?\s*&?\s*dim\s*=\s*1\s*,\s*ncopies\s*=\s*size\s*\(\s*([A-Za-z]\w*)\s*,\s*1\s*\)\s*\)\s*,\s*dim\s*=\s*3\s*,\s*ncopies\s*=\s*size\s*\(\s*\2\s*,\s*3\s*\)\s*\)",
+        r"spread(reshape(\1, [size(\1)]), dim=1, ncopies=size(\2,1))",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
+def rewrite_rank3_loop_print_slices_text(f90: str) -> str:
+    rank3_names: set[str] = set()
+    raw_lines = f90.splitlines()
+    i_decl = 0
+    while i_decl < len(raw_lines):
+        code = raw_lines[i_decl].split("!", 1)[0]
+        if not re.match(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::", code, re.IGNORECASE):
+            i_decl += 1
+            continue
+        full = code
+        while full.rstrip().endswith("&") and i_decl + 1 < len(raw_lines):
+            i_decl += 1
+            cont = raw_lines[i_decl].split("!", 1)[0]
+            full = full.rstrip()[:-1] + " " + re.sub(r"^\s*&\s*", "", cont).strip()
+        m_decl = re.match(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", full, re.IGNORECASE)
+        if m_decl is None:
+            i_decl += 1
+            continue
+        for part in split_top_level_commas(m_decl.group(1)):
+            m_name = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\s*,\s*:\s*\)", part)
+            if m_name is not None:
+                rank3_names.add(m_name.group(1).lower())
+        i_decl += 1
+    if not rank3_names:
+        return f90
+
+    out: list[str] = []
+    loop_stack: list[str] = []
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_do = re.match(r"^\s*do\s+([A-Za-z]\w*)\s*=", code, re.IGNORECASE)
+        if m_do is not None:
+            loop_stack.append(m_do.group(1))
+            out.append(line)
+            continue
+        if re.match(r"^\s*end\s+do\b", code, re.IGNORECASE):
+            if loop_stack:
+                loop_stack.pop()
+            out.append(line)
+            continue
+        if loop_stack:
+            idx = loop_stack[-1]
+
+            def repl(m: re.Match[str]) -> str:
+                nm = m.group(1)
+                if nm.lower() not in rank3_names:
+                    return m.group(0)
+                return f"{nm}(:, :, {idx})"
+
+            line = re.sub(r"\b([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*\)", repl, line)
+
+            def repl_col(m: re.Match[str]) -> str:
+                nm = m.group(1)
+                col = m.group(2)
+                if nm.lower() not in rank3_names:
+                    return m.group(0)
+                return f"{nm}(:, {col}, {idx})"
+
+            line = re.sub(r"\b([A-Za-z]\w*)\s*\(\s*:\s*,\s*([A-Za-z]\w*|\d+)\s*\)", repl_col, line)
+            line = re.sub(
+                r"\bcall\s+print_real_vector\s*\(\s*([A-Za-z]\w*\s*\(\s*:\s*,\s*:\s*,\s*[A-Za-z]\w*\s*\))",
+                r"call print_matrix(\1",
+                line,
+                flags=re.IGNORECASE,
+            )
+        out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
+    def is_scalar_rhs(expr: str, array_names: set[str]) -> bool:
+        e = expr.strip()
+        if not e:
+            return False
+        if any(tok in e for tok in ("[", "]")):
+            return False
+        if ":" in e:
+            return False
+        if re.search(
+            r"\b(?:matrix|reshape|pack|which|qnorm|r_seq_\w*|r_rep_\w*|cbind|rbind|rev_int|cumsum|cumprod|sort|rnorm_vec|runif_vec)\s*\(",
+            e,
+            re.IGNORECASE,
+        ):
+            return False
+        bare_call = re.fullmatch(r"([A-Za-z]\w*)\s*\(.*\)", e, re.DOTALL)
+        if (
+            bare_call is not None
+            and bare_call.group(1) not in array_names
+            and bare_call.group(1).lower() not in {
+            "abs", "sqrt", "exp", "log", "r_log", "sin", "cos", "tan",
+            "asin", "acos", "atan", "dnorm", "pnorm", "sd", "mean",
+            "sum", "min", "max", "real", "int", "merge",
+            }
+        ):
+            return False
+        e_refs = e
+        for nm in array_names:
+            def repl_index(m: re.Match[str]) -> str:
+                idx = m.group(1).strip()
+                idx_names = {x.lower() for x in re.findall(r"\b[A-Za-z]\w*\b", idx)}
+                if "," in idx or ":" in idx or idx_names & {x.lower() for x in array_names}:
+                    return m.group(0)
+                if re.search(r"\b(?:which|r_seq_\w*|r_rep_\w*)\s*\(", idx, re.IGNORECASE):
+                    return m.group(0)
+                return ""
+
+            e_refs = re.sub(rf"\b{re.escape(nm)}\s*\(\s*([^()]*)\)", repl_index, e_refs)
+        for nm in array_names:
+            if re.search(rf"\b{re.escape(nm)}\b", e_refs):
+                return False
+        return True
+
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        candidates: set[str] = set()
+        array_names: set[str] = set()
+        for decl_m in re.finditer(
+            r"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)\s*(?:,\s*[^:]*)?::\s*(.+)$",
+            block,
+            re.IGNORECASE,
+        ):
+            for item in split_top_level_commas(decl_m.group(1)):
+                m_any = re.match(r"\s*([A-Za-z]\w*)\s*\(", item.strip())
+                if m_any is not None:
+                    array_names.add(m_any.group(1))
+        for decl_m in re.finditer(
+            r"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            block,
+            re.IGNORECASE,
+        ):
+            for item in split_top_level_commas(decl_m.group(2)):
+                m_item = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item.strip())
+                if m_item is not None:
+                    candidates.add(m_item.group(1))
+        if not candidates:
+            return block
+        scalar_names: set[str] = set()
+        usage_block = "\n".join(
+            ln for ln in block.splitlines()
+            if not re.match(r"^\s*(?:real|integer|logical|complex|character|type)\b.*::", ln, re.IGNORECASE)
+        )
+        for nm in candidates:
+            if nm.lower().endswith("_result"):
+                continue
+            if re.search(rf"\b(?:size|allocated|deallocate|allocate)\s*\(\s*{re.escape(nm)}\b", usage_block, re.IGNORECASE):
+                continue
+            if re.search(rf"\b{re.escape(nm)}\s*\(", usage_block):
+                continue
+            assigns = [
+                m.group(1).strip()
+                for m in re.finditer(rf"(?m)^\s*{re.escape(nm)}\s*=\s*(.+)$", usage_block)
+            ]
+            rhs_array_names = {x for x in array_names if x.lower() != nm.lower()}
+            if assigns and all(is_scalar_rhs(a, rhs_array_names) for a in assigns):
+                scalar_names.add(nm)
+        if not scalar_names:
+            return block
+        out_lines: list[str] = []
+        for line in block.splitlines():
+            m_decl = re.match(
+                r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if m_decl is None:
+                out_lines.append(line)
+                continue
+            kept: list[str] = []
+            demoted: list[str] = []
+            for item in split_top_level_commas(m_decl.group(2)):
+                item_s = item.strip()
+                m_item = re.fullmatch(r"([A-Za-z]\w*)\s*\(:\s*\)", item_s)
+                if m_item is not None and m_item.group(1) in scalar_names:
+                    demoted.append(m_item.group(1))
+                elif item_s:
+                    kept.append(item_s)
+            if demoted:
+                out_lines.append(f"{m_decl.group(1)}real(kind=dp) :: " + ", ".join(demoted))
+                if kept:
+                    out_lines.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept))
+            else:
+                out_lines.append(line)
+        return "\n".join(out_lines)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def scalarize_singleton_user_vec_tmp_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        tmp_names: set[str] = set()
+        for m in re.finditer(
+            r"(?m)^\s*(xr2f_user_vec_tmp)\s*=\s*[A-Za-z]\w*\s*\((?:(?!\n).)*\[[^\],]+\](?:(?!\n).)*\)\s*$",
+            block,
+            re.IGNORECASE,
+        ):
+            tmp_names.add(m.group(1))
+        if not tmp_names:
+            return block
+        for tmp in tmp_names:
+            block = re.sub(
+                rf"(?m)^(\s*[A-Za-z]\w*\s*=\s*){re.escape(tmp)}\s*$",
+                rf"\1{tmp}(1)",
+                block,
+            )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
 def promote_sample_int_bound_scalars_text(f90: str) -> str:
     needed = {
         m.group(1).lower()
@@ -30364,11 +30636,25 @@ def promote_rank3_dummy_arguments(lines: list[str]) -> list[str]:
 
 def promote_rank3_result_assignments(lines: list[str]) -> list[str]:
     names: set[str] = set()
+    rank3_funcs: set[str] = set()
+    for ln in lines:
+        m_res = re.match(
+            r"^\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)_result\s*\(:\s*,\s*:\s*,\s*:\s*\)",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_res is not None:
+            rank3_funcs.add(m_res.group(1).lower())
     for ln in lines:
         m_cov = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(?:make_ccc_covariances|make_dcc_covariances)\s*\(", ln, re.IGNORECASE)
         if m_cov is not None:
             names.add(m_cov.group(1))
             continue
+        if rank3_funcs:
+            m_fn = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(", ln, re.IGNORECASE)
+            if m_fn is not None and m_fn.group(2).lower() in rank3_funcs:
+                names.add(m_fn.group(1))
+                continue
         m_arr = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(r_array_real|r_array_int)\s*\((.+)\)\s*$", ln, re.IGNORECASE)
         if m_arr is not None:
             c_arr = parse_call_text(f"{m_arr.group(2)}({m_arr.group(3)})")
@@ -31650,6 +31936,140 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def promote_locals_from_derived_component_assignments_text(f90: str) -> str:
+    """Promote locals assigned from ranked derived-type components.
+
+    The front end can infer list fields such as `fit%z` or `theta%mu` as
+    vectors, while a same-named local alias starts scalar.  Repair this from the
+    generated Fortran declarations instead of relying on particular R names.
+    """
+    lines = f90.splitlines()
+    type_fields: dict[tuple[str, str], tuple[str, int]] = {}
+    current_type: str | None = None
+    comp_decl_re = re.compile(
+        r"^\s*(real\(kind=dp\)|integer|logical|character\(len=:\))\s*([^:]*)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+
+    def _item_name_rank(part: str) -> tuple[str, int] | None:
+        m_item = re.match(r"\s*([A-Za-z]\w*)\s*(\(.*\))?", part.strip())
+        if m_item is None:
+            return None
+        dims = (m_item.group(2) or "").replace(" ", "")
+        rank = 0
+        if dims:
+            rank = max(1, dims.count(",") + 1, dims.count(":"))
+        return m_item.group(1), rank
+
+    for ln in lines:
+        m_begin = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_begin is not None:
+            current_type = m_begin.group(1).lower()
+            continue
+        if current_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            current_type = None
+            continue
+        if current_type is None:
+            continue
+        m_decl = comp_decl_re.match(ln)
+        if m_decl is None:
+            continue
+        base = m_decl.group(1).lower()
+        for part in split_top_level_commas(m_decl.group(3)):
+            item = _item_name_rank(part)
+            if item is None:
+                continue
+            field, rank = item
+            type_fields[(current_type, field.lower())] = (base, rank)
+
+    if not type_fields:
+        return f90
+
+    unit_required: dict[int, dict[str, tuple[str, int]]] = {}
+    unit_start: int | None = None
+    local_types: dict[str, str] = {}
+    local_required: dict[str, tuple[str, int]] = {}
+    type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+    assign_re = re.compile(r"^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
+    unit_begin_re = re.compile(r"^\s*(?:program|(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function|subroutine)\b", re.IGNORECASE)
+    unit_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
+
+    for idx, ln in enumerate(lines):
+        if unit_begin_re.match(ln):
+            unit_start = idx
+            local_types = {}
+            local_required = {}
+        if unit_start is None:
+            continue
+        m_type = type_var_re.match(ln)
+        if m_type is not None:
+            tname = m_type.group(1).lower()
+            for part in split_top_level_commas(m_type.group(2)):
+                item = _item_name_rank(part)
+                if item is not None:
+                    local_types[item[0].lower()] = tname
+            continue
+        m_assign = assign_re.match(ln)
+        if m_assign is not None:
+            lhs, obj, field = m_assign.groups()
+            obj_type = local_types.get(obj.lower())
+            if obj_type is not None:
+                component = type_fields.get((obj_type, field.lower()))
+                if component is not None and component[1] > 0:
+                    local_required[lhs.lower()] = component
+        if unit_end_re.match(ln):
+            if local_required:
+                unit_required[unit_start] = dict(local_required)
+            unit_start = None
+            local_types = {}
+            local_required = {}
+
+    if not unit_required:
+        return f90
+
+    def _decl_for(base: str, name: str, rank: int) -> str:
+        dims = "(:)" if rank == 1 else "(:,:)" if rank == 2 else "(:,:,:)"
+        return f"{base}, allocatable :: {name}{dims}"
+
+    out: list[str] = []
+    active_required: dict[str, tuple[str, int]] = {}
+    for idx, ln in enumerate(lines):
+        if idx in unit_required:
+            active_required = unit_required[idx]
+        if active_required:
+            m_decl = comp_decl_re.match(ln)
+            if m_decl is not None:
+                indent = re.match(r"^(\s*)", ln).group(1)
+                base = m_decl.group(1).lower()
+                attrs = m_decl.group(2)
+                kept: list[str] = []
+                promoted: list[str] = []
+                changed = False
+                for part in split_top_level_commas(m_decl.group(3)):
+                    item = _item_name_rank(part)
+                    if item is None:
+                        kept.append(part.strip())
+                        continue
+                    nm, old_rank = item
+                    required = active_required.get(nm.lower())
+                    if required is not None and required[0] == base and required[1] > old_rank:
+                        promoted.append(_decl_for(base, nm, required[1]))
+                        changed = True
+                    else:
+                        kept.append(part.strip())
+                if changed:
+                    if kept:
+                        out.append(f"{indent}{m_decl.group(1)}{attrs}:: {', '.join(kept)}")
+                    out.extend(f"{indent}{p}" for p in promoted)
+                    if unit_end_re.match(ln):
+                        active_required = {}
+                    continue
+        out.append(ln)
+        if unit_end_re.match(ln):
+            active_required = {}
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def rewrite_acf_names_print_text(f90: str) -> str:
     acf_names: set[str] = set()
     for ln in f90.splitlines():
@@ -32041,7 +32461,11 @@ def keep_indexed_scalarized_user_vector_assignments_text(f90: str) -> str:
     assigned = set(
         re.findall(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*xr2f_user_vec_tmp\s*\(\s*1\s*\)\s*$", f90)
     )
-    indexed = {nm for nm in assigned if re.search(rf"\b{re.escape(nm)}\s*\(", f90)}
+    usage_text = "\n".join(
+        ln for ln in f90.splitlines()
+        if not re.match(r"^\s*(?:real|integer|logical|complex|character|type)\b.*::", ln, re.IGNORECASE)
+    )
+    indexed = {nm for nm in assigned if re.search(rf"\b{re.escape(nm)}\s*\(", usage_text)}
     if not indexed:
         return f90
     for nm in sorted(indexed, key=len, reverse=True):
@@ -33046,6 +33470,134 @@ def mark_pure_with_xpure(lines: list[str]) -> list[str]:
     return out
 
 
+def ensure_pure_dummy_intents(lines: list[str]) -> list[str]:
+    """Fortran requires every dummy argument of a pure procedure to have intent.
+
+    The main emitter usually writes intent(in), but later purity analysis can
+    mark additional procedures pure after declarations have already been
+    generated.  Repair those declarations generically by adding intent(in) to
+    dummy-argument declaration lines that do not already specify an intent.
+    """
+    out = list(lines)
+    decl_re = re.compile(
+        r"^(\s*)(real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))"
+        r"(\s*(?:,\s*[^:]*)?)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+
+    def _entity_name(part: str) -> str | None:
+        m = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+        return m.group(1) if m else None
+
+    i = 0
+    while i < len(out):
+        header = out[i]
+        hm = re.match(
+            r"^\s*pure\s+(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\s+\w+\s*\(([^)]*)\)",
+            header,
+            re.IGNORECASE,
+        )
+        if hm is None:
+            i += 1
+            continue
+        dummy_names = {
+            a.strip().lower()
+            for a in split_top_level_commas(hm.group(1))
+            if re.fullmatch(r"[A-Za-z]\w*", a.strip())
+        }
+        if not dummy_names:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(out):
+            if re.match(r"^\s*end\s+(?:function|subroutine)\b", out[j], re.IGNORECASE):
+                break
+            raw = out[j]
+            code, comment = fscan._split_code_comment(raw.rstrip("\r\n"))  # type: ignore[attr-defined]
+            if "::" not in code or "intent" in code.lower():
+                j += 1
+                continue
+            m = decl_re.match(code)
+            if m is None:
+                j += 1
+                continue
+            entities = split_top_level_commas(m.group(4))
+            names = {_entity_name(e).lower() for e in entities if _entity_name(e) is not None}
+            if not names or not names <= dummy_names:
+                j += 1
+                continue
+            eol = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "")
+            suffix = (" " + comment.strip()) if comment.strip() else ""
+            out[j] = f"{m.group(1)}{m.group(2)}{m.group(3)}, intent(in) :: {m.group(4).strip()}{suffix}{eol}"
+            j += 1
+        i = j + 1
+    return out
+
+
+def ensure_present_dummy_optional(lines: list[str]) -> list[str]:
+    out = list(lines)
+    decl_re = re.compile(
+        r"^(\s*)(real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))"
+        r"(\s*(?:,\s*[^:]*)?)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+
+    def _entity_name(part: str) -> str | None:
+        m = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+        return m.group(1) if m else None
+
+    i = 0
+    while i < len(out):
+        header = out[i]
+        hm = re.match(
+            r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\s+\w+\s*\(([^)]*)\)",
+            header,
+            re.IGNORECASE,
+        )
+        if hm is None:
+            i += 1
+            continue
+        dummy_names = {
+            a.strip().lower()
+            for a in split_top_level_commas(hm.group(1))
+            if re.fullmatch(r"[A-Za-z]\w*", a.strip())
+        }
+        if not dummy_names:
+            i += 1
+            continue
+        j = i + 1
+        present_names: set[str] = set()
+        while j < len(out):
+            if re.match(r"^\s*end\s+(?:function|subroutine)\b", out[j], re.IGNORECASE):
+                break
+            code = out[j].split("!", 1)[0]
+            for pm in re.finditer(r"\bpresent\s*\(\s*([A-Za-z]\w*)\s*\)", code, re.IGNORECASE):
+                nm = pm.group(1).lower()
+                if nm in dummy_names:
+                    present_names.add(nm)
+            j += 1
+        if not present_names:
+            i = j + 1
+            continue
+        for k in range(i + 1, j):
+            raw = out[k]
+            code, comment = fscan._split_code_comment(raw.rstrip("\r\n"))  # type: ignore[attr-defined]
+            if "::" not in code or "optional" in code.lower():
+                continue
+            m = decl_re.match(code)
+            if m is None:
+                continue
+            entities = split_top_level_commas(m.group(4))
+            names = {_entity_name(e).lower() for e in entities if _entity_name(e) is not None}
+            if not names or not names <= present_names:
+                continue
+            eol = "\r\n" if raw.endswith("\r\n") else ("\n" if raw.endswith("\n") else "")
+            suffix = (" " + comment.strip()) if comment.strip() else ""
+            out[k] = f"{m.group(1)}{m.group(2)}{m.group(3)}, optional :: {m.group(4).strip()}{suffix}{eol}"
+        i = j + 1
+    return out
+
+
 def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run command with robust text decoding on Windows."""
     try:
@@ -33507,6 +34059,8 @@ def _warn_approximate_r_function_calls(src: str) -> None:
     calls = _find_approximate_r_function_calls(src)
     if not calls:
         return
+    if _SUPPRESS_WARNINGS:
+        return
     print("Warning: approximate/subset R function translations detected:")
     for line_no, meta in calls:
         print(f"  line {line_no}: {meta['name']} ({meta['category']}): {meta['reason']}")
@@ -33797,6 +34351,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--no-recycle")
     if args.recycle_warn:
         cmd.append("--recycle-warn")
+    if getattr(args, "no_warn", False):
+        cmd.append("--no-warn")
     if getattr(args, "no_fortran_comments", False):
         cmd.append("--no-fortran-comments")
     if args.recycle_stop:
@@ -34238,6 +34794,11 @@ def main() -> int:
         help="error stop whenever vector recycling occurs (lengths differ; requires r_mod helper)",
     )
     ap.add_argument(
+        "--no-warn",
+        action="store_true",
+        help="suppress xr2f warning messages while still showing errors and build diagnostics",
+    )
+    ap.add_argument(
         "--no-fortran-comments",
         action="store_true",
         help="treat #f and #fortran comments as ordinary R comments",
@@ -34264,6 +34825,8 @@ def main() -> int:
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
+    global _SUPPRESS_WARNINGS
+    _SUPPRESS_WARNINGS = bool(args.no_warn)
     if args.run_repeat < 1:
         print("Error: --run-repeat must be positive.")
         return 2
@@ -34523,9 +35086,10 @@ def main() -> int:
                 print(f"Transpile: FAIL (unsupported package import at line {ln}: {stmt})")
                 print("Hint: rerun with --allow-library for best-effort partial transpilation.")
                 return 1
-            print("Warning: package import detected; continuing with best-effort partial translation:")
-            for ln, stmt in lib_calls:
-                print(f"  line {ln}: {stmt}")
+            if not args.no_warn:
+                print("Warning: package import detected; continuing with best-effort partial translation:")
+                for ln, stmt in lib_calls:
+                    print(f"  line {ln}: {stmt}")
         if args.warn_approx:
             _warn_approximate_r_function_calls(src)
         forced_skips: dict[str, str] = {}
@@ -34731,9 +35295,10 @@ def main() -> int:
                 print(f"Transpile: FAIL (unsupported package import at line {ln}: {stmt})")
                 print("Hint: rerun with --allow-library for best-effort transpilation.")
                 return 1
-            print("Warning: package import detected; continuing with best-effort translation:")
-            for ln, stmt in lib_calls:
-                print(f"  line {ln}: {stmt}")
+            if not args.no_warn:
+                print("Warning: package import detected; continuing with best-effort translation:")
+                for ln, stmt in lib_calls:
+                    print(f"  line {ln}: {stmt}")
         if args.warn_approx:
             _warn_approximate_r_function_calls(src)
         if annotate_r_path is not None:
@@ -34819,6 +35384,7 @@ def main() -> int:
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
     f90_lines = mark_pure_with_xpure(f90_lines)
+    f90_lines = ensure_pure_dummy_intents(f90_lines)
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     f90_lines = fpost.simplify_do_while_true(f90_lines)
     f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
@@ -35517,8 +36083,10 @@ def main() -> int:
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = add_missing_derived_type_fields_from_assignments_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
+    f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
+    f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = rewrite_rank1_component_matrix_prints_text(f90)
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
@@ -35549,6 +36117,16 @@ def main() -> int:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
     f90 = _remove_redundant_single_blank_writes(f90)
     f90 = _simplify_single_literal_g0_writes(f90)
+    f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
+    f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
+    f90 = coerce_named_integer_actuals_from_decls_text(f90)
+    f90 = rewrite_invalid_rank2_double_spread_text(f90)
+    f90 = rewrite_rank3_loop_print_slices_text(f90)
+    f90 = scalarize_singleton_user_vec_tmp_text(f90)
+    f90 = demote_scalar_assigned_rank1_real_locals_text(f90)
+    f90 = promote_locals_from_derived_component_assignments_text(f90)
+    if "call print_matrix(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
