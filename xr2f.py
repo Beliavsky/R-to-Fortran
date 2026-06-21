@@ -70,6 +70,7 @@ _TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
 _FIT_TERM_LABELS: dict[str, list[str]] = {}
 _KNOWN_RANK3_NAMES: set[str] = set()
 _ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
+_RANK3_SLICE_PRINT_LABELS: dict[str, tuple[str, str]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
@@ -1408,6 +1409,20 @@ def _parse_array_dim_labels(expr: str) -> list[list[str]] | None:
             return None
         labels.append(labs)
     return labels
+
+
+def _parse_array_dim_label_sources(expr: str) -> list[str] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "array":
+        return None
+    dimnames_src = cinfo[2].get("dimnames")
+    if dimnames_src is None:
+        return None
+    linfo = parse_call_text(dimnames_src.strip())
+    if linfo is None or linfo[0].lower() != "list":
+        return None
+    items = linfo[1] + list(linfo[2].values())
+    return [item.strip() for item in items]
 
 
 def _numeric_list_array_expr(expr: str) -> tuple[str, int] | None:
@@ -13384,6 +13399,14 @@ def emit_stmts(
             labs_direct = fallback_matrix_labels_map.get(t_key)
         if isinstance(labs_direct, list) and labs_direct:
             return [str(x) for x in labs_direct]
+        m_subset_base_labs = re.match(r"^\s*([A-Za-z]\w*)\s*\[", t)
+        if m_subset_base_labs is not None:
+            base_key_labs = m_subset_base_labs.group(1).lower()
+            labs_base = matrix_labels_map.get(base_key_labs)
+            if not (isinstance(labs_base, list) and labs_base):
+                labs_base = fallback_matrix_labels_map.get(base_key_labs)
+            if isinstance(labs_base, list) and labs_base:
+                return [str(x) for x in labs_base]
         candidates = [m.group(1).lower() for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", t)]
         for cand in reversed(candidates):
             labs = matrix_labels_map.get(cand)
@@ -21712,6 +21735,76 @@ def collect_direct_function_matrix_col_labels_from_source(src: str) -> dict[str,
     return out
 
 
+def collect_function_array_dimname_sources_from_source(src: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+
+    def find_matching(src_txt: str, open_pos: int, open_ch: str, close_ch: str) -> int:
+        depth = 0
+        quote: str | None = None
+        i = open_pos
+        while i < len(src_txt):
+            ch = src_txt[i]
+            if quote is not None:
+                if ch == quote and (i == 0 or src_txt[i - 1] != "\\"):
+                    quote = None
+                i += 1
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "#":
+                nl = src_txt.find("\n", i)
+                if nl < 0:
+                    return len(src_txt)
+                i = nl + 1
+                continue
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return len(src_txt)
+
+    for m_fn in re.finditer(r"\b([A-Za-z]\w*)\s*<-\s*function\b[^{]*\{", src, re.DOTALL):
+        fn_name = m_fn.group(1).lower()
+        open_body = src.find("{", m_fn.start())
+        if open_body < 0:
+            continue
+        close_body = find_matching(src, open_body, "{", "}")
+        body_txt = src[open_body + 1 : close_body]
+        returned: str | None = None
+        ret_calls = list(re.finditer(r"\breturn\s*\(\s*([A-Za-z]\w*)\s*\)", body_txt))
+        if ret_calls:
+            returned = ret_calls[-1].group(1)
+        else:
+            for raw_line in reversed(body_txt.splitlines()):
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line == "}":
+                    continue
+                if re.fullmatch(r"[A-Za-z]\w*", line):
+                    returned = line
+                break
+        if returned is None:
+            continue
+        assign_pat = re.compile(rf"\b{re.escape(returned)}\s*(?:<-|=)\s*array\s*\(", re.IGNORECASE)
+        matches = list(assign_pat.finditer(body_txt))
+        if not matches:
+            continue
+        m_arr = matches[-1]
+        open_call = body_txt.find("(", m_arr.start())
+        if open_call < 0:
+            continue
+        close_call = find_matching(body_txt, open_call, "(", ")")
+        call_src = "array" + body_txt[open_call : close_call + 1]
+        dim_sources = _parse_array_dim_label_sources(call_src)
+        if dim_sources is not None and len(dim_sources) >= 2:
+            out[fn_name] = dim_sources
+    return out
+
+
 def _function_return_symbol_from_body(fn: FuncDef) -> str | None:
     for st in reversed(fn.body):
         if isinstance(st, ExprStmt):
@@ -22762,6 +22855,18 @@ def transpile_r_to_fortran(
     globals()["_XR2F_FN_MATRIX_COL_LABELS"] = {k.lower(): v for k, v in fn_matrix_col_labels.items()}
     fn_matrix_row_exprs = {f.name: collect_rownames_sources(f.body) for f in funcs}
     fn_matrix_col_exprs = {f.name: collect_colname_sources(f.body) for f in funcs}
+    source_fn_array_dimnames = collect_function_array_dimname_sources_from_source(src)
+    for fn_dim_labs, dim_srcs_labs in source_fn_array_dimnames.items():
+        if len(dim_srcs_labs) >= 1 and dim_srcs_labs[0].strip():
+            fn_matrix_row_exprs.setdefault(fn_dim_labs, {})["__return__"] = dim_srcs_labs[0].strip()
+        if len(dim_srcs_labs) >= 2 and dim_srcs_labs[1].strip():
+            col_labs_src = _parse_string_c_vector(dim_srcs_labs[1].strip())
+            if col_labs_src is not None:
+                fn_matrix_col_labels.setdefault(fn_dim_labs, {})["__return__"] = [
+                    str(x) for x in col_labs_src
+                ]
+            else:
+                fn_matrix_col_exprs.setdefault(fn_dim_labs, {})["__return__"] = dim_srcs_labs[1].strip()
     for f_row in funcs:
         ret_sym_row = _function_return_symbol_from_body(f_row)
         if ret_sym_row:
@@ -22771,6 +22876,64 @@ def transpile_r_to_fortran(
             src_col = fn_matrix_col_exprs.get(f_row.name, {}).get(ret_sym_row.lower())
             if isinstance(src_col, str) and src_col.strip():
                 fn_matrix_col_exprs.setdefault(f_row.name, {})["__return__"] = src_col
+            for st_dimlabs in f_row.body:
+                if not isinstance(st_dimlabs, Assign):
+                    continue
+                if st_dimlabs.name.strip().lower() != ret_sym_row.lower():
+                    continue
+                dim_sources = _parse_array_dim_label_sources(st_dimlabs.expr.strip())
+                if dim_sources is None or len(dim_sources) < 2:
+                    continue
+                row_src = dim_sources[0].strip()
+                if row_src:
+                    fn_matrix_row_exprs.setdefault(f_row.name, {})["__return__"] = row_src
+                col_labs = _parse_string_c_vector(dim_sources[1].strip())
+                if col_labs is not None:
+                    fn_matrix_col_labels.setdefault(f_row.name, {})["__return__"] = [
+                        str(x) for x in col_labs
+                    ]
+                elif dim_sources[1].strip():
+                    fn_matrix_col_exprs.setdefault(f_row.name, {})["__return__"] = dim_sources[1].strip()
+    for f_slice_labs in funcs:
+        ret_sym_labs = _function_return_symbol_from_body(f_slice_labs)
+        if not ret_sym_labs:
+            continue
+        ret_pat_labs = re.compile(
+            rf"^\s*{re.escape(ret_sym_labs)}\s*\[.*\]\s*$",
+            re.IGNORECASE,
+        )
+
+        def _walk_slice_label_assignments(ss_labs: list[object]) -> None:
+            for st_labs in ss_labs:
+                if isinstance(st_labs, Assign):
+                    if not ret_pat_labs.match(st_labs.name.strip()):
+                        continue
+                    c_rhs_labs = parse_call_text(st_labs.expr.strip())
+                    if c_rhs_labs is None:
+                        continue
+                    src_fn_labs = c_rhs_labs[0].lower()
+                    src_col_labs = fn_matrix_col_labels.get(src_fn_labs, {}).get("__return__")
+                    if isinstance(src_col_labs, list) and src_col_labs:
+                        fn_matrix_col_labels.setdefault(f_slice_labs.name, {})["__return__"] = [
+                            str(x) for x in src_col_labs
+                        ]
+                    src_col_expr_labs = fn_matrix_col_exprs.get(src_fn_labs, {}).get("__return__")
+                    if isinstance(src_col_expr_labs, str) and src_col_expr_labs.strip():
+                        fn_matrix_col_exprs.setdefault(f_slice_labs.name, {})["__return__"] = src_col_expr_labs
+                    src_row_labs = fn_matrix_row_exprs.get(src_fn_labs, {}).get("__return__")
+                    if isinstance(src_row_labs, str) and src_row_labs.strip():
+                        fn_matrix_row_exprs.setdefault(f_slice_labs.name, {})["__return__"] = src_row_labs
+                elif isinstance(st_labs, IfStmt):
+                    _walk_slice_label_assignments(st_labs.then_body)
+                    _walk_slice_label_assignments(st_labs.else_body)
+                elif isinstance(st_labs, ForStmt):
+                    _walk_slice_label_assignments(st_labs.body)
+                elif isinstance(st_labs, WhileStmt):
+                    _walk_slice_label_assignments(st_labs.body)
+                elif isinstance(st_labs, RepeatStmt):
+                    _walk_slice_label_assignments(st_labs.body)
+
+        _walk_slice_label_assignments(f_slice_labs.body)
     fn_alias_return_type: dict[str, str] = {}
     for f_alias in funcs:
         if f_alias.name in list_specs:
@@ -24288,6 +24451,28 @@ def transpile_r_to_fortran(
             if re.fullmatch(r"[A-Za-z]\w*", actual):
                 out_src = re.sub(rf"\b{re.escape(formal)}\b", actual, out_src)
         return out_src
+
+    global _RANK3_SLICE_PRINT_LABELS
+    _RANK3_SLICE_PRINT_LABELS = {}
+    for st_rank3_labs in main_stmts:
+        if not isinstance(st_rank3_labs, Assign):
+            continue
+        if not re.fullmatch(r"[A-Za-z]\w*", st_rank3_labs.name.strip()):
+            continue
+        c_rank3_labs = parse_call_text(st_rank3_labs.expr.strip())
+        if c_rank3_labs is None:
+            continue
+        dim_srcs_rank3 = source_fn_array_dimnames.get(c_rank3_labs[0].lower())
+        if dim_srcs_rank3 is None or len(dim_srcs_rank3) < 2:
+            continue
+        row_src_rank3 = _subst_label_source_for_call(dim_srcs_rank3[0], c_rank3_labs).strip()
+        col_src_rank3 = _subst_label_source_for_call(dim_srcs_rank3[1], c_rank3_labs).strip()
+        if not row_src_rank3 or not col_src_rank3:
+            continue
+        _RANK3_SLICE_PRINT_LABELS[_sanitize_r_var_name(st_rank3_labs.name).lower()] = (
+            r_expr_to_fortran(row_src_rank3),
+            r_expr_to_fortran(col_src_rank3),
+        )
 
     def _matrix_labels_from_list_field(expr_txt: str) -> list[str] | None:
         m_lf = re.match(r"^([A-Za-z]\w*)\$([A-Za-z]\w*)$", expr_txt.strip())
@@ -32070,6 +32255,34 @@ def promote_locals_from_derived_component_assignments_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_rank3_slice_prints_with_dimnames_text(
+    f90: str,
+    labels_by_var: dict[str, tuple[str, str]],
+) -> str:
+    if not labels_by_var:
+        return f90
+
+    def _repl(m: re.Match[str]) -> str:
+        var = m.group(1)
+        labels = labels_by_var.get(var.lower())
+        if labels is None:
+            return m.group(0)
+        row_expr, col_expr = labels
+        idx = m.group(2).strip()
+        digits = m.group(3).strip()
+        return (
+            f"call print_table2({var}(:, :, {idx}), {row_expr}, {col_expr}, "
+            f"digits={digits})"
+        )
+
+    return re.sub(
+        r"\bcall\s+print_matrix\s*\(\s*([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*,\s*([^)]+?)\s*\)\s*,\s*digits\s*=\s*([^)]+?)\s*\)",
+        _repl,
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
 def rewrite_acf_names_print_text(f90: str) -> str:
     acf_names: set[str] = set()
     for ln in f90.splitlines():
@@ -36125,6 +36338,7 @@ def main() -> int:
     f90 = scalarize_singleton_user_vec_tmp_text(f90)
     f90 = demote_scalar_assigned_rank1_real_locals_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
+    f90 = rewrite_rank3_slice_prints_with_dimnames_text(f90, _RANK3_SLICE_PRINT_LABELS)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
