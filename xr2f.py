@@ -6474,6 +6474,96 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     return 0
 
 
+def _array_refs_outside_scalar_reductions(expr: str, rank_names: set[str]) -> set[str]:
+    """Return ranked names still visible after masking scalar reductions."""
+    if not rank_names:
+        return set()
+    reducers = re.compile(r"\b(?:sum|mean|prod|min|max|maxval|minval|product|log_sum_exp)\s*\(", re.IGNORECASE)
+
+    def find_close(src: str, open_idx: int) -> int:
+        depth = 0
+        in_str = False
+        quote = ""
+        for i in range(open_idx, len(src)):
+            ch = src[i]
+            if in_str:
+                if ch == quote:
+                    in_str = False
+                continue
+            if ch in {'"', "'"}:
+                in_str = True
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    masked: list[str] = []
+    i = 0
+    while i < len(expr):
+        m = reducers.search(expr, i)
+        if m is None:
+            masked.append(expr[i:])
+            break
+        masked.append(expr[i : m.start()])
+        close = find_close(expr, m.end() - 1)
+        if close < 0:
+            masked.append(expr[m.start() :])
+            break
+        masked.append("0")
+        i = close + 1
+    toks = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", "".join(masked))}
+    return toks & {nm.lower() for nm in rank_names}
+
+
+def _assigned_scalar_reduction_names(stmts: list[object], rank_names: set[str] | None = None) -> set[str]:
+    out: set[str] = set()
+    flat_assigns: list[Assign] = []
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                flat_assigns.append(st)
+                expr_s = st.expr.strip()
+                if re.match(r"^\s*(?:sum|mean|prod|min|max)\s*\(", expr_s, re.IGNORECASE) and not re.search(
+                    r"\bdim\s*=", expr_s, re.IGNORECASE
+                ):
+                    out.add(st.name.lower())
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    walk(stmts)
+    if rank_names:
+        rank_l = {nm.lower() for nm in rank_names}
+        changed = True
+        while changed:
+            changed = False
+            for st in flat_assigns:
+                nm_l = st.name.lower()
+                if nm_l in out:
+                    continue
+                expr = st.expr.strip()
+                toks = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", expr)}
+                if not (toks & out or re.search(r"\b(?:sum|mean|prod|min|max|maxval|minval|product|log_sum_exp)\s*\(", expr, re.IGNORECASE)):
+                    continue
+                if re.search(r"\bdim\s*=", expr, re.IGNORECASE):
+                    continue
+                if not _array_refs_outside_scalar_reductions(expr, rank_l - out):
+                    out.add(nm_l)
+                    changed = True
+    return out
+
+
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
     """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
     expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
@@ -10312,7 +10402,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if dim_src is None and len(pos_a) >= 2:
             dim_src = pos_a[1]
         if dim_src is None:
-            raise NotImplementedError("array(...) requires dim argument in this subset")
+            dim_src = "1"
 
         data_txt = data_src.strip()
         data_rng = _split_top_level_colon(data_txt)
@@ -18286,7 +18376,8 @@ def emit_function(
             for a in fn.args
             if infer_arg_rank(fn, a) > 0
         }
-        for nm_ret_rank in infer_assigned_names(body_stmts):
+        assigned_ret_names = infer_assigned_names(body_stmts)
+        for nm_ret_rank in assigned_ret_names:
             rk_ret_nm = _infer_local_array_rank(body_stmts, nm_ret_rank)
             if rk_ret_nm > 0:
                 ret_rank_hints[nm_ret_rank.lower()] = rk_ret_nm
@@ -18439,7 +18530,10 @@ def emit_function(
         return False
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
-        if not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE):
+        if not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE) and _array_refs_outside_scalar_reductions(
+            ex_last,
+            {a for a, rk_arg in arg_rank.items() if rk_arg > 0},
+        ):
             for a in fn.args:
                 if arg_rank.get(a, 0) < 1:
                     continue
@@ -23067,28 +23161,6 @@ def transpile_r_to_fortran(
                     rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
                 else:
                     rr_tail = _infer_assignment_rank_hint(expr_rank_tail, inferred_ret_ranks)
-                    if rr_tail == 0 and not re.match(
-                        r"^-?\s*(?:sum|mean|prod|min|max)\s*\(",
-                        expr_rank_tail,
-                        re.IGNORECASE,
-                    ):
-                        for arg_tail, arg_rank_tail in inferred_ret_ranks.items():
-                            if arg_rank_tail <= 0:
-                                continue
-                            if re.search(rf"\b{re.escape(arg_tail)}\b", expr_rank_tail, re.IGNORECASE) and any(
-                                _split_top_level_token(expr_rank_tail, op, from_right=True) is not None
-                                for op in ["+", "-", "*", "/"]
-                            ):
-                                rr_tail = max(rr_tail, arg_rank_tail)
-                    if rr_tail == 0 and not re.match(
-                        r"^-?\s*(?:sum|mean|prod|min|max)\s*\(",
-                        expr_rank_tail,
-                        re.IGNORECASE,
-                    ):
-                        for arg_tail, arg_rank_tail in inferred_ret_ranks.items():
-                            if arg_rank_tail > 0 and re.search(rf"\b{re.escape(arg_tail)}\b", expr_rank_tail, re.IGNORECASE):
-                                if re.search(r"(?:\+|-|\*|/|\^)", expr_rank_tail):
-                                    rr_tail = max(rr_tail, arg_rank_tail)
                 if re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", expr_rank_tail, re.IGNORECASE):
                     rr_tail = 0
                 return rr_tail
@@ -29427,6 +29499,10 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
             re.IGNORECASE,
         ):
             return False
+        if re.match(r"^\s*(?:sum|maxval|minval|count|size)\s*\(", e, re.IGNORECASE) and not re.search(
+            r"\bdim\s*=", e, re.IGNORECASE
+        ):
+            return True
         bare_call = re.fullmatch(r"([A-Za-z]\w*)\s*\(.*\)", e, re.DOTALL)
         if (
             bare_call is not None
@@ -29434,7 +29510,7 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
             and bare_call.group(1).lower() not in {
             "abs", "sqrt", "exp", "log", "r_log", "sin", "cos", "tan",
             "asin", "acos", "atan", "dnorm", "pnorm", "sd", "mean",
-            "sum", "min", "max", "real", "int", "merge",
+            "sum", "min", "max", "maxval", "minval", "real", "int", "merge",
             }
         ):
             return False
@@ -30581,6 +30657,8 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
                     continue
                 rhs = m_asn.group(1)
                 if re.match(r"^\s*-?\s*(?:sum|mean|maxval|minval|dot_product)\s*\(", rhs, re.IGNORECASE):
+                    continue
+                if not _array_refs_outside_scalar_reductions(rhs, rank1_names):
                     continue
                 for nm in rank1_names:
                     rhs_for_vector_check = re.sub(
@@ -32929,12 +33007,22 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return block
         if re.search(rf"(?m)^\s*{re.escape(res)}\s*=\s*\[", block):
             return block
+        scalar_assigned_names = set()
+        for m_scalar_asn in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval)\s*\([^\n]*)",
+            block,
+            re.IGNORECASE,
+        ):
+            if not re.search(r"\bdim\s*=", m_scalar_asn.group(2), re.IGNORECASE):
+                scalar_assigned_names.add(m_scalar_asn.group(1).lower())
         array_names: set[str] = set()
         for dm in re.finditer(r"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)[^:]*::\s*(.+)$", block, re.IGNORECASE):
             for part in split_top_level_commas(dm.group(1)):
                 base = part.split("=", 1)[0].strip()
                 nm = re.sub(r"\s*\(.*\)\s*$", "", base).strip()
                 if nm == res:
+                    continue
+                if nm.lower() in scalar_assigned_names:
                     continue
                 if "(" in base and re.fullmatch(r"[A-Za-z]\w*", nm):
                     array_names.add(nm.lower())
@@ -32944,25 +33032,56 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return block
         for rhs in assigns:
             rhs_s = rhs.strip()
-            if re.search(r"\[[^\]]*\]|\b(?:pack|r_rep_real|r_seq_int|matrix|reshape|spread)\s*\(", rhs_s, re.IGNORECASE):
+            if "[" in rhs_s or "]" in rhs_s:
                 return block
-            rhs_check = _strip_scalar_reduction_calls(rhs_s)
-            for nm in array_names:
-                if re.search(rf"\b{re.escape(nm)}\b", rhs_check, re.IGNORECASE):
-                    return block
+            if re.search(r"\bdim\s*=|\b(?:pack|r_rep_real|r_seq_int|matrix|reshape|spread)\s*\(", rhs_s, re.IGNORECASE):
+                return block
+            if _array_refs_outside_scalar_reductions(rhs_s, array_names):
+                return block
         def decl_repl(dm_res: re.Match[str]) -> str:
             if dm_res.start() != decl_match.start():
                 return dm_res.group(0)
             kept: list[str] = []
+            scalar_kept: list[str] = []
             for item in split_top_level_commas(dm_res.group(2)):
-                if not re.fullmatch(rf"\s*{re.escape(res)}\s*\(:\)\s*", item, re.IGNORECASE):
+                m_scalar_item = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\)\s*", item, re.IGNORECASE)
+                if re.fullmatch(rf"\s*{re.escape(res)}\s*\(:\)\s*", item, re.IGNORECASE):
+                    continue
+                if m_scalar_item is not None and m_scalar_item.group(1).lower() in scalar_assigned_names:
+                    scalar_kept.append(m_scalar_item.group(1))
+                else:
                     kept.append(item.strip())
             lines = [f"{dm_res.group(1)}real(kind=dp) :: {res}"]
+            if scalar_kept:
+                lines.append(f"{dm_res.group(1)}real(kind=dp) :: " + ", ".join(scalar_kept))
             if kept:
                 lines.append(f"{dm_res.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept))
             return "\n".join(lines)
 
-        return decl_line_pat.sub(decl_repl, block)
+        new_block = decl_line_pat.sub(decl_repl, block)
+
+        def scalar_local_decl_repl(dm_loc: re.Match[str]) -> str:
+            kept_loc: list[str] = []
+            scalar_loc: list[str] = []
+            for item in split_top_level_commas(dm_loc.group(2)):
+                m_item = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\)\s*", item, re.IGNORECASE)
+                m_scalar_item = re.fullmatch(r"\s*([A-Za-z]\w*)\s*", item, re.IGNORECASE)
+                if m_item is not None and m_item.group(1).lower() in scalar_assigned_names:
+                    scalar_loc.append(m_item.group(1))
+                elif m_scalar_item is not None and m_scalar_item.group(1).lower() in scalar_assigned_names:
+                    scalar_loc.append(m_scalar_item.group(1))
+                else:
+                    kept_loc.append(item.strip())
+            if not scalar_loc:
+                return dm_loc.group(0)
+            lines_loc: list[str] = []
+            if scalar_loc:
+                lines_loc.append(f"{dm_loc.group(1)}real(kind=dp) :: " + ", ".join(scalar_loc))
+            if kept_loc:
+                lines_loc.append(f"{dm_loc.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept_loc))
+            return "\n".join(lines_loc)
+
+        return decl_line_pat.sub(scalar_local_decl_repl, new_block)
 
     return re.sub(
         r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
@@ -32983,6 +33102,26 @@ def promote_scalar_pure_functions_to_elemental_text(f90: str) -> str:
         if m_args is None:
             return block
         fn_name = m_args.group(1)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", first, re.IGNORECASE)
+        if m_res is not None:
+            res_name = m_res.group(1)
+            m_res_decl = re.search(
+                rf"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer\b|logical\b)[^\n:]*::[^\n]*\b{re.escape(res_name)}\b[^\n]*$",
+                block,
+                re.IGNORECASE,
+            )
+            if m_res_decl is None:
+                return block
+            res_item = next(
+                (
+                    item
+                    for item in split_top_level_commas(m_res_decl.group(0).split("::", 1)[1])
+                    if re.search(rf"\b{re.escape(res_name)}\b", item, re.IGNORECASE)
+                ),
+                "",
+            )
+            if "allocatable" in m_res_decl.group(0).lower() or re.search(rf"\b{re.escape(res_name)}\s*\(", res_item, re.IGNORECASE):
+                return block
         if re.search(rf"\b(?:nlm_optimize_scalar|nlm_optimize_vec|optim|integrate)\s*\(\s*{re.escape(fn_name)}\b", f90, re.IGNORECASE):
             return block
         args = [a.strip().lower() for a in split_top_level_commas(m_args.group(2)) if a.strip()]
@@ -33191,6 +33330,14 @@ def promote_array_rhs_function_results_text(f90: str) -> str:
         decl_m = decl_pat.search(block)
         if decl_m is None:
             return block
+        scalar_assigned_names = set()
+        for m_scalar_asn in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval)\s*\([^\n]*)",
+            block,
+            re.IGNORECASE,
+        ):
+            if not re.search(r"\bdim\s*=", m_scalar_asn.group(2), re.IGNORECASE):
+                scalar_assigned_names.add(m_scalar_asn.group(1).lower())
         array_names: set[str] = set()
         for dm in re.finditer(
             r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
@@ -33199,7 +33346,7 @@ def promote_array_rhs_function_results_text(f90: str) -> str:
         ):
             for item in split_top_level_commas(dm.group(1)):
                 m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", item)
-                if m_item is not None:
+                if m_item is not None and m_item.group(1).lower() not in scalar_assigned_names:
                     array_names.add(m_item.group(1).lower())
         if not array_names:
             return block
@@ -36270,6 +36417,7 @@ def main() -> int:
     f90 = promote_integer_maxval_locals_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = promote_array_rhs_function_results_text(f90)
+    f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = promote_scalar_pure_functions_to_elemental_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = restore_matrix_row_seq_index_text(f90)
@@ -36295,6 +36443,11 @@ def main() -> int:
         f90_lines = next_lines
     f90_lines = demote_diag_vector_results(f90_lines)
     f90_lines = promote_vector_function_results(f90_lines)
+    f90_tmp_after_promote = demote_scalar_allocatable_function_results_text(
+        "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    )
+    f90_tmp_after_promote = promote_scalar_pure_functions_to_elemental_text(f90_tmp_after_promote)
+    f90_lines = f90_tmp_after_promote.splitlines()
     f90_lines = remove_module_globals_redeclared_in_program(f90_lines)
     f90_lines = promote_logical_function_result_assignments(f90_lines)
     f90_lines = rewrite_sum_logical_arrays(f90_lines)
