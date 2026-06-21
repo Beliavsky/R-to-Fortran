@@ -3773,6 +3773,27 @@ def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
                 return j
         return len(out)
 
+    def collect_module_spec_integer_names() -> set[str]:
+        names: set[str] = set()
+        i_mod = 0
+        while i_mod < len(out):
+            txt_mod = code_only(out[i_mod]).strip()
+            if not re.match(r"^module\s+[A-Za-z]\w*\b", txt_mod, re.IGNORECASE) or re.match(
+                r"^module\s+procedure\b", txt_mod, re.IGNORECASE
+            ):
+                i_mod += 1
+                continue
+            end_mod = find_scope_end(i_mod, "module")
+            contains_idx = end_mod
+            for k_mod in range(i_mod + 1, end_mod):
+                if re.match(r"^\s*contains\b", code_only(out[k_mod]).strip(), re.IGNORECASE):
+                    contains_idx = k_mod
+                    break
+            names.update(collect_integer_names(i_mod + 1, contains_idx))
+            i_mod = end_mod + 1
+        return names
+
+    module_int_names = collect_module_spec_integer_names()
     i = 0
     while i < len(out):
         txt = code_only(out[i]).strip()
@@ -3782,7 +3803,7 @@ def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
             continue
         unit_kind = m_scope.group(1).lower()
         end = find_scope_end(i, unit_kind)
-        int_names = collect_integer_names(i + 1, end)
+        int_names = collect_integer_names(i + 1, end) | module_int_names
         if int_names:
             def coerce_call(fn_name: str, inner: str) -> str:
                 kinds = _USER_FUNC_ARG_KIND.get(fn_name.lower())
