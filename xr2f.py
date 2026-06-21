@@ -7336,6 +7336,33 @@ def _looks_integer_fortran_expr(expr: str) -> bool:
     return False
 
 
+def _mod_operand_is_integer_fortran_expr(expr: str) -> bool:
+    t = expr.strip()
+    tl = t.lower()
+    if re.fullmatch(r"[A-Za-z]\w*", t):
+        seen_arg_kind = False
+        all_arg_kinds_integer = True
+        for fn_l_mod, idx_mod in _USER_FUNC_ARG_INDEX.items():
+            pos_mod = idx_mod.get(tl)
+            if pos_mod is None:
+                continue
+            kinds_mod = _USER_FUNC_ARG_KIND.get(fn_l_mod, [])
+            if pos_mod >= len(kinds_mod):
+                continue
+            seen_arg_kind = True
+            if kinds_mod[pos_mod] != "integer":
+                all_arg_kinds_integer = False
+        if seen_arg_kind and all_arg_kinds_integer:
+            return True
+    return (
+        _is_int_literal(t)
+        or tl in _KNOWN_INT_NAMES
+        or tl in _KNOWN_INT_VECTOR_NAMES
+        or tl in _CURRENT_INT_ARRAY_NAMES
+        or re.match(r"^(?:int|size)\s*\(", t, re.IGNORECASE) is not None
+    )
+
+
 def _contains_r_complex_literal(expr: str) -> bool:
     stripped: list[str] = []
     quote: str | None = None
@@ -9694,10 +9721,7 @@ def r_expr_to_fortran(expr: str) -> str:
     if mm_mod is not None:
         lhs = r_expr_to_fortran(mm_mod[0])
         rhs = r_expr_to_fortran(mm_mod[1])
-        def _mod_operand_is_explicit_int(e_mod: str) -> bool:
-            e_mod = e_mod.strip()
-            return _is_int_literal(e_mod) or re.match(r"^(?:int|size)\s*\(", e_mod, re.IGNORECASE) is not None
-        if _mod_operand_is_explicit_int(lhs) and _mod_operand_is_explicit_int(rhs):
+        if _mod_operand_is_integer_fortran_expr(lhs) and _mod_operand_is_integer_fortran_expr(rhs):
             return f"mod({_int_bound_expr(lhs)}, {_int_bound_expr(rhs)})"
         return f"mod(real({lhs}, kind=dp), real({rhs}, kind=dp))"
     mm = _split_top_level_token(s, "%*%", from_right=True)
@@ -12710,10 +12734,7 @@ def r_expr_to_fortran(expr: str) -> str:
         def _mod_repl(m_mod: re.Match[str]) -> str:
             lhs_mod = m_mod.group(1)
             rhs_mod = m_mod.group(2)
-            def _mod_operand_is_explicit_int(e_mod: str) -> bool:
-                e_mod = e_mod.strip()
-                return _is_int_literal(e_mod) or re.match(r"^(?:int|size)\s*\(", e_mod, re.IGNORECASE) is not None
-            if _mod_operand_is_explicit_int(lhs_mod) and _mod_operand_is_explicit_int(rhs_mod):
+            if _mod_operand_is_integer_fortran_expr(lhs_mod) and _mod_operand_is_integer_fortran_expr(rhs_mod):
                 return f"mod({_int_bound_expr(lhs_mod)}, {_int_bound_expr(rhs_mod)})"
             return f"mod(real({lhs_mod}, kind=dp), real({rhs_mod}, kind=dp))"
         s = mod_pat.sub(_mod_repl, s)
