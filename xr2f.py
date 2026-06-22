@@ -5310,7 +5310,20 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
     if (
         rank_out == 1
         and re.search(rf"\bnchar\s*\(\s*{re.escape(arg)}\s*\)", body_text, re.IGNORECASE)
-        and re.search(rf"\b{re.escape(arg)}\s*/\s*10\s*(?:\^|\*\*)\s*\(", body_text, re.IGNORECASE)
+        and (
+            re.search(rf"\b{re.escape(arg)}\s*/\s*10\s*(?:\^|\*\*)\s*\(", body_text, re.IGNORECASE)
+            or (lambda m_nchar_bound: bool(
+                m_nchar_bound
+                and re.search(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\s*/\s*([A-Za-z]\w*)\b", body_text, re.IGNORECASE)
+                and re.search(r"\b[A-Za-z]\w*\s*<-\s*10\s*\^\s*[A-Za-z]\w*\b", body_text, re.IGNORECASE)
+                and re.search(rf"\b[A-Za-z]\w*\s*<-\s*0\s*:\s*\(?[^\n)]*\b{re.escape(m_nchar_bound.group(1))}\b", body_text, re.IGNORECASE)
+            ))(re.search(rf"\b([A-Za-z]\w*)\s*<-\s*nchar\s*\(\s*{re.escape(arg)}\s*\)", body_text, re.IGNORECASE))
+            or (
+                re.search(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\s*/\s*([A-Za-z]\w*)\b", body_text, re.IGNORECASE)
+                and re.search(r"\b[A-Za-z]\w*\s*<-\s*10\s*\^\s*[A-Za-z]\w*\b", body_text, re.IGNORECASE)
+                and re.search(r"\b[A-Za-z]\w*\s*<-\s*0\s*:\s*\([^)]*\bnchar\s*\(", body_text, re.IGNORECASE)
+            )
+        )
     ):
         rank_out = 0
     if forced_rank is not None:
@@ -14938,6 +14951,32 @@ def emit_stmts(
                 else:
                     _wstmt(f"allocate({st.name}(p, {len_f}))", st.comment)
                 continue
+            c_nchar_assign = parse_call_text(rhs)
+            if (
+                c_nchar_assign is not None
+                and c_nchar_assign[0].lower() == "nchar"
+                and local_ranks_ctx.get(st.name, 0) == 0
+                and st.name not in int_vector_vars
+                and st.name not in real_vector_vars
+                and st.name not in logical_vector_vars
+                and st.name not in int_matrix_vars
+                and st.name not in real_matrix_vars
+                and st.name not in logical_matrix_vars
+            ):
+                nchar_src = c_nchar_assign[1][0].strip() if c_nchar_assign[1] else c_nchar_assign[2].get("x", c_nchar_assign[2].get("string", "")).strip()
+                nchar_f = r_expr_to_fortran(nchar_src)
+                nchar_l = nchar_src.lower()
+                if (
+                    _dequote_string_literal(nchar_src) is not None
+                    or (re.match(r"^[A-Za-z]\w*$", nchar_src) and nchar_l in _CURRENT_CHAR_SCALAR_NAMES)
+                ):
+                    _wstmt(f"{st.name} = nchar({nchar_f})", st.comment)
+                    continue
+                if re.match(r"^[A-Za-z]\w*$", nchar_src) and local_ranks_ctx.get(nchar_src, local_ranks_ctx.get(nchar_l, 0)) >= 1:
+                    nchar_f = f"{nchar_f}(1)"
+                xr_nchar = f"abs(real({nchar_f}, kind=dp))"
+                _wstmt(f"{st.name} = merge(1, int(floor(log10({xr_nchar}))) + 1, {xr_nchar} < 1.0_dp)", st.comment)
+                continue
             m_seq_assign = _split_top_level_colon(rhs)
             if m_seq_assign is not None and ("[" not in rhs) and ("]" not in rhs):
                 a_src, b_src = m_seq_assign
@@ -20233,6 +20272,38 @@ def emit_function(
             params.pop(nm_scalar, None)
             real_scalars.add(nm_scalar)
             local_ranks.pop(nm_scalar, None)
+
+        def _force_integer_scalar_local(nm_scalar: str) -> None:
+            int_arrays.discard(nm_scalar)
+            real_arrays.discard(nm_scalar)
+            logical_arrays.discard(nm_scalar)
+            real_scalars.discard(nm_scalar)
+            params.pop(nm_scalar, None)
+            ints.add(nm_scalar)
+            local_ranks.pop(nm_scalar, None)
+
+        def _local_is_used_as_sequence_bound(nm_bound: str) -> bool:
+            for st_bound in assign_nodes:
+                seq_bound = _split_top_level_colon(st_bound.expr.strip())
+                if seq_bound is None:
+                    continue
+                if any(re.search(rf"\b{re.escape(nm_bound)}\b", part) for part in seq_bound):
+                    return True
+                c_bound = parse_call_text(st_bound.expr.strip())
+                if c_bound is not None and c_bound[0].lower() in {"seq", "seq.int", "seq_len"}:
+                    args_bound = list(c_bound[1]) + list(c_bound[2].values())
+                    if any(re.search(rf"\b{re.escape(nm_bound)}\b", arg_bound) for arg_bound in args_bound):
+                        return True
+            return False
+
+        for st_nchar_rank in assign_nodes:
+            c_nchar_rank = parse_call_text(st_nchar_rank.expr.strip())
+            if (
+                c_nchar_rank is not None
+                and c_nchar_rank[0].lower() == "nchar"
+                and _local_is_used_as_sequence_bound(st_nchar_rank.name)
+            ):
+                _force_real_scalar_local(st_nchar_rank.name)
 
         def _rhs_is_scalar_reduction(rhs_scalar: str) -> bool:
             rhs_scalar_s = rhs_scalar.strip()
