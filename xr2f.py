@@ -18529,21 +18529,57 @@ def emit_function(
     if isinstance(fn_body[-1], IfStmt):
         tail_if = fn_body[-1]
 
+        def _branch_has_expr_tail(branch: list[object]) -> bool:
+            if not branch:
+                return False
+            last_b = branch[-1]
+            if isinstance(last_b, ExprStmt):
+                return True
+            if isinstance(last_b, IfStmt):
+                return (
+                    _branch_has_expr_tail(last_b.then_body)
+                    and _branch_has_expr_tail(last_b.else_body)
+                )
+            return False
+
+        def _branch_tail_rank(branch: list[object], ranks: dict[str, int]) -> int:
+            if not branch:
+                return 0
+            last_b = branch[-1]
+            if isinstance(last_b, ExprStmt):
+                return _infer_assignment_rank_hint(last_b.expr.strip(), ranks)
+            if isinstance(last_b, IfStmt):
+                return max(
+                    _branch_tail_rank(last_b.then_body, ranks),
+                    _branch_tail_rank(last_b.else_body, ranks),
+                )
+            return 0
+
         def _branch_expr_to_assign(branch: list[object], target: str) -> list[object]:
             if branch and isinstance(branch[-1], ExprStmt):
                 return list(branch[:-1]) + [Assign(target, branch[-1].expr, branch[-1].comment)]
+            if branch and isinstance(branch[-1], IfStmt):
+                last_if = branch[-1]
+                if _branch_has_expr_tail(last_if.then_body) and _branch_has_expr_tail(last_if.else_body):
+                    return list(branch[:-1]) + [
+                        IfStmt(
+                            last_if.cond,
+                            _branch_expr_to_assign(last_if.then_body, target),
+                            _branch_expr_to_assign(last_if.else_body, target),
+                        )
+                    ]
             return branch
 
         if (
             tail_if.then_body
             and tail_if.else_body
-            and isinstance(tail_if.then_body[-1], ExprStmt)
-            and isinstance(tail_if.else_body[-1], ExprStmt)
+            and _branch_has_expr_tail(tail_if.then_body)
+            and _branch_has_expr_tail(tail_if.else_body)
         ):
             inferred_tail_ranks = {a.lower(): infer_arg_rank(fn, a) for a in fn.args}
             tail_if_result_rank = max(
-                _infer_assignment_rank_hint(tail_if.then_body[-1].expr.strip(), inferred_tail_ranks),
-                _infer_assignment_rank_hint(tail_if.else_body[-1].expr.strip(), inferred_tail_ranks),
+                _branch_tail_rank(tail_if.then_body, inferred_tail_ranks),
+                _branch_tail_rank(tail_if.else_body, inferred_tail_ranks),
             )
             ret_tmp = f"{fn.name}_return_value"
             fn_body = (
@@ -18975,12 +19011,17 @@ def emit_function(
     elif ret_is_char:
         rdecl = "character(len=:), allocatable"
     elif list_spec is None:
-        if ret_rank == 0 and rk == "int":
+        fn_return_kind_hint = _USER_FUNC_RETURN_KIND.get(fn.name.lower())
+        if ret_rank == 0 and fn_return_kind_hint == "int":
+            rdecl = "integer"
+        elif ret_rank == 0 and fn_return_kind_hint == "logical":
+            rdecl = "logical"
+        elif ret_rank == 0 and rk == "int":
             rdecl = "integer"
         elif ret_rank == 0 and rk == "logical":
             rdecl = "logical"
         elif ret_rank >= 1 and "allocatable" not in rdecl:
-            if rk == "int":
+            if fn_return_kind_hint == "int" or rk == "int":
                 rdecl = "integer, allocatable"
             else:
                 rdecl = "real(kind=dp), allocatable"
@@ -19102,7 +19143,20 @@ def emit_function(
         and fn.name.lower() not in _NLM_OBJECTIVE_NAMES
         and fn.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
     )
-    pref = "pure elemental " if is_elemental else ("pure " if can_be_pure else "")
+    is_recursive = any(
+        re.search(rf"\b{re.escape(fn.name)}\s*\(", txt, re.IGNORECASE)
+        for txt in _collect_stmt_expr_texts(body_stmts)
+    ) or (isinstance(last, ExprStmt) and re.search(rf"\b{re.escape(fn.name)}\s*\(", last.expr, re.IGNORECASE) is not None)
+    if is_recursive:
+        is_elemental = False
+    pref_parts: list[str] = []
+    if can_be_pure:
+        pref_parts.append("pure")
+    if is_elemental:
+        pref_parts.append("elemental")
+    if is_recursive:
+        pref_parts.append("recursive")
+    pref = (" ".join(pref_parts) + " ") if pref_parts else ""
     for cmt in fn.leading_comments:
         c = cmt.strip()
         if c:
@@ -23914,14 +23968,61 @@ def transpile_r_to_fortran(
         return stmt_rank(fn_rank_tail.body[-1])
 
     for f_rank_ret in funcs:
-        if f_rank_ret.body and isinstance(f_rank_ret.body[-1], ExprStmt):
-            ret_kind_expr = f_rank_ret.body[-1].expr.strip()
+        def _tail_kind_exprs(st_kind: object) -> list[str]:
+            if isinstance(st_kind, ExprStmt):
+                return [st_kind.expr.strip()]
+            if isinstance(st_kind, IfStmt):
+                out_kind: list[str] = []
+                if st_kind.then_body:
+                    out_kind.extend(_tail_kind_exprs(st_kind.then_body[-1]))
+                if st_kind.else_body:
+                    out_kind.extend(_tail_kind_exprs(st_kind.else_body[-1]))
+                return out_kind
+            return []
+
+        ret_kind_exprs = _tail_kind_exprs(f_rank_ret.body[-1]) if f_rank_ret.body else []
+        if ret_kind_exprs:
+            ret_kind_expr = ret_kind_exprs[-1]
             ret_kind_arg = _return_call_arg(ret_kind_expr)
             if ret_kind_arg is not None:
                 ret_kind_expr = ret_kind_arg.strip()
             if re.fullmatch(r"[A-Za-z]\w*", ret_kind_expr) and ret_kind_expr in infer_local_logical_arrays(f_rank_ret.body):
                 _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = "logical"
-            ret_kind = _expr_kind_simple(ret_kind_expr)
+            fn_int_names_for_ret = {nm.lower() for nm in infer_function_integer_names(f_rank_ret)}
+
+            def _is_known_integer_expr_for_return(expr_ret_kind: str) -> bool:
+                expr_t = expr_ret_kind.strip()
+                if _is_int_literal(expr_t) or _is_integer_arith_expr(expr_t):
+                    return True
+                if not _is_integerish_expr_with_names(expr_t):
+                    return False
+                if re.search(r"\b(?:inf|nan|sqrt|exp|log|sin|cos|tan|mean|sd|var|dnorm|pnorm|qnorm)\b", expr_t, re.IGNORECASE):
+                    return False
+                names = [
+                    tok.lower()
+                    for tok in re.findall(r"\b[A-Za-z]\w*\b", expr_t)
+                    if not re.fullmatch(r"\d+", tok)
+                ]
+                return bool(names) and all(tok in fn_int_names_for_ret for tok in names)
+
+            ret_kind_values: list[str] = []
+            self_call_only = True
+            for ret_kind_src in ret_kind_exprs:
+                ret_kind_one = _return_call_arg(ret_kind_src) or ret_kind_src
+                ret_kind_one = ret_kind_one.strip()
+                c_ret_kind_one = parse_call_text(ret_kind_one)
+                if c_ret_kind_one is not None and c_ret_kind_one[0].lower() == f_rank_ret.name.lower():
+                    ret_kind_values.append("self")
+                    continue
+                self_call_only = False
+                if _is_known_integer_expr_for_return(ret_kind_one):
+                    ret_kind_values.append("int")
+                else:
+                    ret_kind_values.append(_expr_kind_simple(ret_kind_one))
+            if ret_kind_values and all(k in {"int", "self"} for k in ret_kind_values) and not self_call_only:
+                ret_kind = "int"
+            else:
+                ret_kind = _expr_kind_simple(ret_kind_expr)
             if f_rank_ret.name.lower() in _USER_FUNC_RETURN_KIND:
                 pass
             elif ret_kind in {"integer", "int"}:
