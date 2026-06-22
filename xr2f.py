@@ -1886,7 +1886,7 @@ def _expr_returns_character(expr: str) -> bool:
     ci = parse_call_text(t)
     if ci is None:
         return False
-    return ci[0].lower() in {"paste", "paste0", "sprintf", "format", "sub", "substr"}
+    return ci[0].lower() in {"paste", "paste0", "sprintf", "format", "sub", "substr", "getwd"}
 
 
 def _sprintf_arg_items(expr: str) -> list[str] | None:
@@ -9378,6 +9378,33 @@ def r_expr_to_fortran(expr: str) -> str:
         if recursive_src is not None:
             args_lf0.append(f"recursive={r_expr_to_fortran(recursive_src)}")
         return f"list_files({', '.join(args_lf0)})"
+    c_getwd0 = parse_call_text(s)
+    if c_getwd0 is not None and c_getwd0[0].lower() == "getwd":
+        return "getwd()"
+    c_file_exists0 = parse_call_text(s)
+    if c_file_exists0 is not None and c_file_exists0[0].lower() in {"file.exists", "file_exists"}:
+        _nm_fe0, pos_fe0, kw_fe0 = c_file_exists0
+        path_src = pos_fe0[0] if pos_fe0 else kw_fe0.get("x", kw_fe0.get("file", ""))
+        return f"file_exists({r_expr_to_fortran(path_src)})"
+    c_file_create0 = parse_call_text(s)
+    if c_file_create0 is not None and c_file_create0[0].lower() in {"file.create", "file_create"}:
+        _nm_fc0, pos_fc0, kw_fc0 = c_file_create0
+        path_src = pos_fc0[0] if pos_fc0 else kw_fc0.get("file", kw_fc0.get("files", ""))
+        return f"file_create({r_expr_to_fortran(path_src)})"
+    c_file_remove0 = parse_call_text(s)
+    if c_file_remove0 is not None and c_file_remove0[0].lower() in {"file.remove", "file_remove"}:
+        _nm_fr0, pos_fr0, kw_fr0 = c_file_remove0
+        path_src = pos_fr0[0] if pos_fr0 else kw_fr0.get("file", kw_fr0.get("files", ""))
+        return f"file_remove({r_expr_to_fortran(path_src)})"
+    c_dir_create0 = parse_call_text(s)
+    if c_dir_create0 is not None and c_dir_create0[0].lower() in {"dir.create", "dir_create"}:
+        _nm_dc0, pos_dc0, kw_dc0 = c_dir_create0
+        path_src = pos_dc0[0] if pos_dc0 else kw_dc0.get("path", "")
+        recursive_src = kw_dc0.get("recursive")
+        args_dc0 = [r_expr_to_fortran(path_src)]
+        if recursive_src is not None:
+            args_dc0.append(f"recursive={r_expr_to_fortran(recursive_src)}")
+        return f"dir_create({', '.join(args_dc0)})"
     mm_in_early = _split_top_level_token(s, "%in%", from_right=True)
     if mm_in_early is not None:
         lhs_src_in = mm_in_early[0].strip()
@@ -18173,6 +18200,14 @@ def emit_stmts(
                 _wstmt(f"call sys_sleep(real({r_expr_to_fortran(delay_src)}, kind=dp))", st.comment)
                 need_r_mod.add("sys_sleep")
                 continue
+            if c_expr_print is not None and c_expr_print[0].lower() in {"file.remove", "file_remove", "file.create", "file_create", "dir.create", "dir_create"}:
+                o.w("block")
+                o.push()
+                o.w("logical :: xr2f_file_ok")
+                _wstmt(f"xr2f_file_ok = {r_expr_to_fortran(expr_print_src)}", st.comment)
+                o.pop()
+                o.w("end block")
+                continue
             if re.fullmatch(r"[A-Za-z]\w*", expr_print_src) and expr_print_src in rle_vars_ctx:
                 _wstmt(f"call print_rle({expr_print_src})", st.comment)
                 need_r_mod.update({"print_rle", rle_vars_ctx[expr_print_src]})
@@ -18338,6 +18373,8 @@ def _expr_kind_simple(expr: str) -> str:
                 return "logical"
             return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
+        return "logical"
+    if re.match(r"^(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.create|dir_create)\s*\(", t, re.IGNORECASE):
         return "logical"
     if _split_top_level_token(t, "&&", from_right=True) is not None or _split_top_level_token(t, "||", from_right=True) is not None:
         return "logical"
@@ -21319,7 +21356,7 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                     out.add(st.name)
                     continue
                 c_rhs = parse_call_text(rhs)
-                if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class"}:
+                if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class", "getwd"}:
                     out.add(st.name)
                     continue
                 if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
@@ -21611,6 +21648,9 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                 rhs = st.expr.strip()
                 if _dequote_string_literal(rhs) is not None:
                     out.add(st.name)
+                c_rhs_char = parse_call_text(rhs)
+                if c_rhs_char is not None and c_rhs_char[0].lower() == "getwd":
+                    out.add(st.name)
                 if re.match(r"^(sub|substr)\s*\(", rhs, re.IGNORECASE):
                     out.add(st.name)
                 texts.append(rhs)
@@ -21723,13 +21763,29 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
 
 
 def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
-    """Find scalar vars assigned from R logical literals TRUE/FALSE in main statements."""
+    """Find scalar vars assigned from scalar logical expressions in main statements."""
     out: set[str] = set()
     for st in stmts:
         if not isinstance(st, Assign):
             continue
-        rhs = st.expr.strip().upper()
-        if rhs in {"TRUE", "FALSE"}:
+        rhs = st.expr.strip()
+        rhs_u = rhs.upper()
+        if rhs_u in {"TRUE", "FALSE"}:
+            out.add(st.name)
+            continue
+        c_rhs = parse_call_text(rhs)
+        if c_rhs is not None and c_rhs[0].lower() in {
+            "file.exists",
+            "file_exists",
+            "file.create",
+            "file_create",
+            "file.remove",
+            "file_remove",
+            "dir.create",
+            "dir_create",
+            "all",
+            "any",
+        }:
             out.add(st.name)
     return out
 
@@ -27944,6 +28000,11 @@ def transpile_r_to_fortran(
         "r_matrix_col",
         "r_matrix_row",
         "char_join",
+        "getwd",
+        "file_exists",
+        "file_create",
+        "file_remove",
+        "dir_create",
         "list_files",
         "strsplit_fixed",
         "toupper",
@@ -35087,6 +35148,15 @@ def rewrite_same_rank_self_update_aliases_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_noncharacter_a_descriptor_writes_text(f90: str) -> str:
+    """Avoid writing numeric/logical expressions with an A edit descriptor."""
+    return re.sub(
+        r'(?m)^(\s*)write\(\*,"\(a,\s*1x,\s*g0\)"\)\s*(?!")(.+)$',
+        r'\1write(*,"(*(g0,1x))") \2',
+        f90,
+    )
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -37212,6 +37282,7 @@ def main() -> int:
     f90 = simplify_real_dp_casts_text(f90)
     f90 = rewrite_user_call_dotted_keyword_aliases_text(f90)
     f90 = rewrite_same_rank_self_update_aliases_text(f90)
+    f90 = rewrite_noncharacter_a_descriptor_writes_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
