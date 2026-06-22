@@ -11307,6 +11307,8 @@ def r_expr_to_fortran(expr: str) -> str:
             t = p.strip()
             if has_nonint and _is_int_literal(t):
                 outp.append(f"{t}.0_dp")
+            elif has_nonint and re.match(r"^(?:floor|ceiling|trunc)\s*\(", t, re.IGNORECASE):
+                outp.append(f"real({t}, kind=dp)")
             else:
                 outp.append(t)
         return ", ".join(outp)
@@ -23158,6 +23160,74 @@ def _lower_minimal_s3(stmts: list[object]) -> list[object]:
     return out
 
 
+def _normalize_dotted_function_names(stmts: list[object]) -> list[object]:
+    """Map remaining dotted user function names to valid Fortran identifiers.
+
+    S3 method names are intentionally handled before this pass.  At this point,
+    a dotted function name such as `is.prime` is just an ordinary user function
+    and must be rewritten consistently in definitions, calls, and bare callback
+    references.
+    """
+    rename_map: dict[str, str] = {}
+
+    def collect(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, FuncDef):
+                new_name = _sanitize_fortran_kwarg_name(st.name)
+                if new_name != st.name:
+                    rename_map[st.name] = new_name
+                collect(st.body)
+            elif isinstance(st, IfStmt):
+                collect(st.then_body)
+                collect(st.else_body)
+            elif isinstance(st, ForStmt):
+                collect(st.body)
+            elif isinstance(st, WhileStmt):
+                collect(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect(st.body)
+
+    collect(stmts)
+    if not rename_map:
+        return stmts
+
+    def rewrite_expr(expr: str) -> str:
+        return _replace_idents(expr, rename_map)
+
+    def rewrite_stmt(st: object) -> object:
+        if isinstance(st, Assign):
+            return Assign(st.name, rewrite_expr(st.expr), st.comment)
+        if isinstance(st, ExprStmt):
+            return ExprStmt(rewrite_expr(st.expr), st.comment)
+        if isinstance(st, PrintStmt):
+            return PrintStmt([rewrite_expr(a) for a in st.args], st.comment)
+        if isinstance(st, CallStmt):
+            return CallStmt(rename_map.get(st.name, st.name), [rewrite_expr(a) for a in st.args], st.comment)
+        if isinstance(st, ForStmt):
+            return ForStmt(st.var, rewrite_expr(st.iter_expr), [rewrite_stmt(b) for b in st.body])
+        if isinstance(st, WhileStmt):
+            return WhileStmt(rewrite_expr(st.cond), [rewrite_stmt(b) for b in st.body])
+        if isinstance(st, RepeatStmt):
+            return RepeatStmt([rewrite_stmt(b) for b in st.body])
+        if isinstance(st, IfStmt):
+            return IfStmt(
+                rewrite_expr(st.cond),
+                [rewrite_stmt(b) for b in st.then_body],
+                [rewrite_stmt(b) for b in st.else_body],
+            )
+        if isinstance(st, FuncDef):
+            return FuncDef(
+                name=rename_map.get(st.name, st.name),
+                args=list(st.args),
+                defaults={k: rewrite_expr(v) for k, v in st.defaults.items()},
+                body=[rewrite_stmt(b) for b in st.body],
+                leading_comments=st.leading_comments,
+            )
+        return st
+
+    return [rewrite_stmt(st) for st in stmts]
+
+
 def _r_declare_type_call(kind: str) -> str:
     if kind == "integer":
         return "integer()"
@@ -23453,6 +23523,7 @@ def transpile_r_to_fortran(
     stmts = _lower_dim_assignments(stmts)
     stmts = _lower_minimal_s4(stmts)
     stmts = _lower_minimal_s3(stmts)
+    stmts = _normalize_dotted_function_names(stmts)
     stmts = _rename_duplicate_function_defs(stmts)
     stmts = attach_function_adjacent_comments(stmts)
     loop_shadow_warnings: list[tuple[str, str, int | None]] = []
