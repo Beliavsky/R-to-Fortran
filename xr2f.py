@@ -17606,6 +17606,30 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
+            elif parse_call_text(it) is not None:
+                arr = r_expr_to_fortran(it)
+                idx = f"i_{st.var}"
+                tmp = f"iter_for_{st.var}"
+                direct_body = _print_only_loop_body_with_value(st.body, st.var, f"{tmp}({idx})")
+                o.w("block")
+                o.push()
+                o.w(f"integer :: {idx}")
+                o.w(f"real(kind=dp), allocatable :: {tmp}(:)")
+                o.w(f"{tmp} = real({arr}, kind=dp)")
+                o.w(f"do {idx} = 1, size({tmp})")
+                o.push()
+                if _emit_direct_print_only_loop_body(st.body, st.var, f"{tmp}({idx})", "f0.6"):
+                    pass
+                elif direct_body is not None:
+                    emit_stmts(o, direct_body, need_rnorm, params, alloc_seen, helper_ctx)
+                else:
+                    o.w(f"{st.var} = {tmp}({idx})")
+                    emit_stmts(o, st.body, need_rnorm, params, alloc_seen, helper_ctx)
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             elif re.match(r"^[A-Za-z]\w*$", it):
                 arr = it
                 idx = f"i_{st.var}"
