@@ -17011,13 +17011,13 @@ def emit_stmts(
                         continue
                     if c_one is not None:
                         nm_one = c_one[0].lower()
-                        is_matrix_expr = nm_one in {"matrix", "cbind", "cbind2", "array"} or (
+                        is_matrix_expr = nm_one in {"matrix", "cbind", "cbind2", "rbind", "array"} or (
                             nm_one in {"cov", "cor"} and len(c_one[1]) <= 1
                         )
                         if is_matrix_expr:
                             one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                             use_helper_print = has_r_mod and (
-                                nm_one in {"matrix", "cbind", "cbind2"}
+                                nm_one in {"matrix", "cbind", "cbind2", "rbind"}
                                 or (nm_one in {"cov", "cor"} and len(c_one[1]) <= 1)
                             )
                             if use_helper_print:
@@ -33633,12 +33633,19 @@ def remove_noncomplex_redecls_text(f90: str) -> str:
 
 
 def rewrite_cbind_prints_text(f90: str) -> str:
-    return re.sub(
-        r"\bcall\s+print_real_vector\s*\(\s*cbind\s*\(",
-        "call print_matrix(cbind(",
+    f90 = re.sub(
+        r"\bcall\s+print_real_vector\s*\(\s*(cbind|rbind)\s*\(",
+        r"call print_matrix(\1(",
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = re.sub(
+        r"\bcall\s+print_real_vector\s*\(\s*(transpose\s*\(\s*reshape\s*\()",
+        r"call print_matrix(\1",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    return f90
 
 
 def rewrite_matmul_vector_result_ranks_text(f90: str) -> str:
