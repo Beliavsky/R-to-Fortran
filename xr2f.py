@@ -1886,7 +1886,36 @@ def _expr_returns_character(expr: str) -> bool:
     ci = parse_call_text(t)
     if ci is None:
         return False
-    return ci[0].lower() in {"paste", "paste0", "sprintf", "format", "sub", "substr", "getwd"}
+    return ci[0].lower() in {"paste", "paste0", "sprintf", "format", "sub", "substr", "getwd", "mode"}
+
+
+def _r_mode_literal_for_expr(expr: str) -> str:
+    """Return an R mode(...) string literal for expressions we can classify."""
+    txt = expr.strip()
+    txt_l = txt.lower()
+    simple = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
+    simple_name = _sanitize_r_var_name(txt).lower() if simple else ""
+    call = parse_call_text(txt)
+    call_name = call[0].lower() if call is not None else ""
+    if _dequote_string_literal(txt) is not None or call_name == "character" or simple_name in _KNOWN_CHAR_VECTOR_NAMES:
+        return '"character"'
+    if txt_l in {"true", "false", "t", "f"} or call_name == "logical" or simple_name in _KNOWN_LOGICAL_VECTOR_NAMES:
+        return '"logical"'
+    if call_name == "c":
+        vals = list(call[1]) + list(call[2].values()) if call is not None else []
+        if vals and all(_dequote_string_literal(v.strip()) is not None for v in vals):
+            return '"character"'
+        if vals and all(v.strip().lower() in {"true", "false", "t", "f"} for v in vals):
+            return '"logical"'
+        return '"numeric"'
+    if (
+        _is_int_literal(txt)
+        or _is_real_literal(txt)
+        or call_name in {"numeric", "double", "integer", "seq", "seq.int", "seq_len", "runif", "rnorm"}
+        or simple_name in (_KNOWN_VECTOR_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+    ):
+        return '"numeric"'
+    return '"numeric"'
 
 
 def _sprintf_arg_items(expr: str) -> list[str] | None:
@@ -8896,6 +8925,9 @@ def r_expr_to_fortran(expr: str) -> str:
         pos_pre = c_pre[1]
         if nm_pre == "class":
             return '"acf"'
+        if nm_pre == "mode":
+            mode_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
+            return _r_mode_literal_for_expr(mode_src)
         if nm_pre == "names":
             names_src = pos_pre[0].strip() if pos_pre else ""
             names_src_l = names_src.lower()
@@ -16070,6 +16102,7 @@ def emit_stmts(
                         "sys.timezone",
                         "sys_timezone",
                         "class",
+                        "mode",
                     }:
                         _wstmt(f'write(*,"(a)") trim({r_expr_to_fortran(one)})', st.comment)
                         if c_char_direct_print0[0].lower() in {"date", "sys.timezone", "sys_timezone"}:
