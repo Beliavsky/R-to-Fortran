@@ -33645,6 +33645,11 @@ def rewrite_cbind_prints_text(f90: str) -> str:
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = re.sub(
+        r"(?is)\bcall\s+print_real_vector\s*\(\s*([^()\n]*(?:r_matmul|[+*/-])[\s\S]*?transpose\s*\(\s*reshape\s*\([\s\S]*?)\)\s*(?=\n|$)",
+        r"call print_matrix(\1)",
+        f90,
+    )
     return f90
 
 
