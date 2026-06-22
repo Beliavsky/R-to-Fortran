@@ -4277,6 +4277,19 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif (c_vector_rhs := parse_call_text(rhs)) is not None and c_vector_rhs[0].lower() == "vector":
+                    mode_src_vec = c_vector_rhs[1][0] if c_vector_rhs[1] else c_vector_rhs[2].get("mode", '"numeric"')
+                    mode_l_vec = mode_src_vec.strip().strip('"\'').lower()
+                    if mode_l_vec == "integer":
+                        int_arrays.add(st.name)
+                        real_arrays.discard(st.name)
+                    else:
+                        real_arrays.add(st.name)
+                        int_arrays.discard(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif rhs_l.startswith("as.integer("):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -10723,6 +10736,19 @@ def r_expr_to_fortran(expr: str) -> str:
         _nd, pos_d, kw_d = c_rng
         n_src = pos_d[0] if pos_d else kw_d.get("length", kw_d.get("n", "0"))
         n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        return f"numeric({n_f})"
+    if c_rng is not None and c_rng[0].lower() == "vector":
+        _nv, pos_v, kw_v = c_rng
+        mode_src = pos_v[0] if pos_v else kw_v.get("mode", '"numeric"')
+        n_src = pos_v[1] if len(pos_v) >= 2 else kw_v.get("length", kw_v.get("n", "0"))
+        n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+        mode_l = mode_src.strip().strip('"\'').lower()
+        if mode_l in {"integer"}:
+            return f"r_rep_int([0], times={n_f})"
+        if mode_l in {"logical"}:
+            return f"(r_rep_int([0], times={n_f}) /= 0)"
+        if mode_l in {"character"}:
+            return f"r_character({n_f})"
         return f"numeric({n_f})"
     if c_rng is not None and c_rng[0].lower() == "integer":
         _ni, pos_i, kw_i = c_rng
