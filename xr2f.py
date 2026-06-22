@@ -10642,8 +10642,6 @@ def r_expr_to_fortran(expr: str) -> str:
         byrow_src = kw_m.get("byrow")
         if byrow_src is None and len(pos_m) >= 4:
             byrow_src = pos_m[3]
-        if nr_src is None and nc_src is None:
-            raise NotImplementedError("matrix(...) requires nrow or ncol in this subset")
         data_f = (
             _strict_int_vector_literal_from_c(data_src.strip())
             or _real_vector_constructor_from_mixed_c(data_src.strip())
@@ -10658,7 +10656,10 @@ def r_expr_to_fortran(expr: str) -> str:
         ):
             data_f = f"[{data_f}]"
         byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
-        if nr_src is None:
+        if nr_src is None and nc_src is None:
+            nr_f = f"size({data_f})"
+            nc_f = "1"
+        elif nr_src is None:
             nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
             nr_f = f"((size({data_f}) + ({nc_f}) - 1) / ({nc_f}))"
         else:
@@ -15232,8 +15233,6 @@ def emit_stmts(
                         ncol_src = posm[2]
                     if byrow_src is None and len(posm) >= 4:
                         byrow_src = posm[3]
-                    if nrow_src is None and ncol_src is None:
-                        raise NotImplementedError("matrix(...) requires nrow or ncol in this subset")
                     d_ci = parse_call_text(data_src.strip())
                     if d_ci is not None and d_ci[0].lower() == "rnorm":
                         nsrc = d_ci[1][0] if d_ci[1] else d_ci[2].get("n")
@@ -15300,7 +15299,10 @@ def emit_stmts(
                             nc_f = _int_bound_expr(r_expr_to_fortran(dim_pair[1]))
                             explicit_shape = True
                     if not explicit_shape:
-                        if nrow_src is None:
+                        if nrow_src is None and ncol_src is None:
+                            nr_f = f"size({data_size_f})"
+                            nc_f = "1"
+                        elif nrow_src is None:
                             nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
                             nr_f = f"((size({data_size_f}) + ({nc_f}) - 1) / ({nc_f}))"
                         else:
