@@ -5149,6 +5149,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 txt = st.expr
             elif isinstance(st, ForStmt):
                 txt = st.iter_expr
+                if re.fullmatch(re.escape(arg), st.iter_expr.strip()):
+                    rank = max(rank, 1)
             elif isinstance(st, WhileStmt):
                 txt = st.cond
             elif isinstance(st, RepeatStmt):
@@ -13646,6 +13648,8 @@ def emit_stmts(
         c = parse_call_text(t)
         if c is not None:
             nm_c = c[0].lower()
+            if nm_c in _USER_FUNC_RETURN_RANK and nm_c not in _USER_FUNC_ELEMENTAL:
+                return _USER_FUNC_RETURN_RANK.get(nm_c, 0)
             if nm_c in {"confint", "lm_confint"}:
                 return 2
             if nm_c in {"qr.r", "qr_r", "qr.q", "qr_q"}:
@@ -23829,6 +23833,15 @@ def transpile_r_to_fortran(
         )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    program_name = unit_name
+    if unit_name.lower() in {f.name.lower() for f in funcs}:
+        used_program_names = {f.name.lower() for f in funcs} | {module_name.lower()}
+        candidate_program_name = f"{unit_name}_main"
+        suffix_program_name = 2
+        while candidate_program_name.lower() in used_program_names:
+            candidate_program_name = f"{unit_name}_main_{suffix_program_name}"
+            suffix_program_name += 1
+        program_name = candidate_program_name
     fn_named_return_labels = collect_function_named_return_labels(funcs)
     _CATEGORICAL_LABELS = collect_categorical_sample_labels(stmts)
     _CHAR_INDEX_ALIASES = collect_character_index_aliases(stmts)
@@ -24163,7 +24176,15 @@ def transpile_r_to_fortran(
                     return 1
                 m_tail = re.match(r"^([A-Za-z]\w*)$", expr_rank_tail)
                 if m_tail is not None:
-                    rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
+                    tail_name_l = m_tail.group(1).lower()
+                    if tail_name_l in {nm.lower() for nm in infer_function_integer_names(fn_rank_tail)} and tail_name_l not in {
+                        nm.lower() for nm in fn_int_array_names.get(fn_rank_tail.name, set())
+                    }:
+                        rr_tail = 0
+                    elif tail_name_l in inferred_ret_ranks:
+                        rr_tail = inferred_ret_ranks[tail_name_l]
+                    else:
+                        rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
                 else:
                     rr_tail = _infer_assignment_rank_hint(expr_rank_tail, inferred_ret_ranks)
                 if re.match(r"^-?\s*(?:sum|mean|prod|min|max|Reduce)\s*\(", expr_rank_tail, re.IGNORECASE):
@@ -28799,7 +28820,7 @@ def transpile_r_to_fortran(
             o.lines.extend(mprocs.lines)
         o.w(f"end module {module_name}")
         o.w("")
-        o.w(f"program {unit_name}")
+        o.w(f"program {program_name}")
         o.w(f"use {module_name}")
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
@@ -28807,7 +28828,7 @@ def transpile_r_to_fortran(
             o.w("use r_mod, only: " + _render_r_mod_only(main_needed))
         o.w("implicit none")
         o.lines.extend(pbody.lines)
-        o.w(f"end program {unit_name}")
+        o.w(f"end program {program_name}")
     else:
         o = FEmit()
         combined_main_text = main_text_now + "\n" + "\n".join(pbody.lines)
@@ -28818,7 +28839,7 @@ def transpile_r_to_fortran(
         main_needs_pi = bool(re.search(r"\bpi\b", main_text_now))
         if main_needs_pi:
             main_needs_dp = True
-        o.w(f"program {unit_name}")
+        o.w(f"program {program_name}")
         if main_needs_dp or main_needs_int64:
             iso_imports_main: list[str] = []
             if main_needs_dp:
@@ -28834,7 +28855,7 @@ def transpile_r_to_fortran(
         if main_needs_pi:
             o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
         o.lines.extend(pbody.lines)
-        o.w(f"end program {unit_name}")
+        o.w(f"end program {program_name}")
     return o.text()
 
 
@@ -35157,6 +35178,50 @@ def rewrite_noncharacter_a_descriptor_writes_text(f90: str) -> str:
     )
 
 
+def rewrite_scalar_function_vector_prints_text(f90: str) -> str:
+    """Do not print visibly scalar function calls with vector print helpers."""
+    scalar_funcs: set[str] = set()
+    fn_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)(.*?)^\s*end\s+function\b"
+    )
+    for m in fn_re.finditer(f90):
+        fn_name = m.group(1)
+        result_name = m.group(2)
+        body = m.group(3)
+        decl_re = re.compile(
+            rf"(?im)^\s*(?:integer|logical|real\s*\([^)]*\)|real\(kind=dp\))(?:\s*,\s*[^:]*)?\s*::\s*([^\n]*\b{re.escape(result_name)}\b[^\n]*)$"
+        )
+        m_decl = decl_re.search(body)
+        if m_decl is None:
+            continue
+        result_part = next(
+            (part for part in split_top_level_commas(m_decl.group(1)) if re.match(rf"\s*{re.escape(result_name)}\b", part)),
+            "",
+        )
+        if result_part and "allocatable" not in m_decl.group(0).lower() and "(" not in result_part:
+            scalar_funcs.add(fn_name.lower())
+    if not scalar_funcs:
+        return f90
+
+    def repl_print(m: re.Match[str]) -> str:
+        fn_name = m.group(2)
+        if fn_name.lower() not in scalar_funcs:
+            return m.group(0)
+        return f'{m.group(1)}write(*,"(g0)") {m.group(2)}({m.group(3)})'
+
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*real\s*\(\s*([A-Za-z]\w*)\s*\((.*)\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*$",
+        repl_print,
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*\((.*)\)\s*\)\s*$",
+        repl_print,
+        f90,
+    )
+    return f90
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -37283,6 +37348,7 @@ def main() -> int:
     f90 = rewrite_user_call_dotted_keyword_aliases_text(f90)
     f90 = rewrite_same_rank_self_update_aliases_text(f90)
     f90 = rewrite_noncharacter_a_descriptor_writes_text(f90)
+    f90 = rewrite_scalar_function_vector_prints_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
@@ -37981,6 +38047,7 @@ def main() -> int:
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = rewrite_rank3_slice_prints_with_dimnames_text(f90, _RANK3_SLICE_PRINT_LABELS)
+    f90 = rewrite_scalar_function_vector_prints_text(f90)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
