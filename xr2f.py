@@ -76,6 +76,9 @@ _RANK3_SLICE_PRINT_LABELS: dict[str, tuple[str, str]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
+_R_IDENT_RE = r"(?:[A-Za-z]\w*(?:\.[A-Za-z]\w*)*|\.+[A-Za-z_]\w*(?:\.[A-Za-z]\w*)*|\.\.[0-9]\w*)"
+_RAW_R_IDENT_NAMES: set[str] = set()
+_SANITIZED_R_NAME_BY_RAW: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
 _EXPANDED_DATA_FRAME_ALIASES: dict[str, dict[str, str]] = {}
 _DATA_FRAME_FORCE_MATERIALIZE: set[str] = set()
@@ -1048,7 +1051,7 @@ def _parse_for_head(line: str) -> tuple[str, str, str] | None:
                 if depth == 0:
                     inside = s[i0 + 1 : j].strip()
                     tail = s[j + 1 :].strip()
-                    m_in = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s+in\s+(.+)$", inside)
+                    m_in = re.match(rf"^({_R_IDENT_RE})\s+in\s+(.+)$", inside)
                     if not m_in:
                         return None
                     raw_var = m_in.group(1)
@@ -1243,12 +1246,44 @@ def _sanitize_fortran_kwarg_name(name: str) -> str:
 def _sanitize_r_var_name(name: str) -> str:
     """Map an R variable name to a valid Fortran identifier without function-name collisions."""
     nm = name.strip()
+    cached = _SANITIZED_R_NAME_BY_RAW.get(nm)
+    if cached is not None:
+        return cached
+    raw_nm = nm
+    leading_dot = nm.startswith(".")
+    if leading_dot:
+        leading = len(nm) - len(nm.lstrip("."))
+        nm = ("dot_" * leading) + nm[leading:]
     if "." in nm:
         nm = nm.replace(".", "_dot_")
     nm = re.sub(r"[^A-Za-z0-9_]", "_", nm)
     if nm and nm[0].isdigit():
         nm = "_" + nm
+    if leading_dot:
+        base = nm or "dot"
+        cand = base
+        i = 2
+        while cand != raw_nm and cand in _RAW_R_IDENT_NAMES:
+            cand = f"{base}_{i}"
+            i += 1
+        nm = cand
+    _SANITIZED_R_NAME_BY_RAW[raw_nm] = nm
     return nm
+
+
+def _collect_raw_r_ident_names(src: str) -> set[str]:
+    out: set[str] = set()
+    pat = re.compile(_R_IDENT_RE)
+    for raw in src.splitlines():
+        code, _cmt = split_r_code_comment(raw)
+        for m in pat.finditer(code):
+            start, end = m.span()
+            if start > 0 and re.match(r"[A-Za-z0-9_.]", code[start - 1]):
+                continue
+            if end < len(code) and re.match(r"[A-Za-z0-9_.]", code[end]):
+                continue
+            out.add(m.group(0))
+    return out
 
 
 def _replace_dotted_var_refs(expr: str) -> str:
@@ -2381,11 +2416,12 @@ def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | No
         inner = ln[len("print(") : -1].strip()
         args = split_top_level_commas(inner) if inner else []
         return PrintStmt(args=args, comment=cmt)
-    m_asn_dot = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)+)\s*(<-|=)\s*(.+)$", ln)
+    m_asn_dot = re.match(rf"^({_R_IDENT_RE})\s*(<-|=)\s*(.+)$", ln)
     if m_asn_dot:
         raw_name = m_asn_dot.group(1)
         name = _sanitize_r_var_name(raw_name)
-        _DOTTED_VAR_RENAMES[raw_name] = name
+        if raw_name != name:
+            _DOTTED_VAR_RENAMES[raw_name] = name
         rhs = m_asn_dot.group(3).strip()
         return Assign(name=name, expr=rhs, comment=cmt)
     m_asn = re.match(r"^([A-Za-z]\w*)\s*(<-|=)\s*(.+)$", ln)
@@ -23534,7 +23570,11 @@ def transpile_r_to_fortran(
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME
     global _CALL_COERCION_WARNINGS
+    global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
+    _DOTTED_VAR_RENAMES = {}
+    _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
+    _SANITIZED_R_NAME_BY_RAW = {}
     _NULL_ARRAY_SENTINELS = {}
     _EXPANDED_DATA_FRAME_FIELDS = {}
     _EXPANDED_DATA_FRAME_ALIASES = {}
