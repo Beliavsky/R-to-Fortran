@@ -11645,6 +11645,8 @@ def r_expr_to_fortran(expr: str) -> str:
     # basic helpers
     def _length_repl(inner: str) -> str:
         txt = inner.strip()
+        if txt.upper() == "NULL" or txt.lower() in _KNOWN_NULL_NAMES:
+            return "0"
         simple_name = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
         if simple_name:
             ft = _sanitize_r_var_name(txt)
@@ -25282,28 +25284,46 @@ def transpile_r_to_fortran(
         formals = fn_force_obj.args
         forced_ranks = _FORCED_FUNC_ARG_RANKS.setdefault(callee_l, {})
         user_ranks = _USER_FUNC_ARG_RANK.setdefault(callee_l, {})
+        fn_force_body_text = "\n".join(_stmt_texts_for_rank_scan(fn_force_obj.body))
 
-        def _actual_rank(actual_src: str) -> int:
+        def _formal_is_flattened_vector(formal_name: str) -> bool:
+            pat = re.escape(formal_name)
+            if not re.search(rf"\bc\s*\([^)]*\b{pat}\b", fn_force_body_text, re.IGNORECASE):
+                return False
+            matrix_use_patterns = [
+                rf"\b{pat}\s*\[[^\]\n]*,[^\]\n]*\]",
+                rf"\bn(?:row|col)\s*\(\s*{pat}\b",
+                rf"\bdim\s*\(\s*{pat}\b",
+                rf"\b(?:chol|det|sweep|apply|as\.matrix)\s*\([^)]*\b{pat}\b",
+                rf"\b{pat}\s*%\*%",
+                rf"%\*%\s*{pat}\b",
+            ]
+            return not any(re.search(p, fn_force_body_text, re.IGNORECASE) for p in matrix_use_patterns)
+
+        def _actual_rank(actual_src: str, formal_name: str) -> int:
             actual_l = actual_src.strip().lower()
             if actual_l in _KNOWN_MATRIX_NAMES:
-                return 2
+                return 1 if _formal_is_flattened_vector(formal_name) else 2
             if actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES or actual_l in _KNOWN_CHAR_VECTOR_NAMES:
                 return 1
-            return _infer_assignment_rank_hint(actual_src, {nm: 1 for nm in _KNOWN_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES})
+            rank_actual = _infer_assignment_rank_hint(actual_src, {nm: 1 for nm in _KNOWN_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES})
+            if rank_actual >= 2 and _formal_is_flattened_vector(formal_name):
+                return 1
+            return rank_actual
 
         for i_actual, actual_src in enumerate(c_call_force[1]):
             if i_actual >= len(formals):
                 break
-            rank_actual = _actual_rank(actual_src)
+            formal_l = formals[i_actual].lower()
+            rank_actual = _actual_rank(actual_src, formal_l)
             if rank_actual > 0:
-                formal_l = formals[i_actual].lower()
                 forced_ranks[formal_l] = max(forced_ranks.get(formal_l, 0), rank_actual)
                 user_ranks[formal_l] = max(user_ranks.get(formal_l, 0), rank_actual)
         for key_actual, actual_src in c_call_force[2].items():
             key_l = key_actual.lower()
             if key_l not in {a.lower() for a in formals}:
                 continue
-            rank_actual = _actual_rank(actual_src)
+            rank_actual = _actual_rank(actual_src, key_l)
             if rank_actual > 0:
                 forced_ranks[key_l] = max(forced_ranks.get(key_l, 0), rank_actual)
                 user_ranks[key_l] = max(user_ranks.get(key_l, 0), rank_actual)
@@ -30701,6 +30721,54 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
         if not kinds or ("integer" not in kinds and "real" not in kinds):
             return f"{fn_name}({inner})"
         idx_map = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
+        ranks_by_name = _USER_FUNC_ARG_RANK.get(fn_name.lower(), {})
+        rank_by_idx = {idx: ranks_by_name.get(name_l, 0) for name_l, idx in idx_map.items()}
+
+        def _looks_rank2_actual(v: str) -> bool:
+            t = v.strip()
+            tl = t.lower()
+            if tl in _KNOWN_MATRIX_NAMES or tl in _KNOWN_LOGICAL_MATRIX_NAMES:
+                return True
+            if re.match(r"^(?:matrix|r_array_real|r_array_int|r_matmul|matmul)\s*\(", t, re.IGNORECASE):
+                return True
+            if re.search(r"\(:\s*,\s*:\)", t):
+                return True
+            return False
+
+        def _flatten_for_rank1_formal(v: str, idx: int) -> str:
+            t = v.strip()
+            if rank_by_idx.get(idx, 0) == 1:
+                if _looks_rank2_actual(t) and not re.match(r"^reshape\s*\(", t, re.IGNORECASE):
+                    return f"reshape({t}, [size({t})])"
+                tl = t.lower()
+                m_cast_vector_actual = re.match(r"^(?:real|int)\s*\(\s*([A-Za-z]\w*)\b", t, re.IGNORECASE)
+                cast_vector_name = m_cast_vector_actual.group(1).lower() if m_cast_vector_actual is not None else ""
+                is_known_vector_actual = (
+                    tl in _KNOWN_VECTOR_NAMES
+                    or tl in _KNOWN_INT_VECTOR_NAMES
+                    or tl in _CURRENT_INT_ARRAY_NAMES
+                    or tl in _KNOWN_LOGICAL_VECTOR_NAMES
+                    or tl in _KNOWN_CHAR_VECTOR_NAMES
+                    or cast_vector_name in _KNOWN_VECTOR_NAMES
+                    or cast_vector_name in _KNOWN_INT_VECTOR_NAMES
+                    or cast_vector_name in _CURRENT_INT_ARRAY_NAMES
+                    or cast_vector_name in _KNOWN_LOGICAL_VECTOR_NAMES
+                    or cast_vector_name in _KNOWN_CHAR_VECTOR_NAMES
+                    or t.startswith("[")
+                    or re.match(r"^(?:reshape|r_seq_int|r_seq_len|r_seq_real|r_rep|r_rep_real|r_rep_int|pack)\s*\(", t, re.IGNORECASE)
+                    or re.search(r"\(:\)", t) is not None
+                )
+                is_numeric_scalar_actual = (
+                    re.fullmatch(r"[+-]?\d+(?:\.\d*)?(?:_dp)?", t) is not None
+                    or _is_real_literal(t)
+                    or tl in _KNOWN_INT_NAMES
+                    or re.fullmatch(r"[A-Za-z]\w*", t) and tl in real_scalar_names
+                    or re.fullmatch(r"(?:real|int)\s*\(.+\)", t, re.IGNORECASE) is not None
+                )
+                if not is_known_vector_actual and is_numeric_scalar_actual:
+                    return f"[{t}]"
+            return t
+
         parts = split_top_level_commas(inner)
         out_parts: list[str] = []
         pos_i = 0
@@ -30712,6 +30780,7 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
                 val = m_kw.group(2).strip()
                 idx = idx_map.get(key, -1)
                 if idx >= 0 and idx < len(kinds):
+                    val = _flatten_for_rank1_formal(val, idx)
                     if kinds[idx] == "integer" and _needs_int_wrap(val):
                         val = f"int({val})"
                     elif kinds[idx] == "real":
@@ -30719,6 +30788,7 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
                 out_parts.append(f"{m_kw.group(1)}={val}")
                 continue
             if pos_i < len(kinds):
+                ps = _flatten_for_rank1_formal(ps, pos_i)
                 if kinds[pos_i] == "integer" and _needs_int_wrap(ps):
                     ps = f"int({ps})"
                 elif kinds[pos_i] == "real":
