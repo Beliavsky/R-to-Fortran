@@ -3084,7 +3084,14 @@ def _split_index_dims(inner: str) -> list[str]:
 
 def _index_inner_1d_to_fortran(inner: str) -> str:
     """Translate one R index expression with R ':' precedence into Fortran."""
-    t = fscan.strip_redundant_outer_parens_expr(inner.strip())
+    raw_t = inner.strip()
+    raw_seq = _split_top_level_colon(raw_t)
+    if raw_seq is not None and (raw_seq[0].strip().startswith("(") and raw_seq[0].strip().endswith(")")):
+        a, b = raw_seq
+        a_f = _int_bound_expr(r_expr_to_fortran(a))
+        b_f = _int_bound_expr(r_expr_to_fortran(b))
+        return f"({a_f}):{b_f}"
+    t = fscan.strip_redundant_outer_parens_expr(raw_t)
     m_lag_upper = re.match(r"^1\s*:\s*([A-Za-z]\w*)\s*-\s*lag$", t, re.IGNORECASE)
     if m_lag_upper is not None:
         return f"1:{_int_bound_expr(r_expr_to_fortran(m_lag_upper.group(1)))} - lag"
@@ -9480,6 +9487,16 @@ def r_expr_to_fortran(expr: str) -> str:
         if lhs_val_in is not None or lhs_f_in.startswith("[character("):
             return f"any(r_in({lhs_f_in}, {r_expr_to_fortran(rhs_src_in)}))"
         return f"r_in({lhs_f_in}, {r_expr_to_fortran(rhs_src_in)})"
+    seq_explicit_bound = _split_top_level_colon(s)
+    if seq_explicit_bound is not None and ("[" not in s) and ("]" not in s):
+        a_seq, b_seq = seq_explicit_bound
+        if (
+            (a_seq.strip().startswith("(") and a_seq.strip().endswith(")"))
+            or (b_seq.strip().startswith("(") and b_seq.strip().endswith(")"))
+        ):
+            a_f = _int_bound_expr(r_expr_to_fortran(a_seq.strip()))
+            b_f = _int_bound_expr(r_expr_to_fortran(b_seq.strip()))
+            return f"r_seq_int({a_f}, {b_f})"
     # Preserve operator precedence: parse top-level scalar +/- before scalar division.
     # Example: m4 / sd**4 - 3.0 must map to (m4 / sd**4) - 3.0, not m4 / (sd**4 - 3.0).
     addsub = _find_top_level_addsub(s)
@@ -12515,7 +12532,7 @@ def r_expr_to_fortran(expr: str) -> str:
         s,
     )
     # Replace simple colon ranges embedded in larger expressions, e.g. 10*1:2.
-    atom = r"(?:[A-Za-z]\w*|\d+(?:\.\d+)?(?:_dp)?|\([^()]+\))"
+    atom = r"(?:[A-Za-z]\w*|\d+(?:\.\d+)?(?:_dp)?)"
     colon_pat = re.compile(rf"(?<![\w\)])({atom})\s*:\s*({atom})(?![\w\(])")
     prev_s_col = None
     while prev_s_col != s:
@@ -12815,7 +12832,7 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     s = re.sub(
         r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*\(\s*([A-Za-z]\w*)\s*\+\s*1\s*\)\s*:\s*([A-Za-z]\w*)\s*\]",
-        lambda m: f"{m.group(1)}({_int_bound_expr(r_expr_to_fortran(m.group(2)))} + 1:{_int_bound_expr(r_expr_to_fortran(m.group(3)))})",
+        lambda m: f"{m.group(1)}(({_int_bound_expr(r_expr_to_fortran(m.group(2)))} + 1):{_int_bound_expr(r_expr_to_fortran(m.group(3)))})",
         s,
     )
     s = re.sub(
