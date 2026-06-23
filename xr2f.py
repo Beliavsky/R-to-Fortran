@@ -13938,6 +13938,10 @@ def emit_stmts(
                     if rr is not None
                 ]
                 return max(arg_ranks) if arg_ranks else 0
+            if nm_c == "sign":
+                x_arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+                rr_sign = _expr_rank_for_print(x_arg) if x_arg else None
+                return rr_sign if rr_sign is not None else 0
             if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c in {"anyduplicated", "setequal"}:
@@ -18710,6 +18714,8 @@ def _expr_kind_simple(expr: str) -> str:
                     return "int"
                 if yes_kind == "logical" and no_kind == "logical":
                     return "logical"
+            return "real"
+        if key == "sign":
             return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
