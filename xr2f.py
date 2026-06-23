@@ -16077,21 +16077,49 @@ def emit_stmts(
         elif isinstance(st, PrintStmt):
             if st.args:
                 print_args: list[str] = []
+                print_digits_src: str | None = None
                 for a_pr in st.args:
-                    m_kw_pr = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)?)\s*=\s*(.+)$", a_pr.strip())
+                    a_pr_s = a_pr.strip()
+                    m_kw_pr = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)?)\s*=\s*(.+)$", a_pr_s)
                     if m_kw_pr is not None and _sanitize_fortran_kwarg_name(m_kw_pr.group(1)).lower() in {
                         "row_names",
                         "quote",
                         "right",
-                        "digits",
                         "na_print",
                         "print_gap",
                     }:
+                        continue
+                    if m_kw_pr is not None and _sanitize_fortran_kwarg_name(m_kw_pr.group(1)).lower() == "digits":
+                        print_digits_src = m_kw_pr.group(2).strip()
+                        continue
+                    if len(print_args) == 1 and print_digits_src is None and re.fullmatch(r"[+-]?\d+[lL]?", a_pr_s):
+                        print_digits_src = a_pr_s
                         continue
                     print_args.append(a_pr)
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if print_digits_src is not None and has_r_mod:
+                        digits_raw_f = _int_bound_expr(r_expr_to_fortran(print_digits_src))
+                        if re.fullmatch(r"[+-]?\d+[lL]?", print_digits_src.strip()):
+                            print_digits_f = str(max(0, int(_normalize_r_int_literal(print_digits_src.strip())) - 1))
+                        else:
+                            print_digits_f = f"max(0, {digits_raw_f} - 1)"
+                        one_digits_f = r_expr_to_fortran(one)
+                        one_digits_rank = _expr_rank_for_print(one)
+                        one_digits_is_vector = one_digits_rank == 1 or re.search(
+                            r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep)\s*\(",
+                            one_digits_f,
+                            re.IGNORECASE,
+                        ) is not None or "[" in one_digits_f
+                        if one_digits_is_vector:
+                            _wstmt(f"call print_real_vector(real({one_digits_f}, kind=dp), digits={print_digits_f})", st.comment)
+                            need_r_mod.add("print_real_vector")
+                            continue
+                        if one_digits_rank == 2:
+                            _wstmt(f"call print_matrix(real({one_digits_f}, kind=dp), digits={print_digits_f})", st.comment)
+                            need_r_mod.add("print_matrix_rstyle")
+                            continue
                     if _emit_print_array_expr_scalar_subset(one, st.comment):
                         continue
                     if one in benchmark_vars:
@@ -32705,6 +32733,71 @@ def rewrite_z_stats_row_named_print(lines: list[str]) -> list[str]:
     return out
 
 
+def rewrite_vector_elemental_write_calls(lines: list[str]) -> list[str]:
+    """Print elementwise vector-valued real expressions with vector formatting."""
+    rank1: set[str] = set()
+    complex_rank1: set[str] = set()
+    decl_pat = re.compile(
+        r"^\s*(complex\s*\([^)]*\)|real(?:\([^)]*\))?|integer|logical)\s*(?:,\s*[^:]*)?::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    cont_kind: str | None = None
+    for ln in lines:
+        m = decl_pat.match(ln)
+        if m is None and cont_kind is None:
+            continue
+        if m is not None:
+            kind = m.group(1).lower()
+            cont_kind = "complex" if kind.startswith("complex") else "other"
+            decl_items = m.group(2)
+        else:
+            decl_items = re.sub(r"^\s*&\s*", "", ln)
+        decl_items = re.sub(r"\s*&\s*$", "", decl_items.strip())
+        for item in split_top_level_commas(decl_items):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", item)
+            if mm is not None:
+                rank1.add(mm.group(1))
+                if cont_kind == "complex":
+                    complex_rank1.add(mm.group(1))
+        if not ln.rstrip().endswith("&"):
+            cont_kind = None
+
+    elemental = {
+        "acos", "asin", "atan", "cos", "cosh", "exp", "expm1", "floor",
+        "log", "log10", "log2", "log1p", "sin", "sinh", "sqrt", "tan",
+        "tanh", "trunc",
+    }
+
+    def is_vector_expr(expr: str) -> bool:
+        e = expr.strip()
+        if "cmplx(" in e.lower():
+            return False
+        if e.lower().startswith("r_round(") and re.search(r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep|sqrt)\s*\(", e, re.IGNORECASE):
+            return True
+        m_call = re.match(r"^([A-Za-z]\w*)\s*\(", e)
+        if m_call is None or m_call.group(1).lower() not in elemental:
+            return False
+        if "[" in e and "]" in e:
+            return True
+        if re.search(r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep)\s*\(", e, re.IGNORECASE) is not None:
+            return True
+        if re.search(r"\b(?:sum|mean|size|maxval|minval)\s*\(", e, re.IGNORECASE):
+            return False
+        return any(
+            nm not in complex_rank1 and re.search(rf"\b{re.escape(nm)}\b", e)
+            for nm in rank1
+        )
+
+    out: list[str] = []
+    for ln in lines:
+        m = re.match(r'^(\s*)write\(\*,"\(g0\)"\)\s+(.+?)\s*$', ln, re.IGNORECASE)
+        if m is not None and is_vector_expr(m.group(2)):
+            out.append(f"{m.group(1)}call print_real_vector({m.group(2).strip()})")
+            continue
+        out.append(ln)
+    return out
+
+
 def rewrite_dcc_coef_print_calls(lines: list[str]) -> list[str]:
     labels = {
         "dcc_fit%coef": '[character(len=11) :: "a", "b", "persistence", "loglik", "aic", "bic", "convergence"]',
@@ -35466,6 +35559,23 @@ def repair_vector_function_result_declarations_text(f90: str) -> str:
     return proc_re.sub(repl_proc, f90)
 
 
+def rewrite_vector_elemental_write_calls_text(f90: str) -> str:
+    """Repair wrapped scalar writes for vector-valued elemental expressions."""
+    return f90
+    pat = re.compile(
+        r'(?ims)^(\s*)write\(\*,"\(g0\)"\)\s+((?:r_round|sqrt|log|exp|sin|cos|tan)\s*\(.*?\))\s*$',
+        re.MULTILINE,
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        expr = " ".join(x.strip().lstrip("&").strip() for x in m.group(2).splitlines()).replace("&", "")
+        if not re.search(r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep)\s*\(", expr, re.IGNORECASE):
+            return m.group(0)
+        return f"{m.group(1)}call print_real_vector({expr})"
+
+    return pat.sub(repl, f90)
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -37514,6 +37624,7 @@ def main() -> int:
     f90_lines = rewrite_vector_bracket_assignment_with_replace(f90_lines)
     f90_lines = rewrite_residual_vector_bracket_subscripts(f90_lines)
     f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
+    f90_lines = rewrite_vector_elemental_write_calls(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
@@ -37564,6 +37675,7 @@ def main() -> int:
     f90_lines = rewrite_arma_table_label_access(f90_lines)
     f90_lines = compact_array_section_subscripts(f90_lines)
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
+    f90_lines = rewrite_vector_elemental_write_calls(f90_lines)
     f90_lines = rewrite_named_vector_print_calls(f90_lines)
     f90_lines = rewrite_asset_named_print_calls(f90_lines)
     f90_lines = rewrite_z_stats_row_named_print(f90_lines)
@@ -37593,6 +37705,7 @@ def main() -> int:
     f90 = rewrite_same_rank_self_update_aliases_text(f90)
     f90 = rewrite_noncharacter_a_descriptor_writes_text(f90)
     f90 = rewrite_scalar_function_vector_prints_text(f90)
+    f90 = rewrite_vector_elemental_write_calls_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
@@ -37618,6 +37731,12 @@ def main() -> int:
     f90 = re.sub(r'\(:,\s*"ES"\)', "(:, 2)", f90)
     f90 = re.sub(r'\(:,\s*"latest_VaR"\)', "(:, 1)", f90)
     f90 = re.sub(r'\(:,\s*"latest_ES"\)', "(:, 2)", f90)
+    f90 = re.sub(r",\s*&\)\s*\n\s*&\s*kind\s*=", ", &\n& kind=", f90)
+    f90 = re.sub(
+        r"(?m)^(call\s+print_real_vector\s*\(\s*exp\s*\(\s*real\s*\(.+,\s*&\n\s*&\s*kind\s*=\s*dp\s*\)\))$",
+        r"\1)",
+        f90,
+    )
     f90 = re.sub(r"\b([A-Za-z]\w*(?:%[A-Za-z]\w*)*%convergence)\b", r"real(\1, kind=dp)", f90)
     f90 = re.sub(r"real\(([A-Za-z]\w*(?:%[A-Za-z]\w*)*%convergence),\s*kind=dp\)(\s*=)", r"\1\2", f90)
     f90 = re.sub(r"\bqnorm\s*\(\s*([A-Za-z]\w*\s*\([^()\n]*\))\s*\)", r"qnorm_scalar(\1)", f90)
