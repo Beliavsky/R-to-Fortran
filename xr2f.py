@@ -35420,6 +35420,52 @@ def repair_null_append_function_results_text(f90: str) -> str:
     return proc_re.sub(repl_proc, f90)
 
 
+def repair_vector_function_result_declarations_text(f90: str) -> str:
+    """Repair scalar result declarations when later generated code uses result(:)."""
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+[A-Za-z]\w*\b.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        result = m.group(2)
+        if re.search(rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(result)}\s*\(:", block):
+            return block
+        uses_as_vector = (
+            re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*numeric\s*\(", block) is not None
+            or re.search(rf"\b{re.escape(result)}\s*\(", block) is not None
+            or re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*{re.escape(result)}\s*\(", block) is not None
+        )
+        if not uses_as_vector:
+            return block
+        new = re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\)\s*::\s*{re.escape(result)}\s*$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)",
+            block,
+            count=1,
+        )
+        new = re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\)\s*::\s*{re.escape(result)}\s*,\s*(.+)$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)\n\1real(kind=dp) :: \2",
+            new,
+            count=1,
+        )
+        new = re.sub(
+            rf"(?im)^(\s*)else\s+{re.escape(result)}\s*=\s*-1(?:\.0_dp)?\s*$",
+            rf"\1else\n\1   {result} = [real(kind=dp) ::]",
+            new,
+        )
+        new = re.sub(
+            rf"(?im)^(\s*)if\s*\((.+)\)\s*{re.escape(result)}\s*=\s*(.+)\n\1else\n\1\s+{re.escape(result)}\s*=\s*\[real\(kind=dp\)\s*::\s*\]",
+            rf"\1if (\2) then\n\1   {result} = \3\n\1else\n\1   {result} = [real(kind=dp) ::]\n\1end if",
+            new,
+        )
+        return new
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -38247,6 +38293,7 @@ def main() -> int:
     f90 = rewrite_rank3_slice_prints_with_dimnames_text(f90, _RANK3_SLICE_PRINT_LABELS)
     f90 = rewrite_scalar_function_vector_prints_text(f90)
     f90 = repair_null_append_function_results_text(f90)
+    f90 = repair_vector_function_result_declarations_text(f90)
     f90 = rewrite_null_sentinel_append_assignments_text(f90)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
