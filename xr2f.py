@@ -10880,7 +10880,7 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_m, pos_m, kw_m = c_mat
         data_src = pos_m[0] if pos_m else kw_m.get("data")
         if data_src is None:
-            raise NotImplementedError("matrix(...) requires data argument in this subset")
+            data_src = "NA_real_"
         nr_src = kw_m.get("nrow")
         nc_src = kw_m.get("ncol")
         if nr_src is None and len(pos_m) >= 2:
@@ -11695,8 +11695,45 @@ def r_expr_to_fortran(expr: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) != 3:
             return "ifelse(" + inner + ")"
-        yes_f = r_expr_to_fortran(parts[1].strip())
-        no_f = r_expr_to_fortran(parts[2].strip())
+        yes_src = parts[1].strip()
+        no_src = parts[2].strip()
+        yes_f = r_expr_to_fortran(yes_src)
+        no_f = r_expr_to_fortran(no_src)
+        def _ifelse_branch_is_int(src_b: str, f_b: str) -> bool:
+            s_b = src_b.strip()
+            f_t = f_b.strip()
+            s_l = s_b.lower()
+            f_l = f_t.lower()
+            return (
+                _is_int_literal(s_b)
+                or _is_int_literal(f_t)
+                or s_l in _KNOWN_INT_NAMES
+                or s_l in _KNOWN_INT_VECTOR_NAMES
+                or s_l in _CURRENT_INT_ARRAY_NAMES
+                or f_l in _KNOWN_INT_NAMES
+                or f_l in _KNOWN_INT_VECTOR_NAMES
+                or f_l in _CURRENT_INT_ARRAY_NAMES
+            )
+        def _ifelse_branch_is_real(src_b: str, f_b: str) -> bool:
+            s_b = src_b.strip()
+            f_t = f_b.strip()
+            if _is_real_literal(s_b) or _is_real_literal(f_t):
+                return True
+            if re.search(r"\bkind\s*=\s*dp\b|_dp\b", f_t):
+                return True
+            if re.match(r"^(?:real|as\.numeric|as\.double)\s*\(", s_b, re.IGNORECASE):
+                return True
+            if f_t.lower().startswith("real("):
+                return True
+            if _ifelse_branch_is_int(src_b, f_b):
+                return False
+            if f_t in {"TRUE", "FALSE", ".true.", ".false."}:
+                return False
+            return _expr_kind_simple(s_b) == "real"
+        if _ifelse_branch_is_int(yes_src, yes_f) and _ifelse_branch_is_real(no_src, no_f):
+            yes_f = f"real({yes_f}, kind=dp)"
+        if _ifelse_branch_is_int(no_src, no_f) and _ifelse_branch_is_real(yes_src, yes_f):
+            no_f = f"real({no_f}, kind=dp)"
         if yes_f.startswith("date_to_char(") or no_f.startswith("date_to_char("):
             date_len = 10
             for name in ("yes_f", "no_f"):
@@ -15556,6 +15593,8 @@ def emit_stmts(
                 if cinfo_m is not None:
                     _nmm, posm, kwm = cinfo_m
                     data_src = posm[0] if posm else kwm.get("data", "")
+                    if not data_src:
+                        data_src = "NA_real_"
                     nrow_src = kwm.get("nrow")
                     ncol_src = kwm.get("ncol")
                     byrow_src = kwm.get("byrow")
