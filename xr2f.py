@@ -9284,6 +9284,37 @@ def r_expr_to_fortran(expr: str) -> str:
                 return max(arg_ranks or [0])
         return 0
 
+    for op_r, op_f in [("==", "=="), ("!=", "/="), (">=", ">="), ("<=", "<="), (">", ">"), ("<", "<")]:
+        mm_cmp_early = _split_top_level_token(s, op_r, from_right=True)
+        if mm_cmp_early is not None:
+            lhs_src = mm_cmp_early[0].strip()
+            rhs_src = mm_cmp_early[1].strip()
+            lhs_label = _dequote_string_literal(lhs_src)
+            rhs_label = _dequote_string_literal(rhs_src)
+            if rhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", lhs_src) and lhs_src in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[lhs_src]
+                if rhs_label in labels:
+                    return f"{r_expr_to_fortran(lhs_src)} {op_f} {labels.index(rhs_label) + 1}"
+            if lhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", rhs_src) and rhs_src in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[rhs_src]
+                if lhs_label in labels:
+                    return f"{labels.index(lhs_label) + 1} {op_f} {r_expr_to_fortran(rhs_src)}"
+            lhs = r_expr_to_fortran(lhs_src)
+            rhs = r_expr_to_fortran(rhs_src)
+            lhs_logical = (
+                lhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or lhs.strip() in {".true.", ".false."}
+                or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", lhs.strip(), re.IGNORECASE) is not None
+            )
+            rhs_logical = (
+                rhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or rhs.strip() in {".true.", ".false."}
+                or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", rhs.strip(), re.IGNORECASE) is not None
+            )
+            if (lhs_logical or rhs_logical) and op_r in {"==", "!="}:
+                return f"{lhs} {'.eqv.' if op_r == '==' else '.neqv.'} {rhs}"
+            return f"{lhs} {op_f} {rhs}"
+
     for op, fn in [("+", "r_add"), ("-", "r_sub"), ("*", "r_mul"), ("/", "r_div")]:
         mm_op = _split_top_level_token(s, op, from_right=True)
         if mm_op is not None:
