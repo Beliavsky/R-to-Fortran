@@ -8441,6 +8441,20 @@ def r_expr_to_fortran(expr: str) -> str:
                 src_meta = _LAST_ROWNAME_SOURCES.get(key_meta)
                 if isinstance(src_meta, str) and src_meta.strip() and not re.search(r"\b(?:colnames|rownames|names)\s*\(", src_meta, re.IGNORECASE):
                     return r_expr_to_fortran(src_meta.strip())
+    c_el0 = parse_call_text(s)
+    if c_el0 is not None and c_el0[0].lower() == "el":
+        pos_el, kw_el = c_el0[1], c_el0[2]
+        x_src_el = pos_el[0].strip() if pos_el else kw_el.get("x", "").strip()
+        idx_src_el = pos_el[1].strip() if len(pos_el) >= 2 else kw_el.get("i", kw_el.get("index", "")).strip()
+        if x_src_el and idx_src_el:
+            x_f_el = r_expr_to_fortran(x_src_el)
+            idx_f_el = _int_bound_expr(r_expr_to_fortran(idx_src_el))
+            if re.fullmatch(r"[A-Za-z]\w*", x_f_el):
+                if x_f_el.lower() in _KNOWN_RANK3_NAMES:
+                    return f"{x_f_el}(:, :, {idx_f_el})"
+                if x_f_el.lower() in _KNOWN_MATRIX_NAMES:
+                    return f"{x_f_el}(:, {idx_f_el})"
+            return f"{x_f_el}({idx_f_el})"
     m_nested_dbl_subset = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+?)\s*\]\]\s*\[\[\s*(.+)\s*\]\]\s*$", s)
     if m_nested_dbl_subset is not None:
         base_nested = m_nested_dbl_subset.group(1)
