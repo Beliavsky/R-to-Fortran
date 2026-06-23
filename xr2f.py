@@ -30894,7 +30894,7 @@ def repair_matrix_filter_assignment_targets_text(f90: str) -> str:
         m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*reshape\s*\(\s*pack\s*\(\s*[A-Za-z]\w*\s*,\s*spread\s*\(", ln, re.IGNORECASE)
         if m is not None:
             matrix_targets.add(m.group(1).lower())
-        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matrix_row_filter\s*\(", ln, re.IGNORECASE)
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matrix_(?:row|col)_filter\s*\(", ln, re.IGNORECASE)
         if m is not None:
             matrix_targets.add(m.group(1).lower())
     if not matrix_targets:
@@ -38591,6 +38591,22 @@ def main() -> int:
         f90,
     )
     f90 = re.sub(
+        r"\b([A-Za-z]\w*)\(\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*,\s*:\s*\)",
+        lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(2).strip()})"
+        if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
+        else m.group(0),
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\(\s*:\s*,\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*\)",
+        lambda m: f"r_matrix_col_filter({m.group(1)}, {m.group(2).strip()})"
+        if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
+        else m.group(0),
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
         r"\b([A-Za-z]\w*)\s*\[\s*,\s*,\s*shape\(\s*\1\s*\)\s*\[\s*3\s*\]\s*\]",
         r"\1(:, :, size(\1, 3))",
         f90,
@@ -38815,6 +38831,8 @@ def main() -> int:
         extra_use_names.append("r_matrix_index")
     if "r_matrix_row_filter(" in f90:
         extra_use_names.append("r_matrix_row_filter")
+    if "r_matrix_col_filter(" in f90:
+        extra_use_names.append("r_matrix_col_filter")
     if "which_first(" in f90:
         extra_use_names.append("which_first")
     if "which_last(" in f90:
