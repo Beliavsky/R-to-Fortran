@@ -55,6 +55,7 @@ _CURRENT_CHAR_SCALAR_NAMES: set[str] = set()
 _KNOWN_INT_CONSTANTS: dict[str, int] = {}
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
+_CURRENT_LOGICAL_ARRAY_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
 _KNOWN_DATE_NAMES: set[str] = set()
@@ -9319,15 +9320,25 @@ def r_expr_to_fortran(expr: str) -> str:
             rhs = r_expr_to_fortran(rhs_src)
             lhs_logical = (
                 lhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or lhs_src.lower() in _CURRENT_LOGICAL_ARRAY_NAMES
                 or lhs.strip() in {".true.", ".false."}
                 or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", lhs.strip(), re.IGNORECASE) is not None
             )
             rhs_logical = (
                 rhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or rhs_src.lower() in _CURRENT_LOGICAL_ARRAY_NAMES
                 or rhs.strip() in {".true.", ".false."}
                 or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", rhs.strip(), re.IGNORECASE) is not None
             )
             if (lhs_logical or rhs_logical) and op_r in {"==", "!="}:
+                if lhs_logical and rhs_src.strip() in {"1", "1L"}:
+                    rhs = ".true."
+                elif lhs_logical and rhs_src.strip() in {"0", "0L"}:
+                    rhs = ".false."
+                if rhs_logical and lhs_src.strip() in {"1", "1L"}:
+                    lhs = ".true."
+                elif rhs_logical and lhs_src.strip() in {"0", "0L"}:
+                    lhs = ".false."
                 return f"{lhs} {'.eqv.' if op_r == '==' else '.neqv.'} {rhs}"
             return f"{lhs} {op_f} {rhs}"
 
@@ -9671,6 +9682,17 @@ def r_expr_to_fortran(expr: str) -> str:
         arr_ind_src = c_usr[2].get("arr.ind", c_usr[2].get("arr_ind", "FALSE")).strip().lower()
         if arr_ind_src in {"true", "t", ".true."}:
             return f"which_arr_ind({r_expr_to_fortran(mask_src)})"
+        m_logical_int_mask = re.fullmatch(
+            r"\s*([A-Za-z]\w*)\s*(==|!=)\s*([01])L?\s*",
+            mask_src,
+            re.IGNORECASE,
+        )
+        if m_logical_int_mask is not None and m_logical_int_mask.group(1).lower() in _CURRENT_LOGICAL_ARRAY_NAMES:
+            name_mask = m_logical_int_mask.group(1)
+            op_mask = m_logical_int_mask.group(2)
+            val_mask = m_logical_int_mask.group(3)
+            truth_mask = (op_mask == "==" and val_mask == "1") or (op_mask == "!=" and val_mask == "0")
+            return f"which({name_mask})" if truth_mask else f"which(.not. {name_mask})"
         return f"which({r_expr_to_fortran(mask_src)})"
     if c_usr is not None and c_usr[0].lower() == "rle":
         x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
@@ -10002,15 +10024,25 @@ def r_expr_to_fortran(expr: str) -> str:
             rhs = r_expr_to_fortran(rhs_src)
             lhs_logical = (
                 lhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or lhs_src.lower() in _CURRENT_LOGICAL_ARRAY_NAMES
                 or lhs.strip() in {".true.", ".false."}
                 or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", lhs.strip(), re.IGNORECASE) is not None
             )
             rhs_logical = (
                 rhs_src.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                or rhs_src.lower() in _CURRENT_LOGICAL_ARRAY_NAMES
                 or rhs.strip() in {".true.", ".false."}
                 or re.match(r"^(?:duplicated|r_in|is_na)\s*\(", rhs.strip(), re.IGNORECASE) is not None
             )
             if (lhs_logical or rhs_logical) and op_r in {"==", "!="}:
+                if lhs_logical and rhs_src.strip() in {"1", "1L"}:
+                    rhs = ".true."
+                elif lhs_logical and rhs_src.strip() in {"0", "0L"}:
+                    rhs = ".false."
+                if rhs_logical and lhs_src.strip() in {"1", "1L"}:
+                    lhs = ".true."
+                elif rhs_logical and lhs_src.strip() in {"0", "0L"}:
+                    lhs = ".false."
                 return f"{lhs} {'.eqv.' if op_r == '==' else '.neqv.'} {rhs}"
             return f"{lhs} {op_f} {rhs}"
     mm_mod = _split_top_level_token(s, "%%", from_right=True)
@@ -19628,6 +19660,7 @@ def emit_function(
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     fn_int_args = infer_function_integer_names(fn)
     fn_int_mod_args = infer_function_integer_modulus_arg_names(fn)
+    fn_logical_arr_args = infer_function_logical_array_arg_names(fn)
     fn_proc_args = infer_function_callback_args(fn)
 
     def _arg_list_result_type(arg_name: str) -> str | None:
@@ -19693,6 +19726,11 @@ def emit_function(
             dims = "(" + ":," * (ar - 1) + ":)"
             o.w(f"integer, intent({intent}){opt} :: {a}{dims}")
             arg_type[a] = "integer_array"
+            continue
+        if ar >= 1 and a in fn_logical_arr_args:
+            dims = "(" + ":," * (ar - 1) + ":)"
+            o.w(f"logical, intent({intent}){opt} :: {a}{dims}")
+            arg_type[a] = "logical_array"
             continue
         if ar >= 1:
             dims = "(" + ":," * (ar - 1) + ":)"
@@ -21001,6 +21039,10 @@ def emit_function(
                 logical_scalars.add(nm_scalar_call)
                 real_scalars.discard(nm_scalar_call)
                 ints.discard(nm_scalar_call)
+            elif _USER_FUNC_RETURN_KIND.get(c_scalar_call[0].lower()) == "int":
+                ints.add(nm_scalar_call)
+                real_scalars.discard(nm_scalar_call)
+                logical_scalars.discard(nm_scalar_call)
             else:
                 real_scalars.add(nm_scalar_call)
             local_ranks[nm_scalar_call] = 0
@@ -21327,6 +21369,22 @@ def infer_function_integer_modulus_arg_names(fn: FuncDef) -> set[str]:
             if canon is not None:
                 out.add(canon)
         for m in re.finditer(r"\bformat\s*\(\s*([A-Za-z]\w*)\s*,\s*['\"]%Y", txt, re.IGNORECASE):
+            canon = arg_names.get(m.group(1).lower())
+            if canon is not None:
+                out.add(canon)
+    return out
+
+
+def infer_function_logical_array_arg_names(fn: FuncDef) -> set[str]:
+    """Infer function arguments used as logical vectors."""
+    arg_names = {a.lower(): a for a in fn.args}
+    out: set[str] = set()
+    for txt in _collect_stmt_expr_texts(fn.body):
+        for m in re.finditer(r"\bwhich\s*\(\s*([A-Za-z]\w*)\s*(?:==|!=)\s*(?:TRUE|FALSE|T|F|1|0)\s*\)", txt, re.IGNORECASE):
+            canon = arg_names.get(m.group(1).lower())
+            if canon is not None:
+                out.add(canon)
+        for m in re.finditer(r"\b(?:all|any)\s*\(\s*([A-Za-z]\w*)\s*\)", txt, re.IGNORECASE):
             canon = arg_names.get(m.group(1).lower())
             if canon is not None:
                 out.add(canon)
@@ -24037,7 +24095,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
@@ -24074,6 +24132,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
     _KNOWN_NULL_NAMES = set()
     _KNOWN_NA_VECTOR_NAMES = set()
+    _CURRENT_LOGICAL_ARRAY_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
@@ -24525,6 +24584,8 @@ def transpile_r_to_fortran(
 
             def _is_known_integer_expr_for_return(expr_ret_kind: str) -> bool:
                 expr_t = expr_ret_kind.strip()
+                if re.match(r"^(?:which|match)\s*\(.+\)\s*\[\s*.+\s*\]$", expr_t, re.IGNORECASE):
+                    return True
                 if _is_int_literal(expr_t) or _is_integer_arith_expr(expr_t):
                     return True
                 if not _is_integerish_expr_with_names(expr_t):
@@ -24799,6 +24860,7 @@ def transpile_r_to_fortran(
         fn_ints = fn_int_names.get(f.name, set())
         fn_int_arrs = fn_int_array_names.get(f.name, set())
         fn_int_mod_args = infer_function_integer_modulus_arg_names(f)
+        fn_logical_arr_args = infer_function_logical_array_arg_names(f)
         fn_declared_double_args = _function_declared_double_args(f)
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
@@ -24828,6 +24890,9 @@ def transpile_r_to_fortran(
                     or a in fn_int_arrs
                     or a in {"asset_names", "price_names"}
                 )
+                else
+                "logical"
+                if a in fn_logical_arr_args
                 else
                 "real"
                 if arg_rank_f.get(a, 0) >= 1
@@ -26940,8 +27005,10 @@ def transpile_r_to_fortran(
     mprocs = FEmit()
     fn_needs_rnorm = False
     for fn in funcs:
+        _CURRENT_LOGICAL_ARRAY_NAMES = {a.lower() for a in infer_function_logical_array_arg_names(fn)}
         fn_needs_rnorm = emit_function(mprocs, fn, list_specs, helper_ctx=helper_ctx_mod) or fn_needs_rnorm
         mprocs.w("")
+    _CURRENT_LOGICAL_ARRAY_NAMES = set()
     for info_wrap in _NLM_CLOSURE_WRAPPERS.values():
         name_wrap = str(info_wrap.get("name", ""))
         fn_wrap = str(info_wrap.get("fn", ""))
@@ -30672,7 +30739,15 @@ def repair_vector_call_scalar_index_assignments_text(f90: str) -> str:
 
     out: list[str] = []
     tmp_i = 0
+    logical_names: set[str] = set()
     for line in f90.splitlines():
+        m_log_decl = re.match(r"^\s*logical\s*(?:,[^:]*)?::\s*(.+)$", line, re.IGNORECASE)
+        if m_log_decl is not None:
+            for item in split_top_level_commas(m_log_decl.group(1)):
+                nm = item.split("=", 1)[0].strip()
+                nm = re.sub(r"\s*\(.*\)\s*$", "", nm).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", nm):
+                    logical_names.add(nm.lower())
         m = re.match(r"^(\s*)([A-Za-z]\w*(?:%[A-Za-z]\w*)?)\s*=\s*(.+)$", line)
         if m is None:
             out.append(line)
@@ -30682,18 +30757,99 @@ def repair_vector_call_scalar_index_assignments_text(f90: str) -> str:
             out.append(line)
             continue
         call_txt, idx = split
+        m_which_log = re.fullmatch(r"which\s*\(\s*([A-Za-z]\w*)\s*(==|/=|!=)\s*([01])\s*\)", call_txt, re.IGNORECASE)
+        if m_which_log is not None and m_which_log.group(1).lower() in logical_names:
+            nm_log = m_which_log.group(1)
+            op_log = m_which_log.group(2)
+            val_log = m_which_log.group(3)
+            truth_log = (op_log == "==" and val_log == "1") or (op_log in {"/=", "!="} and val_log == "0")
+            call_txt = f"which({nm_log})" if truth_log else f"which(.not. {nm_log})"
         tmp_i += 1
         tmp = f"xr2f_call_idx_tmp_{tmp_i}"
         indent, target = m.group(1), m.group(2)
+        tmp_decl = "integer, allocatable" if re.match(r"^which\s*\(", call_txt, re.IGNORECASE) else "real(kind=dp), allocatable"
         out.extend(
             [
                 f"{indent}block",
-                f"{indent}   real(kind=dp), allocatable :: {tmp}(:)",
+                f"{indent}   {tmp_decl} :: {tmp}(:)",
                 f"{indent}   {tmp} = {call_txt}",
-                f"{indent}   {target} = {tmp}({r_expr_to_fortran(idx)})",
+                f"{indent}   if (size({tmp}) >= {_int_bound_expr(r_expr_to_fortran(idx))}) then",
+                f"{indent}      {target} = {tmp}({_int_bound_expr(r_expr_to_fortran(idx))})",
+                f"{indent}   else",
+                f"{indent}      {target} = -huge(0)",
+                f"{indent}   end if",
                 f"{indent}end block",
             ]
         )
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_scalar_integer_function_callers_text(f90: str) -> str:
+    integer_funcs: set[str] = set()
+    current_fn: str | None = None
+    for ln in f90.splitlines():
+        m_fn = re.match(r"^\s*(?:pure\s+)?function\s+([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_fn is not None:
+            current_fn = m_fn.group(1)
+            continue
+        if current_fn and re.match(rf"^\s*integer\s*::\s*{re.escape(current_fn)}_result\b", ln, re.IGNORECASE):
+            integer_funcs.add(current_fn.lower())
+            continue
+        if re.match(r"^\s*end\s+function\b", ln, re.IGNORECASE):
+            current_fn = None
+
+    if not integer_funcs:
+        return f90
+
+    integer_vars: set[str] = set()
+    for ln in f90.splitlines():
+        m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(", ln)
+        if m_assign is not None and m_assign.group(2).lower() in integer_funcs:
+            integer_vars.add(m_assign.group(1).lower())
+    if not integer_vars:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_decl = re.match(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m_decl is not None:
+            parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
+            keep: list[str] = []
+            demote: list[str] = []
+            for p in parts:
+                name = re.sub(r"\s*\(.*\)\s*$", "", p.split("=", 1)[0].strip()).strip()
+                if name.lower() in integer_vars:
+                    demote.append(name)
+                else:
+                    keep.append(p)
+            if demote:
+                if keep:
+                    out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+                out.append(f"{m_decl.group(1)}integer :: {', '.join(demote)}")
+                continue
+        m_print_int = re.match(r"^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", ln, re.IGNORECASE)
+        if m_print_int is not None and m_print_int.group(2).lower() in integer_vars:
+            ind, var = m_print_int.group(1), m_print_int.group(2)
+            out.extend([
+                f"{ind}if ({var} == -huge(0)) then",
+                f'{ind}   write(*,"(a)") "NA"',
+                f"{ind}else",
+                f'{ind}   write(*,"(i0)") {var}',
+                f"{ind}end if",
+            ])
+            continue
+        m_print_index = re.match(r"^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*\)\s*$", ln, re.IGNORECASE)
+        if m_print_index is not None and m_print_index.group(3).lower() in integer_vars:
+            ind, base, idx = m_print_index.group(1), m_print_index.group(2), m_print_index.group(3)
+            out.extend([
+                f"{ind}if ({idx} == -huge(0)) then",
+                f'{ind}   write(*,"(a)") "NA"',
+                f"{ind}else",
+                f'{ind}   write(*,"(g0)") {base}({idx})',
+                f"{ind}end if",
+            ])
+            continue
+        out.append(ln)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -38598,6 +38754,7 @@ def main() -> int:
     f90 = rewrite_allocatable_array_merge_assignments_text(f90)
     f90 = rewrite_recursive_io_function_args_text(f90)
     f90 = repair_vector_call_scalar_index_assignments_text(f90)
+    f90 = repair_scalar_integer_function_callers_text(f90)
     f90 = coerce_user_call_integer_actuals_text(f90)
     f90 = promote_sample_int_bound_scalars_text(f90)
     f90 = rewrite_raw_derived_type_writes_text(f90)
