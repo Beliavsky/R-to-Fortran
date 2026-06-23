@@ -12811,6 +12811,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 if re.fullmatch(r"(?:count|size)\s*\(.+\)", v_s, re.IGNORECASE):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
                     continue
+                if re.match(r"^(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length|r_rep_int)\s*\(", v_s, re.IGNORECASE):
+                    coerced_vals.append(f"real({v_s}, kind=dp)")
+                    continue
                 if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)*", v_s):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
                     continue
