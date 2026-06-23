@@ -2441,8 +2441,9 @@ def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | No
         return ExprStmt(expr="next", comment=cmt)
     if ln.startswith("function("):
         raise NotImplementedError("nested/anonymous function definitions not supported")
-    if ln.startswith("print(") and ln.endswith(")"):
-        inner = ln[len("print(") : -1].strip()
+    m_display = re.match(r"^(print|show)\s*\((.*)\)$", ln, re.IGNORECASE)
+    if m_display is not None:
+        inner = m_display.group(2).strip()
         args = split_top_level_commas(inner) if inner else []
         return PrintStmt(args=args, comment=cmt)
     m_asn_dot = re.match(rf"^({_R_IDENT_RE})\s*(<-|=)\s*(.+)$", ln)
@@ -16107,11 +16108,26 @@ def emit_stmts(
                             print_digits_f = f"max(0, {digits_raw_f} - 1)"
                         one_digits_f = r_expr_to_fortran(one)
                         one_digits_rank = _expr_rank_for_print(one)
-                        one_digits_is_vector = one_digits_rank == 1 or re.search(
-                            r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep)\s*\(",
+                        one_digits_src_is_scalar_reduction = re.match(
+                            r"^\s*(?:sum|mean|prod|min|max|sd|var|det|length|nchar)\s*\(",
+                            one,
+                            re.IGNORECASE,
+                        ) is not None
+                        one_digits_is_scalar_reduction = re.match(
+                            r"^\s*(?:real\s*\(\s*)*(?:sum|product|maxval|minval|count|dot_product|sd|var|det|size)\s*\(",
                             one_digits_f,
                             re.IGNORECASE,
-                        ) is not None or "[" in one_digits_f
+                        ) is not None or one_digits_src_is_scalar_reduction
+                        one_digits_is_vector = (not one_digits_is_scalar_reduction) and (
+                            one_digits_rank == 1
+                            or re.search(
+                                r"\b(?:r_seq_int|r_seq_len|r_seq_real|r_rep)\s*\(",
+                                one_digits_f,
+                                re.IGNORECASE,
+                            )
+                            is not None
+                            or "[" in one_digits_f
+                        )
                         if one_digits_is_vector:
                             _wstmt(f"call print_real_vector(real({one_digits_f}, kind=dp), digits={print_digits_f})", st.comment)
                             need_r_mod.add("print_real_vector")
@@ -16120,6 +16136,9 @@ def emit_stmts(
                             _wstmt(f"call print_matrix(real({one_digits_f}, kind=dp), digits={print_digits_f})", st.comment)
                             need_r_mod.add("print_matrix_rstyle")
                             continue
+                        _wstmt(f"call print_real_vector([real({one_digits_f}, kind=dp)], digits={print_digits_f})", st.comment)
+                        need_r_mod.add("print_real_vector")
+                        continue
                     if _emit_print_array_expr_scalar_subset(one, st.comment):
                         continue
                     if one in benchmark_vars:
@@ -30592,6 +30611,7 @@ def coerce_user_call_integer_actuals_text(f90: str) -> str:
             or tl in _KNOWN_INT_VECTOR_NAMES
             or tl in _CURRENT_INT_ARRAY_NAMES
             or re.fullmatch(r"int\s*\(.+\)", t, re.IGNORECASE)
+            or re.match(r"^(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length|r_rep_int)\s*\(", t, re.IGNORECASE)
         ):
             return f"real({t}, kind=dp)"
         return t
@@ -35426,6 +35446,42 @@ def rewrite_scalar_function_vector_prints_text(f90: str) -> str:
     return f90
 
 
+def rewrite_vector_function_scalar_prints_text(f90: str) -> str:
+    """Print user function calls with vector actuals using vector helpers."""
+    vector_result_funcs: set[str] = set()
+    fn_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)(.*?)^\s*end\s+function\b"
+    )
+    for m in fn_re.finditer(f90):
+        fn_name = m.group(1)
+        result_name = m.group(2)
+        body = m.group(3)
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::[^\n]*\b{re.escape(result_name)}\s*\(:",
+            body,
+        ):
+            vector_result_funcs.add(fn_name.lower())
+    if not vector_result_funcs:
+        return f90
+
+    def has_vector_actual(args: str) -> bool:
+        return re.search(r"\b(?:real\s*\(\s*)?(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length|r_rep_int|r_rep_real)\s*\(", args, re.IGNORECASE) is not None or "[" in args
+
+    def repl(m: re.Match[str]) -> str:
+        fn_name = m.group(2)
+        args = m.group(3)
+        if fn_name.lower() not in vector_result_funcs or not has_vector_actual(args):
+            return m.group(0)
+        comment = m.group(4) or ""
+        return f"{m.group(1)}call print_real_vector({fn_name}({args})){comment}"
+
+    return re.sub(
+        r"(?m)^(\s*)call\s+print_real_scalar\s*\(\s*([A-Za-z]\w*)\s*\((.*)\)\s*\)\s*(\s*!.*)?$",
+        repl,
+        f90,
+    )
+
+
 def rewrite_null_sentinel_append_assignments_text(f90: str) -> str:
     """Lower c(NULL_initialized_vector, value) sentinel constructors to appends."""
     out: list[str] = []
@@ -37705,6 +37761,7 @@ def main() -> int:
     f90 = rewrite_same_rank_self_update_aliases_text(f90)
     f90 = rewrite_noncharacter_a_descriptor_writes_text(f90)
     f90 = rewrite_scalar_function_vector_prints_text(f90)
+    f90 = rewrite_vector_function_scalar_prints_text(f90)
     f90 = rewrite_vector_elemental_write_calls_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
