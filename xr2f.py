@@ -47,6 +47,7 @@ _INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
 _R_EXPRESSION_OBJECTS: dict[str, str] = {}
 _R_DERIVATIVE_OBJECTS: dict[str, str] = {}
 _KNOWN_VECTOR_NAMES: set[str] = set()
+_KNOWN_NA_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
 _KNOWN_INT_VECTOR_NAMES: set[str] = set()
 _CURRENT_INT_ARRAY_NAMES: set[str] = set()
@@ -9104,6 +9105,21 @@ def r_expr_to_fortran(expr: str) -> str:
             return r_expr_to_fortran(pos_pre[0]) if pos_pre else "0"
         if nm_pre == "try":
             return r_expr_to_fortran(pos_pre[0]) if pos_pre else "0"
+        if nm_pre == "subset":
+            x_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
+            mask_src = (
+                pos_pre[1].strip()
+                if len(pos_pre) >= 2
+                else c_pre[2].get("subset", "").strip()
+            )
+            select_src = c_pre[2].get("select", "").strip()
+            if not x_src:
+                raise NotImplementedError("subset requires an x argument")
+            if select_src:
+                raise NotImplementedError("subset(select=...) is not supported")
+            if not mask_src:
+                return r_expr_to_fortran(x_src)
+            return f"pack({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(mask_src)})"
         if nm_pre == "inherits" and len(pos_pre) >= 2:
             cls = _dequote_string_literal(pos_pre[1].strip())
             if cls == "try-error":
@@ -12983,7 +12999,15 @@ def r_expr_to_fortran(expr: str) -> str:
                 or re.match(r"^all\s*\(.+\bdim\s*=\s*2\s*\)\s*$", il)
                 or any(op in il for op in ("==", "!=", "<=", ">=", "<", ">", ".and.", ".or."))
             ):
-                return f"pack({base}, {r_expr_to_fortran(inner)})"
+                mask_f = r_expr_to_fortran(inner)
+                if (
+                    base.lower() in _KNOWN_NA_VECTOR_NAMES
+                    and
+                    re.search(rf"\b{re.escape(base)}\b", inner)
+                    and not re.search(r"\bis\.na\s*\(|\bis_na\s*\(", inner, re.IGNORECASE)
+                ):
+                    mask_f = f"(({mask_f}) .or. is_na({base}))"
+                return f"pack({base}, {mask_f})"
         else:
             dims_all = _split_index_dims(inner)
             drop_false_idx = any(
@@ -24013,7 +24037,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
@@ -24049,6 +24073,7 @@ def transpile_r_to_fortran(
     _KNOWN_COMPLEX_SCALAR_NAMES = set()
     _KNOWN_COMPLEX_MATRIX_NAMES = set()
     _KNOWN_NULL_NAMES = set()
+    _KNOWN_NA_VECTOR_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
@@ -25315,6 +25340,14 @@ def transpile_r_to_fortran(
     _KNOWN_INT_NAMES = {n.lower() for n in ints}
     _KNOWN_INT_VECTOR_NAMES = {n.lower() for n in int_arrays}
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
+    _KNOWN_NA_VECTOR_NAMES = set()
+    for txt_na_vec in _stmt_texts_for_rank_scan(stmts):
+        m_na_vec = re.match(r"^\s*([A-Za-z]\w*)\s*(?:<-|=)\s*(.+)$", txt_na_vec)
+        if m_na_vec is not None:
+            nm_na_vec = m_na_vec.group(1).lower()
+            rhs_na_vec = m_na_vec.group(2)
+            if nm_na_vec in _KNOWN_VECTOR_NAMES and re.search(r"\b(?:NA|NA_real_|NaN)\b|ieee_value\s*\(", rhs_na_vec, re.IGNORECASE):
+                _KNOWN_NA_VECTOR_NAMES.add(nm_na_vec)
     _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_LOGICAL_MATRIX_NAMES = {n.lower() for n in logical_matrices}
