@@ -21533,8 +21533,19 @@ def _infer_literal_array_parameter(rhs: str) -> tuple[str, int, str] | None:
 def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) -> dict[str, tuple[str, int, str]]:
     """Find conservative top-level named-constant array candidates."""
     out: dict[str, tuple[str, int, str]] = {}
+    subscript_mutated: set[str] = set()
+    for txt in _stmt_texts_for_rank_scan(stmts):
+        asn = split_top_level_assignment(txt.strip())
+        if asn is None:
+            continue
+        lhs = asn[0].strip()
+        m_lhs = re.match(r"^([A-Za-z]\w*)\s*\[", lhs)
+        if m_lhs is not None:
+            subscript_mutated.add(m_lhs.group(1))
     for st in stmts:
         if not isinstance(st, Assign):
+            continue
+        if st.name in subscript_mutated:
             continue
         if assign_counts.get(st.name, 0) != 1:
             continue
@@ -36138,6 +36149,14 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _runtime_cache_root() -> Path:
+    root = Path(tempfile.gettempdir()) / "xr2f_runtime_cache"
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "").strip()
+    if worker:
+        root = root / re.sub(r"[^A-Za-z0-9_.-]+", "_", worker)
+    return root
+
+
 def _cached_runtime_object(
     helper: Path,
     cparts: list[str],
@@ -36147,7 +36166,7 @@ def _cached_runtime_object(
     src_hash = _sha256_file(helper)
     key_src = "\0".join(["xr2f-rmod-v3", str(helper), src_hash, *cparts])
     key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
-    cache_dir = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key
+    cache_dir = _runtime_cache_root() / key
     obj = cache_dir / "r.o"
     mod = cache_dir / "r_mod.mod"
     if obj.exists() and mod.exists():
@@ -36631,7 +36650,7 @@ def _compile_r_rng_shim(
     rscript_cmd: str,
 ) -> tuple[Path, list[str], subprocess.CompletedProcess[str] | None, str]:
     shim_src = Path(__file__).resolve().with_name("xr2f_r_rng.c")
-    fallback_obj = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / "xr2f_r_rng_failed.o"
+    fallback_obj = _runtime_cache_root() / "xr2f_r_rng_failed.o"
     if not shim_src.exists():
         return fallback_obj, [], subprocess.CompletedProcess([], 1, "", f"missing R RNG shim source: {shim_src}\n"), ""
 
@@ -36668,7 +36687,7 @@ def _compile_r_rng_shim(
         rhome,
     ])
     key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
-    cache_dir = Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key
+    cache_dir = _runtime_cache_root() / key
     obj = cache_dir / "xr2f_r_rng.o"
     if obj.exists():
         return obj, ldflags, None, f"cached {obj}"
@@ -36732,14 +36751,14 @@ def _build_exe_cache_path(
         *link_flags,
     ])
     key = hashlib.sha256(key_src.encode("utf-8", errors="replace")).hexdigest()[:24]
-    return Path(tempfile.gettempdir()) / "xr2f_runtime_cache" / key / "program.exe"
+    return _runtime_cache_root() / key / "program.exe"
 
 
 def _cleanup_runtime_cache_exe(exe_path: Path | None) -> None:
     if exe_path is None:
         return
     try:
-        cache_root = (Path(tempfile.gettempdir()) / "xr2f_runtime_cache").resolve()
+        cache_root = _runtime_cache_root().resolve()
         resolved = Path(exe_path).resolve()
         if resolved.name.lower() == "program.exe" and cache_root in resolved.parents:
             resolved.unlink(missing_ok=True)
@@ -36749,7 +36768,7 @@ def _cleanup_runtime_cache_exe(exe_path: Path | None) -> None:
 
 def _cleanup_runtime_cache_program_exes() -> None:
     try:
-        cache_root = Path(tempfile.gettempdir()) / "xr2f_runtime_cache"
+        cache_root = _runtime_cache_root()
         if not cache_root.is_dir():
             return
         for exe_path in cache_root.glob("*/program.exe"):
