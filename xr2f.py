@@ -30888,6 +30888,48 @@ def repair_scalar_integer_function_callers_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_matrix_filter_assignment_targets_text(f90: str) -> str:
+    matrix_targets: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*reshape\s*\(\s*pack\s*\(\s*[A-Za-z]\w*\s*,\s*spread\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            matrix_targets.add(m.group(1).lower())
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matrix_row_filter\s*\(", ln, re.IGNORECASE)
+        if m is not None:
+            matrix_targets.add(m.group(1).lower())
+    if not matrix_targets:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_decl = re.match(r"^(\s*)(real\(kind=dp\)|integer|logical),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m_decl is not None:
+            parts = [p.strip() for p in split_top_level_commas(m_decl.group(3))]
+            keep: list[str] = []
+            promote: list[tuple[str, str]] = []
+            for p in parts:
+                name = re.sub(r"\s*\(.*\)\s*$", "", p.split("=", 1)[0].strip()).strip()
+                if name.lower() in matrix_targets:
+                    if re.search(r"\(:\s*,\s*:\)", p):
+                        keep.append(p)
+                    else:
+                        promote.append((m_decl.group(2), name))
+                else:
+                    keep.append(p)
+            if promote:
+                if keep:
+                    out.append(f"{m_decl.group(1)}{m_decl.group(2)}, allocatable :: {', '.join(keep)}")
+                for typ, name in promote:
+                    out.append(f"{m_decl.group(1)}{typ}, allocatable :: {name}(:,:)")
+                continue
+        m_print = re.match(r"^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", ln, re.IGNORECASE)
+        if m_print is not None and m_print.group(2).lower() in matrix_targets:
+            out.append(f"{m_print.group(1)}call print_matrix({m_print.group(2)})")
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def coerce_user_call_integer_actuals_text(f90: str) -> str:
     real_scalar_names: set[str] = set()
     for decl_line in f90.splitlines():
@@ -38535,10 +38577,17 @@ def main() -> int:
     )
     f90 = re.sub(
         r"\b([A-Za-z]\w*)\(\s*([A-Za-z]\w*\s*==\s*[A-Za-z]\w*)\s*,\s*:\s*\)",
-        lambda m: (
-            f"reshape(pack({m.group(1)}, spread({m.group(2)}, dim=2, ncopies=size({m.group(1)},2))), "
-            f"[count({m.group(2)}), size({m.group(1)},2)])"
-        ),
+        lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(2)})",
+        f90,
+    )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\(\s*\1\(:,\s*([A-Za-z]\w*|\d+)\)\s*(==|/=|!=|>=|<=|>|<)\s*([A-Za-z]\w*|[+-]?\d+(?:\.\d*)?(?:_dp)?)\s*,\s*:\s*\)",
+        lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(1)}(:, {m.group(2)}) {'/=' if m.group(3) == '!=' else m.group(3)} {m.group(4)})",
+        f90,
+    )
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)\(\s*\1\(\s*([A-Za-z]\w*|\d+)\s*,\s*:\s*\)\s*(==|/=|!=|>=|<=|>|<)\s*([A-Za-z]\w*|[+-]?\d+(?:\.\d*)?(?:_dp)?)\s*,\s*:\s*\)",
+        lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(1)}({m.group(2)}, :) {'/=' if m.group(3) == '!=' else m.group(3)} {m.group(4)})",
         f90,
     )
     f90 = re.sub(
@@ -38764,6 +38813,8 @@ def main() -> int:
         extra_use_names.append("r_paste0_real")
     if "r_matrix_index(" in f90:
         extra_use_names.append("r_matrix_index")
+    if "r_matrix_row_filter(" in f90:
+        extra_use_names.append("r_matrix_row_filter")
     if "which_first(" in f90:
         extra_use_names.append("which_first")
     if "which_last(" in f90:
@@ -38790,6 +38841,7 @@ def main() -> int:
     f90 = rewrite_recursive_io_function_args_text(f90)
     f90 = repair_vector_call_scalar_index_assignments_text(f90)
     f90 = repair_scalar_integer_function_callers_text(f90)
+    f90 = repair_matrix_filter_assignment_targets_text(f90)
     f90 = coerce_user_call_integer_actuals_text(f90)
     f90 = promote_sample_int_bound_scalars_text(f90)
     f90 = rewrite_raw_derived_type_writes_text(f90)
