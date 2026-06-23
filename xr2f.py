@@ -13027,6 +13027,7 @@ def emit_stmts(
     arima_vars_ctx: set[str] = set()
     arima_pred_vars_ctx: set[str] = set()
     acf_vars_ctx: set[str] = set()
+    hist_vars_ctx: set[str] = set()
     nlm_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
     benchmark_vars: set[str] = set()
@@ -13136,6 +13137,9 @@ def emit_stmts(
         acfv = helper_ctx.get("acf_vars")
         if isinstance(acfv, set):
             acf_vars_ctx = {str(x) for x in acfv}
+        histv = helper_ctx.get("hist_vars")
+        if isinstance(histv, set):
+            hist_vars_ctx = {str(x) for x in histv}
         nlv = helper_ctx.get("nlm_vars")
         if isinstance(nlv, set):
             nlm_vars_ctx = {str(x) for x in nlv}
@@ -16457,6 +16461,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in acf_vars_ctx:
                         _wstmt(f"call print_acf({one})", st.comment)
                         need_r_mod.update({"print_acf", "acf_fit_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in hist_vars_ctx:
+                        _wstmt(f"call print_hist({one})", st.comment)
+                        need_r_mod.update({"print_hist", "hist_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in nlm_vars_ctx:
                         _wstmt(f"call print_nlm_result({one})", st.comment)
@@ -25480,6 +25488,7 @@ def transpile_r_to_fortran(
     arima_vars: set[str] = set()
     arima_pred_vars: set[str] = set()
     acf_vars: set[str] = set()
+    hist_vars: set[str] = set()
     qr_vars: set[str] = set()
     nlm_vars: set[str] = set()
     t_test_vars: set[str] = set()
@@ -25568,6 +25577,9 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() in {"acf", "pacf", "ccf"}:
                 acf_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"acf_fit_t", "r_acf", "r_ccf", "print_acf"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "hist":
+                hist_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"hist", "hist_result_t", "print_hist"})
             if c_fit_main is not None and c_fit_main[0].lower() == "qr":
                 qr_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
@@ -26404,7 +26416,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["date_scalar_vars"] = set(_KNOWN_DATE_NAMES)
     helper_ctx_main["posixct_vars"] = set(_KNOWN_POSIXCT_NAMES)
 
-    for nm in set(list_vars) | set(main_object_list_vars):
+    for nm in set(list_vars) | set(main_object_list_vars) | set(hist_vars):
         ints.discard(nm)
         int_arrays.discard(nm)
         real_arrays.discard(nm)
@@ -26615,6 +26627,9 @@ def transpile_r_to_fortran(
     if acf_vars:
         for nm in sorted(acf_vars):
             pbody.w(f"type(acf_fit_t) :: {nm}")
+    if hist_vars:
+        for nm in sorted(hist_vars):
+            pbody.w(f"type(hist_result_t) :: {nm}")
     if qr_vars:
         for nm in sorted(qr_vars):
             pbody.w(f"type(qr_fit_t) :: {nm}")
@@ -26650,6 +26665,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["arima_pred_vars"] = set(arima_pred_vars)
     if acf_vars:
         helper_ctx_main["acf_vars"] = set(acf_vars)
+    if hist_vars:
+        helper_ctx_main["hist_vars"] = set(hist_vars)
     if nlm_vars:
         helper_ctx_main["nlm_vars"] = set(nlm_vars)
     if rle_vars:
@@ -28123,6 +28140,9 @@ def transpile_r_to_fortran(
         "cut",
         "outer",
         "hclust",
+        "hist",
+        "hist_result_t",
+        "print_hist",
         "cutree",
         "dist",
         "cumsum",
