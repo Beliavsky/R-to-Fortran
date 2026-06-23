@@ -13923,6 +13923,21 @@ def emit_stmts(
                 return 0
             if nm_c == "acf":
                 return 0
+            if nm_c == "merge":
+                arg_ranks = [
+                    rr
+                    for rr in (_expr_rank_for_print(a.strip()) for a in list(c[1])[:3] + list(c[2].values()))
+                    if rr is not None
+                ]
+                return max(arg_ranks) if arg_ranks else 0
+            if nm_c == "ifelse":
+                vals_ifelse = list(c[1]) + list(c[2].values())
+                arg_ranks = [
+                    rr
+                    for rr in (_expr_rank_for_print(a.strip()) for a in vals_ifelse[:3])
+                    if rr is not None
+                ]
+                return max(arg_ranks) if arg_ranks else 0
             if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c in {"anyduplicated", "setequal"}:
@@ -18670,6 +18685,10 @@ def _expr_kind_simple(expr: str) -> str:
     if c is not None:
         nm, pos, kw = c
         key = nm.lower()
+        if key in {"real", "as.numeric", "as.double"}:
+            return "real"
+        if key in {"int", "as.integer"}:
+            return "int"
         if key in _USER_FUNC_RETURN_KIND:
             return _USER_FUNC_RETURN_KIND[key]
         if key == "sum" and pos:
@@ -18681,6 +18700,16 @@ def _expr_kind_simple(expr: str) -> str:
                 return "int"
             if a_kind == "logical" and b_kind == "logical":
                 return "logical"
+            return "real"
+        if key == "ifelse":
+            vals = list(pos) + list(kw.values())
+            if len(vals) >= 3:
+                yes_kind = _expr_kind_simple(vals[1].strip())
+                no_kind = _expr_kind_simple(vals[2].strip())
+                if yes_kind == "int" and no_kind == "int":
+                    return "int"
+                if yes_kind == "logical" and no_kind == "logical":
+                    return "logical"
             return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
