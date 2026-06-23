@@ -1115,6 +1115,50 @@ def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
     return nm, pos, kw
 
 
+def _parse_quoted_operator_call(txt: str) -> tuple[str, list[str]] | None:
+    s = txt.strip()
+    if not s or s[0] not in {"'", '"', "`"}:
+        return None
+    q = s[0]
+    end_q = s.find(q, 1)
+    if end_q < 0:
+        return None
+    op = s[1:end_q]
+    rest = s[end_q + 1 :].lstrip()
+    if not rest.startswith("("):
+        return None
+    open_i = len(s) - len(rest)
+    depth = 0
+    quote: str | None = None
+    esc = False
+    close_i = -1
+    for i in range(open_i, len(s)):
+        ch = s[i]
+        if quote is not None:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in {"'", '"', "`"}:
+            quote = ch
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_i = i
+                break
+    if close_i < 0 or s[close_i + 1 :].strip():
+        return None
+    inner = s[open_i + 1 : close_i].strip()
+    args = split_top_level_commas(inner) if inner else []
+    return op, args
+
+
 def _strip_variadic_actuals_in_calls(expr: str) -> str:
     """Remove `...` arguments from function calls in R-like expression strings."""
 
@@ -8299,6 +8343,16 @@ def r_expr_to_fortran(expr: str) -> str:
     s_pipe = _lower_r_native_pipe_expr(s)
     if s_pipe != s:
         return r_expr_to_fortran(s_pipe)
+    quoted_op_call = _parse_quoted_operator_call(s)
+    if quoted_op_call is not None:
+        op_q, args_q = quoted_op_call
+        binary_ops_q = {"+", "-", "*", "/", "^", "%%", "%/%", "==", "!=", "<", "<=", ">", ">=", "&", "|", "&&", "||"}
+        unary_ops_q = {"+", "-", "!"}
+        if op_q in binary_ops_q and len(args_q) == 2:
+            return r_expr_to_fortran(f"({args_q[0].strip()}) {op_q} ({args_q[1].strip()})")
+        if op_q in unary_ops_q and len(args_q) == 1:
+            return r_expr_to_fortran(f"{op_q}({args_q[0].strip()})")
+        raise NotImplementedError(f"unsupported quoted operator call: {op_q}({len(args_q)} args)")
     if len(s) > 1 and s[0] in {"+", "-"}:
         rest_unary = s[1:].strip()
         if rest_unary and not rest_unary[0].isdigit() and rest_unary[0] != ".":
@@ -17024,6 +17078,18 @@ def emit_stmts(
                             and (
                                 one_f_simple in logical_vector_vars
                                 or one_f_simple.lower() in _KNOWN_LOGICAL_VECTOR_NAMES
+                            )
+                        ) or (
+                            _expr_rank_for_print(one) == 1
+                            and any(
+                                _split_top_level_token(one_f_simple, op_log_vec, from_right=True) is not None
+                                for op_log_vec in [".and.", ".or.", "==", "/=", "!=", ">=", "<=", ">", "<"]
+                            )
+                        ) or (
+                            one_f_simple.lower().startswith(".not.")
+                            and any(
+                                re.search(rf"\b{re.escape(nm)}\b", one_f_simple, re.IGNORECASE)
+                                for nm in set(logical_vector_vars) | set(_KNOWN_LOGICAL_VECTOR_NAMES)
                             )
                         ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple|is_na|ieee_is_finite)\s*\(", one_f_simple, re.IGNORECASE) or re.match(r"^spread\s*\(\s*\.(?:true|false)\.", one_f_simple, re.IGNORECASE) or (
                             one_f_simple.lower().startswith("(.not. ieee_is_finite(")
