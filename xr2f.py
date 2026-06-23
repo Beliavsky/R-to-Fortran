@@ -35337,6 +35337,72 @@ def rewrite_null_sentinel_append_assignments_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_null_append_function_results_text(f90: str) -> str:
+    """Repair functions returning vectors built by c(NULL, value) append loops."""
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+[A-Za-z]\w*\b.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        result = m.group(2)
+        m_vec = re.search(r"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(:\)\s*$", block)
+        if m_vec is None:
+            return block
+        vec = m_vec.group(1)
+        assign_pat = re.compile(
+            rf"(?m)^(\s*)(if\s*\(.+\)\s*){re.escape(vec)}\s*=\s*\[\s*{re.escape(result)}\s*,\s*(.+)\]\s*$",
+            re.IGNORECASE,
+        )
+        if assign_pat.search(block) is None:
+            return block
+        new = re.sub(
+            rf"(?im)^(\s*)integer\s*::\s*{re.escape(result)}\s*$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)",
+            block,
+            count=1,
+        )
+        new = re.sub(
+            rf"(?im)^(\s*)integer\s*::\s*{re.escape(result)}\s*,\s*(.+)$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)\n\1integer :: \2",
+            new,
+            count=1,
+        )
+
+        def repl_assign(ma: re.Match[str]) -> str:
+            ind, if_head, value = ma.group(1), ma.group(2), ma.group(3).strip()
+            return "\n".join(
+                [
+                    f"{ind}{if_head}then",
+                    f"{ind}   if (allocated({vec})) then",
+                    f"{ind}      {vec} = [{vec}, real({value}, kind=dp)]",
+                    f"{ind}   else",
+                    f"{ind}      {vec} = [real({value}, kind=dp)]",
+                    f"{ind}   end if",
+                    f"{ind}end if",
+                ]
+            )
+
+        new = assign_pat.sub(repl_assign, new)
+        end_match = re.search(r"(?im)^(\s*)end\s+function\b", new)
+        if end_match is not None and f"{result} =" not in new[: end_match.start()]:
+            ind = end_match.group(1)
+            tail = "\n".join(
+                [
+                    f"{ind}if (allocated({vec})) then",
+                    f"{ind}   {result} = {vec}",
+                    f"{ind}else",
+                    f"{ind}   allocate({result}(0))",
+                    f"{ind}end if",
+                ]
+            )
+            new = new[: end_match.start()] + tail + "\n" + new[end_match.start() :]
+        return new
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -38163,6 +38229,7 @@ def main() -> int:
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = rewrite_rank3_slice_prints_with_dimnames_text(f90, _RANK3_SLICE_PRINT_LABELS)
     f90 = rewrite_scalar_function_vector_prints_text(f90)
+    f90 = repair_null_append_function_results_text(f90)
     f90 = rewrite_null_sentinel_append_assignments_text(f90)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
