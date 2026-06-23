@@ -12695,6 +12695,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)*", v_s):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
                     continue
+                if _is_integerish_expr_with_names(v_s):
+                    coerced_vals.append(f"real({v_s}, kind=dp)")
+                    continue
                 m_int_ratio = re.fullmatch(
                     r"\(?\s*((?:count|size)\s*\(.+\))\s*/\s*((?:count|size)\s*\(.+\))\s*\)?",
                     v_s,
@@ -35313,6 +35316,27 @@ def rewrite_scalar_function_vector_prints_text(f90: str) -> str:
     return f90
 
 
+def rewrite_null_sentinel_append_assignments_text(f90: str) -> str:
+    """Lower c(NULL_initialized_vector, value) sentinel constructors to appends."""
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*\[\s*-1(?:\.0_dp)?\s*,\s*(.+)\]\s*$", ln)
+        if m is None:
+            out.append(ln)
+            continue
+        ind, name, value = m.group(1), m.group(2), m.group(3).strip()
+        out.extend(
+            [
+                f"{ind}if (allocated({name})) then",
+                f"{ind}   {name} = [{name}, {value}]",
+                f"{ind}else",
+                f"{ind}   {name} = [{value}]",
+                f"{ind}end if",
+            ]
+        )
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     """Repair stale renamed local aliases that are declared but never assigned."""
     proc_re = re.compile(
@@ -38139,6 +38163,7 @@ def main() -> int:
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = rewrite_rank3_slice_prints_with_dimnames_text(f90, _RANK3_SLICE_PRINT_LABELS)
     f90 = rewrite_scalar_function_vector_prints_text(f90)
+    f90 = rewrite_null_sentinel_append_assignments_text(f90)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
