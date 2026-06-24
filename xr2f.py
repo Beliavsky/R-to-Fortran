@@ -14413,6 +14413,8 @@ def emit_stmts(
                 x_arg = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
                 rr_sign = _expr_rank_for_print(x_arg) if x_arg else None
                 return rr_sign if rr_sign is not None else 0
+            if nm_c in {"order", "rank"}:
+                return 1
             if nm_c in {"is.element", "is_element", "r_in", "unique", "duplicated", "replace", "which", "union", "intersect", "setdiff"}:
                 return 1
             if nm_c in {"anyduplicated", "setequal"}:
