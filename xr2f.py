@@ -46,6 +46,7 @@ _SUBROUTINE_FUNCTIONS: set[str] = set()
 _INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
 _R_EXPRESSION_OBJECTS: dict[str, str] = {}
 _R_DERIVATIVE_OBJECTS: dict[str, str] = {}
+_CUSTOM_INFIX_OPS: dict[str, str] = {}
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_NA_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
@@ -977,13 +978,31 @@ def _parse_while_head(line: str) -> tuple[str, str] | None:
     return None
 
 
+def _custom_infix_function_name(op: str) -> str:
+    inner = op.strip()
+    if inner.startswith("%") and inner.endswith("%") and len(inner) >= 2:
+        inner = inner[1:-1]
+    base = _fortran_ident(inner)
+    if not base:
+        base = "op"
+    return base if base.startswith("op_") else f"op_{base}"
+
+
 def _parse_function_assign_head(line: str) -> tuple[str, str, str] | None:
     s = line.strip()
-    m = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*(?:<-|=)\s*function\s*\(", s)
-    if not m:
-        return None
-    fname = m.group(1)
-    i = m.end() - 1
+    m_op = re.match(r"""^["'](%[^"']+%)["']\s*(?:<-|=)\s*function\s*\(""", s)
+    if m_op:
+        raw_op = m_op.group(1)
+        fname = _custom_infix_function_name(raw_op)
+        _CUSTOM_INFIX_OPS[raw_op] = fname
+        _CUSTOM_INFIX_OPS[raw_op.lower()] = fname
+        i = m_op.end() - 1
+    else:
+        m = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*(?:<-|=)\s*function\s*\(", s)
+        if not m:
+            return None
+        fname = m.group(1)
+        i = m.end() - 1
     depth = 0
     bdepth = 0
     in_single = False
@@ -3045,6 +3064,24 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
         return None
     k = hits[-1] if from_right else hits[0]
     return text[:k].strip(), text[k + len(token) :].strip()
+
+
+def _split_known_custom_infix_expr(text: str) -> tuple[str, str, str] | None:
+    if not _CUSTOM_INFIX_OPS:
+        return None
+    seen: set[str] = set()
+    for op in sorted(_CUSTOM_INFIX_OPS, key=len, reverse=True):
+        opl = op.lower()
+        if op in seen or opl in seen or opl in {"%%", "%/%", "%*%", "%in%"}:
+            continue
+        seen.add(op)
+        seen.add(opl)
+        split = _split_top_level_token(text, op, from_right=True)
+        if split is not None:
+            lhs, rhs = split
+            if lhs.strip() and rhs.strip():
+                return op, lhs, rhs
+    return None
 
 
 def _split_top_level_muldiv_chain(text: str) -> tuple[list[str], list[str]] | None:
@@ -8666,6 +8703,12 @@ def r_expr_to_fortran(expr: str) -> str:
         if op_q in unary_ops_q and len(args_q) == 1:
             return r_expr_to_fortran(f"{op_q}({args_q[0].strip()})")
         raise NotImplementedError(f"unsupported quoted operator call: {op_q}({len(args_q)} args)")
+    custom_infix = _split_known_custom_infix_expr(s)
+    if custom_infix is not None:
+        op_custom, lhs_custom, rhs_custom = custom_infix
+        fn_custom = _CUSTOM_INFIX_OPS.get(op_custom) or _CUSTOM_INFIX_OPS.get(op_custom.lower())
+        if fn_custom:
+            return f"{fn_custom}({r_expr_to_fortran(lhs_custom)}, {r_expr_to_fortran(rhs_custom)})"
     if len(s) > 1 and s[0] in {"+", "-"}:
         rest_unary = s[1:].strip()
         if rest_unary and not rest_unary[0].isdigit() and rest_unary[0] != ".":
@@ -24748,7 +24791,7 @@ def transpile_r_to_fortran(
     recycle_stop: bool = False,
     fortran_comments: bool = True,
 ) -> str:
-    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -24792,6 +24835,7 @@ def transpile_r_to_fortran(
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
+    _CUSTOM_INFIX_OPS = {}
     _MIXED_CHARACTER_COERCION_WARNINGS = set()
     _CALL_COERCION_WARNINGS = set()
     unit_name = _fortran_ident(stem)
