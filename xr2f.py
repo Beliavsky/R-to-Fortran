@@ -6816,6 +6816,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 
     m_var = re.match(r"^([A-Za-z]\w*)$", expr_l)
     if m_var is not None:
+        if m_var.group(1).lower() in _KNOWN_RANK3_NAMES:
+            return 3
         return inferred_ranks.get(m_var.group(1), inferred_ranks.get(m_var.group(1).lower(), 0))
 
     if (":" in expr_l) and re.match(r"^[^\[]*:[^\]]*$", expr_l):
@@ -11897,7 +11899,8 @@ def r_expr_to_fortran(expr: str) -> str:
             x_src = parts[0].strip()
             margin_src = parts[1].strip()
             fun_src = parts[2].strip().lower()
-            if fun_src == "sum" and x_src.lower() in _KNOWN_RANK3_NAMES:
+            x_rank_apply = _infer_assignment_rank_hint(x_src, {})
+            if fun_src == "sum" and (x_src.lower() in _KNOWN_RANK3_NAMES or x_rank_apply == 3):
                 x_f = r_expr_to_fortran(x_src)
                 if margin_src in {"1", "1L"}:
                     return f"sum(sum({x_f}, dim=3), dim=2)"
@@ -11909,6 +11912,30 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"sum({x_f}, dim=3)"
             if margin_src in {"2", "2L"} and fun_src == "cumsum":
                 return f"apply_col_cumsum({r_expr_to_fortran(x_src)})"
+            if margin_src in {"1", "1L"} and fun_src == "mean":
+                x_f = r_expr_to_fortran(x_src)
+                return f"(sum({x_f}, dim=2)/real(size({x_f}, 2), kind=dp))"
+            if margin_src in {"2", "2L"} and fun_src == "mean":
+                x_f = r_expr_to_fortran(x_src)
+                return f"(sum({x_f}, dim=1)/real(size({x_f}, 1), kind=dp))"
+            if margin_src in {"1", "1L"} and fun_src == "sum":
+                return f"sum({r_expr_to_fortran(x_src)}, dim=2)"
+            if margin_src in {"2", "2L"} and fun_src == "sum":
+                return f"sum({r_expr_to_fortran(x_src)}, dim=1)"
+            if margin_src in {"1", "1L"} and fun_src in {"prod", "product"}:
+                return f"product({r_expr_to_fortran(x_src)}, dim=2)"
+            if margin_src in {"2", "2L"} and fun_src in {"prod", "product"}:
+                return f"product({r_expr_to_fortran(x_src)}, dim=1)"
+            if margin_src in {"1", "1L"} and fun_src in {"min", "minval"}:
+                return f"minval({r_expr_to_fortran(x_src)}, dim=2)"
+            if margin_src in {"2", "2L"} and fun_src in {"min", "minval"}:
+                return f"minval({r_expr_to_fortran(x_src)}, dim=1)"
+            if margin_src in {"1", "1L"} and fun_src in {"max", "maxval"}:
+                return f"maxval({r_expr_to_fortran(x_src)}, dim=2)"
+            if margin_src in {"2", "2L"} and fun_src in {"max", "maxval"}:
+                return f"maxval({r_expr_to_fortran(x_src)}, dim=1)"
+            if margin_src in {"1", "1L"} and fun_src in {"sd", "r_sd"}:
+                return f"apply_row_sd(real({r_expr_to_fortran(x_src)}, kind=dp))"
             if margin_src in {"2", "2L"} and fun_src in {"sd", "r_sd"}:
                 return f"apply_col_sd(real({r_expr_to_fortran(x_src)}, kind=dp))"
         return f"apply({inner})"
@@ -13930,6 +13957,18 @@ def emit_stmts(
             nm_c = c[0].lower()
             if nm_c in _USER_FUNC_RETURN_RANK and nm_c not in _USER_FUNC_ELEMENTAL:
                 return _USER_FUNC_RETURN_RANK.get(nm_c, 0)
+            if nm_c == "apply":
+                vals_apply = list(c[1]) + list(c[2].values())
+                x_apply = vals_apply[0].strip() if vals_apply else ""
+                margin_apply = vals_apply[1].strip() if len(vals_apply) >= 2 else ""
+                x_rank_apply = _expr_rank_for_print(x_apply) if x_apply else None
+                if x_rank_apply == 3:
+                    if re.match(r"^c\s*\(", margin_apply, re.IGNORECASE):
+                        return 2
+                    return 1
+                if x_rank_apply == 2:
+                    return 1
+                return 1
             if nm_c in {"confint", "lm_confint"}:
                 return 2
             if nm_c in {"qr.r", "qr_r", "qr.q", "qr_q"}:
@@ -16124,7 +16163,7 @@ def emit_stmts(
                             return f"(sum({slice_f})/real(size({slice_f}), kind=dp))"
                         if key == "sd":
                             return f"sd(real({slice_f}, kind=dp))"
-                        return f"{fn_f}({slice_f})"
+                        return f"{fn_f}(real({slice_f}, kind=dp))"
 
                     o.w("block")
                     o.push()
@@ -16135,6 +16174,18 @@ def emit_stmts(
                     elif dim_f == "2":
                         slice_f = f"{mat_f}(:, i_apply)"
                         o.w(f"{st.name} = [({_apply_call(slice_f)}, i_apply=1,size({mat_f},2))]")
+                    elif re.match(r"^[A-Za-z]\w*$", dim_f):
+                        o.w(f"if ({dim_f} == 1) then")
+                        o.push()
+                        slice_f = f"{mat_f}(i_apply, :)"
+                        o.w(f"{st.name} = [({_apply_call(slice_f)}, i_apply=1,size({mat_f},1))]")
+                        o.pop()
+                        o.w("else")
+                        o.push()
+                        slice_f = f"{mat_f}(:, i_apply)"
+                        o.w(f"{st.name} = [({_apply_call(slice_f)}, i_apply=1,size({mat_f},2))]")
+                        o.pop()
+                        o.w("end if")
                     else:
                         raise NotImplementedError("apply currently supports dim 1 or 2")
                     o.pop()
@@ -28460,6 +28511,7 @@ def transpile_r_to_fortran(
         "colMeans",
         "apply_col_cumsum",
         "apply_col_sd",
+        "apply_row_sd",
         "cov",
         "cor",
         "cov2cor",
@@ -36003,6 +36055,83 @@ def rewrite_null_sentinel_append_assignments_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_apply_variable_margin_prints_text(f90: str) -> str:
+    """Lower print(apply(x, margin_var, fun)) forms emitted as dynamic apply calls."""
+
+    def apply_scalar(fun: str, slice_expr: str) -> str:
+        key = fun.lower()
+        if key == "max":
+            return f"maxval({slice_expr})"
+        if key == "min":
+            return f"minval({slice_expr})"
+        if key == "sum":
+            return f"sum({slice_expr})"
+        if key in {"prod", "product"}:
+            return f"product({slice_expr})"
+        if key == "mean":
+            return f"(sum({slice_expr})/real(size({slice_expr}), kind=dp))"
+        if key in {"sd", "r_sd"}:
+            return f"sd(real({slice_expr}, kind=dp))"
+        return f"{fun}(real({slice_expr}, kind=dp))"
+
+    out: list[str] = []
+    pat = re.compile(
+        r"^(\s*)call\s+print_real_vector\s*\(\s*(?:real\s*\(\s*)?apply\s*\(\s*"
+        r"([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)"
+        r"(?:\s*,\s*kind\s*=\s*dp\s*)?\)+\s*$",
+        re.IGNORECASE,
+    )
+    for ln in f90.splitlines():
+        m = pat.match(ln)
+        if m is None:
+            out.append(ln)
+            continue
+        ind, mat, margin, fun = m.group(1), m.group(2), m.group(3), m.group(4)
+        row_expr = apply_scalar(fun, f"{mat}(i_apply, :)")
+        col_expr = apply_scalar(fun, f"{mat}(:, i_apply)")
+        out.extend(
+            [
+                f"{ind}block",
+                f"{ind}   integer :: i_apply",
+                f"{ind}   if ({margin} == 1) then",
+                f"{ind}      call print_real_vector(real([({row_expr}, i_apply=1,size({mat},1))], kind=dp))",
+                f"{ind}   else",
+                f"{ind}      call print_real_vector(real([({col_expr}, i_apply=1,size({mat},2))], kind=dp))",
+                f"{ind}   end if",
+                f"{ind}end block",
+            ]
+        )
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_rank3_apply_sum_prints_text(f90: str) -> str:
+    """Repair matrix-style apply(sum) lowering accidentally used for rank-3 arrays."""
+    rank3_names: set[str] = set()
+    for m in re.finditer(
+        r"(?im)^\s*(?:integer|real\s*\(\s*kind\s*=\s*dp\s*\))\s*,\s*allocatable\s*::\s*([^\n]+)$",
+        f90,
+    ):
+        for part in split_top_level_commas(m.group(1)):
+            p = part.strip()
+            mm = re.match(r"^([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*,\s*:\s*\)\s*$", p)
+            if mm is not None:
+                rank3_names.add(mm.group(1))
+    if not rank3_names:
+        return f90
+
+    def repl(m: re.Match[str]) -> str:
+        ind, name, dim = m.group(1), m.group(2), m.group(3)
+        if name not in rank3_names:
+            return m.group(0)
+        return f"{ind}call print_real_vector(real(sum(sum({name}, dim=3), dim={dim}), kind=dp))"
+
+    return re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*real\s*\(\s*sum\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*([12])\s*\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*$",
+        repl,
+        f90,
+    )
+
+
 def repair_null_append_function_results_text(f90: str) -> str:
     """Repair functions returning vectors built by c(NULL, value) append loops."""
     proc_re = re.compile(
@@ -38841,6 +38970,8 @@ def main() -> int:
         )
     if "program x_32_mle_normal_distribution" in f90:
         f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
+    f90 = repair_apply_variable_margin_prints_text(f90)
+    f90 = repair_rank3_apply_sum_prints_text(f90)
     extra_use_names: list[str] = []
     if "type(decompose_result_t)" in f90 or "decompose(" in f90:
         extra_use_names.extend(["decompose", "decompose_result_t"])
