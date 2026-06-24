@@ -23842,7 +23842,7 @@ def collect_names_sources(stmts: list[object]) -> dict[str, str]:
         for st in ss:
             if isinstance(st, ExprStmt):
                 m = re.match(
-                    rf"^\s*names\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
+                    rf"^\s*names\s*\(\s*{target_pat}\s*\)\s*(?:<-|=)\s*(.+)$",
                     st.expr.strip(),
                     re.IGNORECASE,
                 )
@@ -24973,6 +24973,10 @@ def transpile_r_to_fortran(
             named_vectors[st_nv.name] = parsed_nv
     _NAMED_VECTOR_NAMES = {nm.lower(): f"{nm}_names" for nm in named_vectors}
     _NAMED_VECTOR_LABELS = {nm.lower(): labels for nm, (labels, _vals) in named_vectors.items()}
+    for nm_name_src, expr_name_src in collect_names_sources(stmts).items():
+        labs_name_src = _parse_string_c_vector(expr_name_src.strip())
+        if labs_name_src is not None:
+            _NAMED_VECTOR_LABELS[nm_name_src.lower()] = labs_name_src
     _NAMED_VECTOR_LABELS.update(collect_colname_labels(stmts))
     for st_adl in main_stmts:
         if isinstance(st_adl, Assign):
