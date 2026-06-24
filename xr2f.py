@@ -830,6 +830,9 @@ def _looks_vector_expr_for_recycle(expr: str) -> bool:
         "c",
         "r_seq_int",
         "r_seq_len",
+        "int_to_string",
+        "real_to_string_f",
+        "real_to_string_g",
         "r_seq_int_by",
         "r_seq_int_length",
         "r_seq_real_by",
@@ -1812,6 +1815,53 @@ def _split_sprintf_format(fmt: str) -> tuple[list[str], int]:
         nspec += 1
     pieces.append(fmt[last:])
     return pieces, nspec
+
+
+def _sprintf_scalar_expr_to_fortran(expr: str) -> str | None:
+    ci = parse_call_text(expr.strip())
+    if ci is None or ci[0].lower() != "sprintf" or not ci[1]:
+        return None
+    fmt_raw = _dequote_string_literal(ci[1][0].strip())
+    if fmt_raw is None:
+        return None
+    vals = list(ci[1][1:])
+    spec_re = re.compile(r"%(?P<flags>[-+ 0#]*)(?P<width>\d+)?(?:\.(?P<prec>\d+))?(?P<conv>[diufFeEgGs%])")
+    out: list[str] = []
+    last = 0
+    arg_i = 0
+    for m in spec_re.finditer(fmt_raw):
+        lit = fmt_raw[last:m.start()]
+        if lit:
+            out.append(_fortran_str_literal(lit))
+        conv = m.group("conv")
+        if conv == "%":
+            out.append(_fortran_str_literal("%"))
+        else:
+            if arg_i >= len(vals):
+                return None
+            val_f = r_expr_to_fortran(vals[arg_i].strip())
+            arg_i += 1
+            if conv in {"d", "i", "u"}:
+                out.append(f"int_to_string({_int_bound_expr(val_f)})")
+            elif conv in {"f", "F"}:
+                digits = int(m.group("prec") or "6")
+                out.append(f"real_to_string_f(real({val_f}, kind=dp), {max(0, digits)})")
+            elif conv in {"e", "E", "g", "G"}:
+                digits = int(m.group("prec") or "0")
+                out.append(f"real_to_string_g(real({val_f}, kind=dp), {max(0, digits)})")
+            elif conv == "s":
+                out.append(r_expr_to_fortran(vals[arg_i - 1].strip()))
+            else:
+                return None
+        last = m.end()
+    tail = fmt_raw[last:]
+    if tail:
+        out.append(_fortran_str_literal(tail))
+    if arg_i != len(vals):
+        return None
+    if not out:
+        return '""'
+    return " // ".join(out)
 
 
 def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
@@ -8758,6 +8808,11 @@ def r_expr_to_fortran(expr: str) -> str:
     c_sys0 = parse_call_text(s)
     if c_sys0 is not None:
         sys_nm0 = c_sys0[0].lower()
+        if sys_nm0 == "sprintf":
+            sp_scalar0 = _sprintf_scalar_expr_to_fortran(s)
+            if sp_scalar0 is not None:
+                return sp_scalar0
+            raise NotImplementedError("unsupported sprintf(): only scalar calls with a literal format are currently supported")
         if sys_nm0 in {"sys.time", "sys_time"}:
             return "sys_time()"
         if sys_nm0 in {"sys.date", "sys_date"}:
@@ -40372,6 +40427,12 @@ def main() -> int:
         extra_use_names.extend(["r_paste0_int", "r_seq_int"])
     if "r_paste0_real(" in f90:
         extra_use_names.append("r_paste0_real")
+    if "int_to_string(" in f90:
+        extra_use_names.append("int_to_string")
+    if "real_to_string_f(" in f90:
+        extra_use_names.append("real_to_string_f")
+    if "real_to_string_g(" in f90:
+        extra_use_names.append("real_to_string_g")
     if "r_matrix_index(" in f90:
         extra_use_names.append("r_matrix_index")
     if "r_matrix_row_filter(" in f90:
