@@ -10030,6 +10030,11 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_fe0, pos_fe0, kw_fe0 = c_file_exists0
         path_src = pos_fe0[0] if pos_fe0 else kw_fe0.get("x", kw_fe0.get("file", ""))
         return f"file_exists({r_expr_to_fortran(path_src)})"
+    c_dir_exists0 = parse_call_text(s)
+    if c_dir_exists0 is not None and c_dir_exists0[0].lower() in {"dir.exists", "dir_exists"}:
+        _nm_de0, pos_de0, kw_de0 = c_dir_exists0
+        path_src = pos_de0[0] if pos_de0 else kw_de0.get("paths", kw_de0.get("path", ""))
+        return f"dir_exists({r_expr_to_fortran(path_src)})"
     c_file_create0 = parse_call_text(s)
     if c_file_create0 is not None and c_file_create0[0].lower() in {"file.create", "file_create"}:
         _nm_fc0, pos_fc0, kw_fc0 = c_file_create0
@@ -18606,15 +18611,28 @@ def emit_stmts(
                 arr = r_expr_to_fortran(it)
                 idx = f"i_{st.var}"
                 tmp = f"iter_for_{st.var}"
+                c_it_call = parse_call_text(it)
+                is_char_iter = False
+                if c_it_call is not None and c_it_call[0].lower() == "c":
+                    iter_vals = list(c_it_call[1]) + list(c_it_call[2].values())
+                    is_char_iter = bool(iter_vals) and all(
+                        _dequote_string_literal(v.strip()) is not None for v in iter_vals
+                    )
+                if arr.strip().startswith("[character(") or it.strip() in _KNOWN_CHAR_VECTOR_NAMES:
+                    is_char_iter = True
                 direct_body = _print_only_loop_body_with_value(st.body, st.var, f"{tmp}({idx})")
                 o.w("block")
                 o.push()
                 o.w(f"integer :: {idx}")
-                o.w(f"real(kind=dp), allocatable :: {tmp}(:)")
-                o.w(f"{tmp} = real({arr}, kind=dp)")
+                if is_char_iter:
+                    o.w(f"character(len=:), allocatable :: {tmp}(:)")
+                    o.w(f"{tmp} = {arr}")
+                else:
+                    o.w(f"real(kind=dp), allocatable :: {tmp}(:)")
+                    o.w(f"{tmp} = real({arr}, kind=dp)")
                 o.w(f"do {idx} = 1, size({tmp})")
                 o.push()
-                if _emit_direct_print_only_loop_body(st.body, st.var, f"{tmp}({idx})", "f0.6"):
+                if (not is_char_iter) and _emit_direct_print_only_loop_body(st.body, st.var, f"{tmp}({idx})", "f0.6"):
                     pass
                 elif direct_body is not None:
                     emit_stmts(o, direct_body, need_rnorm, params, alloc_seen, helper_ctx)
@@ -19392,7 +19410,7 @@ def _expr_kind_simple(expr: str) -> str:
         return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
-    if re.match(r"^(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.create|dir_create)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.exists|dir_exists|dir\.create|dir_create)\s*\(", t, re.IGNORECASE):
         return "logical"
     if _split_top_level_token(t, "&&", from_right=True) is not None or _split_top_level_token(t, "||", from_right=True) is not None:
         return "logical"
@@ -22919,6 +22937,8 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
             "file_create",
             "file.remove",
             "file_remove",
+            "dir.exists",
+            "dir_exists",
             "dir.create",
             "dir_create",
             "all",
@@ -29439,6 +29459,7 @@ def transpile_r_to_fortran(
         "file_info",
         "file_info_t",
         "print_file_info",
+        "dir_exists",
         "dir_create",
         "list_files",
         "strsplit_fixed",
@@ -40407,6 +40428,8 @@ def main() -> int:
         extra_use_names.append("optim_result_t")
     if "type(file_info_t)" in f90 or "file_info(" in f90 or "print_file_info(" in f90:
         extra_use_names.extend(["file_info_t", "file_info", "print_file_info"])
+    if "dir_exists(" in f90:
+        extra_use_names.append("dir_exists")
     if "ecdf_eval(" in f90:
         extra_use_names.append("ecdf_eval")
     if "ks_test(" in f90 or "print_ks_test(" in f90:
