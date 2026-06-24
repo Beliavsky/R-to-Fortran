@@ -6857,6 +6857,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "sum",
                 "mean",
                 "sd",
+                "length",
+                "nrow",
+                "ncol",
                 "min",
                 "max",
                 "rowSums",
@@ -6925,7 +6928,10 @@ def _array_refs_outside_scalar_reductions(expr: str, rank_names: set[str]) -> se
     """Return ranked names still visible after masking scalar reductions."""
     if not rank_names:
         return set()
-    reducers = re.compile(r"\b(?:sum|mean|prod|min|max|maxval|minval|product|log_sum_exp)\s*\(", re.IGNORECASE)
+    reducers = re.compile(
+        r"\b(?:sum|mean|prod|min|max|maxval|minval|product|log_sum_exp|size|length|nrow|ncol|count|sd|var|median)\s*\(",
+        re.IGNORECASE,
+    )
 
     def find_close(src: str, open_idx: int) -> int:
         depth = 0
@@ -20085,6 +20091,7 @@ def emit_function(
         dflt = fn.defaults.get(a, "")
         intent = "in"
         opt = ", optional" if dflt.strip() else ""
+        scalar_value_attr = ", value" if a in written_args and not opt else ""
         if s3_receiver_type is not None and a == fn.args[0]:
             o.w(f"type({s3_receiver_type}), intent(in){opt} :: {a}")
             arg_type[a] = "s3_object"
@@ -20123,7 +20130,7 @@ def emit_function(
             and a not in {"n", "p", "order", "nacf", "seed", "iter", "max_iter", "maxit", "it"}
             and not a.endswith("_order")
         ):
-            o.w(f"real(kind=dp), intent({intent}){opt} :: {a}")
+            o.w(f"real(kind=dp), intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "real"
             continue
         if ar >= 1 and a in fn_int_mod_args:
@@ -20146,7 +20153,7 @@ def emit_function(
             or a.endswith("_order")
             or a in fn_int_args
         ):
-            o.w(f"integer, intent(in){opt} :: {a}")
+            o.w(f"integer, intent(in){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "integer"
             continue
         if dflt.startswith("c("):
@@ -20159,13 +20166,13 @@ def emit_function(
             o.w(f"integer, intent(in){opt} :: {a}")
             arg_type[a] = "integer"
         elif _is_int_literal(dflt):
-            o.w(f"integer, intent(in){opt} :: {a}")
+            o.w(f"integer, intent(in){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "integer"
         elif dflt in {"TRUE", "FALSE"}:
-            o.w(f"logical, intent(in){opt} :: {a}")
+            o.w(f"logical, intent(in){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "logical"
         else:
-            o.w(f"real(kind=dp), intent({intent}){opt} :: {a}")
+            o.w(f"real(kind=dp), intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "real"
     if emit_as_subroutine:
         pass
@@ -25433,6 +25440,8 @@ def transpile_r_to_fortran(
         if reduced_expr_vec_ret != expr_vec_ret and not re.search(r"\b[A-Za-z]\w*\b", reduced_expr_vec_ret):
             continue
         arg_ranks_vec_ret = _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {})
+        if _infer_assignment_rank_hint(expr_vec_ret, arg_ranks_vec_ret) == 0:
+            continue
         for arg_vec_ret, rank_vec_ret in arg_ranks_vec_ret.items():
             if rank_vec_ret > 0 and re.search(rf"\b{re.escape(arg_vec_ret)}\b", expr_vec_ret, re.IGNORECASE):
                 if re.search(r"(?:\+|-|\*|/|\^)", expr_vec_ret):
@@ -26143,6 +26152,8 @@ def transpile_r_to_fortran(
         if reduced_expr_vec_ret != expr_vec_ret and not re.search(r"\b[A-Za-z]\w*\b", reduced_expr_vec_ret):
             continue
         arg_ranks_vec_ret = _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {})
+        if _infer_assignment_rank_hint(expr_vec_ret, arg_ranks_vec_ret) == 0:
+            continue
         for arg_vec_ret, rank_vec_ret in arg_ranks_vec_ret.items():
             if rank_vec_ret > 0 and re.search(rf"\b{re.escape(arg_vec_ret)}\b", expr_vec_ret, re.IGNORECASE):
                 if re.search(r"(?:\+|-|\*|/|\^)", expr_vec_ret):
