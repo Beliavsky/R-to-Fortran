@@ -9993,10 +9993,35 @@ def r_expr_to_fortran(expr: str) -> str:
         if lam_src is None and len(pos_rp0) >= 2:
             lam_src = pos_rp0[1]
         return f"rpois({_int_bound_expr(r_expr_to_fortran(n_src))}, {r_expr_to_fortran(lam_src or '1.0')})"
+    c_file_path0 = parse_call_text(s)
+    if c_file_path0 is not None and c_file_path0[0].lower() in {"file.path", "file_path"}:
+        parts_fp0 = list(c_file_path0[1]) + list(c_file_path0[2].values())
+        if not parts_fp0:
+            return '""'
+        out_fp0 = r_expr_to_fortran(parts_fp0[0])
+        for part_fp0 in parts_fp0[1:]:
+            out_fp0 = f"file_path({out_fp0}, {r_expr_to_fortran(part_fp0)})"
+        return out_fp0
+    c_tempfile0 = parse_call_text(s)
+    if c_tempfile0 is not None and c_tempfile0[0].lower() == "tempfile":
+        pat_tf0 = c_tempfile0[1][0] if c_tempfile0[1] else c_tempfile0[2].get("pattern", '"file"')
+        return f"tempfile({r_expr_to_fortran(pat_tf0)})"
+    c_scan0 = parse_call_text(s)
+    if c_scan0 is not None and c_scan0[0].lower() == "scan":
+        _nm_scan0, pos_scan0, kw_scan0 = c_scan0
+        path_scan0 = pos_scan0[0] if pos_scan0 else kw_scan0.get("file", "")
+        return f"scan_real({r_expr_to_fortran(path_scan0)})"
     c_list_files0 = parse_call_text(s)
-    if c_list_files0 is not None and c_list_files0[0].lower() in {"list.files", "list_files"}:
+    if c_list_files0 is not None and c_list_files0[0].lower() in {"list.files", "list_files", "dir"}:
         _nm_lf0, pos_lf0, kw_lf0 = c_list_files0
         args_lf0: list[str] = []
+        def _lf_arg(src_lf: str) -> str:
+            src_lf_s = src_lf.strip()
+            if src_lf_s.upper() in {"TRUE", "T"}:
+                return ".true."
+            if src_lf_s.upper() in {"FALSE", "F"}:
+                return ".false."
+            return r_expr_to_fortran(src_lf)
         path_src = pos_lf0[0] if pos_lf0 else kw_lf0.get("path")
         if path_src is not None and not path_src.strip():
             path_src = None
@@ -10014,13 +10039,13 @@ def r_expr_to_fortran(expr: str) -> str:
         if recursive_src is not None and not recursive_src.strip():
             recursive_src = None
         if path_src is not None:
-            args_lf0.append(f"path={r_expr_to_fortran(path_src)}")
+            args_lf0.append(f"path={_lf_arg(path_src)}")
         if pattern_src is not None:
-            args_lf0.append(f"pattern={r_expr_to_fortran(pattern_src)}")
+            args_lf0.append(f"pattern={_lf_arg(pattern_src)}")
         if full_names_src is not None:
-            args_lf0.append(f"full_names={r_expr_to_fortran(full_names_src)}")
+            args_lf0.append(f"full_names={_lf_arg(full_names_src)}")
         if recursive_src is not None:
-            args_lf0.append(f"recursive={r_expr_to_fortran(recursive_src)}")
+            args_lf0.append(f"recursive={_lf_arg(recursive_src)}")
         return f"list_files({', '.join(args_lf0)})"
     c_getwd0 = parse_call_text(s)
     if c_getwd0 is not None and c_getwd0[0].lower() == "getwd":
@@ -10050,6 +10075,15 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_fi0, pos_fi0, kw_fi0 = c_file_info0
         path_src = pos_fi0[0] if pos_fi0 else kw_fi0.get("file", kw_fi0.get("files", ""))
         return f"file_info({r_expr_to_fortran(path_src)})"
+    m_file_info_field0 = re.match(r"^(?:file\.info|file_info)\s*\((.*)\)\s*\$\s*([A-Za-z]\w*)\s*$", s, re.IGNORECASE | re.DOTALL)
+    if m_file_info_field0 is not None:
+        c_fif0 = parse_call_text("file.info(" + m_file_info_field0.group(1).strip() + ")")
+        if c_fif0 is not None:
+            path_src = c_fif0[1][0] if c_fif0[1] else c_fif0[2].get("file", c_fif0[2].get("files", ""))
+            field_fif0 = m_file_info_field0.group(2)
+            if field_fif0.lower() == "isdir":
+                return f"file_isdir({r_expr_to_fortran(path_src)})"
+            return f"file_info({r_expr_to_fortran(path_src)})%{field_fif0}"
     c_dir_create0 = parse_call_text(s)
     if c_dir_create0 is not None and c_dir_create0[0].lower() in {"dir.create", "dir_create"}:
         _nm_dc0, pos_dc0, kw_dc0 = c_dir_create0
@@ -18331,6 +18365,47 @@ def emit_stmts(
                 continue
             if nm == "cat":
                 if st.args:
+                    c_cat_full = parse_call_text(st.name + "(" + ", ".join(st.args) + ")")
+                    if c_cat_full is not None and "file" in c_cat_full[2]:
+                        file_f_cat = r_expr_to_fortran(c_cat_full[2]["file"])
+                        payload_cat = list(c_cat_full[1])
+                        o.w("block")
+                        o.push()
+                        o.w("integer :: fp_cat")
+                        o.w(f'open(newunit=fp_cat, file={file_f_cat}, status="replace", action="write")')
+                        line_items_cat: list[str] = []
+                        for a_cat in payload_cat:
+                            a_cat_s = a_cat.strip()
+                            lit_cat = _dequote_string_literal(a_cat_s)
+                            if lit_cat is not None and re.fullmatch(r"(?:\\n|\n)+", lit_cat):
+                                if line_items_cat:
+                                    o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                                    line_items_cat = []
+                                else:
+                                    o.w("write(fp_cat,*)")
+                                continue
+                            if lit_cat is not None and ("\\n" in lit_cat or "\n" in lit_cat):
+                                parts_cat = re.split(r"(?:\\n|\n)", lit_cat)
+                                for i_part_cat, part_cat in enumerate(parts_cat):
+                                    if part_cat:
+                                        line_items_cat.append(_fortran_str_literal(part_cat))
+                                    if i_part_cat < len(parts_cat) - 1:
+                                        if line_items_cat:
+                                            o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                                            line_items_cat = []
+                                        else:
+                                            o.w("write(fp_cat,*)")
+                                continue
+                            item_cat_f = _display_expr_to_fortran(a_cat_s)
+                            if re.fullmatch(r"[A-Za-z]\w*", item_cat_f.strip()) and item_cat_f.strip() in char_scalar_vars:
+                                item_cat_f = f"trim({item_cat_f.strip()})"
+                            line_items_cat.append(item_cat_f)
+                        if line_items_cat:
+                            o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                        o.w("close(fp_cat)")
+                        o.pop()
+                        o.w("end block")
+                        continue
                     out_items: list[str] = []
                     just_flushed_cat_line = False
                     for a in st.args:
@@ -20093,6 +20168,8 @@ def emit_function(
     purity_texts = _collect_stmt_expr_texts(body_stmts) + ([last.expr] if isinstance(last, ExprStmt) else [])
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
+    if any(re.search(r"\b(?:dir\.exists|dir_exists|dir|list\.files|list_files|file\.info|file_info|scan|scan_real|tempfile|file\.path|file_path)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
+        can_be_pure = False
     if any(re.search(r"\b(?:lm\.fit|qr|qr\.coef|qr\.resid|qr_coef|qr_resid)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
     if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
@@ -20463,6 +20540,10 @@ def emit_function(
     arg_local_init_lines: list[str] = []
     fn_char_scalars = infer_function_character_scalars(fn)
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
+    fn_char_array_lowers = {x.lower() for x in fn_char_arrays}
+    for st_char_loop in fn.body:
+        if isinstance(st_char_loop, ForStmt) and st_char_loop.iter_expr.strip().lower() in fn_char_array_lowers:
+            fn_char_scalars.add(st_char_loop.var)
     fn_int_args = infer_function_integer_names(fn)
     fn_int_mod_args = infer_function_integer_modulus_arg_names(fn)
     fn_logical_arr_args = infer_function_logical_array_arg_names(fn)
@@ -22509,7 +22590,7 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                     out.add(st.name)
                     continue
                 c_rhs = parse_call_text(rhs)
-                if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class", "getwd"}:
+                if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class", "getwd", "tempfile", "file.path", "file_path"}:
                     out.add(st.name)
                     continue
                 if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
@@ -22588,7 +22669,7 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 if low.startswith("strsplit("):
                     out.add(st.name)
                     continue
-                if low.startswith("list.files(") or low.startswith("list_files("):
+                if low.startswith("list.files(") or low.startswith("list_files(") or low.startswith("dir("):
                     out.add(st.name)
                     continue
                 c_rhs = parse_call_text(rhs)
@@ -22805,7 +22886,7 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                 if _dequote_string_literal(rhs) is not None:
                     out.add(st.name)
                 c_rhs_char = parse_call_text(rhs)
-                if c_rhs_char is not None and c_rhs_char[0].lower() == "getwd":
+                if c_rhs_char is not None and c_rhs_char[0].lower() in {"getwd", "tempfile", "file.path", "file_path"}:
                     out.add(st.name)
                 if re.match(r"^(sub|substr)\s*\(", rhs, re.IGNORECASE):
                     out.add(st.name)
@@ -22852,6 +22933,26 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                             _mark_char_arg(actual_arg)
             for txt in texts:
                 _mark_nchar_arg_calls(txt)
+                def _mark_path_args(inner: str) -> str:
+                    parts = split_top_level_commas(inner)
+                    c_path = parse_call_text("f(" + inner + ")")
+                    first = parts[0] if parts else ""
+                    path_src = ""
+                    if c_path is not None:
+                        kw_path = c_path[2]
+                        path_src = kw_path.get("path", kw_path.get("paths", kw_path.get("file", kw_path.get("files", ""))))
+                    if not path_src:
+                        path_src = first
+                    if path_src:
+                        _mark_char_arg(path_src)
+                    return "f(" + inner + ")"
+                for _path_fn in ("dir.exists", "dir_exists", "dir.create", "dir_create", "dir", "list.files", "list_files", "file.info", "file_info", "scan"):
+                    _ = _replace_balanced_func_calls(txt, _path_fn, _mark_path_args)
+                def _mark_file_path_args(inner: str) -> str:
+                    for part in split_top_level_commas(inner):
+                        _mark_char_arg(part)
+                    return "file.path(" + inner + ")"
+                _ = _replace_balanced_func_calls(txt, "file.path", _mark_file_path_args)
                 def _mark_regexpr_args(inner: str) -> str:
                     parts = split_top_level_commas(inner)
                     if len(parts) >= 2:
@@ -22897,6 +22998,8 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
                 if rhs.lower().startswith("commandargs("):
                     out.add(st.name)
                 if rhs.lower().startswith("strsplit("):
+                    out.add(st.name)
+                if rhs.lower().startswith("list.files(") or rhs.lower().startswith("list_files(") or rhs.lower().startswith("dir("):
                     out.add(st.name)
                 if re.match(r"^(?:format|date_format_vec)\s*\(", rhs, re.IGNORECASE):
                     out.add(st.name)
@@ -29453,15 +29556,19 @@ def transpile_r_to_fortran(
         "r_matrix_row",
         "char_join",
         "getwd",
+        "tempfile",
+        "file_path",
         "file_exists",
         "file_create",
         "file_remove",
         "file_info",
         "file_info_t",
+        "file_isdir",
         "print_file_info",
         "dir_exists",
         "dir_create",
         "list_files",
+        "scan_real",
         "strsplit_fixed",
         "toupper",
         "tolower",
@@ -40428,8 +40535,16 @@ def main() -> int:
         extra_use_names.append("optim_result_t")
     if "type(file_info_t)" in f90 or "file_info(" in f90 or "print_file_info(" in f90:
         extra_use_names.extend(["file_info_t", "file_info", "print_file_info"])
+    if "file_isdir(" in f90:
+        extra_use_names.append("file_isdir")
     if "dir_exists(" in f90:
         extra_use_names.append("dir_exists")
+    if "tempfile(" in f90:
+        extra_use_names.append("tempfile")
+    if "file_path(" in f90:
+        extra_use_names.append("file_path")
+    if "scan_real(" in f90:
+        extra_use_names.append("scan_real")
     if "ecdf_eval(" in f90:
         extra_use_names.append("ecdf_eval")
     if "ks_test(" in f90 or "print_ks_test(" in f90:
