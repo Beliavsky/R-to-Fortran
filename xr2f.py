@@ -30067,11 +30067,11 @@ def _pretty_output_text(text: str, strip_r_indices: bool = False) -> str:
     if strip_r_indices:
         stripped_lines: list[str] = []
         for ln in lines:
-            if re.fullmatch(r"(?:\[,\d+\]\s*)+", ln):
+            if re.fullmatch(r"(?:\[,?\d+\]\s*)+", ln):
                 continue
-            if re.fullmatch(r",\s*,\s*\d+", ln):
+            if re.fullmatch(r"(?:,\s*)+\d+(?:\s+(?:,\s*)+\d+)*", ln):
                 continue
-            stripped_lines.append(re.sub(r"^\[\d+(?:,\d*)?\]\s*", "", ln))
+            stripped_lines.append(re.sub(r"^\[\d+\s*,\s*\]\s*", "", re.sub(r"^\[\d+(?:,\d*)?\]\s*", "", ln)))
         lines = stripped_lines
     while lines and lines[-1] == "":
         lines.pop()
@@ -39283,6 +39283,7 @@ def main() -> int:
                             round_digits=fortran_round_digits,
                             trim_zero_decimals=args.trim_zero_decimals,
                             strip_quotes=args.strip_quotes,
+                            strip_r_indices=args.pretty,
                             wrap_out=args.wrap_out,
                         )
                         return failed_frun.returncode
@@ -39300,6 +39301,7 @@ def main() -> int:
                             round_digits=fortran_round_digits,
                             trim_zero_decimals=args.trim_zero_decimals,
                             strip_quotes=args.strip_quotes,
+                            strip_r_indices=args.pretty,
                             wrap_out=args.wrap_out,
                         )
                 if args.time:
@@ -39377,6 +39379,7 @@ def main() -> int:
                     round_digits=fortran_round_digits,
                     trim_zero_decimals=args.trim_zero_decimals,
                     strip_quotes=args.strip_quotes,
+                    strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
                 )
                 return failed_frun.returncode
@@ -39394,6 +39397,7 @@ def main() -> int:
                     round_digits=fortran_round_digits,
                     trim_zero_decimals=args.trim_zero_decimals,
                     strip_quotes=args.strip_quotes,
+                    strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
                 )
 
@@ -39412,7 +39416,7 @@ def main() -> int:
                 if args.normalize_num_output:
                     f_blob = _normalize_numeric_leading_zeros_text(f_blob)
                 if args.pretty:
-                    f_blob = _pretty_output_text(f_blob)
+                    f_blob = _pretty_output_text(f_blob, strip_r_indices=True)
                 if fortran_round_digits is not None:
                     f_blob = _round_output_text(f_blob, fortran_round_digits)
                 if args.trim_zero_decimals:
