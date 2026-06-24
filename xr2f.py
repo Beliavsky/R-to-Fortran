@@ -19519,7 +19519,7 @@ def emit_function(
         if rk_ret_nm > 0:
             ret_rank_hints[nm_ret_rank.lower()] = rk_ret_nm
     reduced_ret_expr_src_outer = ret_expr_src
-    for red_name_ret_outer in ("sum", "mean", "prod", "min", "max"):
+    for red_name_ret_outer in ("sum", "mean", "median", "sd", "var", "prod", "min", "max", "which.max", "which.min"):
         reduced_ret_expr_src_outer = _replace_balanced_func_calls(
             reduced_ret_expr_src_outer,
             red_name_ret_outer,
@@ -19530,14 +19530,14 @@ def emit_function(
         and _infer_assignment_rank_hint(reduced_ret_expr_src_outer, ret_rank_hints) == 0
     ):
         ret_rank = 0
-    if re.search(r"\bmean\s*\(", ret_expr_src, re.IGNORECASE):
+    if re.search(r"\b(?:mean|median|sd|var|which\.max|which\.min)\s*\(", ret_expr_src, re.IGNORECASE):
         ret_rank = 0
     if ret_rank == 0 and not ret_is_reduce_scalar:
         rr_ret_expr = _infer_assignment_rank_hint(ret_expr_src, ret_rank_hints)
         if rr_ret_expr > 0:
             ret_rank = rr_ret_expr
         reduced_ret_expr_src = ret_expr_src
-        for red_name_ret in ("sum", "mean", "prod", "min", "max"):
+        for red_name_ret in ("sum", "mean", "median", "sd", "var", "prod", "min", "max", "which.max", "which.min"):
             reduced_ret_expr_src = _replace_balanced_func_calls(
                 reduced_ret_expr_src,
                 red_name_ret,
@@ -24691,10 +24691,10 @@ def transpile_r_to_fortran(
                         rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
                 else:
                     rr_tail = _infer_assignment_rank_hint(expr_rank_tail, inferred_ret_ranks)
-                if re.match(r"^-?\s*(?:sum|mean|prod|min|max|Reduce)\s*\(", expr_rank_tail, re.IGNORECASE):
+                if re.match(r"^-?\s*(?:sum|mean|median|sd|var|prod|min|max|Reduce|which\.max|which\.min)\s*\(", expr_rank_tail, re.IGNORECASE):
                     rr_tail = 0
                 reduced_expr_tail = expr_rank_tail
-                for red_name_tail in ("sum", "mean", "prod", "min", "max"):
+                for red_name_tail in ("sum", "mean", "median", "sd", "var", "prod", "min", "max", "which.max", "which.min"):
                     reduced_expr_tail = _replace_balanced_func_calls(
                         reduced_expr_tail,
                         red_name_tail,
@@ -24743,6 +24743,8 @@ def transpile_r_to_fortran(
 
             def _is_known_integer_expr_for_return(expr_ret_kind: str) -> bool:
                 expr_t = expr_ret_kind.strip()
+                if re.match(r"^(?:which\.max|which\.min)\s*\(", expr_t, re.IGNORECASE):
+                    return True
                 if re.match(r"^(?:which|match)\s*\(.+\)\s*\[\s*.+\s*\]$", expr_t, re.IGNORECASE):
                     return True
                 if _is_int_literal(expr_t) or _is_integer_arith_expr(expr_t):
@@ -34800,6 +34802,54 @@ def demote_scalar_reduction_result_declarations_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def demote_scalar_reduction_local_declarations_text(f90: str) -> str:
+    """Demote allocatable real locals assigned scalar reducer results."""
+    reducer_pat = r"(?:sum|mean|median|sd|var|maxval|minval|count|size|maxloc|minloc)"
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\b.*?^\s*end\s+(?:function|subroutine)\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        scalar_names: set[str] = set()
+        for ma in re.finditer(
+            rf"(?im)^\s*([A-Za-z]\w*)\s*=\s*{reducer_pat}\s*\((.*?)\)\s*$",
+            block,
+        ):
+            rhs_inner = ma.group(2)
+            if not re.search(r"\bdim\s*=", rhs_inner, re.IGNORECASE):
+                scalar_names.add(ma.group(1).lower())
+        if not scalar_names:
+            return block
+
+        def repl_decl(dm: re.Match[str]) -> str:
+            indent = dm.group(1)
+            rest = dm.group(2)
+            kept: list[str] = []
+            demoted: list[str] = []
+            for item in split_top_level_commas(rest):
+                item_s = item.strip()
+                mi = re.fullmatch(r"([A-Za-z]\w*)\s*\(:\)\s*", item_s, re.IGNORECASE)
+                if mi is not None and mi.group(1).lower() in scalar_names:
+                    demoted.append(mi.group(1))
+                elif item_s:
+                    kept.append(item_s)
+            if not demoted:
+                return dm.group(0)
+            lines: list[str] = [f"{indent}real(kind=dp) :: " + ", ".join(demoted)]
+            if kept:
+                lines.append(f"{indent}real(kind=dp), allocatable :: " + ", ".join(kept))
+            return "\n".join(lines)
+
+        return re.sub(
+            r"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            repl_decl,
+            block,
+        )
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def promote_vector_workvars_from_vector_assignments_text(f90: str) -> str:
     lines = f90.splitlines()
     out = list(lines)
@@ -35210,7 +35260,7 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
         out = txt
         for _ in range(20):
             changed = False
-            for name in ("sum", "size", "count", "maxval", "minval"):
+            for name in ("sum", "size", "count", "maxval", "minval", "median", "sd", "var", "maxloc", "minloc"):
                 m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
                 while m is not None:
                     depth = 1
@@ -35254,7 +35304,7 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return block
         scalar_assigned_names = set()
         for m_scalar_asn in re.finditer(
-            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval)\s*\([^\n]*)",
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval|median|sd|var|maxloc|minloc)\s*\([^\n]*)",
             block,
             re.IGNORECASE,
         ):
@@ -39180,10 +39230,12 @@ def main() -> int:
     f90 = demote_scalar_objective_result_decls_text(f90)
     f90 = demote_elemental_allocatable_result_functions_text(f90)
     f90 = demote_real_element_scalar_locals_text(f90)
+    f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = promote_integer_maxval_locals_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = promote_array_rhs_function_results_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
+    f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = promote_scalar_pure_functions_to_elemental_text(f90)
     f90 = demote_scalar_objective_result_decls_text(f90)
     f90 = demote_elemental_allocatable_result_functions_text(f90)
@@ -39251,6 +39303,7 @@ def main() -> int:
     f90 = remove_allocatable_result_entry_deallocate_text(f90)
     f90 = demote_scalar_reduction_result_declarations_text(f90)
     f90 = promote_vector_workvars_from_vector_assignments_text(f90)
+    f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = f90.replace(
         "real(kind=dp), allocatable :: qnorm_scalar_result(:)",
