@@ -6408,6 +6408,131 @@ def _rename_stmt_obj(st: object, mapping: dict[str, str]) -> object:
     return st
 
 
+def _static_character_vector_values(expr: str) -> list[str] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "c":
+        return None
+    vals: list[str] = []
+    for arg in list(cinfo[1]) + list(cinfo[2].values()):
+        val = _dequote_string_literal(arg.strip())
+        if val is None:
+            return None
+        vals.append(val)
+    return vals
+
+
+def _static_get_target(arg: str, scalar_names: dict[str, str]) -> str | None:
+    arg_s = arg.strip()
+    lit = _dequote_string_literal(arg_s)
+    if lit is not None:
+        return _fortran_ident(lit)
+    if re.fullmatch(r"[A-Za-z]\w*", arg_s):
+        target = scalar_names.get(arg_s)
+        if target is not None:
+            return _fortran_ident(target)
+    return None
+
+
+def _replace_static_get_expr(expr: str, scalar_names: dict[str, str]) -> str:
+    def repl(inner: str) -> str:
+        args = split_top_level_commas(inner)
+        if not args:
+            return "get()"
+        target = _static_get_target(args[0], scalar_names)
+        if target is None:
+            return f"get({inner})"
+        return target
+
+    return _replace_balanced_func_calls(expr, "get", repl)
+
+
+def _expand_static_get_print_for_loop(loop_var: str, names: list[str], stmt: PrintStmt) -> object | None:
+    if len(stmt.args) != 1:
+        return None
+    arg = stmt.args[0].strip()
+    cinfo = parse_call_text(arg)
+    if cinfo is None or cinfo[0].lower() != "get":
+        return None
+    get_arg = (cinfo[1][0] if cinfo[1] else cinfo[2].get("x", cinfo[2].get("pos", ""))).strip()
+    if get_arg != loop_var:
+        return None
+    chain: object | None = None
+    for nm in reversed(names):
+        target = _fortran_ident(nm)
+        branch = [PrintStmt([target], stmt.comment)]
+        if chain is None:
+            chain = IfStmt(f'{loop_var} == "{nm}"', branch, [])
+        else:
+            chain = IfStmt(f'{loop_var} == "{nm}"', branch, [chain])
+    return chain
+
+
+def lower_static_get_calls(stmts: list[object]) -> list[object]:
+    """Lower feasible get() calls with statically known character names.
+
+    This deliberately does not attempt dynamic R environment lookup.  Supported:
+    get("x"), get(name) where name was assigned a string literal, and
+    print(get(loop_var)) inside a for-loop over c("a", "b", ...).
+    """
+    scalar_names: dict[str, str] = {}
+    char_vectors: dict[str, list[str]] = {}
+
+    def lower_list(ss: list[object], env: dict[str, str], vec_env: dict[str, list[str]]) -> list[object]:
+        out: list[object] = []
+        for st in ss:
+            if isinstance(st, Assign):
+                expr_new = _replace_static_get_expr(st.expr, env)
+                lit = _dequote_string_literal(expr_new.strip())
+                vals = _static_character_vector_values(expr_new)
+                if lit is not None:
+                    env = dict(env)
+                    env[st.name] = lit
+                elif st.name in env:
+                    env = dict(env)
+                    env.pop(st.name, None)
+                if vals is not None:
+                    vec_env = dict(vec_env)
+                    vec_env[st.name] = vals
+                elif st.name in vec_env:
+                    vec_env = dict(vec_env)
+                    vec_env.pop(st.name, None)
+                out.append(Assign(st.name, expr_new, st.comment))
+            elif isinstance(st, PrintStmt):
+                out.append(PrintStmt([_replace_static_get_expr(a, env) for a in st.args], st.comment))
+            elif isinstance(st, CallStmt):
+                out.append(CallStmt(st.name, [_replace_static_get_expr(a, env) for a in st.args], st.comment))
+            elif isinstance(st, ExprStmt):
+                out.append(ExprStmt(_replace_static_get_expr(st.expr, env), st.comment))
+            elif isinstance(st, IfStmt):
+                out.append(
+                    IfStmt(
+                        _replace_static_get_expr(st.cond, env),
+                        lower_list(st.then_body, dict(env), dict(vec_env)),
+                        lower_list(st.else_body, dict(env), dict(vec_env)),
+                    )
+                )
+            elif isinstance(st, ForStmt):
+                iter_expr = _replace_static_get_expr(st.iter_expr, env)
+                names = vec_env.get(iter_expr.strip())
+                body_out: list[object] = []
+                for b in st.body:
+                    expanded = _expand_static_get_print_for_loop(st.var, names or [], b) if names else None
+                    if expanded is not None:
+                        body_out.append(expanded)
+                    else:
+                        body_out.extend(lower_list([b], dict(env), dict(vec_env)))
+                out.append(ForStmt(st.var, iter_expr, body_out))
+            elif isinstance(st, WhileStmt):
+                out.append(WhileStmt(_replace_static_get_expr(st.cond, env), lower_list(st.body, dict(env), dict(vec_env))))
+            elif isinstance(st, RepeatStmt):
+                out.append(RepeatStmt(lower_list(st.body, dict(env), dict(vec_env))))
+            else:
+                out.append(st)
+        return out
+
+    return lower_list(stmts, scalar_names, char_vectors)
+
+
 def _assigned_names_in_stmts(stmts: list[object]) -> set[str]:
     out: set[str] = set()
 
@@ -22163,6 +22288,9 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                 walk(st.then_body)
                 walk(st.else_body)
             elif isinstance(st, ForStmt):
+                iter_src = st.iter_expr.strip()
+                if iter_src.lower() in {x.lower() for x in char_arrays_seen}:
+                    out.add(st.var)
                 walk(st.body)
             elif isinstance(st, WhileStmt):
                 walk(st.body)
@@ -24612,6 +24740,7 @@ def transpile_r_to_fortran(
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
+    stmts = lower_static_get_calls(stmts)
     validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
