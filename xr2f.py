@@ -2270,6 +2270,89 @@ def split_top_level_assignment(s: str) -> tuple[str, str] | None:
     return None
 
 
+def _contains_superassignment(expr: str) -> bool:
+    in_single = False
+    in_double = False
+    esc = False
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if esc:
+            esc = False
+            i += 1
+            continue
+        if ch == "\\":
+            esc = True
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double and expr.startswith("<<-", i):
+            return True
+        i += 1
+    return False
+
+
+def _expr_has_assign_call(expr: str) -> bool:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is not None and cinfo[0].lower() == "assign":
+        return True
+    found = False
+
+    def repl(_inner: str) -> str:
+        nonlocal found
+        found = True
+        return "assign()"
+
+    _replace_balanced_func_calls(expr, "assign", repl)
+    return found
+
+
+def validate_unsupported_environment_assignment(stmts: list[object]) -> None:
+    def check_expr(expr: str) -> None:
+        if _contains_superassignment(expr):
+            raise NotImplementedError("unsupported superassignment <<-; R environment mutation is not supported")
+        if _expr_has_assign_call(expr):
+            raise NotImplementedError("unsupported assign(): dynamic/environment assignment is not supported")
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                check_expr(st.expr)
+            elif isinstance(st, PrintStmt):
+                for a in st.args:
+                    check_expr(a)
+            elif isinstance(st, CallStmt):
+                if st.name.lower() == "assign":
+                    raise NotImplementedError("unsupported assign(): dynamic/environment assignment is not supported")
+                for a in st.args:
+                    check_expr(a)
+            elif isinstance(st, ExprStmt):
+                check_expr(st.expr)
+            elif isinstance(st, IfStmt):
+                check_expr(st.cond)
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                check_expr(st.iter_expr)
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                check_expr(st.cond)
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+
+    walk(stmts)
+
+
 def _split_top_level_pipe(expr: str) -> list[str] | None:
     parts: list[str] = []
     cur: list[str] = []
@@ -24718,6 +24801,7 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    validate_unsupported_environment_assignment(stmts)
     _KNOWN_CHAR_VECTOR_NAMES.update(_collect_character0_assignments(stmts))
     _STATIC_LS_NAMES = []
     _STATIC_LS_STR_LINES = []
