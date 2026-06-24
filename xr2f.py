@@ -3084,6 +3084,35 @@ def _split_known_custom_infix_expr(text: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _replace_chars_outside_strings(text: str, repl: dict[str, str]) -> str:
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    esc = False
+    for ch in text:
+        if esc:
+            out.append(ch)
+            esc = False
+            continue
+        if ch == "\\" and (in_single or in_double):
+            out.append(ch)
+            esc = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+        if not in_single and not in_double and ch in repl:
+            out.append(repl[ch])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _split_top_level_muldiv_chain(text: str) -> tuple[list[str], list[str]] | None:
     """Split a top-level chain of * and / operators, preserving left-to-right order."""
     in_single = False
@@ -9914,9 +9943,21 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_lf0, pos_lf0, kw_lf0 = c_list_files0
         args_lf0: list[str] = []
         path_src = pos_lf0[0] if pos_lf0 else kw_lf0.get("path")
+        if path_src is not None and not path_src.strip():
+            path_src = None
+        if path_src is None:
+            m_path_lf0 = re.search(r"(?:^|,)\s*path\s*=\s*([^,\)]+)", s, re.IGNORECASE)
+            if m_path_lf0 is not None:
+                path_src = m_path_lf0.group(1).strip()
         pattern_src = kw_lf0.get("pattern")
+        if pattern_src is not None and not pattern_src.strip():
+            pattern_src = None
         full_names_src = kw_lf0.get("full.names", kw_lf0.get("full_names"))
+        if full_names_src is not None and not full_names_src.strip():
+            full_names_src = None
         recursive_src = kw_lf0.get("recursive")
+        if recursive_src is not None and not recursive_src.strip():
+            recursive_src = None
         if path_src is not None:
             args_lf0.append(f"path={r_expr_to_fortran(path_src)}")
         if pattern_src is not None:
@@ -9944,6 +9985,11 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_fr0, pos_fr0, kw_fr0 = c_file_remove0
         path_src = pos_fr0[0] if pos_fr0 else kw_fr0.get("file", kw_fr0.get("files", ""))
         return f"file_remove({r_expr_to_fortran(path_src)})"
+    c_file_info0 = parse_call_text(s)
+    if c_file_info0 is not None and c_file_info0[0].lower() in {"file.info", "file_info"}:
+        _nm_fi0, pos_fi0, kw_fi0 = c_file_info0
+        path_src = pos_fi0[0] if pos_fi0 else kw_fi0.get("file", kw_fi0.get("files", ""))
+        return f"file_info({r_expr_to_fortran(path_src)})"
     c_dir_create0 = parse_call_text(s)
     if c_dir_create0 is not None and c_dir_create0[0].lower() in {"dir.create", "dir_create"}:
         _nm_dc0, pos_dc0, kw_dc0 = c_dir_create0
@@ -13385,8 +13431,7 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"{obj}${_LIST_FIELD_NAME_ALIASES.get(field, field)}"
 
         s = re.sub(r"\b([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)\b", _repl_list_field_alias, s)
-    s = s.replace("$", "%")
-    s = s.replace("@", "%")
+    s = _replace_chars_outside_strings(s, {"$": "%", "@": "%"})
     s = re.sub(
         r"%([A-Za-z]\w*(?:\.[A-Za-z]\w*)+)",
         lambda m: "%" + _sanitize_fortran_kwarg_name(m.group(1)),
@@ -13668,6 +13713,7 @@ def emit_stmts(
     arima_pred_vars_ctx: set[str] = set()
     acf_vars_ctx: set[str] = set()
     hist_vars_ctx: set[str] = set()
+    file_info_vars_ctx: set[str] = set()
     nlm_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
     benchmark_vars: set[str] = set()
@@ -13780,6 +13826,9 @@ def emit_stmts(
         histv = helper_ctx.get("hist_vars")
         if isinstance(histv, set):
             hist_vars_ctx = {str(x) for x in histv}
+        fiv = helper_ctx.get("file_info_vars")
+        if isinstance(fiv, set):
+            file_info_vars_ctx = {str(x) for x in fiv}
         nlv = helper_ctx.get("nlm_vars")
         if isinstance(nlv, set):
             nlm_vars_ctx = {str(x) for x in nlv}
@@ -17199,6 +17248,14 @@ def emit_stmts(
                         _wstmt(f"call print_hist({one})", st.comment)
                         need_r_mod.update({"print_hist", "hist_result_t"})
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and one in file_info_vars_ctx:
+                        _wstmt(f"call print_file_info({one})", st.comment)
+                        need_r_mod.update({"print_file_info", "file_info_t"})
+                        continue
+                    if c_one is not None and c_one[0].lower() in {"file.info", "file_info"}:
+                        _wstmt(f"call print_file_info({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"file_info", "print_file_info", "file_info_t"})
+                        continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in nlm_vars_ctx:
                         _wstmt(f"call print_nlm_result({one})", st.comment)
                         need_r_mod.update({"print_nlm_result", "nlm_result_t"})
@@ -19090,6 +19147,14 @@ def emit_stmts(
                 _wstmt(f"call print_acf({expr_print_src})", st.comment)
                 need_r_mod.update({"print_acf", "acf_fit_t"})
                 continue
+            if re.fullmatch(r"[A-Za-z]\w*", expr_print_src) and expr_print_src in file_info_vars_ctx:
+                _wstmt(f"call print_file_info({expr_print_src})", st.comment)
+                need_r_mod.update({"print_file_info", "file_info_t"})
+                continue
+            if c_expr_print is not None and c_expr_print[0].lower() in {"file.info", "file_info"}:
+                _wstmt(f"call print_file_info({r_expr_to_fortran(expr_print_src)})", st.comment)
+                need_r_mod.update({"file_info", "print_file_info", "file_info_t"})
+                continue
             if c_expr_print is not None and c_expr_print[0].lower() == "rle":
                 _wstmt(f"call print_rle({r_expr_to_fortran(expr_print_src)})", st.comment)
                 need_r_mod.update({"rle", "print_rle"})
@@ -19266,6 +19331,10 @@ def _expr_kind_simple(expr: str) -> str:
             return "real"
         if key == "sign":
             return "real"
+    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*isdir\s*$", t, re.IGNORECASE):
+        return "logical"
+    if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:size|mode|mtime|ctime|atime)\s*$", t, re.IGNORECASE):
+        return "real"
     if re.match(r"^(?:all|any|is\.[A-Za-z_]\w*)\s*\(", t, re.IGNORECASE):
         return "logical"
     if re.match(r"^(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.create|dir_create)\s*\(", t, re.IGNORECASE):
@@ -26677,6 +26746,8 @@ def transpile_r_to_fortran(
     arima_pred_vars: set[str] = set()
     acf_vars: set[str] = set()
     hist_vars: set[str] = set()
+    file_info_vars: set[str] = set()
+    file_info_vector_vars: set[str] = set()
     qr_vars: set[str] = set()
     nlm_vars: set[str] = set()
     t_test_vars: set[str] = set()
@@ -26768,6 +26839,16 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "hist":
                 hist_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"hist", "hist_result_t", "print_hist"})
+            if c_fit_main is not None and c_fit_main[0].lower() in {"file.info", "file_info"}:
+                file_info_vars.add(st.name)
+                path_arg_fi = c_fit_main[1][0].strip() if c_fit_main[1] else c_fit_main[2].get("file", c_fit_main[2].get("files", "")).strip()
+                if (
+                    path_arg_fi in char_arrays
+                    or path_arg_fi.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                    or re.match(r"^c\s*\(", path_arg_fi, re.IGNORECASE)
+                ):
+                    file_info_vector_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"file_info", "file_info_t", "print_file_info"})
             if c_fit_main is not None and c_fit_main[0].lower() == "qr":
                 qr_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"qr", "qr_fit_t"})
@@ -27604,7 +27685,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["date_scalar_vars"] = set(_KNOWN_DATE_NAMES)
     helper_ctx_main["posixct_vars"] = set(_KNOWN_POSIXCT_NAMES)
 
-    for nm in set(list_vars) | set(main_object_list_vars) | set(hist_vars):
+    for nm in set(list_vars) | set(main_object_list_vars) | set(hist_vars) | set(file_info_vars):
         ints.discard(nm)
         int_arrays.discard(nm)
         real_arrays.discard(nm)
@@ -27818,6 +27899,12 @@ def transpile_r_to_fortran(
     if hist_vars:
         for nm in sorted(hist_vars):
             pbody.w(f"type(hist_result_t) :: {nm}")
+    if file_info_vars:
+        for nm in sorted(file_info_vars):
+            if nm in file_info_vector_vars:
+                pbody.w(f"type(file_info_t), allocatable :: {nm}(:)")
+            else:
+                pbody.w(f"type(file_info_t) :: {nm}")
     if qr_vars:
         for nm in sorted(qr_vars):
             pbody.w(f"type(qr_fit_t) :: {nm}")
@@ -27855,6 +27942,8 @@ def transpile_r_to_fortran(
         helper_ctx_main["acf_vars"] = set(acf_vars)
     if hist_vars:
         helper_ctx_main["hist_vars"] = set(hist_vars)
+    if file_info_vars:
+        helper_ctx_main["file_info_vars"] = set(file_info_vars)
     if nlm_vars:
         helper_ctx_main["nlm_vars"] = set(nlm_vars)
     if rle_vars:
@@ -29292,6 +29381,9 @@ def transpile_r_to_fortran(
         "file_exists",
         "file_create",
         "file_remove",
+        "file_info",
+        "file_info_t",
+        "print_file_info",
         "dir_create",
         "list_files",
         "strsplit_fixed",
@@ -40240,6 +40332,12 @@ def main() -> int:
     if "program x_32_mle_normal_distribution" in f90:
         f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
     f90 = rewrite_character_constructor_vector_writes_text(f90)
+    f90 = re.sub(
+        r'(?m)^(\s*)write\(\*,"\(g0\)"\)\s+(file_info\s*\(.*\))\s*$',
+        r"\1call print_file_info(\2)",
+        f90,
+        flags=re.IGNORECASE,
+    )
     f90 = repair_apply_variable_margin_prints_text(f90)
     f90 = repair_apply_scalar_assignment_text(f90)
     f90 = repair_apply_callback_vector_dummies_text(f90)
@@ -40252,6 +40350,8 @@ def main() -> int:
         extra_use_names.extend(["decompose", "decompose_result_t"])
     if "type(optim_result_t)" in f90:
         extra_use_names.append("optim_result_t")
+    if "type(file_info_t)" in f90 or "file_info(" in f90 or "print_file_info(" in f90:
+        extra_use_names.extend(["file_info_t", "file_info", "print_file_info"])
     if "ecdf_eval(" in f90:
         extra_use_names.append("ecdf_eval")
     if "ks_test(" in f90 or "print_ks_test(" in f90:
