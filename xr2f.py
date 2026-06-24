@@ -58,6 +58,7 @@ _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _CURRENT_LOGICAL_ARRAY_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
+_STATIC_LS_NAMES: list[str] = []
 _KNOWN_DATE_NAMES: set[str] = set()
 _KNOWN_DATE_VECTOR_NAMES: set[str] = set()
 _KNOWN_POSIXCT_NAMES: set[str] = set()
@@ -6544,7 +6545,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     # Constructor vectors/matrices.
     if expr_l.startswith("c(") or expr_f.startswith("c("):
         return 1
-    if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along)\s*\(", expr_l):
+    if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|ls)\s*\(", expr_l):
         return 1
 
     m_subset_rank = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr)
@@ -8630,7 +8631,20 @@ def r_expr_to_fortran(expr: str) -> str:
                     idx_f_txt = r_expr_to_fortran(idx_src_subset).strip()
                     return f"pack({r_expr_to_fortran(base_subset)}, {idx_f_txt})"
                 else:
-                    idx_f_subset = _strict_int_vector_literal_from_c(idx_src_subset) or r_expr_to_fortran(idx_src_subset)
+                    c_idx_subset = parse_call_text(idx_src_subset)
+                    if (
+                        c_idx_subset is not None
+                        and c_idx_subset[0].lower() in {"cbind", "cbind2"}
+                        and len(c_idx_subset[1]) >= 2
+                    ):
+                        row_idx_f = r_expr_to_fortran(c_idx_subset[1][0].strip())
+                        col_idx_f = r_expr_to_fortran(c_idx_subset[1][1].strip())
+                        idx_f_subset = (
+                            f"int(({row_idx_f}) + (({col_idx_f}) - 1) * "
+                            f"size({r_expr_to_fortran(base_subset)}, 1))"
+                        )
+                    else:
+                        idx_f_subset = _strict_int_vector_literal_from_c(idx_src_subset) or r_expr_to_fortran(idx_src_subset)
                     idx_f_txt = idx_f_subset.strip()
                     if not (
                         idx_f_txt.startswith("[")
@@ -10427,6 +10441,24 @@ def r_expr_to_fortran(expr: str) -> str:
         if x_src is not None and x_src.strip().lower() in _ARRAY_DIM_LABELS:
             return '"[dimnames]"'
         return '"NULL"'
+    c_ls = parse_call_text(s)
+    if c_ls is not None and c_ls[0].lower() == "ls":
+        _nls, pos_ls, kw_ls = c_ls
+        unsupported_ls = set(kw_ls) - {"pattern", "all.names", "all_names"}
+        if pos_ls or unsupported_ls:
+            raise NotImplementedError("ls() only supports static top-level names in this subset")
+        names_ls = list(_STATIC_LS_NAMES)
+        pattern_ls = kw_ls.get("pattern")
+        if pattern_ls is not None:
+            pat_lit = _dequote_string_literal(pattern_ls.strip())
+            if pat_lit is None:
+                raise NotImplementedError("ls(pattern=...) requires a string literal in this subset")
+            names_ls = [nm for nm in names_ls if re.search(pat_lit, nm)]
+        if not names_ls:
+            return "[character(len=1) :: ]"
+        width_ls = max(1, max(len(nm) for nm in names_ls))
+        vals_ls = ", ".join(_fortran_str_literal(nm) for nm in names_ls)
+        return f"[character(len={width_ls}) :: {vals_ls}]"
     c_drop = parse_call_text(s)
     if c_drop is not None and c_drop[0].lower() == "drop":
         _ndr, pos_dr, kw_dr = c_drop
@@ -12480,6 +12512,18 @@ def r_expr_to_fortran(expr: str) -> str:
         s,
         "mean",
         _mean_to_fortran,
+    )
+
+    def _median_to_fortran(inner: str) -> str:
+        x_src, na_rm = _split_reduction_args(inner)
+        inner_f = r_expr_to_fortran(x_src)
+        if na_rm:
+            inner_f = _non_na_pack_expr(inner_f)
+        return f"median(real({inner_f}, kind=dp))"
+    s = _replace_balanced_func_calls(
+        s,
+        "median",
+        _median_to_fortran,
     )
 
     def _is_logical_reduction_arg(x_src: str, x_f: str) -> bool:
@@ -18690,6 +18734,8 @@ def emit_stmts(
                     if m_char_grep_subset is not None and m_char_grep_subset.group(1).lower() in _KNOWN_CHAR_VECTOR_NAMES:
                         return "character"
                     c_vpk = parse_call_text(t_vpk)
+                    if c_vpk is not None and c_vpk[0].lower() == "ls":
+                        return "character"
                     if c_vpk is not None and c_vpk[0].lower() in {"unique", "sort", "replace"}:
                         arg_vpk = c_vpk[1][0].strip() if c_vpk[1] else c_vpk[2].get("x", "").strip()
                         if arg_vpk in char_vector_vars_ctx or arg_vpk.lower() in _KNOWN_CHAR_VECTOR_NAMES:
@@ -24253,7 +24299,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS
     global _SUBROUTINE_FUNCTIONS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
@@ -24305,6 +24351,7 @@ def transpile_r_to_fortran(
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
     _KNOWN_CHAR_VECTOR_NAMES.update(_collect_character0_assignments(stmts))
+    _STATIC_LS_NAMES = []
     raw_matrix_col_labels = collect_colname_labels(stmts)
     raw_colname_sources = collect_colname_sources(stmts)
     raw_rowname_sources = collect_rownames_sources(stmts)
@@ -24368,6 +24415,9 @@ def transpile_r_to_fortran(
     _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts, {fn.name for fn in funcs})
+    _STATIC_LS_NAMES = sorted(
+        {f.name for f in funcs} | set(infer_assigned_names(main_stmts).keys())
+    )
     _KNOWN_NULL_NAMES.update(
         st.name.lower()
         for st in main_stmts
@@ -36400,6 +36450,18 @@ def repair_apply_scalar_assignment_text(f90: str) -> str:
     return f90
 
 
+def rewrite_character_constructor_vector_writes_text(f90: str) -> str:
+    """Rewrite list-directed character constructor vector writes to print_char_vector."""
+    pat = re.compile(
+        r'(?im)^(\s*)write\(\*,"\([^"]*\)"\)\s+(\[character\s*\([^\n]*(?:\n\s*&[^\n]*)*)$'
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        return f"{m.group(1)}call print_char_vector({m.group(2)})"
+
+    return pat.sub(repl, f90)
+
+
 def _marked_apply_callbacks(f90: str) -> set[str]:
     out: set[str] = set()
     for m in re.finditer(r"(?im)^\s*!\s*xr2f_apply_callbacks:[ \t]*([A-Za-z0-9_, \t]+)[ \t]*$", f90):
@@ -39372,6 +39434,7 @@ def main() -> int:
         )
     if "program x_32_mle_normal_distribution" in f90:
         f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
+    f90 = rewrite_character_constructor_vector_writes_text(f90)
     f90 = repair_apply_variable_margin_prints_text(f90)
     f90 = repair_apply_scalar_assignment_text(f90)
     f90 = repair_apply_callback_vector_dummies_text(f90)
@@ -39412,6 +39475,8 @@ def main() -> int:
         extra_use_names.append("which_first")
     if "which_last(" in f90:
         extra_use_names.append("which_last")
+    if "call print_char_vector(" in f90:
+        extra_use_names.append("print_char_vector")
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90 = promote_logical_pack_result_decls_text(f90)
