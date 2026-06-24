@@ -36318,6 +36318,194 @@ def repair_apply_variable_margin_prints_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_apply_scalar_assignment_text(f90: str) -> str:
+    """Lower lhs = apply(matrix, margin, scalar_fun) emitted after parsing."""
+    fn_names = re.findall(
+        r"(?im)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\(",
+        f90,
+    )
+    fn_name_map = {name.lower(): name for name in fn_names}
+    callbacks_used: set[str] = set()
+
+    def resolve_fun(name: str) -> str:
+        key = name.lower()
+        if key in fn_name_map:
+            return fn_name_map[key]
+        suffix = "_" + key
+        matches = [orig for low, orig in fn_name_map.items() if low.endswith(suffix)]
+        if len(matches) == 1:
+            return matches[0]
+        return name
+
+    def fun_expr(fun: str, slice_expr: str) -> str:
+        key = fun.lower()
+        if key == "max":
+            return f"maxval({slice_expr})"
+        if key == "min":
+            return f"minval({slice_expr})"
+        if key == "sum":
+            return f"sum({slice_expr})"
+        if key in {"prod", "product"}:
+            return f"product({slice_expr})"
+        if key == "mean":
+            return f"(sum({slice_expr})/real(size({slice_expr}), kind=dp))"
+        if key in {"sd", "r_sd"}:
+            return f"sd(real({slice_expr}, kind=dp))"
+        resolved = resolve_fun(fun)
+        callbacks_used.add(resolved.lower())
+        return f"{resolved}(real({slice_expr}, kind=dp))"
+
+    def repl(m: re.Match[str]) -> str:
+        lhs = m.group(1)
+        mat = m.group(2)
+        margin = m.group(3)
+        fun = m.group(4)
+        if margin in {"1", "1L"}:
+            expr = fun_expr(fun, f"{mat}(i_apply, :)")
+            return f"{lhs} = real([({expr}, i_apply=1,size({mat},1))], kind=dp)"
+        if margin in {"2", "2L"}:
+            expr = fun_expr(fun, f"{mat}(:, i_apply)")
+            return f"{lhs} = real([({expr}, i_apply=1,size({mat},2))], kind=dp)"
+        return m.group(0)
+
+    f90 = re.sub(
+        r"(?im)^\s*([A-Za-z]\w*)\s*=\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*(1L?|2L?)\s*,\s*([A-Za-z]\w*)\s*\)\s*$",
+        repl,
+        f90,
+    )
+    if "i_apply=1,size(" in f90:
+        proc_re = re.compile(
+            r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\b.*?^\s*end\s+(?:function|subroutine)\b[^\n]*\n?)"
+        )
+
+        def add_i_apply_decl(pm: re.Match[str]) -> str:
+            block = pm.group(1)
+            if "i_apply=1,size(" not in block:
+                return block
+            if re.search(r"(?im)^\s*integer\b[^:]*::[^\n]*\bi_apply\b", block):
+                return block
+            lines = block.splitlines()
+            insert_at = -1
+            for idx, line in enumerate(lines):
+                if re.match(r"^\s*(?:real|integer|logical|complex|character|type)\b.*::", line, re.IGNORECASE):
+                    insert_at = idx + 1
+            if insert_at < 0:
+                return block
+            lines.insert(insert_at, "integer :: i_apply")
+            return "\n".join(lines) + ("\n" if block.endswith("\n") else "")
+
+        f90 = proc_re.sub(add_i_apply_decl, f90)
+    if callbacks_used:
+        f90 = "! xr2f_apply_callbacks: " + ",".join(sorted(callbacks_used)) + "\n" + f90
+    return f90
+
+
+def _marked_apply_callbacks(f90: str) -> set[str]:
+    out: set[str] = set()
+    for m in re.finditer(r"(?im)^\s*!\s*xr2f_apply_callbacks:[ \t]*([A-Za-z0-9_, \t]+)[ \t]*$", f90):
+        out.update(x.strip().lower() for x in m.group(1).split(",") if x.strip())
+    return out
+
+
+def repair_apply_callback_vector_dummies_text(f90: str) -> str:
+    """Promote apply callback dummy arguments when row/column slices are passed."""
+    callbacks = _marked_apply_callbacks(f90)
+    if not callbacks:
+        return f90
+
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(pm: re.Match[str]) -> str:
+        block = pm.group(1)
+        fn = pm.group(2)
+        if fn.lower() not in callbacks:
+            return block
+        m_args = re.search(rf"\bfunction\s+{re.escape(fn)}\s*\(([^)]*)\)", block, re.IGNORECASE | re.DOTALL)
+        if m_args is None:
+            return block
+        args = [a.strip() for a in split_top_level_commas(m_args.group(1)) if a.strip()]
+        if not args:
+            return block
+        first_arg = args[0]
+        new = re.sub(r"(?im)^(\s*pure\s+)elemental\s+(function\b)", r"\1\2", block, count=1)
+        new = re.sub(r"(?im)^(\s*)elemental\s+(function\b)", r"\1\2", new, count=1)
+        new = re.sub(
+            rf"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*){re.escape(first_arg)}\s*$",
+            rf"\1{first_arg}(:)",
+            new,
+            count=1,
+        )
+        return new
+
+    return proc_re.sub(repl_proc, f90)
+
+
+def promote_vector_locals_from_rank1_dummy_exprs_text(f90: str) -> str:
+    """Promote scalar real locals assigned expressions over rank-1 dummies."""
+    callbacks = _marked_apply_callbacks(f90)
+    if not callbacks:
+        return f90
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+([A-Za-z]\w*)\b.*?^\s*end\s+(?:function|subroutine)\b[^\n]*\n?)"
+    )
+
+    def repl_proc(pm: re.Match[str]) -> str:
+        block = pm.group(1)
+        fn = pm.group(2)
+        if fn.lower() not in callbacks:
+            return block
+        rank1_dummies: set[str] = set()
+        for dm in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$",
+            block,
+        ):
+            for item in split_top_level_commas(dm.group(1)):
+                mi = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\)\s*", item, re.IGNORECASE)
+                if mi is not None:
+                    rank1_dummies.add(mi.group(1).lower())
+        if not rank1_dummies:
+            return block
+        vector_locals: set[str] = set()
+        for ma in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+            lhs = ma.group(1)
+            rhs = ma.group(2)
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE) for nm in rank1_dummies):
+                if not re.match(r"\s*(?:sum|mean|median|sd|var|maxval|minval|count|size|maxloc|minloc)\s*\(", rhs, re.IGNORECASE):
+                    vector_locals.add(lhs.lower())
+        if not vector_locals:
+            return block
+
+        def repl_decl(dm: re.Match[str]) -> str:
+            indent = dm.group(1)
+            rest = dm.group(2)
+            scalars: list[str] = []
+            vectors: list[str] = []
+            for item in split_top_level_commas(rest):
+                item_s = item.strip()
+                mi = re.fullmatch(r"([A-Za-z]\w*)", item_s, re.IGNORECASE)
+                if mi is not None and mi.group(1).lower() in vector_locals:
+                    vectors.append(f"{mi.group(1)}(:)")
+                elif item_s:
+                    scalars.append(item_s)
+            if not vectors:
+                return dm.group(0)
+            lines: list[str] = []
+            if scalars:
+                lines.append(f"{indent}real(kind=dp) :: " + ", ".join(scalars))
+            lines.append(f"{indent}real(kind=dp), allocatable :: " + ", ".join(vectors))
+            return "\n".join(lines)
+
+        return re.sub(
+            r"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$",
+            repl_decl,
+            block,
+        )
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def repair_rank3_apply_sum_prints_text(f90: str) -> str:
     """Repair matrix-style apply(sum) lowering accidentally used for rank-3 arrays."""
     rank3_names: set[str] = set()
@@ -39185,6 +39373,9 @@ def main() -> int:
     if "program x_32_mle_normal_distribution" in f90:
         f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
     f90 = repair_apply_variable_margin_prints_text(f90)
+    f90 = repair_apply_scalar_assignment_text(f90)
+    f90 = repair_apply_callback_vector_dummies_text(f90)
+    f90 = promote_vector_locals_from_rank1_dummy_exprs_text(f90)
     f90 = repair_rank3_apply_sum_prints_text(f90)
     extra_use_names: list[str] = []
     if "type(decompose_result_t)" in f90 or "decompose(" in f90:
