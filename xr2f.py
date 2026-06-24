@@ -24208,6 +24208,39 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _rewrite_simple_anonymous_apply_functions(src: str) -> str:
+    """Lift simple apply(..., function(x) { expr }) callbacks into named helpers."""
+    lines = src.splitlines()
+    out: list[str] = []
+    i = 0
+    n_fun = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^(\s*.*?\bapply\s*\(.*?,\s*)function\s*\(([^)]*)\)\s*\{\s*$", line)
+        if m is None or i + 2 >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+        body_line = lines[i + 1].strip()
+        close_line = lines[i + 2].strip()
+        close_m = re.match(r"^\}\s*(\)+)\s*$", close_line)
+        if close_m is None or not body_line:
+            out.append(line)
+            i += 1
+            continue
+        n_fun += 1
+        fn_name = f"xr2f_apply_fun_{n_fun}"
+        args = m.group(2).strip()
+        apply_prefix = m.group(1)
+        close_suffix = close_m.group(1)
+        out.append(f"{fn_name} <- function({args}) {{")
+        out.append(f"  {body_line}")
+        out.append("}")
+        out.append(f"{apply_prefix}{fn_name}{close_suffix}")
+        i += 3
+    return "\n".join(out) + ("\n" if src.endswith("\n") else "")
+
+
 def transpile_r_to_fortran(
     src: str,
     stem: str,
@@ -24230,6 +24263,7 @@ def transpile_r_to_fortran(
     global _CALL_COERCION_WARNINGS
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
+    src = _rewrite_simple_anonymous_apply_functions(src)
     _DOTTED_VAR_RENAMES = {}
     _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
     _SANITIZED_R_NAME_BY_RAW = {}
@@ -36056,9 +36090,38 @@ def rewrite_null_sentinel_append_assignments_text(f90: str) -> str:
 
 
 def repair_apply_variable_margin_prints_text(f90: str) -> str:
-    """Lower print(apply(x, margin_var, fun)) forms emitted as dynamic apply calls."""
+    """Lower print(apply(...)) forms emitted as dynamic apply calls."""
 
-    def apply_scalar(fun: str, slice_expr: str) -> str:
+    vector_result_funcs: set[str] = {"range"}
+    fn_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)(.*?)^\s*end\s+function\b"
+    )
+    for mf in fn_re.finditer(f90):
+        fn_name = mf.group(1)
+        result_name = mf.group(2)
+        body = mf.group(3)
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::[^\n]*\b{re.escape(result_name)}\s*\(:",
+            body,
+        ):
+            vector_result_funcs.add(fn_name.lower())
+
+    def _fmt_extra_apply_arg(arg: str) -> str:
+        t = arg.strip()
+        eq = _split_top_level_token(t, "=", from_right=False)
+        if eq is not None:
+            key = _sanitize_fortran_kwarg_name(eq[0].strip())
+            val_src = eq[1].strip()
+            val_f = r_expr_to_fortran(val_src)
+            if _is_int_literal(val_src) or _is_int_literal(val_f):
+                val_f = f"real({val_f}, kind=dp)"
+            return f"{key}={val_f}"
+        val_f = r_expr_to_fortran(t)
+        if _is_int_literal(t) or _is_int_literal(val_f):
+            val_f = f"real({val_f}, kind=dp)"
+        return val_f
+
+    def apply_scalar(fun: str, slice_expr: str, extra_args: list[str]) -> str:
         key = fun.lower()
         if key == "max":
             return f"maxval({slice_expr})"
@@ -36072,35 +36135,136 @@ def repair_apply_variable_margin_prints_text(f90: str) -> str:
             return f"(sum({slice_expr})/real(size({slice_expr}), kind=dp))"
         if key in {"sd", "r_sd"}:
             return f"sd(real({slice_expr}, kind=dp))"
-        return f"{fun}(real({slice_expr}, kind=dp))"
+        extra = "".join(", " + _fmt_extra_apply_arg(a) for a in extra_args)
+        return f"{fun}(real({slice_expr}, kind=dp){extra})"
+
+    def apply_vector(fun: str, slice_expr: str, extra_args: list[str]) -> str:
+        if fun.lower() == "range":
+            return f"[minval({slice_expr}), maxval({slice_expr})]"
+        extra = "".join(", " + _fmt_extra_apply_arg(a) for a in extra_args)
+        return f"{fun}(real({slice_expr}, kind=dp){extra})"
+
+    def find_matching_paren_local(text: str, open_pos: int) -> int:
+        depth = 0
+        in_single = False
+        in_double = False
+        for k in range(open_pos, len(text)):
+            ch = text[k]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return k
+        return -1
 
     out: list[str] = []
-    pat = re.compile(
-        r"^(\s*)call\s+print_real_vector\s*\(\s*(?:real\s*\(\s*)?apply\s*\(\s*"
-        r"([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)"
-        r"(?:\s*,\s*kind\s*=\s*dp\s*)?\)+\s*$",
-        re.IGNORECASE,
-    )
-    for ln in f90.splitlines():
-        m = pat.match(ln)
-        if m is None:
+    raw_lines = f90.splitlines()
+    idx_ln = 0
+    while idx_ln < len(raw_lines):
+        ln = raw_lines[idx_ln]
+        if "apply(" not in ln or not re.match(r"^\s*call\s+print_real_vector\s*\(", ln, re.IGNORECASE):
             out.append(ln)
+            idx_ln += 1
             continue
-        ind, mat, margin, fun = m.group(1), m.group(2), m.group(3), m.group(4)
-        row_expr = apply_scalar(fun, f"{mat}(i_apply, :)")
-        col_expr = apply_scalar(fun, f"{mat}(:, i_apply)")
-        out.extend(
-            [
-                f"{ind}block",
-                f"{ind}   integer :: i_apply",
-                f"{ind}   if ({margin} == 1) then",
-                f"{ind}      call print_real_vector(real([({row_expr}, i_apply=1,size({mat},1))], kind=dp))",
-                f"{ind}   else",
-                f"{ind}      call print_real_vector(real([({col_expr}, i_apply=1,size({mat},2))], kind=dp))",
-                f"{ind}   end if",
-                f"{ind}end block",
-            ]
-        )
+        ind = re.match(r"^(\s*)", ln).group(1)
+        i_apply_call = ln.find("apply(")
+        j_apply_call = find_matching_paren_local(ln, i_apply_call + len("apply") - 1)
+        if j_apply_call < 0:
+            out.append(ln)
+            idx_ln += 1
+            continue
+        inner = ln[i_apply_call + len("apply("):j_apply_call]
+        parts = split_top_level_commas(inner)
+        if len(parts) < 3:
+            out.append(ln)
+            idx_ln += 1
+            continue
+        mat = parts[0].strip()
+        margin = parts[1].strip()
+        fun = parts[2].strip()
+        extra_args = [p.strip() for p in parts[3:] if p.strip()]
+        if not re.fullmatch(r"[A-Za-z]\w*", mat) or not re.fullmatch(r"[A-Za-z]\w*", fun):
+            out.append(ln)
+            idx_ln += 1
+            continue
+        is_vector_result = fun.lower() in vector_result_funcs
+        row_slice = f"{mat}(i_apply, :)"
+        col_slice = f"{mat}(:, i_apply)"
+        row_expr = apply_vector(fun, row_slice, extra_args) if is_vector_result else apply_scalar(fun, row_slice, extra_args)
+        col_expr = apply_vector(fun, col_slice, extra_args) if is_vector_result else apply_scalar(fun, col_slice, extra_args)
+        if margin in {"1", "1L"}:
+            if is_vector_result:
+                out.extend([
+                    f"{ind}block",
+                    f"{ind}   integer :: i_apply",
+                    f"{ind}   real(kind=dp), allocatable :: xr2f_apply_mat(:,:)",
+                    f"{ind}   allocate(xr2f_apply_mat(size({row_expr}), size({mat},1)))",
+                    f"{ind}   do i_apply = 1, size({mat}, 1)",
+                    f"{ind}      xr2f_apply_mat(:, i_apply) = {row_expr}",
+                    f"{ind}   end do",
+                    f"{ind}   call print_matrix(xr2f_apply_mat)",
+                    f"{ind}end block",
+                ])
+            else:
+                out.extend([
+                    f"{ind}block",
+                    f"{ind}   integer :: i_apply",
+                    f"{ind}   call print_real_vector(real([({row_expr}, i_apply=1,size({mat},1))], kind=dp))",
+                    f"{ind}end block",
+                ])
+            idx_ln += 1
+            if idx_ln < len(raw_lines) and re.match(r"^\s*&\s*kind\s*=\s*dp\s*\)\)\s*$", raw_lines[idx_ln], re.IGNORECASE):
+                idx_ln += 1
+            continue
+        if margin in {"2", "2L"}:
+            if is_vector_result:
+                out.extend([
+                    f"{ind}block",
+                    f"{ind}   integer :: i_apply",
+                    f"{ind}   real(kind=dp), allocatable :: xr2f_apply_mat(:,:)",
+                    f"{ind}   allocate(xr2f_apply_mat(size({col_expr}), size({mat},2)))",
+                    f"{ind}   do i_apply = 1, size({mat}, 2)",
+                    f"{ind}      xr2f_apply_mat(:, i_apply) = {col_expr}",
+                    f"{ind}   end do",
+                    f"{ind}   call print_matrix(xr2f_apply_mat)",
+                    f"{ind}end block",
+                ])
+            else:
+                out.extend([
+                    f"{ind}block",
+                    f"{ind}   integer :: i_apply",
+                    f"{ind}   call print_real_vector(real([({col_expr}, i_apply=1,size({mat},2))], kind=dp))",
+                    f"{ind}end block",
+                ])
+            idx_ln += 1
+            if idx_ln < len(raw_lines) and re.match(r"^\s*&\s*kind\s*=\s*dp\s*\)\)\s*$", raw_lines[idx_ln], re.IGNORECASE):
+                idx_ln += 1
+            continue
+        if re.fullmatch(r"[A-Za-z]\w*", margin) and not is_vector_result:
+            out.extend(
+                [
+                    f"{ind}block",
+                    f"{ind}   integer :: i_apply",
+                    f"{ind}   if ({margin} == 1) then",
+                    f"{ind}      call print_real_vector(real([({row_expr}, i_apply=1,size({mat},1))], kind=dp))",
+                    f"{ind}   else",
+                    f"{ind}      call print_real_vector(real([({col_expr}, i_apply=1,size({mat},2))], kind=dp))",
+                    f"{ind}   end if",
+                    f"{ind}end block",
+                ]
+            )
+            idx_ln += 1
+            if idx_ln < len(raw_lines) and re.match(r"^\s*&\s*kind\s*=\s*dp\s*\)\)\s*$", raw_lines[idx_ln], re.IGNORECASE):
+                idx_ln += 1
+            continue
+        out.append(ln)
+        idx_ln += 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
