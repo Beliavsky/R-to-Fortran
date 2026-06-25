@@ -24943,23 +24943,52 @@ def _normalize_dotted_function_names(stmts: list[object]) -> list[object]:
     return [rewrite_stmt(st) for st in stmts]
 
 
-def _r_declare_type_call(kind: str) -> str:
+def _r_declare_type_call(kind: str, rank: int = 0, dims: tuple[str, ...] | None = None) -> str:
+    dims_use: tuple[str, ...]
+    if dims is not None:
+        dims_use = dims
+    elif rank <= 0:
+        dims_use = ("1",)
+    else:
+        dims_use = tuple("NA" for _ in range(rank))
     if kind == "integer":
-        return "integer()"
-    if kind == "logical":
-        return "logical()"
-    if kind == "character":
-        return "character()"
-    return "double()"
+        base = "integer"
+    elif kind == "logical":
+        base = "logical"
+    elif kind == "character":
+        base = "character"
+    else:
+        base = "double"
+    return f"{base}({', '.join(dims_use)})"
+
+
+def _annotation_spec(kind: str, rank: int = 0, dims: tuple[str, ...] | None = None) -> str:
+    return _r_declare_type_call(kind, rank, dims)
+
+
+def _annotation_rank_maps_for_function(fn: FuncDef) -> dict[str, int]:
+    body_eff = fn.body[:-1] if (fn.body and isinstance(fn.body[-1], ExprStmt)) else fn.body
+    known_arrays = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
+    assign_counts = infer_assigned_names(body_eff)
+    _ints, _real_scalars, int_arrays, real_arrays, _params = classify_vars(body_eff, assign_counts, known_arrays=known_arrays)
+    char_scalars = infer_function_character_scalars(fn)
+    char_arrays = infer_function_character_array_names(fn, char_scalars)
+    logical_arrays = infer_local_logical_arrays(body_eff)
+    ranks: dict[str, int] = {}
+    for a in fn.args:
+        ranks[a] = infer_arg_rank(fn, a)
+    for nm in int_arrays | real_arrays | char_arrays | logical_arrays:
+        ranks.setdefault(nm, 1)
+    return ranks
 
 
 def _format_declare_block(specs: list[tuple[str, str]], indent: str) -> list[str]:
     if not specs:
         return []
     out = [f"{indent}declare(type("]
-    for i, (name, kind) in enumerate(specs):
+    for i, (name, type_call) in enumerate(specs):
         comma = "," if i + 1 < len(specs) else ""
-        out.append(f"{indent}  {name} = {_r_declare_type_call(kind)}{comma}")
+        out.append(f"{indent}  {name} = {type_call}{comma}")
     out.append(f"{indent}))")
     return out
 
@@ -25109,6 +25138,7 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
     func_specs: dict[str, list[tuple[str, str]]] = {}
     for fn in funcs:
         kinds = _annotation_kind_maps_for_function(fn)
+        ranks = _annotation_rank_maps_for_function(fn)
         ordered: list[tuple[str, str]] = []
         seen: set[str] = set()
         names_for_decl = list(fn.args) if args_only else list(fn.args) + sorted(k for k in kinds if k not in fn.args)
@@ -25117,7 +25147,7 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
             if raw_nm in seen:
                 continue
             seen.add(raw_nm)
-            ordered.append((raw_nm, kinds[nm]))
+            ordered.append((raw_nm, _annotation_spec(kinds[nm], ranks.get(nm, 0))))
         if ordered:
             func_specs[fn.name] = ordered
 
@@ -25137,7 +25167,9 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
             real_scalars.discard(nm_char_arr)
             params.pop(nm_char_arr, None)
         logical_scalars = infer_main_logical_scalars(main_stmts)
+        logical_arrays = infer_main_logical_arrays(main_stmts, set(int_arrays) | set(real_arrays) | set(array_params))
         main_kinds: dict[str, str] = {}
+        main_ranks: dict[str, int] = {}
         for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
             main_kinds[nm] = "integer"
         for nm in sorted(real_scalars | real_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind != "integer"}):
@@ -25146,7 +25178,13 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
             main_kinds.setdefault(nm, "character")
         for nm in sorted(logical_scalars):
             main_kinds.setdefault(nm, "logical")
-        main_specs = [(raw_name.get(nm, nm), kind) for nm, kind in sorted(main_kinds.items())]
+        for nm in sorted(int_arrays | real_arrays | char_arrays | logical_arrays):
+            main_ranks[nm] = 1
+        for nm, (_kind, _n, _expr) in array_params.items():
+            main_ranks[nm] = 1
+        for nm in sorted(logical_arrays):
+            main_kinds.setdefault(nm, "logical")
+        main_specs = [(raw_name.get(nm, nm), _annotation_spec(kind, main_ranks.get(nm, 0))) for nm, kind in sorted(main_kinds.items())]
 
     func_open_lines = _collect_func_open_lines(src)
     insert_after: dict[int, list[str]] = {}
@@ -36155,6 +36193,45 @@ def demote_scalarized_user_vector_assignments_text(f90: str) -> str:
     return "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_self_slice_truncation_aliases_text(f90: str) -> str:
+    """Repair `x <- x[seq_len(n)]` after reuse-renaming creates scalar alias."""
+    alias_to_base: dict[str, str] = {}
+    assign_pat = re.compile(
+        r"(?m)^(\s*(?:if\s*\([^\n]*\)\s*)?)([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(\s*r_seq_len\s*\(([^)\n]+)\)\s*\)\s*$",
+        re.IGNORECASE,
+    )
+
+    def repl_assign(m: re.Match[str]) -> str:
+        prefix, alias, base, bound = m.groups()
+        if alias.lower() == base.lower():
+            return m.group(0)
+        if not re.fullmatch(rf"{re.escape(base)}_\d+", alias, re.IGNORECASE):
+            return m.group(0)
+        alias_to_base[alias] = base
+        return f"{prefix}{base} = {base}(r_seq_len({bound.strip()}))"
+
+    out = assign_pat.sub(repl_assign, f90)
+    if not alias_to_base:
+        return out
+
+    lines_out: list[str] = []
+    aliases_l = {a.lower() for a in alias_to_base}
+    for line in out.splitlines():
+        m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None:
+            lines_out.append(line)
+            continue
+        kept = [
+            item.strip()
+            for item in split_top_level_commas(m_decl.group(2))
+            if item.strip() and item.strip().lower() not in aliases_l
+        ]
+        if not kept:
+            continue
+        lines_out.append(f"{m_decl.group(1)}real(kind=dp) :: " + ", ".join(kept))
+    return "\n".join(lines_out) + ("\n" if out.endswith("\n") else "")
+
+
 def demote_scalar_reduction_result_declarations_text(f90: str) -> str:
     lines = f90.splitlines()
     out = list(lines)
@@ -40403,6 +40480,7 @@ def main() -> int:
         r"real(kind=dp) :: \1\n",
         f90,
     )
+    f90 = rewrite_self_slice_truncation_aliases_text(f90)
     f90 = keep_indexed_scalarized_user_vector_assignments_text(f90)
     f90 = demote_scalarized_user_vector_assignments_text(f90)
     f90 = demote_literal_index_scalar_assignments_text(f90)
