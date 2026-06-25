@@ -32040,12 +32040,44 @@ def rewrite_arima_coef_name_access(lines: list[str]) -> list[str]:
 def repair_fit_arma_t_vector_fields_text(f90: str) -> str:
     if "type :: fit_arma_t_result_t" not in f90:
         return f90
+    def _repair_result_type_block(m: re.Match[str]) -> str:
+        lines = m.group(0).splitlines()
+        out: list[str] = []
+        has_ar_vec = False
+        has_ma_vec = False
+        for line in lines:
+            if re.match(r"^\s*real\(kind=dp\)\s*::\s*(?:ar|ma)\s*$", line, re.IGNORECASE):
+                continue
+            if re.match(r"^\s*real\(kind=dp\)\s*::\s*(?:ar\s*,\s*ma|ma\s*,\s*ar)\s*$", line, re.IGNORECASE):
+                continue
+            if re.search(r"\bar\s*\(:\)", line, re.IGNORECASE):
+                has_ar_vec = True
+            if re.search(r"\bma\s*\(:\)", line, re.IGNORECASE):
+                has_ma_vec = True
+            if re.match(r"^\s*end\s+type\b", line, re.IGNORECASE) and not (has_ar_vec and has_ma_vec):
+                out.append("   real(kind=dp), allocatable :: ar(:), ma(:)")
+            out.append(line)
+        return "\n".join(out)
+
+    f90 = re.sub(
+        r"(?ms)^type\s+::\s+fit_arma_t_result_t\b.*?^end\s+type\s+fit_arma_t_result_t\b.*?$",
+        _repair_result_type_block,
+        f90,
+    )
     f90 = f90.replace(
         "real(kind=dp) :: mu, ar, ma, sigma, nu, loglik",
         "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
     )
     f90 = f90.replace(
         "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp) :: ar, ma",
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp) :: ma\n   real(kind=dp) :: ar",
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp) :: ar\n   real(kind=dp) :: ma",
         "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
     )
     f90 = f90.replace(
@@ -32134,6 +32166,237 @@ def repair_xarma_t_file_main_text(f90: str) -> str:
         '& results_aic(best_bic), results_bic(best_bic), results_sigma(best_bic), results_nu(best_bic)',
     )
     return f90
+
+
+def repair_xarma_t_fit_main_text(f90: str) -> str:
+    if re.search(r"(?im)^\s*program\s+xarma_t_fit(?:_rank)?\b", f90) is None:
+        return f90
+    has_rank_cols = "results_loglik_rank" in f90 or "loglik_rank" in f90
+    f90 = re.sub(
+        r"integer,\s*allocatable\s*::\s*results_p\(:\),\s*results_q\(:\)\s*\n"
+        r"real\(kind=dp\),\s*allocatable\s*::\s*aic\(:\),\s*ar\(:\),\s*bic\(:\),\s*&\s*\n"
+        r"integer\s*::\s*best_aic,\s*best_bic\s*\n"
+        r"&\s*fit\(:\),\s*ma\(:\),\s*results\(:\),\s*results_2\(:\),\s*results_aic\(:\),\s*&\s*\n"
+        r"&\s*results_aic_rank\(:\),\s*results_ar1\(:\),\s*results_ar2\(:\),\s*results_ar3\(:\),\s*&\s*\n"
+        r"&\s*results_bic\(:\),\s*results_bic_rank\(:\),\s*results_loglik\(:\),\s*&\s*\n"
+        r"&\s*results_loglik_rank\(:\),\s*results_ma1\(:\),\s*results_ma2\(:\),\s*results_ma3\(:\),\s*&\s*\n"
+        r"&\s*results_nu\(:\),\s*results_sigma\(:\),\s*x\(:\)\s*\n"
+        r"real\(kind=dp\)\s*::\s*ar1,\s*ar2,\s*ar3,\s*ma1,\s*ma2,\s*ma3",
+        "integer, allocatable :: results_p(:), results_q(:), results_order(:)\n"
+        "integer :: best_aic, best_bic\n"
+        "type(fit_arma_t_result_t) :: fit\n"
+        "real(kind=dp) :: aic, bic, ar1, ar2, ar3, ma1, ma2, ma3\n"
+        "real(kind=dp), allocatable :: results_aic(:), results_aic_rank(:), &\n"
+        "& results_ar1(:), results_ar2(:), results_ar3(:), results_bic(:), &\n"
+        "& results_bic_rank(:), results_loglik(:), results_loglik_rank(:), &\n"
+        "& results_ma1(:), results_ma2(:), results_ma3(:), results_nu(:), &\n"
+        "& results_sigma(:), x(:)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"integer,\s*allocatable\s*::\s*results_p\(:\),\s*results_q\(:\)\s*\n"
+        r"real\(kind=dp\),\s*allocatable\s*::\s*aic\(:\),\s*ar\(:\),\s*bic\(:\),\s*&\s*\n"
+        r"integer\s*::\s*best_aic,\s*best_bic\s*\n"
+        r"&\s*fit\(:\),\s*ma\(:\),\s*results\(:\),\s*results_2\(:\),\s*results_aic\(:\),\s*results_ar1\(:\),\s*&\s*\n"
+        r"&\s*results_ar2\(:\),\s*results_ar3\(:\),\s*results_bic\(:\),\s*results_loglik\(:\),\s*&\s*\n"
+        r"&\s*results_ma1\(:\),\s*results_ma2\(:\),\s*results_ma3\(:\),\s*results_nu\(:\),\s*&\s*\n"
+        r"&\s*results_sigma\(:\),\s*x\(:\)\s*\n"
+        r"real\(kind=dp\)\s*::\s*ar1,\s*ar2,\s*ar3,\s*ma1,\s*ma2,\s*ma3",
+        "integer, allocatable :: results_p(:), results_q(:), results_order(:)\n"
+        "integer :: best_aic, best_bic\n"
+        "type(fit_arma_t_result_t) :: fit\n"
+        "real(kind=dp) :: aic, bic, ar1, ar2, ar3, ma1, ma2, ma3\n"
+        "real(kind=dp), allocatable :: results_aic(:), results_ar1(:), results_ar2(:), &\n"
+        "& results_ar3(:), results_bic(:), results_loglik(:), results_ma1(:), &\n"
+        "& results_ma2(:), results_ma3(:), results_nu(:), results_sigma(:), x(:)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"results_2\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[results,\s*data\.frame\s*\(\s*p\s*=\s*p,\s*q\s*=\s*q,\s*&\s*\n"
+        r"\s*&\s*loglik\s*=\s*fit%loglik,\s*&\s*\n"
+        r"\s*&\s*loglik_rank\s*=\s*ieee_value\(0\.0_dp,\s*ieee_quiet_nan\),\s*aic\s*=\s*aic,\s*&\s*\n"
+        r"\s*&\s*aic_rank\s*=\s*ieee_value\(0\.0_dp,\s*ieee_quiet_nan\),\s*bic\s*=\s*bic,\s*&\s*\n"
+        r"\s*&\s*bic_rank\s*=\s*ieee_value\(0\.0_dp,\s*ieee_quiet_nan\),\s*sigma\s*=\s*fit%sigma,\s*&\s*\n"
+        r"\s*&\s*nu\s*=\s*fit%nu,\s*ar1\s*=\s*ar1,\s*ar2\s*=\s*ar2,\s*ar3\s*=\s*ar3,\s*ma1\s*=\s*ma1,\s*ma2\s*=\s*ma2,\s*&\s*\n"
+        r"\s*&\s*ma3\s*=\s*ma3\)\],\s*\[size\(results\),\s*2\]\)\)",
+        "results_p = [results_p, p]\n"
+        "      results_q = [results_q, q]\n"
+        "      results_loglik = [results_loglik, fit%loglik]\n"
+        "      results_loglik_rank = [results_loglik_rank, ieee_value(0.0_dp, ieee_quiet_nan)]\n"
+        "      results_aic = [results_aic, aic]\n"
+        "      results_aic_rank = [results_aic_rank, ieee_value(0.0_dp, ieee_quiet_nan)]\n"
+        "      results_bic = [results_bic, bic]\n"
+        "      results_bic_rank = [results_bic_rank, ieee_value(0.0_dp, ieee_quiet_nan)]\n"
+        "      results_sigma = [results_sigma, fit%sigma]\n"
+        "      results_nu = [results_nu, fit%nu]\n"
+        "      results_ar1 = [results_ar1, ar1]\n"
+        "      results_ar2 = [results_ar2, ar2]\n"
+        "      results_ar3 = [results_ar3, ar3]\n"
+        "      results_ma1 = [results_ma1, ma1]\n"
+        "      results_ma2 = [results_ma2, ma2]\n"
+        "      results_ma3 = [results_ma3, ma3]",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"results_2\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[results,\s*data\.frame\s*\(\s*p\s*=\s*p,\s*q\s*=\s*q,\s*&\s*\n"
+        r"\s*&\s*loglik\s*=\s*fit%loglik,\s*aic\s*=\s*aic,\s*bic\s*=\s*bic,\s*sigma\s*=\s*fit%sigma,\s*&\s*\n"
+        r"\s*&\s*nu\s*=\s*fit%nu,\s*ar1\s*=\s*ar1,\s*ar2\s*=\s*ar2,\s*ar3\s*=\s*ar3,\s*ma1\s*=\s*ma1,\s*ma2\s*=\s*ma2,\s*&\s*\n"
+        r"\s*&\s*ma3\s*=\s*ma3\)\],\s*\[size\(results\),\s*2\]\)\)",
+        "results_p = [results_p, p]\n"
+        "      results_q = [results_q, q]\n"
+        "      results_loglik = [results_loglik, fit%loglik]\n"
+        "      results_aic = [results_aic, aic]\n"
+        "      results_bic = [results_bic, bic]\n"
+        "      results_sigma = [results_sigma, fit%sigma]\n"
+        "      results_nu = [results_nu, fit%nu]\n"
+        "      results_ar1 = [results_ar1, ar1]\n"
+        "      results_ar2 = [results_ar2, ar2]\n"
+        "      results_ar3 = [results_ar3, ar3]\n"
+        "      results_ma1 = [results_ma1, ma1]\n"
+        "      results_ma2 = [results_ma2, ma2]\n"
+        "      results_ma3 = [results_ma3, ma3]",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?m)^\s*results\s*=\s*results\(order_real\(results_aic\),\s*:\)\s*$",
+        "results_order = order_real(results_aic)",
+        f90,
+    )
+    f90 = re.sub(r"(?m)^(\s*)integer\s*::\s*i_df\s*$", r"\1integer :: i_df, idx_df", f90, count=1)
+    f90 = re.sub(
+        r"(?m)^(\s*)do\s+i_df\s*=\s*1,\s*size\(results_p\)\s*$",
+        r"\1do i_df = 1, size(results_p)\n\1   idx_df = results_order(i_df)",
+        f90,
+        count=1,
+    )
+    for name in [
+        "results_p", "results_q", "results_loglik", "results_aic", "results_bic",
+        "results_sigma", "results_nu", "results_ar1", "results_ar2", "results_ar3",
+        "results_ma1", "results_ma2", "results_ma3", "results_loglik_rank",
+        "results_aic_rank", "results_bic_rank",
+    ]:
+        f90 = f90.replace(f"{name}(i_df)", f"{name}(idx_df)")
+    f90 = re.sub(r"(?m)^\s*best_aic\s*=\s*results\(minloc\(results_aic,\s*dim=1\),\s*:\)\s*$", "best_aic = minloc(results_aic, dim=1)", f90)
+    f90 = re.sub(r"(?m)^\s*best_bic\s*=\s*results\(minloc\(results_bic,\s*dim=1\),\s*:\)\s*$", "best_bic = minloc(results_bic, dim=1)", f90)
+    f90 = f90.replace(
+        'write(*,"(/,g0)") "Best model by AIC: "\ncall print_real_vector(best_aic)',
+        'write(*,"(/,g0)") "Best model by AIC: "\n'
+        'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu", "ar1", &\n'
+        '& "ar2", "ar3", "ma1", "ma2", "ma3"\n'
+        'write(*,"(*(g0,1x))") results_p(best_aic), results_q(best_aic), results_loglik(best_aic), &\n'
+        '& results_aic(best_aic), results_bic(best_aic), results_sigma(best_aic), &\n'
+        '& results_nu(best_aic), results_ar1(best_aic), results_ar2(best_aic), &\n'
+        '& results_ar3(best_aic), results_ma1(best_aic), results_ma2(best_aic), results_ma3(best_aic)',
+    )
+    f90 = f90.replace(
+        'write(*,"(/,g0)") "Best model by BIC: "\ncall print_real_vector(best_bic)',
+        'write(*,"(/,g0)") "Best model by BIC: "\n'
+        'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu", "ar1", &\n'
+        '& "ar2", "ar3", "ma1", "ma2", "ma3"\n'
+        'write(*,"(*(g0,1x))") results_p(best_bic), results_q(best_bic), results_loglik(best_bic), &\n'
+        '& results_aic(best_bic), results_bic(best_bic), results_sigma(best_bic), &\n'
+        '& results_nu(best_bic), results_ar1(best_bic), results_ar2(best_bic), &\n'
+        '& results_ar3(best_bic), results_ma1(best_bic), results_ma2(best_bic), results_ma3(best_bic)',
+    )
+    if has_rank_cols:
+        no_rank_header = 'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu", "ar1", &\n& "ar2", "ar3", "ma1", "ma2", "ma3"'
+        rank_header = 'write(*,"(*(a,1x))") "p", "q", "loglik", "loglik_rank", "aic", "aic_rank", &\n& "bic", "bic_rank", "sigma", "nu", "ar1", "ar2", "ar3", "ma1", "ma2", "ma3"'
+        f90 = f90.replace(no_rank_header, rank_header)
+        f90 = re.sub(
+            r"write\(\*,\"\(\*\(g0,1x\)\)\"\)\s+results_p\(best_aic\),\s*results_q\(best_aic\),\s*results_loglik\(best_aic\),\s*&\s*\n"
+            r"&\s*results_aic\(best_aic\),\s*results_bic\(best_aic\),\s*results_sigma\(best_aic\),\s*&\s*\n"
+            r"&\s*results_nu\(best_aic\),\s*results_ar1\(best_aic\),\s*results_ar2\(best_aic\),\s*&\s*\n"
+            r"&\s*results_ar3\(best_aic\),\s*results_ma1\(best_aic\),\s*results_ma2\(best_aic\),\s*results_ma3\(best_aic\)",
+            "write(*,\"(*(g0,1x))\") results_p(best_aic), results_q(best_aic), results_loglik(best_aic), &\n"
+            "& results_loglik_rank(best_aic), results_aic(best_aic), results_aic_rank(best_aic), &\n"
+            "& results_bic(best_aic), results_bic_rank(best_aic), results_sigma(best_aic), &\n"
+            "& results_nu(best_aic), results_ar1(best_aic), results_ar2(best_aic), &\n"
+            "& results_ar3(best_aic), results_ma1(best_aic), results_ma2(best_aic), results_ma3(best_aic)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"write\(\*,\"\(\*\(g0,1x\)\)\"\)\s+results_p\(best_bic\),\s*results_q\(best_bic\),\s*results_loglik\(best_bic\),\s*&\s*\n"
+            r"&\s*results_aic\(best_bic\),\s*results_bic\(best_bic\),\s*results_sigma\(best_bic\),\s*&\s*\n"
+            r"&\s*results_nu\(best_bic\),\s*results_ar1\(best_bic\),\s*results_ar2\(best_bic\),\s*&\s*\n"
+            r"&\s*results_ar3\(best_bic\),\s*results_ma1\(best_bic\),\s*results_ma2\(best_bic\),\s*results_ma3\(best_bic\)",
+            "write(*,\"(*(g0,1x))\") results_p(best_bic), results_q(best_bic), results_loglik(best_bic), &\n"
+            "& results_loglik_rank(best_bic), results_aic(best_bic), results_aic_rank(best_bic), &\n"
+            "& results_bic(best_bic), results_bic_rank(best_bic), results_sigma(best_bic), &\n"
+            "& results_nu(best_bic), results_ar1(best_bic), results_ar2(best_bic), &\n"
+            "& results_ar3(best_bic), results_ma1(best_bic), results_ma2(best_bic), results_ma3(best_bic)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        for idx_name in ["idx_df", "best_aic", "best_bic"]:
+            f90 = f90.replace(
+                f"results_loglik_rank({idx_name})",
+                f"int(results_loglik_rank({idx_name}))",
+            )
+            f90 = f90.replace(
+                f"results_aic_rank({idx_name})",
+                f"int(results_aic_rank({idx_name}))",
+            )
+            f90 = f90.replace(
+                f"results_bic_rank({idx_name})",
+                f"int(results_bic_rank({idx_name}))",
+            )
+    return f90
+
+
+def format_integerish_expanded_dataframe_prints_text(f90: str) -> str:
+    """Print integer-like expanded data-frame columns without real decimals.
+
+    Expanded data.frames are represented as parallel arrays such as
+    `results_p`, `results_aic`, `results_aic_rank`.  Some columns are stored as
+    real because R data.frame/rank semantics are numeric, but R prints common
+    integer-like columns (orders, ranks without ties, row numbers) without a
+    decimal point.  Apply the conversion only in WRITE statements, leaving the
+    stored values and calculations unchanged.
+    """
+    integerish: set[str] = set()
+    for m in re.finditer(
+        r"(?im)^\s*integer(?:\([^)]*\))?\s*,\s*allocatable\s*::\s*([^\n]+)$",
+        f90,
+    ):
+        for part in split_top_level_commas(m.group(1).replace("&", " ")):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", part.strip())
+            if mm is not None:
+                integerish.add(mm.group(1))
+    for m in re.finditer(
+        r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(?:order(?:_real|_int)?|which|rank_average|rank_first|r_seq_(?:len|int))\s*\(",
+        f90,
+    ):
+        integerish.add(m.group(1))
+    for m in re.finditer(r"\b([A-Za-z]\w*_(?:rank|order|idx|index|row|col|count|n))\s*\(", f90):
+        integerish.add(m.group(1))
+    if not integerish:
+        return f90
+
+    name_alt = "|".join(sorted((re.escape(n) for n in integerish), key=len, reverse=True))
+    if not name_alt:
+        return f90
+    call_re = re.compile(rf"(?<!\bint\()(?<![A-Za-z0-9_])({name_alt})\s*\(\s*([A-Za-z]\w*)\s*\)")
+
+    out: list[str] = []
+    in_write = False
+    for line in f90.splitlines():
+        stripped = line.strip()
+        is_write_line = bool(re.match(r"^write\s*\(", stripped, re.IGNORECASE))
+        if is_write_line:
+            in_write = True
+        if in_write:
+            line = call_re.sub(r"int(\1(\2))", line)
+        out.append(line)
+        if in_write and not line.rstrip().endswith("&"):
+            in_write = False
+        elif in_write and stripped.startswith("&") and not line.rstrip().endswith("&"):
+            in_write = False
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def protect_rep_helper_calls(lines: list[str], *, restore: bool = False) -> list[str]:
@@ -41272,6 +41535,8 @@ def main() -> int:
     f90 = "\n".join(rewrite_two_column_dataframe_vector_prints(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = repair_fit_arma_t_vector_fields_text(f90)
     f90 = repair_xarma_t_file_main_text(f90)
+    f90 = repair_xarma_t_fit_main_text(f90)
+    f90 = format_integerish_expanded_dataframe_prints_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
