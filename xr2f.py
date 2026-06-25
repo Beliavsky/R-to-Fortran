@@ -13047,7 +13047,7 @@ def r_expr_to_fortran(expr: str) -> str:
         df_src_rt = kw_rt.get("df", pos_rt[1] if len(pos_rt) >= 2 else "1.0")
         n_f_rt = _strict_int_count_expr(r_expr_to_fortran(n_src_rt))
         df_f_rt = r_expr_to_fortran(df_src_rt)
-        return f"(rnorm_vec({n_f_rt}) / sqrt(qchisq(runif_vec({n_f_rt}), real({df_f_rt}, kind=dp)) / real({df_f_rt}, kind=dp)))"
+        return f"rt_vec({n_f_rt}, real({df_f_rt}, kind=dp))"
     s = _replace_balanced_func_calls(s, "rt", _rt_to_fortran)
     def _is_null_to_fortran(inner: str) -> str:
         txt = inner.strip()
@@ -18789,7 +18789,10 @@ def emit_stmts(
                 data_rank = _expr_rank_for_print(data_f)
                 data_arg = data_f
                 if data_rank == 1 or re.search(r"%\s*(?:x|z|loglik|pi|mu|sigma)\b", data_f):
-                    data_arg = f"reshape({data_f}, [size({data_f}), 1])"
+                    o.w(f"call write_table_real_vector({file_f}, {data_arg})")
+                    if helper_ctx is not None:
+                        helper_ctx["need_table_writer"] = True
+                    continue
                 matrix_labels_map = helper_ctx.get("matrix_col_labels") if helper_ctx is not None else None
                 labels = None
                 if isinstance(matrix_labels_map, dict) and re.fullmatch(r"[A-Za-z]\w*", data_src.strip()):
@@ -28543,6 +28546,21 @@ def transpile_r_to_fortran(
         mprocs.w("close(fp)")
         mprocs.w("end subroutine write_table_real_matrix")
         mprocs.w("")
+        mprocs.w("subroutine write_table_real_vector(file_path, x, name)")
+        mprocs.w("character(len=*), intent(in) :: file_path")
+        mprocs.w("real(kind=dp), intent(in) :: x(:)")
+        mprocs.w("character(len=*), intent(in), optional :: name")
+        mprocs.w("integer :: fp, i")
+        mprocs.w('open(newunit=fp, file=file_path, status="replace", action="write")')
+        mprocs.w("if (present(name)) write(fp, '(a)') trim(name)")
+        mprocs.w("do i = 1, size(x)")
+        mprocs.push()
+        mprocs.w("write(fp, *) x(i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("close(fp)")
+        mprocs.w("end subroutine write_table_real_vector")
+        mprocs.w("")
     emit_local_lm = (bool(helper_ctx_main.get("need_lm")) or bool(helper_ctx_mod.get("need_lm"))) and (not has_r_mod_main)
     if emit_local_lm:
         mprocs.w("subroutine print_lm_coef_rstyle(fit, term_names)")
@@ -29899,6 +29917,8 @@ def transpile_r_to_fortran(
         "read_csv_real_matrix",
         "read_csv_header_names",
         "write_table_real_matrix",
+        "write_table_real_vector",
+        "rt_vec",
         "lm_fit_general",
         "lm_r_squared_general",
         "lm_predict_general",
