@@ -16017,6 +16017,9 @@ def emit_stmts(
                     terms = x_terms
                 else:
                     terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
+                intercept_only_lm = len(terms) == 1 and terms[0].strip() == "1"
+                if intercept_only_lm:
+                    terms = []
                 offset_terms: list[str] = []
                 if is_glm:
                     kept_terms: list[str] = []
@@ -16027,10 +16030,14 @@ def emit_stmts(
                         else:
                             kept_terms.append(term)
                     terms = kept_terms
-                if not terms:
+                if not terms and not intercept_only_lm:
                     raise NotImplementedError("lm/glm formula requires at least one predictor")
-                term_labels, term_exprs, first_src = _lm_design_columns(terms, data_name)
-                anova_labels, anova_dfs = _lm_anova_groups(terms, data_name)
+                if intercept_only_lm:
+                    term_labels, term_exprs, first_src = [], [], ""
+                    anova_labels, anova_dfs = [], []
+                else:
+                    term_labels, term_exprs, first_src = _lm_design_columns(terms, data_name)
+                    anova_labels, anova_dfs = _lm_anova_groups(terms, data_name)
                 lm_terms_by_fit[st.name] = term_labels
                 lm_anova_terms_by_fit[st.name] = anova_labels
                 lm_anova_dfs_by_fit[st.name] = anova_dfs
@@ -16041,7 +16048,7 @@ def emit_stmts(
                     glm_terms_by_fit[st.name] = term_labels
                     _FIT_TERM_LABELS[st.name.lower()] = term_labels
                 lm_design_exprs_by_fit[st.name] = term_exprs
-                lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src)
+                lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src) if first_src else ""
                 p = len(term_exprs)
                 single_matrix_term = len(terms) == 1 and (
                     _expr_rank_for_print(terms[0]) == 2
