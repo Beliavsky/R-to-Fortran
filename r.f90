@@ -8,12 +8,12 @@ use, intrinsic :: iso_c_binding, only: c_double, c_int
 #endif
 implicit none
 private
-public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, random_choice2_prob, &
+public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, rpois, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -493,6 +493,272 @@ interface qchisq
    module procedure qchisq_vec
 end interface qchisq
 
+interface qnorm
+   module procedure qnorm_scalar
+   module procedure qnorm_vec
+end interface qnorm
+
+interface ppois
+   module procedure ppois_scalar
+   module procedure ppois_vec
+end interface ppois
+
+interface qpois
+   module procedure qpois_scalar
+   module procedure qpois_vec
+end interface qpois
+
+interface dunif
+   module procedure dunif_scalar
+   module procedure dunif_vec
+end interface dunif
+
+interface punif
+   module procedure punif_scalar
+   module procedure punif_vec
+end interface punif
+
+interface qunif
+   module procedure qunif_scalar
+   module procedure qunif_vec
+end interface qunif
+
+interface dexp
+   module procedure dexp_scalar
+   module procedure dexp_vec
+end interface dexp
+
+interface pexp
+   module procedure pexp_scalar
+   module procedure pexp_vec
+end interface pexp
+
+interface qexp
+   module procedure qexp_scalar
+   module procedure qexp_vec
+end interface qexp
+
+interface dgamma
+   module procedure dgamma_scalar
+   module procedure dgamma_vec
+end interface dgamma
+
+interface pgamma
+   module procedure pgamma_scalar
+   module procedure pgamma_vec
+end interface pgamma
+
+interface qgamma
+   module procedure qgamma_scalar
+   module procedure qgamma_vec
+end interface qgamma
+
+interface dbeta
+   module procedure dbeta_scalar
+   module procedure dbeta_vec
+end interface dbeta
+
+interface pbeta
+   module procedure pbeta_scalar
+   module procedure pbeta_vec
+end interface pbeta
+
+interface qbeta
+   module procedure qbeta_scalar
+   module procedure qbeta_vec
+end interface qbeta
+
+interface dchisq
+   module procedure dchisq_scalar
+   module procedure dchisq_vec
+end interface dchisq
+
+interface dt
+   module procedure dt_scalar
+   module procedure dt_vec
+end interface dt
+
+interface pt
+   module procedure pt_scalar
+   module procedure pt_vec
+end interface pt
+
+interface qt
+   module procedure qt_scalar
+   module procedure qt_vec
+end interface qt
+
+interface df
+   module procedure df_scalar
+   module procedure df_vec
+end interface df
+
+interface pf
+   module procedure pf_scalar
+   module procedure pf_vec
+end interface pf
+
+interface qf
+   module procedure qf_scalar
+   module procedure qf_vec
+end interface qf
+
+interface dlogis
+   module procedure dlogis_scalar
+   module procedure dlogis_vec
+end interface dlogis
+
+interface plogis
+   module procedure plogis_scalar
+   module procedure plogis_vec
+end interface plogis
+
+interface qlogis
+   module procedure qlogis_scalar
+   module procedure qlogis_vec
+end interface qlogis
+
+interface dlnorm
+   module procedure dlnorm_scalar
+   module procedure dlnorm_vec
+end interface dlnorm
+
+interface plnorm
+   module procedure plnorm_scalar
+   module procedure plnorm_vec
+end interface plnorm
+
+interface qlnorm
+   module procedure qlnorm_scalar
+   module procedure qlnorm_vec
+end interface qlnorm
+
+interface dweibull
+   module procedure dweibull_scalar
+   module procedure dweibull_vec
+end interface dweibull
+
+interface pweibull
+   module procedure pweibull_scalar
+   module procedure pweibull_vec
+end interface pweibull
+
+interface qweibull
+   module procedure qweibull_scalar
+   module procedure qweibull_vec
+end interface qweibull
+
+interface dcauchy
+   module procedure dcauchy_scalar
+   module procedure dcauchy_vec
+end interface dcauchy
+
+interface pcauchy
+   module procedure pcauchy_scalar
+   module procedure pcauchy_vec
+end interface pcauchy
+
+interface qcauchy
+   module procedure qcauchy_scalar
+   module procedure qcauchy_vec
+end interface qcauchy
+
+interface dbinom
+   module procedure dbinom_scalar
+   module procedure dbinom_vec
+end interface dbinom
+
+interface pbinom
+   module procedure pbinom_scalar
+   module procedure pbinom_vec
+end interface pbinom
+
+interface qbinom
+   module procedure qbinom_scalar
+   module procedure qbinom_vec
+end interface qbinom
+
+interface dpois
+   module procedure dpois_scalar
+   module procedure dpois_vec
+end interface dpois
+
+interface dgeom
+   module procedure dgeom_scalar
+   module procedure dgeom_vec
+end interface dgeom
+
+interface pgeom
+   module procedure pgeom_scalar
+   module procedure pgeom_vec
+end interface pgeom
+
+interface qgeom
+   module procedure qgeom_scalar
+   module procedure qgeom_vec
+end interface qgeom
+
+interface dnbinom
+   module procedure dnbinom_scalar
+   module procedure dnbinom_vec
+end interface dnbinom
+
+interface pnbinom
+   module procedure pnbinom_scalar
+   module procedure pnbinom_vec
+end interface pnbinom
+
+interface qnbinom
+   module procedure qnbinom_scalar
+   module procedure qnbinom_vec
+end interface qnbinom
+
+interface dhyper
+   module procedure dhyper_scalar
+   module procedure dhyper_vec
+end interface dhyper
+
+interface phyper
+   module procedure phyper_scalar
+   module procedure phyper_vec
+end interface phyper
+
+interface qhyper
+   module procedure qhyper_scalar
+   module procedure qhyper_vec
+end interface qhyper
+
+interface dwilcox
+   module procedure dwilcox_scalar
+   module procedure dwilcox_vec
+end interface dwilcox
+
+interface pwilcox
+   module procedure pwilcox_scalar
+   module procedure pwilcox_vec
+end interface pwilcox
+
+interface qwilcox
+   module procedure qwilcox_scalar
+   module procedure qwilcox_vec
+end interface qwilcox
+
+interface dsignrank
+   module procedure dsignrank_scalar
+   module procedure dsignrank_vec
+end interface dsignrank
+
+interface psignrank
+   module procedure psignrank_scalar
+   module procedure psignrank_vec
+end interface psignrank
+
+interface qsignrank
+   module procedure qsignrank_scalar
+   module procedure qsignrank_vec
+end interface qsignrank
+
+
 interface glm_binomial_fit
    module procedure glm_binomial_fit_real
    module procedure glm_binomial_fit_int
@@ -875,6 +1141,7 @@ end interface dist
 interface arima_sim
    module procedure arima_sim_scalar
    module procedure arima_sim_vector
+   module procedure arima_sim_vector_vector
 end interface arima_sim
 
 interface acf
@@ -4173,6 +4440,22 @@ end do
 #endif
 end function rnorm_vec
 
+function rt_vec(n, df) result(x)
+! Return a length-n vector of Student t variates with df degrees of freedom.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: df
+real(kind=dp), allocatable :: x(:)
+real(kind=dp), allocatable :: z(:), u(:), chi(:)
+if (n <= 0) then
+   allocate(x(0))
+   return
+end if
+z = rnorm_vec(n)
+u = runif_vec(n)
+chi = qchisq(u, df)
+x = z / sqrt(chi / df)
+end function rt_vec
+
 function rnorm_mat(nrow, ncol) result(x)
 ! Return an nrow-by-ncol matrix of N(0,1) variates.
 integer, intent(in) :: nrow, ncol
@@ -5795,6 +6078,30 @@ do i = 1, n
    end do
 end do
 end function arima_sim_vector
+
+function arima_sim_vector_vector(ar, ma, n) result(x)
+! Compute R-like ARMA simulation with vector AR and MA coefficients.
+real(kind=dp), intent(in) :: ar(:) ! autoregressive coefficients
+real(kind=dp), intent(in) :: ma(:) ! moving-average coefficients
+integer, intent(in) :: n
+real(kind=dp), allocatable :: x(:)
+real(kind=dp), allocatable :: z(:)
+integer :: i, j, p, q
+allocate(x(max(0, n)), source=0.0_dp)
+if (n <= 0) return
+p = size(ar)
+q = size(ma)
+z = rnorm_vec(n + q)
+do i = 1, n
+   x(i) = z(i + q)
+   do j = 1, min(q, i - 1)
+      x(i) = x(i) + ma(j) * z(i + q - j)
+   end do
+   do j = 1, min(p, i - 1)
+      x(i) = x(i) + ar(j) * x(i - j)
+   end do
+end do
+end function arima_sim_vector_vector
 
 function arima_fit(x, order, include_mean) result(fit)
 ! Compute R-like time-series helper arima_fit.
@@ -10443,6 +10750,20 @@ end do
 close(fp)
 end subroutine write_table_real_matrix
 
+subroutine write_table_real_vector(file_path, x, name)
+! Write a numeric vector as a one-column whitespace-delimited table.
+character(len=*), intent(in) :: file_path ! output file path
+real(kind=dp), intent(in) :: x(:) ! vector to write
+character(len=*), intent(in), optional :: name ! optional column name
+integer :: fp, i
+open(newunit=fp, file=file_path, status="replace", action="write")
+if (present(name)) write(fp, '(a)') trim(name)
+do i = 1, size(x)
+   write(fp, *) x(i)
+end do
+close(fp)
+end subroutine write_table_real_vector
+
 subroutine print_matrix_real(x, int_like)
 ! Print a real matrix row-by-row; use integer format when all values are integer-like.
 real(kind=dp), intent(in) :: x(:,:) ! matrix to print
@@ -11883,7 +12204,7 @@ p = 1.0_dp - chisq_upper_tail_approx(x, df)
 p = max(0.0_dp, min(1.0_dp, p))
 end function pchisq_scalar
 
-pure function qnorm(pv, mean, sd, lower_tail) result(out)
+pure function qnorm_vec(pv, mean, sd, lower_tail) result(out)
 ! Approximate normal quantiles by bisection.
 ! Defaults: mean=0, sd=1, lower_tail=.true.
 real(kind=dp), intent(in) :: pv(:) ! probabilities, clamped to [0,1]
@@ -11922,9 +12243,9 @@ do i = 1, size(pv)
       out(i) = mu + sig * 0.5_dp * (lo + hi)
    end if
 end do
-end function qnorm
+end function qnorm_vec
 
-pure function ppois(q, lambda, lower_tail) result(out)
+pure function ppois_vec(q, lambda, lower_tail) result(out)
 ! Lower-tail Poisson CDF for vector q.
 ! Defaults: lambda=1, lower_tail=.true.
 real(kind=dp), intent(in) :: q(:) ! quantiles
@@ -11956,9 +12277,9 @@ do i = 1, size(q)
       out(i) = merge(cdf, 1.0_dp - cdf, lower)
    end if
 end do
-end function ppois
+end function ppois_vec
 
-pure function qpois(pv, lambda, lower_tail) result(out)
+pure function qpois_vec(pv, lambda, lower_tail) result(out)
 ! Poisson quantiles as real values for matrix/vector composition.
 ! Defaults: lambda=1, lower_tail=.true.
 real(kind=dp), intent(in) :: pv(:) ! probabilities, clamped to [0,1]
@@ -11990,7 +12311,7 @@ do i = 1, size(pv)
       out(i) = real(k, kind=dp)
    end if
 end do
-end function qpois
+end function qpois_vec
 
 pure elemental function r_choose_real(n, k) result(out)
 ! Runtime helper for R-compatible r choose real.
@@ -12050,7 +12371,7 @@ end if
 gp = max(0.0_dp, min(1.0_dp, gp))
 end function gamma_p
 
-pure function dunif(x, min, max) result(out)
+pure function dunif_vec(x, min, max) result(out)
 ! Evaluate distribution helper dunif.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: min, max
@@ -12062,9 +12383,9 @@ if (present(max)) hi = max
 allocate(out(size(x)))
 out = 0.0_dp
 if (hi > lo) where (x >= lo .and. x <= hi) out = 1.0_dp / (hi - lo)
-end function dunif
+end function dunif_vec
 
-pure function punif(x, min, max) result(out)
+pure function punif_vec(x, min, max) result(out)
 ! Evaluate distribution helper punif.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: min, max
@@ -12081,9 +12402,9 @@ else
    where (out < 0.0_dp) out = 0.0_dp
    where (out > 1.0_dp) out = 1.0_dp
 end if
-end function punif
+end function punif_vec
 
-pure function qunif(p, min, max) result(out)
+pure function qunif_vec(p, min, max) result(out)
 ! Evaluate distribution helper qunif.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: min, max
@@ -12097,9 +12418,9 @@ out = p
 where (out < 0.0_dp) out = 0.0_dp
 where (out > 1.0_dp) out = 1.0_dp
 out = lo + out * (hi - lo)
-end function qunif
+end function qunif_vec
 
-pure function dexp(x, rate, log_) result(out)
+pure function dexp_vec(x, rate, log_) result(out)
 ! Evaluate distribution helper dexp.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: rate ! rate parameter
@@ -12115,9 +12436,9 @@ if (l) then
 else
    out = merge(r * exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
 end if
-end function dexp
+end function dexp_vec
 
-pure function pexp(x, rate) result(out)
+pure function pexp_vec(x, rate) result(out)
 ! Evaluate distribution helper pexp.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: rate
@@ -12126,9 +12447,9 @@ real(kind=dp) :: r
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(x)))
 out = merge(1.0_dp - exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
-end function pexp
+end function pexp_vec
 
-pure function qexp(p, rate) result(out)
+pure function qexp_vec(p, rate) result(out)
 ! Evaluate distribution helper qexp.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: rate
@@ -12137,9 +12458,9 @@ real(kind=dp) :: r
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(p)))
 out = -log(max(0.0_dp, 1.0_dp - max(0.0_dp, min(1.0_dp, p)))) / r
-end function qexp
+end function qexp_vec
 
-pure function dgamma(x, shape, rate) result(out)
+pure function dgamma_vec(x, shape, rate) result(out)
 ! Evaluate distribution helper dgamma.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12154,9 +12475,9 @@ else
    logc = shape * log(r) - log_gamma(shape)
    out = merge(exp(logc + (shape - 1.0_dp) * log(max(x, tiny(1.0_dp))) - r * x), 0.0_dp, x >= 0.0_dp)
 end if
-end function dgamma
+end function dgamma_vec
 
-pure function pgamma(x, shape, rate) result(out)
+pure function pgamma_vec(x, shape, rate) result(out)
 ! Evaluate distribution helper pgamma.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12169,9 +12490,9 @@ allocate(out(size(x)))
 do i = 1, size(x)
    out(i) = merge(gamma_p(shape, r * x(i)), 0.0_dp, x(i) >= 0.0_dp .and. shape > 0.0_dp .and. r > 0.0_dp)
 end do
-end function pgamma
+end function pgamma_vec
 
-pure function qgamma(p, shape, rate) result(out)
+pure function qgamma_vec(p, shape, rate) result(out)
 ! Evaluate distribution helper qgamma.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12194,9 +12515,9 @@ do i = 1, size(p)
    end do
    out(i) = 0.5_dp * (lo + hi)
 end do
-end function qgamma
+end function qgamma_vec
 
-pure function dbeta(x, shape1, shape2) result(out)
+pure function dbeta_vec(x, shape1, shape2) result(out)
 ! Evaluate distribution helper dbeta.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: shape1 ! first shape parameter
@@ -12206,9 +12527,9 @@ real(kind=dp) :: logc
 allocate(out(size(x)))
 logc = log_gamma(shape1 + shape2) - log_gamma(shape1) - log_gamma(shape2)
 out = merge(exp(logc + (shape1 - 1.0_dp) * log(max(x, tiny(1.0_dp))) + (shape2 - 1.0_dp) * log(max(1.0_dp - x, tiny(1.0_dp)))), 0.0_dp, x > 0.0_dp .and. x < 1.0_dp)
-end function dbeta
+end function dbeta_vec
 
-pure function pbeta(x, shape1, shape2) result(out)
+pure function pbeta_vec(x, shape1, shape2) result(out)
 ! Evaluate distribution helper pbeta.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: shape1 ! first shape parameter
@@ -12219,9 +12540,9 @@ allocate(out(size(x)))
 do i = 1, size(x)
    out(i) = merge(0.0_dp, merge(1.0_dp, regularized_beta(x(i), shape1, shape2), x(i) >= 1.0_dp), x(i) <= 0.0_dp)
 end do
-end function pbeta
+end function pbeta_vec
 
-pure function qbeta(p, shape1, shape2) result(out)
+pure function qbeta_vec(p, shape1, shape2) result(out)
 ! Evaluate distribution helper qbeta.
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: shape1 ! first shape parameter
@@ -12239,15 +12560,15 @@ do i = 1, size(p)
    end do
    out(i) = 0.5_dp * (lo + hi)
 end do
-end function qbeta
+end function qbeta_vec
 
-pure function dchisq(x, df) result(out)
+pure function dchisq_vec(x, df) result(out)
 ! Evaluate distribution helper dchisq.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df ! degrees of freedom
 real(kind=dp), allocatable :: out(:)
 out = dgamma(x, 0.5_dp * df, rate=0.5_dp)
-end function dchisq
+end function dchisq_vec
 
 pure function pchisq_vec(x, df) result(out)
 ! Evaluate distribution helper pchisq_vec.
@@ -12283,18 +12604,22 @@ real(kind=dp) :: out
 out = qchisq_scalar(p, real(df, kind=dp))
 end function qchisq_scalar_i
 
-pure function dt(x, df) result(out)
+pure function dt_vec(x, df, log_) result(out)
 ! Evaluate distribution helper dt.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df ! degrees of freedom
+logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: logc
+logical :: l
 allocate(out(size(x)))
+l = .false.; if (present(log_)) l = log_
 logc = log_gamma(0.5_dp * (df + 1.0_dp)) - log_gamma(0.5_dp * df) - 0.5_dp * log(df * acos(-1.0_dp))
 out = exp(logc - 0.5_dp * (df + 1.0_dp) * log(1.0_dp + x * x / df))
-end function dt
+if (l) out = log(max(tiny(1.0_dp), out))
+end function dt_vec
 
-pure function pt(x, df) result(out)
+pure function pt_vec(x, df) result(out)
 ! Evaluate distribution helper pt.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df ! degrees of freedom
@@ -12310,9 +12635,9 @@ do i = 1, size(x)
       out(i) = 0.5_dp * regularized_beta(z, 0.5_dp * df, 0.5_dp)
    end if
 end do
-end function pt
+end function pt_vec
 
-pure function qt(p, df) result(out)
+pure function qt_vec(p, df) result(out)
 ! Evaluate distribution helper qt.
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: df ! degrees of freedom
@@ -12330,9 +12655,9 @@ do i = 1, size(p)
    end do
    out(i) = 0.5_dp * (lo + hi)
 end do
-end function qt
+end function qt_vec
 
-pure function df(x, df1, df2) result(out)
+pure function df_vec(x, df1, df2) result(out)
 ! Evaluate distribution helper df.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
@@ -12343,9 +12668,9 @@ allocate(out(size(x)))
 a = 0.5_dp * df1; b = 0.5_dp * df2
 logc = a * log(df1 / df2) - (log_gamma(a) + log_gamma(b) - log_gamma(a + b))
 out = merge(exp(logc + (a - 1.0_dp) * log(max(x, tiny(1.0_dp))) - (a + b) * log(1.0_dp + (df1 / df2) * x)), 0.0_dp, x > 0.0_dp)
-end function df
+end function df_vec
 
-pure function pf(x, df1, df2) result(out)
+pure function pf_vec(x, df1, df2) result(out)
 ! Evaluate distribution helper pf.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
@@ -12362,9 +12687,9 @@ do i = 1, size(x)
       out(i) = regularized_beta(z, 0.5_dp * df1, 0.5_dp * df2)
    end if
 end do
-end function pf
+end function pf_vec
 
-pure function qf(p, df1, df2) result(out)
+pure function qf_vec(p, df1, df2) result(out)
 ! Evaluate distribution helper qf.
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
@@ -12388,9 +12713,9 @@ do i = 1, size(p)
    end do
    out(i) = 0.5_dp * (lo + hi)
 end do
-end function qf
+end function qf_vec
 
-pure function dlogis(x, location, scale) result(out)
+pure function dlogis_vec(x, location, scale) result(out)
 ! Evaluate distribution helper dlogis.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12403,9 +12728,9 @@ if (present(scale)) sc = scale
 allocate(out(size(x)))
 z = (x - loc) / sc; ez = exp(-z)
 out = ez / (sc * (1.0_dp + ez)**2)
-end function dlogis
+end function dlogis_vec
 
-pure function plogis(x, location, scale) result(out)
+pure function plogis_vec(x, location, scale) result(out)
 ! Evaluate distribution helper plogis.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12417,9 +12742,9 @@ if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
 out = 1.0_dp / (1.0_dp + exp(-((x - loc) / sc)))
-end function plogis
+end function plogis_vec
 
-pure function qlogis(p, location, scale) result(out)
+pure function qlogis_vec(p, location, scale) result(out)
 ! Evaluate distribution helper qlogis.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12432,9 +12757,9 @@ if (present(scale)) sc = scale
 allocate(out(size(p)))
 pp = max(tiny(1.0_dp), min(1.0_dp - epsilon(1.0_dp), p))
 out = loc + sc * log(pp / (1.0_dp - pp))
-end function qlogis
+end function qlogis_vec
 
-pure function dlnorm(x, meanlog, sdlog) result(out)
+pure function dlnorm_vec(x, meanlog, sdlog) result(out)
 ! Evaluate distribution helper dlnorm.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
@@ -12446,9 +12771,9 @@ if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
 allocate(out(size(x)))
 out = merge(exp(-log(x * sig * sqrt(2.0_dp * acos(-1.0_dp))) - 0.5_dp * ((log(x) - mu) / sig)**2), 0.0_dp, x > 0.0_dp)
-end function dlnorm
+end function dlnorm_vec
 
-pure function plnorm(x, meanlog, sdlog) result(out)
+pure function plnorm_vec(x, meanlog, sdlog) result(out)
 ! Evaluate distribution helper plnorm.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
@@ -12460,9 +12785,9 @@ if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
 allocate(out(size(x)))
 out = merge(normal_cdf((log(x) - mu) / sig), 0.0_dp, x > 0.0_dp)
-end function plnorm
+end function plnorm_vec
 
-pure function qlnorm(p, meanlog, sdlog) result(out)
+pure function qlnorm_vec(p, meanlog, sdlog) result(out)
 ! Evaluate distribution helper qlnorm.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
@@ -12473,9 +12798,9 @@ mu = 0.0_dp; sig = 1.0_dp
 if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
 out = exp(qnorm(p, mean=mu, sd=sig))
-end function qlnorm
+end function qlnorm_vec
 
-pure function dweibull(x, shape, scale) result(out)
+pure function dweibull_vec(x, shape, scale) result(out)
 ! Evaluate distribution helper dweibull.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12485,9 +12810,9 @@ real(kind=dp) :: sc
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(x)))
 out = merge((shape / sc) * (x / sc)**(shape - 1.0_dp) * exp(-(x / sc)**shape), 0.0_dp, x >= 0.0_dp)
-end function dweibull
+end function dweibull_vec
 
-pure function pweibull(x, shape, scale) result(out)
+pure function pweibull_vec(x, shape, scale) result(out)
 ! Evaluate distribution helper pweibull.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12497,9 +12822,9 @@ real(kind=dp) :: sc
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(x)))
 out = merge(1.0_dp - exp(-(x / sc)**shape), 0.0_dp, x >= 0.0_dp)
-end function pweibull
+end function pweibull_vec
 
-pure function qweibull(p, shape, scale) result(out)
+pure function qweibull_vec(p, shape, scale) result(out)
 ! Evaluate distribution helper qweibull.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in) :: shape ! shape parameter
@@ -12509,9 +12834,9 @@ real(kind=dp) :: sc
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(p)))
 out = sc * (-log(max(tiny(1.0_dp), 1.0_dp - max(0.0_dp, min(1.0_dp, p)))))**(1.0_dp / shape)
-end function qweibull
+end function qweibull_vec
 
-pure function dcauchy(x, location, scale) result(out)
+pure function dcauchy_vec(x, location, scale) result(out)
 ! Evaluate distribution helper dcauchy.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12524,9 +12849,9 @@ if (present(scale)) sc = scale
 allocate(out(size(x)))
 z = (x - loc) / sc
 out = 1.0_dp / (acos(-1.0_dp) * sc * (1.0_dp + z * z))
-end function dcauchy
+end function dcauchy_vec
 
-pure function pcauchy(x, location, scale) result(out)
+pure function pcauchy_vec(x, location, scale) result(out)
 ! Evaluate distribution helper pcauchy.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12538,9 +12863,9 @@ if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
 out = 0.5_dp + atan((x - loc) / sc) / acos(-1.0_dp)
-end function pcauchy
+end function pcauchy_vec
 
-pure function qcauchy(p, location, scale) result(out)
+pure function qcauchy_vec(p, location, scale) result(out)
 ! Evaluate distribution helper qcauchy.
 real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: location ! location parameter
@@ -12552,9 +12877,9 @@ if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(p)))
 out = loc + sc * tan(acos(-1.0_dp) * (p - 0.5_dp))
-end function qcauchy
+end function qcauchy_vec
 
-pure function dbinom(x, nsize, prob) result(out)
+pure function dbinom_vec(x, nsize, prob) result(out)
 ! Evaluate distribution helper dbinom.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nsize ! input value
@@ -12570,9 +12895,9 @@ do i = 1, size(x)
       out(i) = r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * prob**k * (1.0_dp - prob)**(nsize - k)
    end if
 end do
-end function dbinom
+end function dbinom_vec
 
-pure function pbinom(x, nsize, prob) result(out)
+pure function pbinom_vec(x, nsize, prob) result(out)
 ! Evaluate distribution helper pbinom.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nsize ! input value
@@ -12586,9 +12911,9 @@ do i = 1, size(x)
       out(i) = out(i) + r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * prob**k * (1.0_dp - prob)**(nsize - k)
    end do
 end do
-end function pbinom
+end function pbinom_vec
 
-pure function qbinom(p, nsize, prob) result(out)
+pure function qbinom_vec(p, nsize, prob) result(out)
 ! Evaluate distribution helper qbinom.
 real(kind=dp), intent(in) :: p(:) ! probability value
 integer, intent(in) :: nsize ! input value
@@ -12605,9 +12930,9 @@ do i = 1, size(p)
    end do
    out(i) = real(k, kind=dp)
 end do
-end function qbinom
+end function qbinom_vec
 
-pure function dpois(x, lambda) result(out)
+pure function dpois_vec(x, lambda) result(out)
 ! Evaluate distribution helper dpois.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: lambda ! rate parameter
@@ -12620,27 +12945,27 @@ do i = 1, size(x)
    k = int(x(i))
    out(i) = merge(exp(-lam + real(k, kind=dp) * log(lam) - log_gamma(real(k + 1, kind=dp))), 0.0_dp, k >= 0)
 end do
-end function dpois
+end function dpois_vec
 
-pure function dgeom(x, prob) result(out)
+pure function dgeom_vec(x, prob) result(out)
 ! Evaluate distribution helper dgeom.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
 real(kind=dp), allocatable :: out(:)
 allocate(out(size(x)))
 out = merge(prob * (1.0_dp - prob)**int(x), 0.0_dp, x >= 0.0_dp)
-end function dgeom
+end function dgeom_vec
 
-pure function pgeom(x, prob) result(out)
+pure function pgeom_vec(x, prob) result(out)
 ! Evaluate distribution helper pgeom.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
 real(kind=dp), allocatable :: out(:)
 allocate(out(size(x)))
 out = merge(1.0_dp - (1.0_dp - prob)**(int(x) + 1), 0.0_dp, x >= 0.0_dp)
-end function pgeom
+end function pgeom_vec
 
-pure function qgeom(p, prob) result(out)
+pure function qgeom_vec(p, prob) result(out)
 ! Evaluate distribution helper qgeom.
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: prob ! success probability
@@ -12648,9 +12973,9 @@ real(kind=dp), allocatable :: out(:)
 allocate(out(size(p)))
 out = ceiling(log(max(tiny(1.0_dp), 1.0_dp - p)) / log(1.0_dp - prob) - 1.0_dp)
 where (out < 0.0_dp) out = 0.0_dp
-end function qgeom
+end function qgeom_vec
 
-pure function dnbinom(x, nsize, prob) result(out)
+pure function dnbinom_vec(x, nsize, prob) result(out)
 ! Evaluate distribution helper dnbinom.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
@@ -12662,9 +12987,9 @@ do i = 1, size(x)
    k = int(x(i))
    out(i) = merge(r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k, 0.0_dp, k >= 0)
 end do
-end function dnbinom
+end function dnbinom_vec
 
-pure function pnbinom(x, nsize, prob) result(out)
+pure function pnbinom_vec(x, nsize, prob) result(out)
 ! Evaluate distribution helper pnbinom.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
@@ -12678,9 +13003,9 @@ do i = 1, size(x)
       out(i) = out(i) + r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k
    end do
 end do
-end function pnbinom
+end function pnbinom_vec
 
-pure function qnbinom(p, nsize, prob) result(out)
+pure function qnbinom_vec(p, nsize, prob) result(out)
 ! Evaluate distribution helper qnbinom.
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: prob ! success probability
@@ -12698,9 +13023,9 @@ do i = 1, size(p)
    end do
    out(i) = real(k, kind=dp)
 end do
-end function qnbinom
+end function qnbinom_vec
 
-pure function dhyper(x, m, n, k) result(out)
+pure function dhyper_vec(x, m, n, k) result(out)
 ! Evaluate distribution helper dhyper.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: m ! white ball count
@@ -12716,9 +13041,9 @@ do i = 1, size(x)
    out(i) = r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
       & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / den
 end do
-end function dhyper
+end function dhyper_vec
 
-pure function phyper(x, m, n, k) result(out)
+pure function phyper_vec(x, m, n, k) result(out)
 ! Evaluate distribution helper phyper.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: m ! white ball count
@@ -12735,9 +13060,9 @@ do i = 1, size(x)
          & r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
    end do
 end do
-end function phyper
+end function phyper_vec
 
-pure function qhyper(p, m, n, k) result(out)
+pure function qhyper_vec(p, m, n, k) result(out)
 ! Evaluate distribution helper qhyper.
 real(kind=dp), intent(in) :: p(:) ! probability value
 integer, intent(in) :: m ! white ball count
@@ -12757,7 +13082,7 @@ do i = 1, size(p)
    end do
    out(i) = real(xx, kind=dp)
 end do
-end function qhyper
+end function qhyper_vec
 
 pure function wilcox_counts(m, n) result(counts)
 ! Runtime helper for R-compatible wilcox counts.
@@ -12786,7 +13111,7 @@ do w = 0, maxw
 end do
 end function wilcox_counts
 
-pure function dwilcox(x, m, n) result(out)
+pure function dwilcox_vec(x, m, n) result(out)
 ! Evaluate distribution helper dwilcox.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: m ! white ball count
@@ -12806,9 +13131,9 @@ do i = 1, size(x)
       out(i) = 0.0_dp
    end if
 end do
-end function dwilcox
+end function dwilcox_vec
 
-pure function pwilcox(x, m, n) result(out)
+pure function pwilcox_vec(x, m, n) result(out)
 ! Evaluate distribution helper pwilcox.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: m ! white ball count
@@ -12821,9 +13146,9 @@ do i = 1, size(x)
    xx = max(0, min(m * n, int(floor(x(i)))))
    out(i) = sum(d(1:xx + 1))
 end do
-end function pwilcox
+end function pwilcox_vec
 
-pure function qwilcox(p, m, n) result(out)
+pure function qwilcox_vec(p, m, n) result(out)
 ! Evaluate distribution helper qwilcox.
 real(kind=dp), intent(in) :: p(:) ! probability value
 integer, intent(in) :: m ! white ball count
@@ -12841,7 +13166,7 @@ do i = 1, size(p)
    end do
    out(i) = real(xx, kind=dp)
 end do
-end function qwilcox
+end function qwilcox_vec
 
 pure function signrank_counts(n) result(counts)
 ! Runtime helper for R-compatible signrank counts.
@@ -12859,7 +13184,7 @@ do r = 1, n
 end do
 end function signrank_counts
 
-pure function dsignrank(x, n) result(out)
+pure function dsignrank_vec(x, n) result(out)
 ! Evaluate distribution helper dsignrank.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: n ! black ball count or sample size
@@ -12877,9 +13202,9 @@ do i = 1, size(x)
       out(i) = 0.0_dp
    end if
 end do
-end function dsignrank
+end function dsignrank_vec
 
-pure function psignrank(x, n) result(out)
+pure function psignrank_vec(x, n) result(out)
 ! Evaluate distribution helper psignrank.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: n ! black ball count or sample size
@@ -12892,9 +13217,9 @@ do i = 1, size(x)
    xx = max(0, min(maxs, int(floor(x(i)))))
    out(i) = sum(d(1:xx + 1))
 end do
-end function psignrank
+end function psignrank_vec
 
-pure function qsignrank(p, n) result(out)
+pure function qsignrank_vec(p, n) result(out)
 ! Evaluate distribution helper qsignrank.
 real(kind=dp), intent(in) :: p(:) ! probability value
 integer, intent(in) :: n ! black ball count or sample size
@@ -12912,7 +13237,7 @@ do i = 1, size(p)
    end do
    out(i) = real(xx, kind=dp)
 end do
-end function qsignrank
+end function qsignrank_vec
 
 pure function chisq_test_real_vec(x, p) result(out)
 ! Runtime helper for R-compatible chisq test real vec.
@@ -13651,5 +13976,524 @@ do i = 1, size(q)
    out(i) = real(count(x <= q(i)), kind=dp) / real(size(x), kind=dp)
 end do
 end function ecdf_eval
+
+pure function qnorm_scalar(pv, mean, sd, lower_tail) result(out)
+real(kind=dp), intent(in) :: pv ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in), optional :: mean ! distribution mean
+real(kind=dp), intent(in), optional :: sd ! distribution standard deviation
+logical, intent(in), optional :: lower_tail ! lower-tail probability flag
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qnorm_vec([pv], mean=mean, sd=sd, lower_tail=lower_tail)
+out = tmp(1)
+end function qnorm_scalar
+
+pure function ppois_scalar(q, lambda, lower_tail) result(out)
+real(kind=dp), intent(in) :: q ! quantiles
+real(kind=dp), intent(in), optional :: lambda ! rate parameter
+logical, intent(in), optional :: lower_tail ! lower-tail probability flag
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = ppois_vec([q], lambda=lambda, lower_tail=lower_tail)
+out = tmp(1)
+end function ppois_scalar
+
+pure function qpois_scalar(pv, lambda, lower_tail) result(out)
+real(kind=dp), intent(in) :: pv ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in), optional :: lambda ! rate parameter
+logical, intent(in), optional :: lower_tail ! lower-tail probability flag
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qpois_vec([pv], lambda=lambda, lower_tail=lower_tail)
+out = tmp(1)
+end function qpois_scalar
+
+pure function dunif_scalar(x, min, max) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: min, max
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dunif_vec([x], min=min, max=max)
+out = tmp(1)
+end function dunif_scalar
+
+pure function punif_scalar(x, min, max) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: min, max
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = punif_vec([x], min=min, max=max)
+out = tmp(1)
+end function punif_scalar
+
+pure function qunif_scalar(p, min, max) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in), optional :: min, max
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qunif_vec([p], min=min, max=max)
+out = tmp(1)
+end function qunif_scalar
+
+pure function dexp_scalar(x, rate, log_) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: rate ! rate parameter
+logical, intent(in), optional :: log_
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dexp_vec([x], rate=rate, log_=log_)
+out = tmp(1)
+end function dexp_scalar
+
+pure function pexp_scalar(x, rate) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pexp_vec([x], rate=rate)
+out = tmp(1)
+end function pexp_scalar
+
+pure function qexp_scalar(p, rate) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qexp_vec([p], rate=rate)
+out = tmp(1)
+end function qexp_scalar
+
+pure function dgamma_scalar(x, shape, rate) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dgamma_vec([x], shape=shape, rate=rate)
+out = tmp(1)
+end function dgamma_scalar
+
+pure function pgamma_scalar(x, shape, rate) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pgamma_vec([x], shape=shape, rate=rate)
+out = tmp(1)
+end function pgamma_scalar
+
+pure function qgamma_scalar(p, shape, rate) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qgamma_vec([p], shape=shape, rate=rate)
+out = tmp(1)
+end function qgamma_scalar
+
+pure function dbeta_scalar(x, shape1, shape2) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: shape1 ! first shape parameter
+real(kind=dp), intent(in) :: shape2 ! second shape parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dbeta_vec([x], shape1=shape1, shape2=shape2)
+out = tmp(1)
+end function dbeta_scalar
+
+pure function pbeta_scalar(x, shape1, shape2) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: shape1 ! first shape parameter
+real(kind=dp), intent(in) :: shape2 ! second shape parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pbeta_vec([x], shape1=shape1, shape2=shape2)
+out = tmp(1)
+end function pbeta_scalar
+
+pure function qbeta_scalar(p, shape1, shape2) result(out)
+real(kind=dp), intent(in) :: p ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in) :: shape1 ! first shape parameter
+real(kind=dp), intent(in) :: shape2 ! second shape parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qbeta_vec([p], shape1=shape1, shape2=shape2)
+out = tmp(1)
+end function qbeta_scalar
+
+pure function dchisq_scalar(x, df) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: df ! degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dchisq_vec([x], df=df)
+out = tmp(1)
+end function dchisq_scalar
+
+pure function dt_scalar(x, df, log_) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: df ! degrees of freedom
+logical, intent(in), optional :: log_
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dt_vec([x], df=df, log_=log_)
+out = tmp(1)
+end function dt_scalar
+
+pure function pt_scalar(x, df) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: df ! degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pt_vec([x], df=df)
+out = tmp(1)
+end function pt_scalar
+
+pure function qt_scalar(p, df) result(out)
+real(kind=dp), intent(in) :: p ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in) :: df ! degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qt_vec([p], df=df)
+out = tmp(1)
+end function qt_scalar
+
+pure function df_scalar(x, df1, df2) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
+real(kind=dp), intent(in) :: df2 ! denominator degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = df_vec([x], df1=df1, df2=df2)
+out = tmp(1)
+end function df_scalar
+
+pure function pf_scalar(x, df1, df2) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
+real(kind=dp), intent(in) :: df2 ! denominator degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pf_vec([x], df1=df1, df2=df2)
+out = tmp(1)
+end function pf_scalar
+
+pure function qf_scalar(p, df1, df2) result(out)
+real(kind=dp), intent(in) :: p ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in) :: df1 ! numerator degrees of freedom
+real(kind=dp), intent(in) :: df2 ! denominator degrees of freedom
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qf_vec([p], df1=df1, df2=df2)
+out = tmp(1)
+end function qf_scalar
+
+pure function dlogis_scalar(x, location, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dlogis_vec([x], location=location, scale=scale)
+out = tmp(1)
+end function dlogis_scalar
+
+pure function plogis_scalar(x, location, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = plogis_vec([x], location=location, scale=scale)
+out = tmp(1)
+end function plogis_scalar
+
+pure function qlogis_scalar(p, location, scale) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qlogis_vec([p], location=location, scale=scale)
+out = tmp(1)
+end function qlogis_scalar
+
+pure function dlnorm_scalar(x, meanlog, sdlog) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
+real(kind=dp), intent(in), optional :: sdlog ! standard deviation on log scale
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dlnorm_vec([x], meanlog=meanlog, sdlog=sdlog)
+out = tmp(1)
+end function dlnorm_scalar
+
+pure function plnorm_scalar(x, meanlog, sdlog) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
+real(kind=dp), intent(in), optional :: sdlog ! standard deviation on log scale
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = plnorm_vec([x], meanlog=meanlog, sdlog=sdlog)
+out = tmp(1)
+end function plnorm_scalar
+
+pure function qlnorm_scalar(p, meanlog, sdlog) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
+real(kind=dp), intent(in), optional :: sdlog ! standard deviation on log scale
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qlnorm_vec([p], meanlog=meanlog, sdlog=sdlog)
+out = tmp(1)
+end function qlnorm_scalar
+
+pure function dweibull_scalar(x, shape, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dweibull_vec([x], shape=shape, scale=scale)
+out = tmp(1)
+end function dweibull_scalar
+
+pure function pweibull_scalar(x, shape, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pweibull_vec([x], shape=shape, scale=scale)
+out = tmp(1)
+end function pweibull_scalar
+
+pure function qweibull_scalar(p, shape, scale) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in) :: shape ! shape parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qweibull_vec([p], shape=shape, scale=scale)
+out = tmp(1)
+end function qweibull_scalar
+
+pure function dcauchy_scalar(x, location, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dcauchy_vec([x], location=location, scale=scale)
+out = tmp(1)
+end function dcauchy_scalar
+
+pure function pcauchy_scalar(x, location, scale) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pcauchy_vec([x], location=location, scale=scale)
+out = tmp(1)
+end function pcauchy_scalar
+
+pure function qcauchy_scalar(p, location, scale) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+real(kind=dp), intent(in), optional :: location ! location parameter
+real(kind=dp), intent(in), optional :: scale ! scale parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qcauchy_vec([p], location=location, scale=scale)
+out = tmp(1)
+end function qcauchy_scalar
+
+pure function dbinom_scalar(x, nsize, prob) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: nsize ! input value
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dbinom_vec([x], nsize=nsize, prob=prob)
+out = tmp(1)
+end function dbinom_scalar
+
+pure function pbinom_scalar(x, nsize, prob) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: nsize ! input value
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pbinom_vec([x], nsize=nsize, prob=prob)
+out = tmp(1)
+end function pbinom_scalar
+
+pure function qbinom_scalar(p, nsize, prob) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+integer, intent(in) :: nsize ! input value
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qbinom_vec([p], nsize=nsize, prob=prob)
+out = tmp(1)
+end function qbinom_scalar
+
+pure function dpois_scalar(x, lambda) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+real(kind=dp), intent(in), optional :: lambda ! rate parameter
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dpois_vec([x], lambda=lambda)
+out = tmp(1)
+end function dpois_scalar
+
+pure function dgeom_scalar(x, prob) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dgeom_vec([x], prob=prob)
+out = tmp(1)
+end function dgeom_scalar
+
+pure function pgeom_scalar(x, prob) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pgeom_vec([x], prob=prob)
+out = tmp(1)
+end function pgeom_scalar
+
+pure function qgeom_scalar(p, prob) result(out)
+real(kind=dp), intent(in) :: p ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in) :: prob ! success probability
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qgeom_vec([p], prob=prob)
+out = tmp(1)
+end function qgeom_scalar
+
+pure function dnbinom_scalar(x, nsize, prob) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: prob ! success probability
+integer, intent(in) :: nsize ! input value
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dnbinom_vec([x], nsize=nsize, prob=prob)
+out = tmp(1)
+end function dnbinom_scalar
+
+pure function pnbinom_scalar(x, nsize, prob) result(out)
+real(kind=dp), intent(in) :: x ! quantiles or observed values
+real(kind=dp), intent(in) :: prob ! success probability
+integer, intent(in) :: nsize ! input value
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pnbinom_vec([x], nsize=nsize, prob=prob)
+out = tmp(1)
+end function pnbinom_scalar
+
+pure function qnbinom_scalar(p, nsize, prob) result(out)
+real(kind=dp), intent(in) :: p ! probabilities, clamped to [0,1]
+real(kind=dp), intent(in) :: prob ! success probability
+integer, intent(in) :: nsize ! input value
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qnbinom_vec([p], nsize=nsize, prob=prob)
+out = tmp(1)
+end function qnbinom_scalar
+
+pure function dhyper_scalar(x, m, n, k) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+integer, intent(in) :: k ! draw count or group count
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dhyper_vec([x], m=m, n=n, k=k)
+out = tmp(1)
+end function dhyper_scalar
+
+pure function phyper_scalar(x, m, n, k) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+integer, intent(in) :: k ! draw count or group count
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = phyper_vec([x], m=m, n=n, k=k)
+out = tmp(1)
+end function phyper_scalar
+
+pure function qhyper_scalar(p, m, n, k) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+integer, intent(in) :: k ! draw count or group count
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qhyper_vec([p], m=m, n=n, k=k)
+out = tmp(1)
+end function qhyper_scalar
+
+pure function dwilcox_scalar(x, m, n) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dwilcox_vec([x], m=m, n=n)
+out = tmp(1)
+end function dwilcox_scalar
+
+pure function pwilcox_scalar(x, m, n) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = pwilcox_vec([x], m=m, n=n)
+out = tmp(1)
+end function pwilcox_scalar
+
+pure function qwilcox_scalar(p, m, n) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+integer, intent(in) :: m ! white ball count
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qwilcox_vec([p], m=m, n=n)
+out = tmp(1)
+end function qwilcox_scalar
+
+pure function dsignrank_scalar(x, n) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = dsignrank_vec([x], n=n)
+out = tmp(1)
+end function dsignrank_scalar
+
+pure function psignrank_scalar(x, n) result(out)
+real(kind=dp), intent(in) :: x ! input vector
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = psignrank_vec([x], n=n)
+out = tmp(1)
+end function psignrank_scalar
+
+pure function qsignrank_scalar(p, n) result(out)
+real(kind=dp), intent(in) :: p ! probability value
+integer, intent(in) :: n ! black ball count or sample size
+real(kind=dp) :: out
+real(kind=dp), allocatable :: tmp(:)
+tmp = qsignrank_vec([p], n=n)
+out = tmp(1)
+end function qsignrank_scalar
 
 end module r_mod
