@@ -48,7 +48,11 @@ class Tee:
 
     def print(self, *args: object, sep: str = " ", end: str = "\n") -> None:
         text = sep.join(str(a) for a in args) + end
-        sys.stdout.write(text)
+        try:
+            sys.stdout.write(text)
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "utf-8"
+            sys.stdout.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
         sys.stdout.flush()
         if self._fh is not None:
             self._fh.write(text)
@@ -89,7 +93,7 @@ def _read_input_list(list_path: Path, *, skip_lines: int = 0) -> list[str]:
     return out
 
 
-def _expand_inputs(items: Iterable[str], *, skip_lines: int = 0) -> tuple[list[Path], list[str]]:
+def _expand_inputs(items: Iterable[str], *, skip_lines: int = 0, recursive: bool = False) -> tuple[list[Path], list[str]]:
     out: list[Path] = []
     errors: list[str] = []
     seen: set[str] = set()
@@ -121,6 +125,11 @@ def _expand_inputs(items: Iterable[str], *, skip_lines: int = 0) -> tuple[list[P
         p_in = Path(it)
         pattern = str(p_in if p_in.is_absolute() else base_dir / p_in)
         matches = glob.glob(pattern, recursive=True) if _has_glob_meta(pattern) else [pattern]
+        if recursive and _has_glob_meta(pattern) and "**" not in pattern:
+            parent = Path(pattern).parent
+            name = Path(pattern).name
+            recursive_pattern = str(parent / "**" / name)
+            matches.extend(glob.glob(recursive_pattern, recursive=True))
         for m in matches:
             p = Path(m)
             if p.is_dir():
@@ -306,6 +315,7 @@ def main() -> int:
     t0 = time.perf_counter()
     ap = argparse.ArgumentParser(description="Run xr2f.py on multiple R files/globs/@list files.")
     ap.add_argument("inputs", nargs="+", help="R files, directories, glob patterns, and/or @list files.")
+    ap.add_argument("-r", "--recursive", action="store_true", help="Recursively expand glob patterns under their parent directories.")
     ap.add_argument("--helpers", nargs="*", default=[], help="Optional helper .f90 files passed to xr2f.py.")
     ap.add_argument("--compiler", default="gfortran -O3 -march=native -Wfatal-errors", help="Compiler command forwarded to xr2f.py.")
     ap.add_argument("--rscript", default="rscript", help="Rscript command forwarded to xr2f.py.")
@@ -415,7 +425,7 @@ def main() -> int:
         print("Invalid options: --bridge-include-free-vars requires --bridge.")
         return 1
 
-    r_files, input_errors = _expand_inputs(args.inputs, skip_lines=args.skip_lines)
+    r_files, input_errors = _expand_inputs(args.inputs, skip_lines=args.skip_lines, recursive=args.recursive)
     if input_errors:
         for err in input_errors:
             print(err)
