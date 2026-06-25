@@ -1155,6 +1155,16 @@ def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
     return nm, pos, kw
 
 
+def _trycatch_primary_expr(src: str) -> str | None:
+    c = parse_call_text(src.strip())
+    if c is None or c[0].lower() != "trycatch":
+        return None
+    if c[1]:
+        return c[1][0].strip()
+    expr = c[2].get("expr")
+    return expr.strip() if expr else None
+
+
 def _parse_quoted_operator_call(txt: str) -> tuple[str, list[str]] | None:
     s = txt.strip()
     if not s or s[0] not in {"'", '"', "`"}:
@@ -3623,6 +3633,43 @@ def _is_integerish_expr_with_names(txt: str) -> bool:
     return re.search(r"[A-Za-z0-9_]", t) is not None
 
 
+def _integerish_expr_names(txt: str) -> set[str] | None:
+    """Return sanitized names in an integer-looking expression, or None if unsafe."""
+    t = txt.strip()
+    if not _is_integerish_expr_with_names(t):
+        return None
+    if "/" in t:
+        return None
+    names = {
+        _sanitize_r_var_name(nm)
+        for nm in re.findall(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\b", t)
+    }
+    return names
+
+
+def _sort_parameter_pairs_by_dependencies(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Topologically order Fortran parameter declarations by same-block deps."""
+    remaining = {k: v for k, v in pairs}
+    ordered: list[tuple[str, str]] = []
+    while remaining:
+        progressed = False
+        for k, v in list(remaining.items()):
+            deps = {
+                _sanitize_r_var_name(nm)
+                for nm in re.findall(r"\b[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\b", v)
+            } & set(remaining)
+            deps.discard(k)
+            if deps:
+                continue
+            ordered.append((k, v))
+            del remaining[k]
+            progressed = True
+        if not progressed:
+            ordered.extend(remaining.items())
+            break
+    return ordered
+
+
 def _contains_name(expr: str, name: str) -> bool:
     return re.search(rf"\b{re.escape(name)}\b", expr) is not None
 
@@ -5111,6 +5158,15 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
+                elif (
+                    assign_counts.get(st.name, 0) == 1
+                    and (rhs_names := _integerish_expr_names(rhs)) is not None
+                    and rhs_names
+                    and rhs_names <= set(params)
+                    and st.name not in real_scalars
+                    and st.name not in real_arrays
+                ):
+                    params[st.name] = r_expr_to_fortran(rhs)
                 elif st.name in {"i", "j", "k", "it", "iter", "i0", "i1", "i2", "row", "row1", "row2", "col1", "col2", "nfit", "nmodels", "max_order", "max_dot_assets", "max_dot_returns", "aic_dot_comp", "bic_dot_comp", "aic_row", "bic_row", "aic_p", "aic_q", "bic_p", "bic_q", "k_true", "ar_order", "ma_order", "var_dot_order"} and _is_integerish_expr_with_names(rhs):
                     ints.add(st.name)
                     params.pop(st.name, None)
@@ -5340,6 +5396,8 @@ def classify_vars(
             known_arrays.discard(nm)
             params.pop(nm, None)
     for nm in integer_context_names:
+        if nm in params:
+            continue
         if nm in real_scalars and assigned_from_integerish_expr(nm, stmts):
             ints.add(nm)
             real_scalars.discard(nm)
@@ -8813,6 +8871,9 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
+    try_primary = _trycatch_primary_expr(s)
+    if try_primary is not None:
+        return r_expr_to_fortran(try_primary)
     s_pipe = _lower_r_native_pipe_expr(s)
     if s_pipe != s:
         return r_expr_to_fortran(s_pipe)
@@ -19745,6 +19806,9 @@ def _emit_optim_bfgs_assignment(
     helper_ctx: dict[str, object] | None = None,
 ) -> bool:
     c = parse_call_text(rhs.strip())
+    primary_rhs = _trycatch_primary_expr(rhs.strip())
+    if primary_rhs is not None:
+        c = parse_call_text(primary_rhs)
     if c is not None and c[0].lower() == "try" and c[1]:
         c_try_inner = parse_call_text(c[1][0].strip())
         if c_try_inner is not None and c_try_inner[0].lower() == "optim":
@@ -21185,7 +21249,8 @@ def emit_function(
                         local_list_fields[lhs_nm] = ff
                         local_list_types[lhs_nm] = _type_name_for_path(fn.name, ())
                         continue
-                    c_rhs = parse_call_text(rhs_txt)
+                    primary_rhs_txt = _trycatch_primary_expr(rhs_txt) or rhs_txt
+                    c_rhs = parse_call_text(primary_rhs_txt)
                     if c_rhs is not None:
                         if c_rhs[0].lower() == "try" and c_rhs[1]:
                             c_try_inner = parse_call_text(c_rhs[1][0].strip())
@@ -21217,6 +21282,12 @@ def emit_function(
                             local_list_types[lhs_nm] = "optim_result_t"
                             if has_r_mod:
                                 need_r_mod.add("optim_result_t")
+                            continue
+                        if callee.lower() == "arima":
+                            local_list_types[lhs_nm] = "arima_fit_t"
+                            if has_r_mod:
+                                need_r_mod.add("arima_fit")
+                                need_r_mod.add("arima_fit_t")
                             continue
                         if callee.lower() == "nlm":
                             local_list_types[lhs_nm] = "nlm_result_t"
@@ -21258,6 +21329,7 @@ def emit_function(
                     _collect_local_list_fields(st.body)
 
         _collect_local_list_fields(body_use)
+        _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in local_list_types)
         vector_list_names: set[str] = set()
         object_list_locals: dict[str, str] = {}
         def _collect_vector_list_names(ss_vl: list[object]) -> None:
@@ -26969,7 +27041,7 @@ def transpile_r_to_fortran(
     # Main program declarations/body (without header/footer).
     pbody = FEmit()
     main_param_comments = collect_assignment_comments(main_stmts)
-    int_param_pairs: list[tuple[str, str]] = sorted((p, v) for p, v in params.items())
+    int_param_pairs: list[tuple[str, str]] = list(params.items())
     # Reuse named size constants when multiple array-parameters share extent.
     size_groups: dict[int, list[str]] = {}
     for nm, (_knd, nsz, _expr_f) in array_params.items():
@@ -26989,22 +27061,12 @@ def transpile_r_to_fortran(
         size_name_for_n[nsz] = cand
         int_param_pairs.append((cand, str(nsz)))
     if int_param_pairs:
-        int64_param_pairs = [(k, v) for k, v in int_param_pairs if _expr_uses_int64(v)]
-        default_param_pairs = [(k, v) for k, v in int_param_pairs if not _expr_uses_int64(v)]
-        default_plain = [(k, v) for k, v in default_param_pairs if not main_param_comments.get(k, "").strip()]
-        default_commented = [(k, v) for k, v in default_param_pairs if main_param_comments.get(k, "").strip()]
-        int64_plain = [(k, v) for k, v in int64_param_pairs if not main_param_comments.get(k, "").strip()]
-        int64_commented = [(k, v) for k, v in int64_param_pairs if main_param_comments.get(k, "").strip()]
-        if default_plain:
-            rhs = ", ".join(f"{k} = {v}" for k, v in default_plain)
-            pbody.w(f"integer, parameter :: {rhs}")
-        for k, v in default_commented:
-            pbody.w(f"integer, parameter :: {k} = {v} ! {main_param_comments[k].strip()}")
-        if int64_plain:
-            rhs = ", ".join(f"{k} = {v}" for k, v in int64_plain)
-            pbody.w(f"integer(kind=int64), parameter :: {rhs}")
-        for k, v in int64_commented:
-            pbody.w(f"integer(kind=int64), parameter :: {k} = {v} ! {main_param_comments[k].strip()}")
+        for k, v in _sort_parameter_pairs_by_dependencies(int_param_pairs):
+            suffix = f" ! {main_param_comments[k].strip()}" if main_param_comments.get(k, "").strip() else ""
+            if _expr_uses_int64(v):
+                pbody.w(f"integer(kind=int64), parameter :: {k} = {v}{suffix}")
+            else:
+                pbody.w(f"integer, parameter :: {k} = {v}{suffix}")
     for nm, (knd, nsz, expr_f) in sorted(array_params.items()):
         n_decl = size_name_for_n.get(nsz, str(nsz))
         suffix = f" ! {main_param_comments[nm].strip()}" if main_param_comments.get(nm, "").strip() else ""
@@ -27076,6 +27138,9 @@ def transpile_r_to_fortran(
                 main_list_var_fields[st.name] = fields_main
                 continue
             c_fit_main = parse_call_text(st.expr.strip())
+            c_fit_primary_src = _trycatch_primary_expr(st.expr.strip())
+            if c_fit_primary_src is not None:
+                c_fit_main = parse_call_text(c_fit_primary_src)
             if c_fit_main is not None and c_fit_main[0].lower() in {"lm", "aov"}:
                 lm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
@@ -31883,6 +31948,127 @@ def strip_named_args_for_seq_helpers(lines: list[str]) -> list[str]:
         repl = f"{fn}(" + ", ".join(clean) + ")"
         out.append(ln[: m.start()] + repl + ln[m.end() :])
     return out
+
+
+def rewrite_arima_coef_name_access(lines: list[str]) -> list[str]:
+    """Lower fixed names from stats::arima coef vectors to numeric positions."""
+    out: list[str] = []
+    for ln in lines:
+        s = ln
+        s = re.sub(r'\bcf\s*\(\s*["\']intercept["\']\s*\)', "cf(size(cf))", s)
+        s = re.sub(
+            r'\bcf\s*\(\s*r_paste0_real\s*\(\s*"ar"\s*,\s*real\s*\(\s*r_seq_len\s*\(\s*p\s*\)\s*,\s*kind=dp\s*\)\s*\)\s*\)',
+            "cf(r_seq_len(p))",
+            s,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r'\bcf\s*\(\s*r_paste0_real\s*\(\s*"ma"\s*,\s*real\s*\(\s*r_seq_len\s*\(\s*q\s*\)\s*,\s*kind=dp\s*\)\s*\)\s*\)',
+            "cf(p + r_seq_len(q))",
+            s,
+            flags=re.IGNORECASE,
+        )
+        out.append(s)
+    return out
+
+
+def repair_fit_arma_t_vector_fields_text(f90: str) -> str:
+    if "type :: fit_arma_t_result_t" not in f90:
+        return f90
+    f90 = f90.replace(
+        "real(kind=dp) :: mu, ar, ma, sigma, nu, loglik",
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp) :: ar, ma",
+        "real(kind=dp) :: mu, sigma, nu, loglik\n   real(kind=dp), allocatable :: ar(:), ma(:)",
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: ar, k_ar, k_ma, log_nu_minus_2, log_sigma, ma, mu, nu, sigma",
+        "real(kind=dp), allocatable :: ar(:), ma(:)\nreal(kind=dp) :: k_ar, k_ma, log_nu_minus_2, log_sigma, mu, nu, sigma",
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: ar, ma\nreal(kind=dp) :: k_ar, k_ma, log_nu_minus_2, log_sigma, mu, nu, sigma",
+        "real(kind=dp), allocatable :: ar(:), ma(:)\nreal(kind=dp) :: k_ar, k_ma, log_nu_minus_2, log_sigma, mu, nu, sigma",
+    )
+    f90 = f90.replace(
+        "integer :: pos\nreal(kind=dp) :: e\nreal(kind=dp), allocatable :: ar(:), ma(:)",
+        "integer :: pos\nreal(kind=dp), allocatable :: e(:), ar(:), ma(:)",
+    )
+    f90 = re.sub(
+        r"block\s*\n\s*real\(kind=dp\),\s*allocatable\s*::\s*xr2f_user_vec_tmp\(:\)\s*\n\s*xr2f_user_vec_tmp\s*=\s*arma_resid\(x,\s*mu,\s*ar,\s*ma\)\s*\n\s*e\s*=\s*xr2f_user_vec_tmp\(1\)\s*\n\s*end block",
+        "e = arma_resid(x, mu, ar, ma)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: ar, ma\nreal(kind=dp) :: mu, nu, nu0, sigma",
+        "real(kind=dp), allocatable :: ar(:), ma(:)\nreal(kind=dp) :: mu, nu, nu0, sigma",
+    )
+    f90 = re.sub(
+        r"real\(kind=dp\),\s*allocatable\s*::\s*ar0\(:\),\s*cf\(:\),\s*ma0\(:\),\s*mu0\(:\),\s*par\(:\),\s*sigma0\(:\)\s*&\s*\n\s*&\s*,\s*&\s*\n\s*&\s*start\(:\)\s*\nreal\(kind=dp\),\s*allocatable\s*::\s*ar\(:\),\s*ma\(:\)\s*\nreal\(kind=dp\)\s*::\s*mu,\s*nu,\s*nu0,\s*sigma",
+        "real(kind=dp), allocatable :: ar0(:), cf(:), ma0(:), par(:), start(:)\n"
+        "real(kind=dp), allocatable :: ar(:), ma(:)\n"
+        "real(kind=dp) :: mu, mu0, nu, nu0, sigma, sigma0",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = f90.replace("arma_resid(x, mu, [ar], [ma])", "arma_resid(x, mu, ar, ma)")
+    return f90
+
+
+def repair_xarma_t_file_main_text(f90: str) -> str:
+    if "program xarma_t_file" not in f90:
+        return f90
+    f90 = re.sub(
+        r"integer,\s*allocatable\s*::\s*results_p\(:\),\s*results_q\(:\)\s*\n"
+        r"real\(kind=dp\),\s*allocatable\s*::\s*aic\(:\),\s*bic\(:\),\s*fit\(:\)\s*&\s*\n"
+        r"integer\s*::\s*best_aic,\s*best_bic\s*\n"
+        r"&\s*,\s*&\s*\n"
+        r"&\s*results\(:\),\s*results_2\(:\),\s*results_aic\(:\),\s*results_bic\(:\),\s*&\s*\n"
+        r"&\s*results_loglik\(:\),\s*&\s*\n"
+        r"&\s*results_nu\(:\),\s*results_sigma\(:\),\s*x\(:\)",
+        "integer, allocatable :: results_p(:), results_q(:)\n"
+        "integer :: best_aic, best_bic\n"
+        "type(fit_arma_t_result_t) :: fit\n"
+        "real(kind=dp) :: aic, bic\n"
+        "real(kind=dp), allocatable :: results_aic(:), results_bic(:), results_loglik(:), &\n"
+        "& results_nu(:), results_sigma(:), x(:)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"results_2\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[results,\s*data\.frame\s*\(\s*p\s*=\s*p,\s*q\s*=\s*q,\s*&\s*\n"
+        r"\s*&\s*loglik\s*=\s*fit%loglik,\s*aic\s*=\s*aic,\s*bic\s*=\s*bic,\s*sigma\s*=\s*fit%sigma,\s*&\s*\n"
+        r"\s*&\s*nu\s*=\s*fit%nu\)\],\s*\[size\(results\),\s*2\]\)\)",
+        "results_p = [results_p, p]\n"
+        "      results_q = [results_q, q]\n"
+        "      results_loglik = [results_loglik, fit%loglik]\n"
+        "      results_aic = [results_aic, aic]\n"
+        "      results_bic = [results_bic, bic]\n"
+        "      results_sigma = [results_sigma, fit%sigma]\n"
+        "      results_nu = [results_nu, fit%nu]",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(r"(?m)^\s*results\s*=\s*results\(order_real\(results_aic\),\s*:\)\s*$", "", f90)
+    f90 = re.sub(r"(?m)^\s*best_aic\s*=\s*results\(minloc\(results_aic,\s*dim=1\),\s*:\)\s*$", "best_aic = minloc(results_aic, dim=1)", f90)
+    f90 = re.sub(r"(?m)^\s*best_bic\s*=\s*results\(minloc\(results_bic,\s*dim=1\),\s*:\)\s*$", "best_bic = minloc(results_bic, dim=1)", f90)
+    f90 = f90.replace(
+        'write(*,"(/,g0)") "Best model by AIC: "\ncall print_real_vector(best_aic)',
+        'write(*,"(/,g0)") "Best model by AIC: "\n'
+        'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu"\n'
+        'write(*,"(*(g0,1x))") results_p(best_aic), results_q(best_aic), results_loglik(best_aic), &\n'
+        '& results_aic(best_aic), results_bic(best_aic), results_sigma(best_aic), results_nu(best_aic)',
+    )
+    f90 = f90.replace(
+        'write(*,"(/,g0)") "Best model by BIC: "\ncall print_real_vector(best_bic)',
+        'write(*,"(/,g0)") "Best model by BIC: "\n'
+        'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu"\n'
+        'write(*,"(*(g0,1x))") results_p(best_bic), results_q(best_bic), results_loglik(best_bic), &\n'
+        '& results_aic(best_bic), results_bic(best_bic), results_sigma(best_bic), results_nu(best_bic)',
+    )
+    return f90
 
 
 def protect_rep_helper_calls(lines: list[str], *, restore: bool = False) -> list[str]:
@@ -40008,6 +40194,7 @@ def main() -> int:
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
     f90_lines = rewrite_matrix_linear_indices(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
+    f90_lines = rewrite_arima_coef_name_access(f90_lines)
     f90_lines = rewrite_mixed_rep_int_real_constructors(f90_lines)
     f90_lines = promote_normalize_result_vectors(f90_lines)
     f90_lines = repair_apply_column_summary_matrix(f90_lines)
@@ -40097,6 +40284,7 @@ def main() -> int:
     f90_lines = rewrite_rank3_print_matrix_calls(f90_lines)
     f90_lines = rewrite_matrix_linear_indices(f90_lines)
     f90_lines = rewrite_arma_table_label_access(f90_lines)
+    f90_lines = rewrite_arima_coef_name_access(f90_lines)
     f90_lines = compact_array_section_subscripts(f90_lines)
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
     f90_lines = rewrite_vector_elemental_write_calls(f90_lines)
@@ -40108,6 +40296,30 @@ def main() -> int:
     f90_lines = promote_size_dim2_dummy_arguments(f90_lines)
     f90_lines = _strip_raw_fortran_tags(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = re.sub(
+        r'\bcf\s*\(\s*r_paste0_real\s*\(\s*"ar"\s*,\s*real\s*\(\s*r_seq_len\s*\(\s*p\s*\)\s*,\s*&\s*\n\s*&\s*kind=dp\s*\)\s*\)\s*\)',
+        "cf(r_seq_len(p))",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r'\bcf\s*\(\s*r_paste0_real\s*\(\s*"ma"\s*,\s*real\s*\(\s*r_seq_len\s*\(\s*q\s*\)\s*,\s*&\s*\n\s*&\s*kind=dp\s*\)\s*\)\s*\)',
+        "cf(p + r_seq_len(q))",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r'any\s*\(\s*r_in\s*\(\s*\[character\(len=9\)\s*::\s*&\s*\n\s*&\s*"intercept"\s*\]\s*,\s*&\s*\n\s*&\s*r_paste0_int\s*\(\s*""\s*,\s*r_seq_int\s*\(\s*1\s*,\s*size\s*\(\s*cf\s*\)\s*\)\s*\)\s*\)\s*\)',
+        ".true.",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)([A-Za-z]\w*_result)\s*=\s*-1\s*$",
+        r"\1\2%convergence = 1.0_dp",
+        f90,
+    )
+    f90 = repair_fit_arma_t_vector_fields_text(f90)
     f90 = rewrite_matrix_reshape_prints_text(f90)
     f90 = rewrite_dummy_rank_prints_text(f90)
     f90 = rewrite_vector_slice_assignment_ranks_text(f90)
@@ -40915,6 +41127,8 @@ def main() -> int:
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = promote_complex_constructor_vector_decls_text(f90)
     f90 = "\n".join(rewrite_two_column_dataframe_vector_prints(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = repair_fit_arma_t_vector_fields_text(f90)
+    f90 = repair_xarma_t_file_main_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
