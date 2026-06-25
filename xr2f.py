@@ -30971,6 +30971,24 @@ def _diff_logical_tokens_equal(a: str, b: str) -> bool:
     return av is not None and av == bv
 
 
+def _parse_diff_char_token(tok: str) -> str | None:
+    t = tok.strip().strip(",;")
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        inner = t[1:-1]
+        if "\\" in inner:
+            return None
+        return inner
+    if re.fullmatch(r"[^\s\"']+", t):
+        return t
+    return None
+
+
+def _diff_char_tokens_equal(a: str, b: str) -> bool:
+    av = _parse_diff_char_token(a)
+    bv = _parse_diff_char_token(b)
+    return av is not None and av == bv
+
+
 def _diff_output_lines_equal(a: str, b: str) -> bool:
     if a == b:
         return True
@@ -30984,6 +31002,8 @@ def _diff_output_lines_equal(a: str, b: str) -> bool:
         if _diff_logical_tokens_equal(x, y):
             continue
         if _diff_numeric_tokens_equal(x, y):
+            continue
+        if _diff_char_tokens_equal(x, y):
             continue
         return False
     return True
@@ -39508,7 +39528,12 @@ def main() -> int:
     fortran_round_digits = args.round if args.round is not None else args.round_both
 
     if args.time_both or args.run_both:
-        cmd = [args.rscript, str(in_path.resolve())]
+        if args.run_diff:
+            r_source_path = str(in_path.resolve()).replace("\\", "/").replace('"', '\\"')
+            r_expr = f'options(width = 10000, max.print = 100000); source("{r_source_path}")'
+            cmd = [args.rscript, "-e", r_expr]
+        else:
+            cmd = [args.rscript, str(in_path.resolve())]
         t0 = time.perf_counter() if args.time_both else None
         r_runs = []
         r_run_times = []
