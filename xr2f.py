@@ -135,10 +135,10 @@ _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
 DEFAULT_COMPILER = "gfortran -O3 -march=native -Wfatal-errors"
-IFX_COMPILER = "ifx /O2" if sys.platform.startswith("win") else "ifx -O2"
+IFX_COMPILER = "ifx /O2 /heap-arrays" if sys.platform.startswith("win") else "ifx -O2"
 DEBUG_COMPILER = "gfortran -g -O0 -Wall -Wextra -Wimplicit-interface -fcheck=all -fbacktrace"
 DEBUG_GFORTRAN_COMPILER = DEBUG_COMPILER
-DEBUG_IFX_COMPILER = "ifx /Od /debug:full /traceback /check:all /warn:all" if sys.platform.startswith("win") else "ifx -O0 -g -traceback -check all -warn all"
+DEBUG_IFX_COMPILER = "ifx /Od /debug:full /traceback /check:all /warn:all /heap-arrays" if sys.platform.startswith("win") else "ifx -O0 -g -traceback -check all -warn all"
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
