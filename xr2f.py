@@ -28153,7 +28153,14 @@ def transpile_r_to_fortran(
             real_matrices.discard(st_int_mat_decl.name)
             real_scalars.discard(st_int_mat_decl.name)
             real_arrays.discard(st_int_mat_decl.name)
-        if isinstance(st_int_mat_decl, Assign) and st_int_mat_decl.expr.strip().lower().startswith("read.csv("):
+        if isinstance(st_int_mat_decl, Assign) and (
+            st_int_mat_decl.expr.strip().lower().startswith(("read.csv(", "read.table("))
+            or re.match(
+                r"^as\.matrix\s*\(\s*\(?\s*read\.table\s*\(",
+                st_int_mat_decl.expr.strip(),
+                re.IGNORECASE,
+            )
+        ):
             real_matrices.add(st_int_mat_decl.name)
             int_matrices.discard(st_int_mat_decl.name)
             real_scalars.discard(st_int_mat_decl.name)
@@ -32433,6 +32440,18 @@ def repair_scalar_integer_function_callers_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def _looks_logical_mask_expr(expr: str) -> bool:
+    txt = expr.strip()
+    txt_l = txt.lower()
+    if txt_l.startswith(("r_seq_len(", "r_seq_int(", "int(", "real(")):
+        return False
+    return bool(
+        re.search(r"\b(?:ieee_is_finite|is_na|isnan|isfinite|all|any)\s*\(", txt_l)
+        or re.search(r"(?:==|/=|<=|>=|<|>|\.\s*(?:and|or|not)\s*\.)", txt_l)
+        or txt_l in {".true.", ".false."}
+    )
+
+
 def repair_matrix_filter_assignment_targets_text(f90: str) -> str:
     matrix_targets: set[str] = set()
     for ln in f90.splitlines():
@@ -32442,11 +32461,37 @@ def repair_matrix_filter_assignment_targets_text(f90: str) -> str:
         m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*r_matrix_(?:row|col)_filter\s*\(", ln, re.IGNORECASE)
         if m is not None:
             matrix_targets.add(m.group(1).lower())
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*\1\s*\((.*),\s*:\s*\)\s*$", ln, re.IGNORECASE)
+        if m is not None and _looks_logical_mask_expr(m.group(2).strip()):
+            matrix_targets.add(m.group(1).lower())
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*\1\s*\(:\s*,\s*(.*)\)\s*$", ln, re.IGNORECASE)
+        if m is not None and _looks_logical_mask_expr(m.group(2).strip()):
+            matrix_targets.add(m.group(1).lower())
     if not matrix_targets:
         return f90
 
     out: list[str] = []
     for ln in f90.splitlines():
+        m_row_filter = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*\2\s*\((.*),\s*:\s*\)\s*$", ln, re.IGNORECASE)
+        if m_row_filter is not None and m_row_filter.group(2).lower() in matrix_targets:
+            mask = m_row_filter.group(3).strip()
+            if _looks_logical_mask_expr(mask):
+                nm = m_row_filter.group(2)
+                out.append(
+                    f"{m_row_filter.group(1)}{nm} = reshape(pack({nm}, spread({mask}, dim=2, "
+                    f"ncopies=size({nm},2))), [count({mask}), size({nm},2)])"
+                )
+                continue
+        m_col_filter = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*\2\s*\(:\s*,\s*(.*)\)\s*$", ln, re.IGNORECASE)
+        if m_col_filter is not None and m_col_filter.group(2).lower() in matrix_targets:
+            mask = m_col_filter.group(3).strip()
+            if _looks_logical_mask_expr(mask):
+                nm = m_col_filter.group(2)
+                out.append(
+                    f"{m_col_filter.group(1)}{nm} = reshape(pack({nm}, spread({mask}, dim=1, "
+                    f"ncopies=size({nm},1))), [size({nm},1), count({mask})])"
+                )
+                continue
         m_decl = re.match(r"^(\s*)(real\(kind=dp\)|integer|logical),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
         if m_decl is not None:
             parts = [p.strip() for p in split_top_level_commas(m_decl.group(3))]
@@ -35953,7 +35998,7 @@ def rewrite_matmul_vector_result_ranks_text(f90: str) -> str:
 
 def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
     names: set[str] = set()
-    for m in re.finditer(r"\bcall\s+read_csv_real_matrix\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*\)", f90, re.IGNORECASE):
+    for m in re.finditer(r"\bcall\s+(?:read_csv_real_matrix|read_table_real_matrix)\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*(?:,|\))", f90, re.IGNORECASE):
         names.add(m.group(1))
     if not names:
         return f90
