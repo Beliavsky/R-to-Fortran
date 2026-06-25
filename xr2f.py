@@ -85,6 +85,17 @@ _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _R_IDENT_RE = r"(?:[A-Za-z]\w*(?:\.[A-Za-z]\w*)*|\.+[A-Za-z_]\w*(?:\.[A-Za-z]\w*)*|\.\.[0-9]\w*)"
+_SCALAR_DISTRIBUTION_FUNCTIONS: set[str] = {
+    "dnorm", "pnorm", "qnorm", "dunif", "punif", "qunif", "dexp", "pexp",
+    "qexp", "dgamma", "pgamma", "qgamma", "dbeta", "pbeta", "qbeta",
+    "dchisq", "pchisq", "qchisq", "dt", "pt", "qt", "df", "pf", "qf",
+    "dlogis", "plogis", "qlogis", "dlnorm", "plnorm", "qlnorm",
+    "dweibull", "pweibull", "qweibull", "dcauchy", "pcauchy", "qcauchy",
+    "dbinom", "pbinom", "qbinom", "dpois", "ppois", "qpois", "dgeom",
+    "pgeom", "qgeom", "dnbinom", "pnbinom", "qnbinom", "dhyper", "phyper",
+    "qhyper", "dwilcox", "pwilcox", "qwilcox", "dsignrank", "psignrank",
+    "qsignrank",
+}
 _RAW_R_IDENT_NAMES: set[str] = set()
 _SANITIZED_R_NAME_BY_RAW: dict[str, str] = {}
 _EXPANDED_DATA_FRAME_FIELDS: dict[str, list[str]] = {}
@@ -4867,7 +4878,14 @@ def classify_vars(
                 elif (
                     re.search(r"\bsummary\s*\(.+\)\s*\$\s*r\.squared\b", rhs, re.IGNORECASE)
                     or re.search(r"\blm_r_squared_general\s*\(", rhs_f, re.IGNORECASE)
-                    or re.search(r"\bpchisq\s*\(", rhs_f, re.IGNORECASE)
+                    or (
+                        _infer_assignment_rank_hint(
+                            rhs,
+                            {nm.lower(): 1 for nm in known_arrays | int_arrays | real_arrays | _KNOWN_VECTOR_NAMES},
+                        )
+                        == 0
+                        and (parse_call_text(rhs.strip()) or ("", [], {}))[0].lower() in _SCALAR_DISTRIBUTION_FUNCTIONS
+                    )
                 ):
                     real_scalars.add(st.name)
                     params.pop(st.name, None)
@@ -7002,6 +7020,14 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         c_call = parse_call_text(expr)
         if c_call is not None:
             fn_name = c_call[0].lower()
+            if fn_name in _SCALAR_DISTRIBUTION_FUNCTIONS:
+                arg_src = c_call[1][0].strip() if c_call[1] else ""
+                if not arg_src:
+                    for key in ("x", "q", "p", "pv"):
+                        if key in c_call[2]:
+                            arg_src = c_call[2][key].strip()
+                            break
+                return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "diag":
                 arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
                 arg_rank = _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
@@ -10347,20 +10373,64 @@ def r_expr_to_fortran(expr: str) -> str:
         nm_pois, pos_pois, kw_pois = c_usr
         out_args: list[str] = []
         if pos_pois:
-            out_args.append(r_expr_to_fortran(pos_pois[0]))
+            out_args.append(f"real({r_expr_to_fortran(pos_pois[0])}, kind=dp)")
+            if len(pos_pois) >= 2:
+                out_args.append(f"real({r_expr_to_fortran(pos_pois[1])}, kind=dp)")
         elif "q" in kw_pois:
-            out_args.append(f"q={r_expr_to_fortran(kw_pois['q'])}")
+            out_args.append(f"q=real({r_expr_to_fortran(kw_pois['q'])}, kind=dp)")
         elif "p" in kw_pois:
-            out_args.append(f"p={r_expr_to_fortran(kw_pois['p'])}")
+            out_args.append(f"p=real({r_expr_to_fortran(kw_pois['p'])}, kind=dp)")
         for k_pois, v_pois in kw_pois.items():
             kf_pois = _sanitize_fortran_kwarg_name(k_pois)
             if kf_pois in {"q", "p"} and not pos_pois:
+                continue
+            if kf_pois == "lambda" and len(pos_pois) >= 2:
                 continue
             vf_pois = r_expr_to_fortran(v_pois)
             if kf_pois == "lambda":
                 vf_pois = f"real({vf_pois}, kind=dp)"
             out_args.append(f"{kf_pois}={vf_pois}")
         return f"{nm_pois.lower()}({', '.join(out_args)})"
+    if c_usr is not None and c_usr[0].lower() in {
+        "dunif", "punif", "qunif", "dexp", "pexp", "qexp", "dgamma", "pgamma",
+        "qgamma", "dbeta", "pbeta", "qbeta", "dchisq", "dt", "pt", "qt",
+        "df", "pf", "qf", "dlogis", "plogis", "qlogis", "dlnorm", "plnorm",
+        "qlnorm", "dweibull", "pweibull", "qweibull", "dcauchy", "pcauchy",
+        "qcauchy", "dbinom", "pbinom", "qbinom", "dpois", "dgeom", "pgeom",
+        "qgeom", "dnbinom", "pnbinom", "qnbinom", "dhyper", "phyper", "qhyper",
+        "dwilcox", "pwilcox", "qwilcox", "dsignrank", "psignrank", "qsignrank",
+    }:
+        nm_dist, pos_dist, kw_dist = c_usr
+        real_kw = {
+            "min", "max", "rate", "shape", "shape1", "shape2", "df", "df1",
+            "df2", "location", "scale", "meanlog", "sdlog", "prob", "lambda",
+        }
+        int_kw = {"size", "nsize", "m", "n", "k"}
+        rename_kw = {"size": "nsize", "log": "log_"}
+        pos_int_by_fun = {
+            "dbinom": {1}, "pbinom": {1}, "qbinom": {1},
+            "dnbinom": {1}, "pnbinom": {1}, "qnbinom": {1},
+            "dhyper": {1, 2, 3}, "phyper": {1, 2, 3}, "qhyper": {1, 2, 3},
+            "dwilcox": {1, 2}, "pwilcox": {1, 2}, "qwilcox": {1, 2},
+            "dsignrank": {1}, "psignrank": {1}, "qsignrank": {1},
+        }
+        out_args_dist: list[str] = []
+        int_pos_dist = pos_int_by_fun.get(nm_dist.lower(), set())
+        for i_dist, a_dist in enumerate(pos_dist):
+            af_dist = r_expr_to_fortran(a_dist)
+            if i_dist == 0 or i_dist not in int_pos_dist:
+                af_dist = f"real({af_dist}, kind=dp)"
+            out_args_dist.append(af_dist)
+        for k_dist, v_dist in kw_dist.items():
+            kf_dist = _sanitize_fortran_kwarg_name(k_dist).lower()
+            kf_dist = rename_kw.get(kf_dist, kf_dist)
+            vf_dist = r_expr_to_fortran(v_dist)
+            if kf_dist in real_kw:
+                vf_dist = f"real({vf_dist}, kind=dp)"
+            elif kf_dist in int_kw and _is_int_literal(vf_dist.strip()):
+                vf_dist = str(int(vf_dist.strip()))
+            out_args_dist.append(f"{kf_dist}={vf_dist}")
+        return f"{nm_dist.lower()}({', '.join(out_args_dist)})"
     if c_usr is not None and c_usr[0].lower() == "apply":
         _nm_app, pos_app, kw_app = c_usr
         x_src = pos_app[0] if pos_app else kw_app.get("X", kw_app.get("x", ""))
@@ -20486,9 +20556,13 @@ def emit_function(
         return False
     if list_spec is None and ret_rank == 0:
         ex_last = last.expr.strip()
-        if not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE) and _array_refs_outside_scalar_reductions(
+        if (
+            not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE)
+            and _infer_assignment_rank_hint(ex_last, {a.lower(): 0 for a in fn.args}) > 0
+            and _array_refs_outside_scalar_reductions(
             ex_last,
             {a for a, rk_arg in arg_rank.items() if rk_arg > 0},
+            )
         ):
             for a in fn.args:
                 if arg_rank.get(a, 0) < 1:
@@ -26128,7 +26202,16 @@ def transpile_r_to_fortran(
             real_scalars.discard(st_real_expr.name)
             params.pop(st_real_expr.name, None)
             continue
-        if re.search(r"\b(?:lm_r_squared_general|pchisq)\s*\(", rhs_real_f, re.IGNORECASE):
+        c_dist_main = parse_call_text(st_real_expr.expr.strip())
+        if re.search(r"\blm_r_squared_general\s*\(", rhs_real_f, re.IGNORECASE) or (
+            c_dist_main is not None
+            and c_dist_main[0].lower() in _SCALAR_DISTRIBUTION_FUNCTIONS
+            and _infer_assignment_rank_hint(
+                st_real_expr.expr.strip(),
+                {nm.lower(): 1 for nm in int_arrays | real_arrays | _KNOWN_VECTOR_NAMES},
+            )
+            == 0
+        ):
             real_scalars.add(st_real_expr.name)
             ints.discard(st_real_expr.name)
             int_arrays.discard(st_real_expr.name)
@@ -40668,6 +40751,7 @@ def main() -> int:
     )
     f90_tmp_after_promote = demote_scalar_reduction_result_declarations_text(f90_tmp_after_promote)
     f90_tmp_after_promote = promote_scalar_pure_functions_to_elemental_text(f90_tmp_after_promote)
+    f90_tmp_after_promote = demote_elemental_allocatable_result_functions_text(f90_tmp_after_promote)
     f90_lines = f90_tmp_after_promote.splitlines()
     f90_lines = remove_module_globals_redeclared_in_program(f90_lines)
     f90_lines = promote_logical_function_result_assignments(f90_lines)
