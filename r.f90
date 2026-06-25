@@ -10,10 +10,10 @@ implicit none
 private
 public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
-   & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, count_ws_tokens, &
+   & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -24,7 +24,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
-   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, &
+   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, r_matrix_row_filter, r_matrix_col_filter, &
    & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_matrix_index, r_head, rev_int, rev_real, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
@@ -34,7 +34,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, cut, outer, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
-   & nchar, char_join, list_files, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
@@ -49,7 +49,8 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rnorm_mat, rbinom, rpois, ra
    & print_kruskal_test
 public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char, date_to_char_vec, &
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
-   & date_seq_day, date_seq_length, date_range
+   & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
+   & sys_timezone, sys_time_format, sys_sleep, proc_time_vec
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -97,6 +98,39 @@ type :: prcomp_fit_t
 ! Container for fitted prcomp fit model state.
    real(kind=dp), allocatable :: sdev(:), rotation(:,:), x(:,:), center(:), scale(:)
 end type prcomp_fit_t
+
+type :: hist_result_t
+! Container for R-like hist result values.
+   real(kind=dp), allocatable :: breaks(:), mids(:), density(:)
+   integer, allocatable :: counts(:)
+end type hist_result_t
+
+type :: file_info_t
+! Compact scalar subset of R file.info() result fields.
+   real(kind=dp) :: size = 0.0_dp
+   logical :: isdir = .false.
+   character(len=:), allocatable :: path, mode, mtime, ctime, atime, exe
+end type file_info_t
+
+interface hist
+   module procedure hist_nbreaks
+   module procedure hist_breaks_real
+end interface hist
+
+interface file_info
+   module procedure file_info_scalar
+   module procedure file_info_vector
+end interface file_info
+
+interface print_file_info
+   module procedure print_file_info_scalar
+   module procedure print_file_info_vector
+end interface print_file_info
+
+interface dir_exists
+   module procedure dir_exists_scalar
+   module procedure dir_exists_vector
+end interface dir_exists
 
 type :: eigen_result_t
 ! Container for R-like eigen result results.
@@ -608,6 +642,16 @@ interface r_matrix_row
    module procedure r_matrix_row_int
 end interface r_matrix_row
 
+interface r_matrix_row_filter
+   module procedure r_matrix_row_filter_real
+   module procedure r_matrix_row_filter_int
+end interface r_matrix_row_filter
+
+interface r_matrix_col_filter
+   module procedure r_matrix_col_filter_real
+   module procedure r_matrix_col_filter_int
+end interface r_matrix_col_filter
+
 interface unique
    module procedure unique_int
    module procedure unique_real
@@ -857,12 +901,17 @@ interface is_na
    module procedure is_na_real_vec
    module procedure is_na_int_scalar
    module procedure is_na_int_vec
+   module procedure is_na_logical_scalar
+   module procedure is_na_logical_vec
+   module procedure is_na_complex_scalar
+   module procedure is_na_complex_vec
    module procedure is_na_char_scalar
    module procedure is_na_char_vec
 end interface is_na
 
 interface which
    module procedure which_logical
+   module procedure which_logical_mat
 end interface which
 
 interface replace
@@ -1084,6 +1133,51 @@ else
 end if
 end function r_elapsed
 
+real(kind=dp) function sys_time() result(out)
+! Current date-time as seconds since 1970-01-01, local calendar fields.
+integer :: vals(8)
+integer :: days
+call date_and_time(values=vals)
+days = date_days_from_civil(vals(1), vals(2), vals(3))
+out = real(days, kind=dp) * 86400.0_dp + real(vals(5) * 3600 + vals(6) * 60 + vals(7), kind=dp) &
+   & + real(vals(8), kind=dp) / 1000.0_dp
+end function sys_time
+
+integer function sys_date() result(out)
+! Current date as days since 1970-01-01.
+integer :: vals(8)
+call date_and_time(values=vals)
+out = date_days_from_civil(vals(1), vals(2), vals(3))
+end function sys_date
+
+function sys_timezone() result(out)
+! Best-effort Tier-1 timezone name.
+character(len=:), allocatable :: out
+out = "UTC"
+end function sys_timezone
+
+function sys_date_string() result(out)
+! Current date-time as a character string.
+character(len=:), allocatable :: out
+out = sys_time_format(sys_time(), "%Y-%m-%d %H:%M:%S")
+end function sys_date_string
+
+function proc_time_vec() result(out)
+! R-like proc.time vector with elapsed time in the third slot.
+real(kind=dp) :: out(5)
+out = 0.0_dp
+out(3) = r_elapsed()
+end function proc_time_vec
+
+subroutine sys_sleep(seconds)
+! Busy-wait sleep for Tier-1 Sys.sleep support.
+real(kind=dp), intent(in) :: seconds
+real(kind=dp) :: t0
+t0 = r_elapsed()
+do while (r_elapsed() - t0 < max(0.0_dp, seconds))
+end do
+end subroutine sys_sleep
+
 pure integer function date_digit(ch) result(out)
 ! Convert one decimal character to an integer digit.
 character(len=1), intent(in) :: ch ! character to decode
@@ -1203,6 +1297,42 @@ integer :: y, m, d
 call date_civil_from_days(x, y, m, d)
 write(out, "(i4.4,a,i2.2,a,i2.2)") y, "-", m, "-", d
 end function date_to_char
+
+function sys_time_format(x, fmt) result(out)
+! Format a POSIXct-like second count for common Tier-1 strftime patterns.
+real(kind=dp), intent(in) :: x
+character(len=*), intent(in) :: fmt
+character(len=:), allocatable :: out
+character(len=64) :: buf
+integer :: days, rem, y, m, d, hh, mm, ss
+days = floor(x / 86400.0_dp)
+rem = nint(x - real(days, kind=dp) * 86400.0_dp)
+if (rem < 0) then
+   rem = rem + 86400
+   days = days - 1
+end if
+if (rem >= 86400) then
+   rem = rem - 86400
+   days = days + 1
+end if
+call date_civil_from_days(days, y, m, d)
+hh = rem / 3600
+mm = mod(rem / 60, 60)
+ss = mod(rem, 60)
+select case (trim(fmt))
+case ("%Y-%m-%d")
+   write(buf, "(i4.4,a,i2.2,a,i2.2)") y, "-", m, "-", d
+case ("%H:%M:%S")
+   write(buf, "(i2.2,a,i2.2,a,i2.2)") hh, ":", mm, ":", ss
+case ("%Y-%m-%d %H:%M:%S", "")
+   write(buf, "(i4.4,a,i2.2,a,i2.2,1x,i2.2,a,i2.2,a,i2.2)") y, "-", m, "-", d, hh, ":", mm, ":", ss
+case ("%Y-%m-%d %H:%M:%S %Z")
+   write(buf, "(i4.4,a,i2.2,a,i2.2,1x,i2.2,a,i2.2,a,i2.2,a)") y, "-", m, "-", d, hh, ":", mm, ":", ss, " UTC"
+case default
+   write(buf, "(i4.4,a,i2.2,a,i2.2,1x,i2.2,a,i2.2,a,i2.2)") y, "-", m, "-", d, hh, ":", mm, ":", ss
+end select
+out = trim(buf)
+end function sys_time_format
 
 pure function date_to_char_vec(x) result(out)
 ! Format day counts as yyyy-mm-dd strings.
@@ -1564,6 +1694,102 @@ else
    out = 0
 end if
 end function r_matrix_row_int
+
+pure function r_matrix_row_filter_real(x, mask) result(out)
+! Return matrix rows selected by a recycled logical mask.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:) ! row mask, recycled to nrow(x)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, k, nsel
+nsel = 0
+if (size(mask) > 0) then
+   do i = 1, size(x, 1)
+      if (mask(mod(i - 1, size(mask)) + 1)) nsel = nsel + 1
+   end do
+end if
+allocate(out(nsel, size(x, 2)))
+k = 0
+if (size(mask) > 0) then
+   do i = 1, size(x, 1)
+      if (mask(mod(i - 1, size(mask)) + 1)) then
+         k = k + 1
+         out(k, :) = x(i, :)
+      end if
+   end do
+end if
+end function r_matrix_row_filter_real
+
+pure function r_matrix_row_filter_int(x, mask) result(out)
+! Return integer matrix rows selected by a recycled logical mask.
+integer, intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:) ! row mask, recycled to nrow(x)
+integer, allocatable :: out(:,:)
+integer :: i, k, nsel
+nsel = 0
+if (size(mask) > 0) then
+   do i = 1, size(x, 1)
+      if (mask(mod(i - 1, size(mask)) + 1)) nsel = nsel + 1
+   end do
+end if
+allocate(out(nsel, size(x, 2)))
+k = 0
+if (size(mask) > 0) then
+   do i = 1, size(x, 1)
+      if (mask(mod(i - 1, size(mask)) + 1)) then
+         k = k + 1
+         out(k, :) = x(i, :)
+      end if
+   end do
+end if
+end function r_matrix_row_filter_int
+
+pure function r_matrix_col_filter_real(x, mask) result(out)
+! Return matrix columns selected by a recycled logical mask.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:) ! column mask, recycled to ncol(x)
+real(kind=dp), allocatable :: out(:,:)
+integer :: j, k, nsel
+nsel = 0
+if (size(mask) > 0) then
+   do j = 1, size(x, 2)
+      if (mask(mod(j - 1, size(mask)) + 1)) nsel = nsel + 1
+   end do
+end if
+allocate(out(size(x, 1), nsel))
+k = 0
+if (size(mask) > 0) then
+   do j = 1, size(x, 2)
+      if (mask(mod(j - 1, size(mask)) + 1)) then
+         k = k + 1
+         out(:, k) = x(:, j)
+      end if
+   end do
+end if
+end function r_matrix_col_filter_real
+
+pure function r_matrix_col_filter_int(x, mask) result(out)
+! Return integer matrix columns selected by a recycled logical mask.
+integer, intent(in) :: x(:,:) ! source matrix
+logical, intent(in) :: mask(:) ! column mask, recycled to ncol(x)
+integer, allocatable :: out(:,:)
+integer :: j, k, nsel
+nsel = 0
+if (size(mask) > 0) then
+   do j = 1, size(x, 2)
+      if (mask(mod(j - 1, size(mask)) + 1)) nsel = nsel + 1
+   end do
+end if
+allocate(out(size(x, 1), nsel))
+k = 0
+if (size(mask) > 0) then
+   do j = 1, size(x, 2)
+      if (mask(mod(j - 1, size(mask)) + 1)) then
+         k = k + 1
+         out(:, k) = x(:, j)
+      end if
+   end do
+end if
+end function r_matrix_col_filter_int
 
 pure function r_index_real(x, idx) result(out)
 ! Return vector indexing with real indices so NaN indices become real NA.
@@ -5058,10 +5284,11 @@ function eigen_real(x, symmetric, only_values) result(fit)
 real(kind=dp), intent(in) :: x(:,:) ! input matrix
 logical, intent(in), optional :: symmetric, only_values
 type(eigen_result_t) :: fit
-real(kind=dp), allocatable :: a(:,:), vecs(:,:), tmpv(:)
-real(kind=dp) :: off, app, aqq, apq, tau, t, c, s, phi, tmp, normv
+real(kind=dp), allocatable :: a(:,:), vecs(:,:), tmpv(:), qmat(:,:), rmat(:,:), v(:), w(:), bmat(:,:), coeff(:), bwork(:,:)
+real(kind=dp) :: off, app, aqq, apq, tau, t, c, s, phi, tmp, normv, rkk, delta, mu
 real(kind=dp) :: aa, bb, cc, dd, tr, disc, root, lam
-integer :: n, i, j, k, q, iter, max_iter, imax
+real(kind=dp) :: bound, left, right, mid, fleft, fright, fmid, xval, root_tol
+integer :: n, i, j, k, q, iter, max_iter, imax, m, root_count, grid, ig
 logical :: do_symmetric, only_vals
 n = size(x, 1)
 allocate(fit%values(n), fit%vectors(n, n))
@@ -5075,6 +5302,193 @@ do_symmetric = maxval(abs(x - transpose(x))) <= 100.0_dp * epsilon(1.0_dp) * max
 if (present(symmetric)) do_symmetric = symmetric
 only_vals = .false.
 if (present(only_values)) only_vals = only_values
+if ((.not. do_symmetric) .and. n > 2) then
+   a = x
+   allocate(qmat(n, n), rmat(n, n), v(n), w(n), bmat(n, n), tmpv(n))
+   max_iter = max(1, 4000 * n * n)
+   do m = n, 2, -1
+      do iter = 1, max_iter
+         off = 1000.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(a(1:m, 1:m))))
+         if (abs(a(m, m - 1)) <= off) exit
+         aa = a(m - 1, m - 1)
+         bb = a(m - 1, m)
+         cc = a(m, m - 1)
+         dd = a(m, m)
+         tr = aa + dd
+         disc = (aa - dd) * (aa - dd) + 4.0_dp * bb * cc
+         if (disc >= 0.0_dp) then
+            root = sqrt(disc)
+            if (abs(0.5_dp * (tr + root) - dd) <= abs(0.5_dp * (tr - root) - dd)) then
+               mu = 0.5_dp * (tr + root)
+            else
+               mu = 0.5_dp * (tr - root)
+            end if
+         else
+            mu = dd
+         end if
+         bmat(1:m, 1:m) = a(1:m, 1:m)
+         do i = 1, m
+            bmat(i, i) = bmat(i, i) - mu
+         end do
+         qmat = 0.0_dp
+         rmat = 0.0_dp
+         do j = 1, m
+            v = 0.0_dp
+            v(1:m) = bmat(1:m, j)
+            do k = 1, j - 1
+               rmat(k, j) = sum(qmat(1:m, k) * v(1:m))
+               v(1:m) = v(1:m) - rmat(k, j) * qmat(1:m, k)
+            end do
+            rkk = sqrt(sum(v(1:m) * v(1:m)))
+            if (rkk <= 100.0_dp * tiny(1.0_dp)) then
+               v = 0.0_dp
+               v(j) = 1.0_dp
+               do k = 1, j - 1
+                  tmp = sum(qmat(1:m, k) * v(1:m))
+                  v(1:m) = v(1:m) - tmp * qmat(1:m, k)
+               end do
+               rkk = sqrt(max(tiny(1.0_dp), sum(v(1:m) * v(1:m))))
+            end if
+            qmat(1:m, j) = v(1:m) / rkk
+            rmat(j, j) = rkk
+         end do
+         a(1:m, 1:m) = matmul(rmat(1:m, 1:m), qmat(1:m, 1:m))
+         do i = 1, m
+            a(i, i) = a(i, i) + mu
+         end do
+      end do
+      a(m, m - 1) = 0.0_dp
+   end do
+   do i = 1, n
+      fit%values(i) = a(i, i)
+   end do
+   allocate(coeff(n + 1), bwork(n, n))
+   coeff = 0.0_dp
+   coeff(1) = 1.0_dp
+   bwork = 0.0_dp
+   do i = 1, n
+      bwork(i, i) = 1.0_dp
+   end do
+   do k = 1, n
+      bmat = matmul(x, bwork)
+      tmp = 0.0_dp
+      do i = 1, n
+         tmp = tmp + bmat(i, i)
+      end do
+      coeff(k + 1) = -tmp / real(k, kind=dp)
+      bwork = bmat
+      do i = 1, n
+         bwork(i, i) = bwork(i, i) + coeff(k + 1)
+      end do
+   end do
+   bound = 1.0_dp + maxval(sum(abs(x), dim=2))
+   grid = max(2000, 4000 * n)
+   root_tol = 1000.0_dp * epsilon(1.0_dp) * bound
+   root_count = 0
+   left = -bound
+   fleft = coeff(1)
+   do k = 2, n + 1
+      fleft = fleft * left + coeff(k)
+   end do
+   do ig = 1, grid
+      right = -bound + 2.0_dp * bound * real(ig, kind=dp) / real(grid, kind=dp)
+      fright = coeff(1)
+      do k = 2, n + 1
+         fright = fright * right + coeff(k)
+      end do
+      if (abs(fleft) <= root_tol .or. fleft * fright < 0.0_dp .or. abs(fright) <= root_tol) then
+         if (abs(fleft) <= root_tol) then
+            root = left
+         else if (abs(fright) <= root_tol) then
+            root = right
+         else
+            aa = left
+            bb = right
+            do iter = 1, 80
+               mid = 0.5_dp * (aa + bb)
+               fmid = coeff(1)
+               do k = 2, n + 1
+                  fmid = fmid * mid + coeff(k)
+               end do
+               if (abs(fmid) <= root_tol) exit
+               if (fleft * fmid <= 0.0_dp) then
+                  bb = mid
+                  fright = fmid
+               else
+                  aa = mid
+                  fleft = fmid
+               end if
+            end do
+            root = mid
+         end if
+         if (root_count == 0 .or. minval(abs(fit%values(1:root_count) - root)) > 100.0_dp * root_tol) then
+            root_count = root_count + 1
+            if (root_count <= n) fit%values(root_count) = root
+         end if
+      end if
+      left = right
+      fleft = fright
+   end do
+   if (root_count > 0 .and. root_count < n) then
+      do i = root_count + 1, n
+         fit%values(i) = a(i, i)
+      end do
+   end if
+   do i = 1, n - 1
+      imax = i
+      do j = i + 1, n
+         if (abs(fit%values(j)) > abs(fit%values(imax))) imax = j
+      end do
+      if (imax /= i) then
+         tmp = fit%values(i)
+         fit%values(i) = fit%values(imax)
+         fit%values(imax) = tmp
+      end if
+   end do
+   do j = 1, n
+      lam = fit%values(j)
+      do i = 1, n
+         v(i) = 1.0_dp + real(i + j - 2, kind=dp) / real(max(1, n), kind=dp)
+      end do
+      normv = sqrt(max(tiny(1.0_dp), sum(v * v)))
+      v = v / normv
+      do iter = 1, 80
+         bmat = x
+         delta = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(lam), maxval(abs(x)))
+         do i = 1, n
+            bmat(i, i) = bmat(i, i) - lam + delta
+         end do
+         w = solve_real_vec(bmat, v)
+         normv = sqrt(max(tiny(1.0_dp), sum(w * w)))
+         if (normv <= 100.0_dp * tiny(1.0_dp)) exit
+         v = w / normv
+         w = matmul(x, v)
+         lam = sum(v * w) / max(tiny(1.0_dp), sum(v * v))
+      end do
+      fit%values(j) = lam
+      fit%vectors(:, j) = v
+      if (fit%vectors(1, j) < 0.0_dp) fit%vectors(:, j) = -fit%vectors(:, j)
+   end do
+   do i = 1, n - 1
+      imax = i
+      do j = i + 1, n
+         if (abs(fit%values(j)) > abs(fit%values(imax))) imax = j
+      end do
+      if (imax /= i) then
+         tmp = fit%values(i)
+         fit%values(i) = fit%values(imax)
+         fit%values(imax) = tmp
+         tmpv = fit%vectors(:, i)
+         fit%vectors(:, i) = fit%vectors(:, imax)
+         fit%vectors(:, imax) = tmpv
+      end if
+   end do
+   if (only_vals) then
+      if (allocated(fit%vectors)) deallocate(fit%vectors)
+      allocate(fit%vectors(0, 0))
+   end if
+   return
+end if
 if ((.not. do_symmetric) .and. n == 2) then
    aa = x(1, 1)
    bb = x(1, 2)
@@ -6288,6 +6702,17 @@ do j = 1, size(x, 2)
 end do
 end function apply_col_sd
 
+pure function apply_row_sd(x) result(out)
+! Return apply(x, 1, sd) for a real matrix.
+real(kind=dp), intent(in) :: x(:,:) ! input matrix
+real(kind=dp), allocatable :: out(:)
+integer :: i
+allocate(out(size(x, 1)))
+do i = 1, size(x, 1)
+   out(i) = sd(x(i, :))
+end do
+end function apply_row_sd
+
 pure function findInterval(x, vec) result(out)
 ! Return R-style interval counts for each x against sorted breakpoints vec.
 real(kind=dp), intent(in) :: x(:) ! query values
@@ -6893,6 +7318,259 @@ do i = 1, size(x)
 end do
 end function r_paste0_int
 
+function file_exists(path) result(out)
+! Implement scalar R-like file.exists(path).
+character(len=*), intent(in) :: path
+logical :: out
+integer :: stat
+inquire(file=trim(path), exist=out)
+if (out) return
+if (is_windows_path_env()) then
+   call execute_command_line('cmd /c if exist "' // trim(path) // '" (exit /b 0) else (exit /b 1)', &
+      wait=.true., exitstat=stat)
+else
+   call execute_command_line('test -e "' // trim(path) // '"', wait=.true., exitstat=stat)
+end if
+out = stat == 0
+end function file_exists
+
+function file_create(path) result(out)
+! Implement scalar R-like file.create(path).
+character(len=*), intent(in) :: path
+logical :: out
+integer :: unit, ios
+open(newunit=unit, file=trim(path), status="replace", action="write", iostat=ios)
+if (ios == 0) close(unit, iostat=ios)
+out = ios == 0
+end function file_create
+
+function file_remove(path) result(out)
+! Implement scalar R-like file.remove(path).
+character(len=*), intent(in) :: path
+logical :: out
+integer :: unit, ios, ios_close, stat
+open(newunit=unit, file=trim(path), status="old", action="readwrite", iostat=ios)
+if (ios /= 0) then
+   if (is_windows_path_env()) then
+      call execute_command_line('cmd /c rmdir "' // trim(path) // '" >nul 2>nul', wait=.true., exitstat=stat)
+   else
+      call execute_command_line('rmdir "' // trim(path) // '" >/dev/null 2>&1', wait=.true., exitstat=stat)
+   end if
+   out = stat == 0
+   return
+end if
+close(unit, status="delete", iostat=ios_close)
+out = ios_close == 0
+end function file_remove
+
+function file_info_scalar(path) result(out)
+! Implement a compact scalar subset of R file.info(path).
+character(len=*), intent(in) :: path
+type(file_info_t) :: out
+logical :: exists_file
+integer :: stat
+integer(int64) :: sz
+out%path = trim(path)
+inquire(file=trim(path), exist=exists_file, size=sz)
+if (exists_file .and. sz >= 0_int64) then
+   out%size = real(sz, kind=dp)
+else if (file_exists(path)) then
+   out%size = 0.0_dp
+else
+   out%size = ieee_value(0.0_dp, ieee_quiet_nan)
+end if
+if (is_windows_path_env()) then
+   call execute_command_line('cmd /c if exist "' // trim(path) // '\*" (exit /b 0) else (exit /b 1)', &
+      wait=.true., exitstat=stat)
+else
+   call execute_command_line('test -d "' // trim(path) // '"', wait=.true., exitstat=stat)
+end if
+out%isdir = stat == 0
+out%mode = merge("directory", "file     ", out%isdir)
+if (out%isdir) then
+   out%exe = "no"
+else if (is_windows_path_env()) then
+   if (index(tolower(trim(path)), ".exe") > 0 .or. index(tolower(trim(path)), ".bat") > 0 .or. &
+      & index(tolower(trim(path)), ".cmd") > 0 .or. index(tolower(trim(path)), ".com") > 0) then
+      out%exe = "yes"
+   else
+      out%exe = "no"
+   end if
+else
+   call execute_command_line('test -x "' // trim(path) // '"', wait=.true., exitstat=stat)
+   out%exe = merge("yes", "no ", stat == 0)
+end if
+out%mtime = ""
+out%ctime = ""
+out%atime = ""
+end function file_info_scalar
+
+function file_info_vector(path) result(out)
+! Implement a compact vector subset of R file.info(paths).
+character(len=*), intent(in) :: path(:)
+type(file_info_t), allocatable :: out(:)
+integer :: i
+allocate(out(size(path)))
+do i = 1, size(path)
+   out(i) = file_info_scalar(path(i))
+end do
+end function file_info_vector
+
+function file_isdir(path) result(out)
+! Return file.info(path)$isdir without component selection on a function result.
+character(len=*), intent(in) :: path
+logical :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%isdir
+end function file_isdir
+
+subroutine print_file_info_scalar(x)
+! Print a compact R-like file.info() summary.
+type(file_info_t), intent(in) :: x
+integer :: name_w
+name_w = max(4, len_trim(x%path))
+write(*,'(a)') repeat(" ", name_w + 1) // "      size isdir mode      exe"
+write(*,'(a,1x,f10.0,1x,l5,1x,a4,6x,a3)') repeat(" ", max(0, name_w - len_trim(x%path))) // trim(x%path), &
+   & x%size, x%isdir, trim(x%mode), trim(x%exe)
+end subroutine print_file_info_scalar
+
+subroutine print_file_info_vector(x)
+! Print a compact R-like file.info() summary for multiple files.
+type(file_info_t), intent(in) :: x(:)
+integer :: i, name_w
+name_w = 4
+do i = 1, size(x)
+   name_w = max(name_w, len_trim(x(i)%path))
+end do
+write(*,'(a)') repeat(" ", name_w + 1) // "      size isdir mode      exe"
+do i = 1, size(x)
+   write(*,'(a,1x,f10.0,1x,l5,1x,a4,6x,a3)') repeat(" ", max(0, name_w - len_trim(x(i)%path))) // trim(x(i)%path), &
+      & x(i)%size, x(i)%isdir, trim(x(i)%mode), trim(x(i)%exe)
+end do
+end subroutine print_file_info_vector
+
+function dir_exists_scalar(path) result(out)
+! Implement scalar R-like dir.exists(path).
+character(len=*), intent(in) :: path
+logical :: out
+integer :: stat
+if (is_windows_path_env()) then
+   call execute_command_line('cmd /c if exist "' // trim(path) // '\*" (exit /b 0) else (exit /b 1)', &
+      wait=.true., exitstat=stat)
+else
+   call execute_command_line('test -d "' // trim(path) // '"', wait=.true., exitstat=stat)
+end if
+out = stat == 0
+end function dir_exists_scalar
+
+function dir_exists_vector(path) result(out)
+! Implement vectorized R-like dir.exists(path).
+character(len=*), intent(in) :: path(:)
+logical, allocatable :: out(:)
+integer :: i
+allocate(out(size(path)))
+do i = 1, size(path)
+   out(i) = dir_exists_scalar(path(i))
+end do
+end function dir_exists_vector
+
+function dir_create(path, recursive) result(out)
+! Implement scalar R-like dir.create(path).
+character(len=*), intent(in) :: path
+logical, intent(in), optional :: recursive
+logical :: out, recur
+integer :: stat
+recur = .false.
+if (present(recursive)) recur = recursive
+if (file_exists(path)) then
+   out = .false.
+   return
+end if
+if (is_windows_path_env()) then
+   if (recur) then
+      call execute_command_line('cmd /c mkdir "' // trim(path) // '" >nul 2>nul', wait=.true., exitstat=stat)
+   else
+      call execute_command_line('cmd /c mkdir "' // trim(path) // '" >nul 2>nul', wait=.true., exitstat=stat)
+   end if
+else
+   if (recur) then
+      call execute_command_line('mkdir -p "' // trim(path) // '" >/dev/null 2>&1', wait=.true., exitstat=stat)
+   else
+      call execute_command_line('mkdir "' // trim(path) // '" >/dev/null 2>&1', wait=.true., exitstat=stat)
+   end if
+end if
+out = stat == 0 .and. file_exists(path)
+end function dir_create
+
+function getwd() result(out)
+! Implement scalar R-like getwd().
+character(len=:), allocatable :: out
+character(len=:), allocatable :: tmp
+character(len=4096) :: buf
+integer :: unit, ios, stat
+call random_seed()
+call random_number_list_files_tmp(tmp)
+if (is_windows_path_env()) then
+   call execute_command_line('cmd /c cd > "' // tmp // '"', wait=.true., exitstat=stat)
+else
+   call execute_command_line('pwd > "' // tmp // '"', wait=.true., exitstat=stat)
+end if
+open(newunit=unit, file=tmp, status="old", action="read", iostat=ios)
+if (ios /= 0) then
+   out = "."
+   return
+end if
+read(unit, "(a)", iostat=ios) buf
+close(unit, status="delete")
+if (ios == 0 .and. len_trim(buf) > 0) then
+   out = trim(buf)
+else
+   out = "."
+end if
+end function getwd
+
+function tempfile(pattern) result(out)
+! Return a simple temporary path with an R-like prefix.
+character(len=*), intent(in), optional :: pattern
+character(len=:), allocatable :: out
+character(len=4096) :: root
+character(len=64) :: id
+character(len=1) :: sep
+real(kind=dp) :: u
+integer :: n, stat, got
+call get_environment_variable("TEMP", root, length=got, status=stat)
+if (stat /= 0 .or. got <= 0) call get_environment_variable("TMP", root, length=got, status=stat)
+if (stat /= 0 .or. got <= 0) then
+   root = "."
+   got = 1
+end if
+sep = merge("\", "/", is_windows_path_env())
+call random_number(u)
+n = max(0, int(u * 1000000000.0_dp))
+write(id, "(i0)") n
+if (present(pattern)) then
+   out = trim(root(1:got)) // sep // trim(pattern) // trim(id)
+else
+   out = trim(root(1:got)) // sep // "file" // trim(id)
+end if
+end function tempfile
+
+function file_path(a, b) result(out)
+! Join two path components using the platform separator.
+character(len=*), intent(in) :: a, b
+character(len=:), allocatable :: out
+character(len=1) :: sep
+sep = merge("\", "/", is_windows_path_env())
+if (len_trim(a) == 0) then
+   out = trim(b)
+else if (a(len_trim(a):len_trim(a)) == "/" .or. a(len_trim(a):len_trim(a)) == "\") then
+   out = trim(a) // trim(b)
+else
+   out = trim(a) // sep // trim(b)
+end if
+end function file_path
+
 function list_files(path, pattern, full_names, recursive) result(out)
 ! Implement R-like character helper list_files.
 ! Defaults: path=".", pattern="", full_names=.false., recursive=.false.
@@ -6945,13 +7623,22 @@ do
    if (keep) then
       n = n + 1
       if (fnames) then
-         maxlen = max(maxlen, len_trim(line))
+         if (is_windows_path_env() .and. .not. recur) then
+            maxlen = max(maxlen, len_trim(p) + 1 + len_trim(line))
+         else
+            maxlen = max(maxlen, len_trim(line))
+         end if
       else
          maxlen = max(maxlen, len_trim(base))
       end if
    end if
 end do
 rewind(unit)
+if (n <= 0) then
+   allocate(character(len=1) :: out(0))
+   close(unit, status="delete")
+   return
+end if
 allocate(character(len=maxlen) :: out(n))
 i = 0
 do
@@ -6964,7 +7651,15 @@ do
       i = i + 1
       out(i) = ""
       if (fnames) then
-         out(i) = trim(line)
+         if (is_windows_path_env() .and. .not. recur) then
+            if (len_trim(p) > 0 .and. (p(len_trim(p):len_trim(p)) == "/" .or. p(len_trim(p):len_trim(p)) == "\")) then
+               out(i) = trim(p) // trim(line)
+            else
+               out(i) = trim(p) // "/" // trim(line)
+            end if
+         else
+            out(i) = trim(line)
+         end if
       else if (recur .and. .not. is_windows_path_env()) then
          if (len_trim(p) > 0 .and. index(line, trim(p) // "/") == 1) then
             out(i) = line(len_trim(p) + 2:)
@@ -7004,6 +7699,34 @@ character(len=32) :: buf
 write(buf, "(i0)") i
 out = trim(buf)
 end function int_to_string
+
+function real_to_string_f(x, digits) result(out)
+! Runtime helper for fixed-format scalar sprintf real conversion.
+real(kind=dp), intent(in) :: x
+integer, intent(in) :: digits
+character(len=:), allocatable :: out
+character(len=128) :: buf
+character(len=32) :: fmt
+write(fmt, '("(f0.", i0, ")")') max(0, digits)
+write(buf, fmt) x
+out = trim(buf)
+end function real_to_string_f
+
+function real_to_string_g(x, digits) result(out)
+! Runtime helper for general-format scalar sprintf real conversion.
+real(kind=dp), intent(in) :: x
+integer, intent(in) :: digits
+character(len=:), allocatable :: out
+character(len=128) :: buf
+character(len=32) :: fmt
+if (digits > 0) then
+   write(fmt, '("(g0.", i0, ")")') digits
+else
+   fmt = "(g0)"
+end if
+write(buf, fmt) x
+out = trim(adjustl(buf))
+end function real_to_string_g
 
 function ar_coef_names(nacf) result(out)
 ! Runtime helper for R-compatible ar coef names.
@@ -7061,20 +7784,52 @@ pure function list_files_pattern_match(name, pattern) result(out)
 character(len=*), intent(in) :: name ! filename to test
 character(len=*), intent(in) :: pattern ! simple filename pattern
 logical :: out
-character(len=:), allocatable :: pat
+character(len=:), allocatable :: pat, pat2, suffix, core, prefix
+integer :: i, j, n
 pat = trim(pattern)
+allocate(character(len=max(1, len_trim(pat))) :: pat2)
+pat2 = repeat(" ", len(pat2))
+j = 0
+do i = 1, len_trim(pat)
+   if (pat(i:i) == "\") cycle
+   j = j + 1
+   pat2(j:j) = pat(i:i)
+end do
+if (j > 0) then
+   pat = pat2(1:j)
+else
+   pat = ""
+end if
+n = len_trim(pat)
 if (pat == "") then
    out = .true.
-else if (len_trim(pat) > 2 .and. pat(1:2) == ".*") then
-   out = index(name, pat(3:len_trim(pat))) > 0
-else if (len_trim(pat) == 2 .and. pat(1:2) == ".*") then
+else if (n > 1 .and. pat(n:n) == "$") then
+   core = pat(1:n-1)
+   do while (len_trim(core) > 0 .and. (core(1:1) == "^" .or. core(1:1) == "*"))
+      core = core(2:len_trim(core))
+   end do
+   j = index(core, ".*")
+   if (j > 0) then
+      prefix = core(1:j-1)
+      suffix = core(j+2:len_trim(core))
+      out = (len_trim(prefix) == 0 .or. index(name, trim(prefix)) == 1) .and. &
+         & (len_trim(suffix) == 0 .or. (len_trim(name) >= len_trim(suffix) .and. &
+         & name(len_trim(name)-len_trim(suffix)+1:len_trim(name)) == suffix))
+   else
+      suffix = core
+      if (len_trim(suffix) >= 2 .and. suffix(1:2) == ".*") suffix = suffix(3:len_trim(suffix))
+      out = len_trim(name) >= len_trim(suffix) .and. name(len_trim(name)-len_trim(suffix)+1:len_trim(name)) == suffix
+   end if
+else if (n > 2 .and. pat(1:2) == ".*") then
+   out = index(name, pat(3:n)) > 0
+else if (n == 2 .and. pat(1:2) == ".*") then
    out = .true.
-else if (len_trim(pat) > 1 .and. pat(1:1) == "*") then
-   out = index(name, pat(2:len_trim(pat))) > 0
+else if (n > 1 .and. pat(1:1) == "*") then
+   out = index(name, pat(2:n)) > 0
 else if (pat(1:1) == "*") then
    out = .true.
-else if (pat(len_trim(pat):len_trim(pat)) == "*") then
-   out = index(name, pat(1:len_trim(pat)-1)) == 1
+else if (pat(n:n) == "*") then
+   out = index(name, pat(1:n-1)) == 1
 else
    out = index(name, pat) > 0
 end if
@@ -7311,6 +8066,34 @@ allocate(out(size(x)))
 out = (x == -huge(0))
 end function is_na_int_vec
 
+pure elemental logical function is_na_logical_scalar(x) result(out)
+! Logical values have no NA sentinel in this subset.
+logical, intent(in) :: x ! value to test
+out = .false.
+end function is_na_logical_scalar
+
+pure function is_na_logical_vec(x) result(out)
+! Elementwise NA test for a logical vector.
+logical, intent(in) :: x(:) ! values to test
+logical, allocatable :: out(:)
+allocate(out(size(x)))
+out = .false.
+end function is_na_logical_vec
+
+pure elemental logical function is_na_complex_scalar(x) result(out)
+! True when either complex component is non-finite in this subset.
+complex(kind=dp), intent(in) :: x ! value to test
+out = (.not. ieee_is_finite(real(x, kind=dp))) .or. (.not. ieee_is_finite(aimag(x)))
+end function is_na_complex_scalar
+
+pure function is_na_complex_vec(x) result(out)
+! Elementwise NA test for a complex vector.
+complex(kind=dp), intent(in) :: x(:) ! values to test
+logical, allocatable :: out(:)
+allocate(out(size(x)))
+out = (.not. ieee_is_finite(real(x, kind=dp))) .or. (.not. ieee_is_finite(aimag(x)))
+end function is_na_complex_vec
+
 pure elemental logical function is_na_char_scalar(x) result(out)
 ! True when character scalar uses NA sentinel in this subset.
 character(len=*), intent(in) :: x ! string to test
@@ -7343,6 +8126,24 @@ do i = 1, size(x)
    end if
 end do
 end function which_logical
+
+pure function which_logical_mat(x) result(out)
+! Runtime helper for R-compatible which on matrix masks.
+logical, intent(in) :: x(:,:) ! selection mask matrix
+integer, allocatable :: out(:)
+integer :: i, j, k, n
+n = count(x)
+allocate(out(n))
+k = 0
+do j = 1, size(x, 2)
+   do i = 1, size(x, 1)
+      if (x(i, j)) then
+         k = k + 1
+         out(k) = i + (j - 1) * size(x, 1)
+      end if
+   end do
+end do
+end function which_logical_mat
 
 pure function which_first(x) result(out)
 ! Return the first R-style which() index, or 0 when no element is true.
@@ -7911,6 +8712,118 @@ character(len=:), allocatable :: out
 out = "logical"
 if (size(x) < 0) out = ""
 end function r_typeof_logical_mat
+
+function hist_nbreaks(x, breaks, plot) result(out)
+! Compute a small R-like histogram object for numeric vector input.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in), optional :: breaks
+logical, intent(in), optional :: plot
+type(hist_result_t) :: out
+integer :: nb, i, j
+real(kind=dp) :: xmin, xmax, width, total, raw_width, base_width, step_width
+logical :: ignored_plot
+ignored_plot = .false.
+if (present(plot)) ignored_plot = plot
+nb = 10
+if (present(breaks)) nb = max(1, breaks)
+allocate(out%breaks(nb + 1), out%mids(nb), out%density(nb), out%counts(nb))
+out%counts = 0
+out%density = 0.0_dp
+if (size(x) <= 0) then
+   out%breaks = 0.0_dp
+   out%mids = 0.0_dp
+   return
+end if
+xmin = minval(x)
+xmax = maxval(x)
+if (xmax <= xmin) xmax = xmin + 1.0_dp
+raw_width = (xmax - xmin) / real(nb, kind=dp)
+base_width = 10.0_dp ** floor(log10(raw_width))
+step_width = base_width
+if (step_width < raw_width) step_width = 2.0_dp * base_width
+if (step_width < raw_width) step_width = 5.0_dp * base_width
+if (step_width < raw_width) step_width = 10.0_dp * base_width
+xmin = floor(xmin / step_width) * step_width
+xmax = ceiling(xmax / step_width) * step_width
+nb = max(1, nint((xmax - xmin) / step_width))
+deallocate(out%breaks, out%mids, out%density, out%counts)
+allocate(out%breaks(nb + 1), out%mids(nb), out%density(nb), out%counts(nb))
+out%counts = 0
+out%density = 0.0_dp
+width = step_width
+do i = 1, nb + 1
+   out%breaks(i) = xmin + real(i - 1, kind=dp) * width
+end do
+out%breaks(nb + 1) = xmax
+do i = 1, nb
+   out%mids(i) = 0.5_dp * (out%breaks(i) + out%breaks(i + 1))
+end do
+do i = 1, size(x)
+   if (x(i) <= out%breaks(1) .or. x(i) > out%breaks(nb + 1)) cycle
+   j = ceiling((x(i) - out%breaks(1)) / width)
+   if (j < 1) j = 1
+   if (j > nb) j = nb
+   out%counts(j) = out%counts(j) + 1
+end do
+total = real(sum(out%counts), kind=dp) * width
+if (total > 0.0_dp) out%density = real(out%counts, kind=dp) / total
+if (ignored_plot .and. size(out%counts) < 0) out%counts = out%counts
+end function hist_nbreaks
+
+function hist_breaks_real(x, breaks, plot) result(out)
+! Compute a small R-like histogram object using explicit numeric breaks.
+real(kind=dp), intent(in) :: x(:), breaks(:)
+logical, intent(in), optional :: plot
+type(hist_result_t) :: out
+integer :: nb, i, j
+real(kind=dp) :: total, width
+logical :: ignored_plot
+ignored_plot = .false.
+if (present(plot)) ignored_plot = plot
+nb = max(0, size(breaks) - 1)
+allocate(out%breaks(size(breaks)), out%mids(nb), out%density(nb), out%counts(nb))
+out%breaks = breaks
+out%counts = 0
+out%density = 0.0_dp
+if (nb <= 0) return
+do i = 1, nb
+   out%mids(i) = 0.5_dp * (out%breaks(i) + out%breaks(i + 1))
+end do
+do i = 1, size(x)
+   if (x(i) < out%breaks(1) .or. x(i) > out%breaks(nb + 1)) cycle
+   j = 0
+   if (x(i) == out%breaks(1)) then
+      j = 1
+   else
+      do while (j < nb)
+         j = j + 1
+         if (x(i) > out%breaks(j) .and. x(i) <= out%breaks(j + 1)) exit
+      end do
+   end if
+   if (j >= 1 .and. j <= nb) out%counts(j) = out%counts(j) + 1
+end do
+total = real(sum(out%counts), kind=dp)
+if (total > 0.0_dp) then
+   do i = 1, nb
+      width = out%breaks(i + 1) - out%breaks(i)
+      if (width > 0.0_dp) out%density(i) = real(out%counts(i), kind=dp) / (total * width)
+   end do
+end if
+if (ignored_plot .and. size(out%counts) < 0) out%counts = out%counts
+end function hist_breaks_real
+
+subroutine print_hist(h)
+! Print a compact summary for an R-like hist result.
+type(hist_result_t), intent(in) :: h
+write(*,'(a)') "$breaks"
+call print_real_vector(h%breaks)
+write(*,'(a)') "$counts"
+call print_integer_vector(h%counts)
+write(*,'(a)') "$density"
+call print_real_vector(h%density)
+write(*,'(a)') "$mids"
+call print_real_vector(h%mids)
+end subroutine print_hist
 
 pure function quantile(x, probs, names, type) result(out)
 ! Compute Type-7 quantiles for a numeric vector.
@@ -9297,19 +10210,28 @@ end do
 end function count_ws_tokens
 
 subroutine read_real_vector(file_path, x)
-! Read one real value per line into a vector.
+! Read whitespace-delimited real values into a vector.
 character(len=*), intent(in) :: file_path ! input file path
 real(kind=dp), allocatable, intent(out) :: x(:) ! values read from file
-integer :: fp, ios, n, cap, new_cap
-real(kind=dp) :: v
+integer :: fp, ios, n, cap, new_cap, n_tok
+character(len=4096) :: line
+real(kind=dp), allocatable :: vals(:)
 n = 0
 cap = 0
 open(newunit=fp, file=file_path, status="old", action="read")
 do
-   read(fp, *, iostat=ios) v
+   read(fp, "(a)", iostat=ios) line
    if (ios /= 0) exit
-   if (n == cap) then
-      new_cap = merge(1024, 2 * cap, cap == 0)
+   n_tok = count_ws_tokens(line)
+   if (n_tok <= 0) cycle
+   allocate(vals(n_tok))
+   read(line, *, iostat=ios) vals
+   if (ios /= 0) then
+      deallocate(vals)
+      cycle
+   end if
+   if (n + n_tok > cap) then
+      new_cap = max(n + n_tok, merge(1024, 2 * cap, cap == 0))
       block
          real(kind=dp), allocatable :: tmp(:)
          allocate(tmp(new_cap))
@@ -9318,8 +10240,9 @@ do
       end block
       cap = new_cap
    end if
-   n = n + 1
-   x(n) = v
+   x(n + 1:n + n_tok) = vals
+   n = n + n_tok
+   deallocate(vals)
 end do
 close(fp)
 if (n == 0) then
@@ -9328,6 +10251,13 @@ else if (n < size(x)) then
    x = x(1:n)
 end if
 end subroutine read_real_vector
+
+function scan_real(file_path) result(x)
+! Expression-form numeric scan(file_path) helper.
+character(len=*), intent(in) :: file_path
+real(kind=dp), allocatable :: x(:)
+call read_real_vector(file_path, x)
+end function scan_real
 
 subroutine read_table_real_matrix(file_path, x, header)
 ! Read a whitespace-delimited numeric table into a matrix.
