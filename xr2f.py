@@ -4542,7 +4542,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE) or re.match(r"^as\.(?:numeric|double)\s*\(\s*(?:arima\.sim|arima_sim)\s*\(", rhs_l, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -8374,6 +8374,24 @@ def _int_bound_expr(expr: str) -> str:
     if m:
         return m.group(1).strip()
     if _looks_integer_fortran_expr(t):
+        return t
+    return f"int({t})"
+
+
+def _strict_int_count_expr(expr: str) -> str:
+    """Return an integer expression for Fortran dummy args/extent counts.
+
+    `_int_bound_expr` intentionally preserves bare identifiers because many are
+    already integer loop bounds.  Count dummies such as `rnorm_vec(n)` and
+    allocation extents are stricter: a bare identifier inferred as real must be
+    explicitly converted.
+    """
+    t = expr.strip()
+    if re.match(r"^int\s*\(.+\)$", t, re.IGNORECASE):
+        return t
+    if _is_int_literal(t):
+        return t
+    if re.match(r"^size\s*\(.+\)$", t, re.IGNORECASE):
         return t
     return f"int({t})"
 
@@ -12966,7 +12984,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 kw_rt[_sanitize_fortran_kwarg_name(asn_rt[0].strip()).lower()] = asn_rt[1].strip()
         n_src_rt = kw_rt.get("n", pos_rt[0] if pos_rt else "1")
         df_src_rt = kw_rt.get("df", pos_rt[1] if len(pos_rt) >= 2 else "1.0")
-        n_f_rt = _int_bound_expr(r_expr_to_fortran(n_src_rt))
+        n_f_rt = _strict_int_count_expr(r_expr_to_fortran(n_src_rt))
         df_f_rt = r_expr_to_fortran(df_src_rt)
         return f"(rnorm_vec({n_f_rt}) / sqrt(qchisq(runif_vec({n_f_rt}), real({df_f_rt}, kind=dp)) / real({df_f_rt}, kind=dp)))"
     s = _replace_balanced_func_calls(s, "rt", _rt_to_fortran)
@@ -16486,7 +16504,7 @@ def emit_stmts(
             if c_numeric_assign is not None and c_numeric_assign[0].lower() in {"numeric", "double"}:
                 _nnm, pos_num, kw_num = c_numeric_assign
                 n_src = pos_num[0] if pos_num else kw_num.get("length", kw_num.get("n", "0"))
-                n_f = _int_bound_expr(r_expr_to_fortran(n_src))
+                n_f = _strict_int_count_expr(r_expr_to_fortran(n_src))
                 _wstmt(f"if (allocated({st.name})) deallocate({st.name})", "")
                 _wstmt(f"allocate({st.name}(max(0, {n_f})), source=0.0_dp)", st.comment)
                 alloc_seen.add(st.name)
@@ -17483,13 +17501,27 @@ def emit_stmts(
                                     return split_top_level_commas(t_df[1:-1])
                                 return [t_df]
 
-                            vals0 = _df_vals(cols_df[0][1])
-                            vals1 = _df_vals(cols_df[1][1])
-                            if len(vals0) == len(vals1) and vals0:
-                                _wstmt(f'write(*,"(a,1x,a)") "{cols_df[0][0]}", "{cols_df[1][0]}"', st.comment)
-                                for v0, v1 in zip(vals0, vals1):
-                                    _wstmt(f'write(*,"(a,1x,g0)") {r_expr_to_fortran(v0)}, {r_expr_to_fortran(v1)}', "")
-                                continue
+                        vals0 = _df_vals(cols_df[0][1])
+                        vals1 = _df_vals(cols_df[1][1])
+                        if len(vals0) == len(vals1) and vals0:
+                            _wstmt(f'write(*,"(a,1x,a)") "{cols_df[0][0]}", "{cols_df[1][0]}"', st.comment)
+                            for v0, v1 in zip(vals0, vals1):
+                                _wstmt(f'write(*,"(a,1x,g0)") {r_expr_to_fortran(v0)}, {r_expr_to_fortran(v1)}', "")
+                            continue
+                        col0_f = r_expr_to_fortran(cols_df[0][1])
+                        col1_f = r_expr_to_fortran(cols_df[1][1])
+                        _wstmt(f'write(*,"(a,1x,a)") "{cols_df[0][0]}", "{cols_df[1][0]}"', st.comment)
+                        o.w("block")
+                        o.push()
+                        o.w("integer :: i_df")
+                        o.w(f"do i_df = 1, min(size({col0_f}), size({col1_f}))")
+                        o.push()
+                        o.w(f'write(*,"(*(g0,1x))") {col0_f}(i_df), {col1_f}(i_df)')
+                        o.pop()
+                        o.w("end do")
+                        o.pop()
+                        o.w("end block")
+                        continue
                     if has_r_mod and c_one is not None and c_one[0].lower() in {"paste", "paste0"} and len(c_one[1]) >= 2:
                         first_arg = c_one[1][0].strip()
                         second_arg = c_one[1][1].strip()
@@ -18717,7 +18749,7 @@ def emit_stmts(
             m_seq_along = re.match(r"^seq_along\s*\((.+)\)$", it, re.IGNORECASE)
             if m_seq_len:
                 n = r_expr_to_fortran(m_seq_len.group(1).strip())
-                o.w(f"do {st.var} = 1, {_int_bound_expr(n)}")
+                o.w(f"do {st.var} = 1, {_strict_int_count_expr(n)}")
             elif m_seq_along:
                 along_f = r_expr_to_fortran(m_seq_along.group(1).strip())
                 n = f"size({along_f})"
@@ -23338,16 +23370,6 @@ def infer_main_real_matrices(stmts: list[object], known_int_matrices: set[str] |
         for m in re.finditer(r"\b([A-Za-z]\w*)\s*\[([^\]]+)\]", txt):
             if len(_split_index_dims(m.group(2))) >= 2:
                 out.add(m.group(1))
-        m_wr = re.match(r"^\s*write\.table\s*\((.*)\)\s*$", txt, re.IGNORECASE)
-        if m_wr:
-            cinfo = parse_call_text("write.table(" + m_wr.group(1).strip() + ")")
-            if cinfo is not None:
-                _nm, pos, _kw = cinfo
-                if pos:
-                    p0 = pos[0].strip()
-                    if re.match(r"^[A-Za-z]\w*$", p0):
-                        out.add(p0)
-
     for st in stmts:
         if isinstance(st, Assign):
             rhs = st.expr.strip()
@@ -31530,6 +31552,56 @@ def rewrite_selected_orders_dataframe_print(lines: list[str]) -> list[str]:
                 out.append(f'{indent}write(*,"(a,1x,g0)") "BIC", {vals[1].strip()}')
                 i += 2
                 continue
+        out.append(ln)
+        i += 1
+    return out
+
+
+def rewrite_two_column_dataframe_vector_prints(lines: list[str]) -> list[str]:
+    """Print lowered two-vector data.frames as rows instead of concatenated vectors."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if i + 1 < len(lines):
+            m_head = re.match(
+                r'^(\s*)write\(\*,"\(a,\s*1x,\s*a\)"\)\s*"([^"]+)",\s*"([^"]+)"\s*$',
+                ln,
+                re.IGNORECASE,
+            )
+            m_vals = re.match(
+                r'^\s*write\(\*,"\(\*\(g0,1x\)\)"\)\s*(.+?)\s*$',
+                lines[i + 1],
+                re.IGNORECASE,
+            )
+            if m_head is not None and m_vals is not None:
+                indent = m_head.group(1)
+                name1 = m_head.group(2)
+                name2 = m_head.group(3)
+                vals = split_top_level_commas(m_vals.group(1).strip())
+                if len(vals) != 2:
+                    out.append(ln)
+                    i += 1
+                    continue
+                v1 = vals[0].strip()
+                v2 = vals[1].strip()
+                if any(tok in v1 or tok in v2 for tok in ("%", "&")) or re.search(
+                    r"\breshape\s*\(",
+                    v1 + " " + v2,
+                    re.IGNORECASE,
+                ):
+                    out.append(ln)
+                    i += 1
+                    continue
+                if not (v1.startswith('"') or v2.startswith('"')):
+                    width = max(len(name1), len(name2))
+                    out.append(
+                        f'{indent}call print_matrix_rstyle_named(reshape([real({v1}, kind=dp), {v2}], '
+                        f'[size({v1}), 2]), [character(len={width}) :: "{name1}", "{name2}"], '
+                        'int_cols=[.true., .false.])'
+                    )
+                    i += 2
+                    continue
         out.append(ln)
         i += 1
     return out
@@ -40018,6 +40090,7 @@ def main() -> int:
     f90_lines = format_derived_type_blocks(f90_lines)
     f90_lines = format_interface_blocks(f90_lines)
     f90_lines = rewrite_selected_orders_dataframe_print(f90_lines)
+    f90_lines = rewrite_two_column_dataframe_vector_prints(f90_lines)
     f90_lines = simplify_write_g0_outer_parens(f90_lines)
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
@@ -40841,6 +40914,9 @@ def main() -> int:
     f90 = demote_ls_str_runtime_scalar_declarations_text(f90)
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = promote_complex_constructor_vector_decls_text(f90)
+    f90 = "\n".join(rewrite_two_column_dataframe_vector_prints(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    if "call print_matrix_rstyle_named(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
