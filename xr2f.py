@@ -19822,7 +19822,14 @@ def _control_value_from_list(control_src: str, name: str) -> str | None:
     c = parse_call_text(control_src.strip())
     if c is None or c[0].lower() != "list":
         return None
-    return c[2].get(name)
+    target = name.lower()
+    for k, v in c[2].items():
+        kl = k.lower()
+        if kl == target:
+            return v
+        if target == "maxit" and kl == "maxit_def":
+            return v
+    return None
 
 
 def _emit_optim_bfgs_assignment(
@@ -19856,7 +19863,10 @@ def _emit_optim_bfgs_assignment(
         fn_name = nested_fn_name
     method_src = kw.get("method", '"BFGS"').strip()
     method = (_dequote_string_literal(method_src) or method_src).lower()
-    if method not in {"bfgs", "nelder-mead"}:
+    if method not in {"bfgs", "nelder-mead", "l-bfgs-b"}:
+        return False
+    bounded = method == "l-bfgs-b"
+    if bounded and ("lower" not in kw or "upper" not in kw):
         return False
 
     objective_args = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
@@ -19906,6 +19916,8 @@ def _emit_optim_bfgs_assignment(
     yvec = f"{prefix}_y"
     amat = f"{prefix}_A"
     tmp = f"{prefix}_tmp"
+    lower = f"{prefix}_lower"
+    upper = f"{prefix}_upper"
     np = f"{prefix}_np"
     max_iter = f"{prefix}_max_iter"
     n_iter = f"{prefix}_n_iter"
@@ -19957,8 +19969,14 @@ def _emit_optim_bfgs_assignment(
         f"{alpha}, {slope}, {sy}, {rho}, {shift}"
     )
     o.w(f"real(kind=dp), allocatable :: {p}(:), {pnew}(:), {ptmp}(:), {g}(:), {gnew}(:)")
+    if bounded:
+        o.w(f"real(kind=dp), allocatable :: {lower}(:), {upper}(:)")
     o.w(f"real(kind=dp), allocatable :: {h}(:,:), {d}(:), {svec}(:), {yvec}(:), {amat}(:,:), {tmp}(:,:)")
     o.w(f"{p} = {par_f}")
+    if bounded:
+        o.w(f"{lower} = {r_expr_to_fortran(kw['lower'])}")
+        o.w(f"{upper} = {r_expr_to_fortran(kw['upper'])}")
+        o.w(f"{p} = max({lower}, min({upper}, {p}))")
     o.w(f"{np} = size({p})")
     o.w(f"{max_iter} = {maxit_f}")
     o.w(f"{ndeps} = {ndeps_f}")
@@ -20004,6 +20022,8 @@ def _emit_optim_bfgs_assignment(
     o.w(f"do {j} = 1, 60")
     o.push()
     o.w(f"{pnew} = {p} + {alpha} * {d}")
+    if bounded:
+        o.w(f"{pnew} = max({lower}, min({upper}, {pnew}))")
     o.w(f"{fnew} = {obj_call(pnew)}")
     o.w(f"if ({fnew} <= {fval} + 1.0e-4_dp * {alpha} * {slope}) exit")
     o.w(f"if ({alpha} < 1.0e-12_dp) exit")
@@ -33620,6 +33640,41 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
 
 def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
     f90 = re.sub(
+        r"(?im)^\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character\([^)]*\))\s*(?:,\s*[^:]*)?::\s*&\s*$\n?",
+        "",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^\s*real\(kind=dp\)\s*::\s*real\(kind=dp\)\s*$\n?",
+        "",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?i)real\(kind=dp\),\s*allocatable\s*::\s*allocatable\s*::",
+        "real(kind=dp), allocatable ::",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\)\s*::\s*.*?),\s*real\(kind=dp\)\s*::\s*(.+)$",
+        r"\1\nreal(kind=dp) :: \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*character\(len=:\)\s*,\s*allocatable\s*::\s*(.+)$",
+        r"\1\ncharacter(len=:), allocatable :: \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*::\s*(.+)$",
+        r"\1\nreal(kind=dp) :: \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*character\(len=:\)\s*,\s*&\s*$\n\s*&\s*allocatable\s*::\s*(.+)$",
+        r"\1\ncharacter(len=:), allocatable :: \2",
+        f90,
+    )
+    f90 = re.sub(
         r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*&\s*\n\s*&\s*allocatable\s*::\s*(.+)$",
         r"\1, &\n& \2",
         f90,
@@ -33985,7 +34040,7 @@ def remove_duplicate_local_declarations_text(f90: str) -> str:
         block, j = split_decl_block(i)
         compact = compact_decl_text(block)
         m_decl = re.match(
-            r"^(\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\))\s*(?:,\s*[^:]*)?::\s*)(.+)$",
+            r"^(\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character\([^)]*\))\s*(?:,\s*[^:]*)?\s*::\s*)(.+)$",
             compact,
             re.IGNORECASE,
         )
@@ -35050,14 +35105,16 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
         if re.search(r"\bdim\s*=", e, re.IGNORECASE):
             return False
         if re.search(
-            r"\b(?:matrix|reshape|pack|which|qnorm|r_seq_\w*|r_rep_\w*|cbind|rbind|rev_int|cumsum|cumprod|sort|rnorm_vec|runif_vec)\s*\(",
+            r"\b(?:matrix|reshape|pack|which|qnorm|eigen_sym_values|r_seq_\w*|r_rep_\w*|cbind|rbind|rev_int|cumsum|cumprod|sort|rnorm_vec|runif_vec)\s*\(",
             e,
             re.IGNORECASE,
         ):
             return False
-        if re.match(r"^\s*(?:sum|maxval|minval|count|size)\s*\(", e, re.IGNORECASE) and not re.search(
+        if re.match(r"^\s*(?:sum|maxval|minval|count|size|var|r_var)\s*\(", e, re.IGNORECASE) and not re.search(
             r"\bdim\s*=", e, re.IGNORECASE
         ):
+            return True
+        if re.match(r"^\s*dot_product\s*\(", e, re.IGNORECASE):
             return True
         bare_call = re.fullmatch(r"([A-Za-z]\w*)\s*\(.*\)", e, re.DOTALL)
         if (
@@ -35065,15 +35122,15 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
             and bare_call.group(1) not in array_names
             and bare_call.group(1).lower() not in {
             "abs", "sqrt", "exp", "log", "r_log", "sin", "cos", "tan",
-            "asin", "acos", "atan", "dnorm", "pnorm", "sd", "mean",
-            "sum", "min", "max", "maxval", "minval", "real", "int", "merge",
+            "asin", "acos", "atan", "dnorm", "pnorm", "sd", "mean", "var", "r_var",
+            "sum", "min", "max", "maxval", "minval", "real", "int", "merge", "dot_product",
             }
         ):
             return False
         e_refs = e
         for nm in array_names:
             e_refs = re.sub(
-                rf"\b(?:sum|product|maxval|minval|count|mean|sd|r_sd)\s*\(\s*{re.escape(nm)}\s*(?:,\s*(?!dim\s*=)[^()]*)?\)",
+                rf"\b(?:sum|product|maxval|minval|count|mean|sd|r_sd|var|r_var)\s*\(\s*{re.escape(nm)}\s*(?:,\s*(?!dim\s*=)[^()]*)?\)",
                 "0.0_dp",
                 e_refs,
                 flags=re.IGNORECASE,
@@ -35091,6 +35148,8 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
             e_refs = re.sub(rf"\b{re.escape(nm)}\s*\(\s*([^()]*)\)", repl_index, e_refs)
         for nm in array_names:
             if re.search(rf"\b{re.escape(nm)}\b", e_refs):
+                return False
+            if re.search(rf"\b{re.escape(nm)}\b(?!\s*\()", e):
                 return False
         return True
 
@@ -37977,7 +38036,7 @@ def promote_locals_from_derived_component_assignments_text(f90: str) -> str:
     type_fields: dict[tuple[str, str], tuple[str, int]] = {}
     current_type: str | None = None
     comp_decl_re = re.compile(
-        r"^\s*(real\(kind=dp\)|integer|logical|character\(len=:\))\s*([^:]*)::\s*(.+)$",
+        r"^\s*(real\(kind=dp\)|integer|logical|character\(len=:\))\s*([^:]*)\s*::\s*(.+)$",
         re.IGNORECASE,
     )
 
@@ -38019,7 +38078,7 @@ def promote_locals_from_derived_component_assignments_text(f90: str) -> str:
     unit_start: int | None = None
     local_types: dict[str, str] = {}
     local_required: dict[str, tuple[str, int]] = {}
-    type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+    type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?\s*::\s*(.+)$", re.IGNORECASE)
     assign_re = re.compile(r"^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
     unit_begin_re = re.compile(r"^\s*(?:program|(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function|subroutine)\b", re.IGNORECASE)
     unit_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
@@ -39046,6 +39105,1570 @@ def demote_scalar_objective_result_decls_text(f90: str) -> str:
             j += 1
         i = max(j + 1, i + 1)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def demote_optimizer_scalar_workspace_decls_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    scalar_pat = re.compile(r"^[A-Za-z]\w*_f(?:_new|_plus|_minus)?\s*\(:\)\s*$", re.IGNORECASE)
+    for ln in lines:
+        m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m is None:
+            out.append(ln)
+            continue
+        scalar_parts: list[str] = []
+        kept_parts: list[str] = []
+        for part in split_top_level_commas(m.group(2)):
+            p = part.strip()
+            if scalar_pat.fullmatch(p):
+                scalar_parts.append(p[:-3].strip())
+            elif p:
+                kept_parts.append(p)
+        if not scalar_parts:
+            out.append(ln)
+            continue
+        out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(scalar_parts))
+        if kept_parts:
+            out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept_parts))
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def demote_dot_product_function_results_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(rf"(?m)^\s*{re.escape(res)}\s*=\s*dot_product\s*\(", block, re.IGNORECASE) is None:
+            return block
+        return re.sub(
+            rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return re.sub(
+        r"(?ims)^\s*function\s+[A-Za-z]\w*\s*\([^)]*\)\s*(?:&\s*\n&\s*)?result\s*\(\s*[A-Za-z]\w*\s*\).*?^\s*end\s+function\b[^\n]*",
+        repl,
+        f90,
+    )
+
+
+def demote_scalar_only_function_results_text(f90: str) -> str:
+    def scalarish(rhs: str) -> bool:
+        t = rhs.strip()
+        if not t:
+            return False
+        if any(bad in t for bad in ("[", "]", "(:", "r_rep_", "pack(", "spread(", "matrix(", "reshape(")):
+            return False
+        if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", t):
+            return True
+        if re.fullmatch(r"[+-]?[A-Za-z]\w*\s*\([^)]*\)", t):
+            return True
+        if re.fullmatch(r"[+-]?[A-Za-z]\w*(?:\s*[+\-*/]\s*[A-Za-z]\w*\s*\([^)]*\))*", t):
+            return True
+        return False
+
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(rf"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\)\s*$", block, re.IGNORECASE) is None:
+            return block
+        assigns = [
+            m.group(1).strip()
+            for m in re.finditer(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block, re.IGNORECASE)
+        ]
+        if not assigns or not all(scalarish(rhs) for rhs in assigns):
+            return block
+        return re.sub(
+            rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return re.sub(
+        r"(?ims)^\s*function\s+[A-Za-z]\w*\s*\([^)]*\)\s*(?:&\s*\n&\s*)?result\s*\(\s*[A-Za-z]\w*\s*\).*?^\s*end\s+function\b[^\n]*",
+        repl,
+        f90,
+    )
+
+
+def promote_function_results_from_vector_rhs_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(rf"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(res)}\s*$", block, re.IGNORECASE) is None:
+            return block
+        vecs = {
+            m.group(1)
+            for m in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::.*?\b([A-Za-z]\w*)\s*\(:\)", block, re.IGNORECASE)
+        }
+        if not vecs:
+            return block
+        for m_asn in re.finditer(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", block, re.IGNORECASE):
+            rhs = m_asn.group(1)
+            for vec in vecs:
+                rhs_wo_calls = re.sub(rf"\b(?:sum|size|count|maxval|minval|dot_product)\s*\([^)]*\b{re.escape(vec)}\b[^)]*\)", "", rhs, flags=re.IGNORECASE)
+                if re.search(rf"\b{re.escape(vec)}\b(?!\s*\()", rhs_wo_calls):
+                    return re.sub(
+                        rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(res)}\s*$",
+                        rf"\1real(kind=dp), allocatable :: {res}(:)",
+                        block,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def promote_scalar_locals_from_vector_calls_text(f90: str) -> str:
+    vector_call_re = re.compile(r"^\s*(eigen_sym_values|r_rep_\w+|r_seq_\w+|qnorm|rnorm_vec|runif_vec)\s*\(", re.IGNORECASE)
+
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        promote: set[str] = set()
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+            if vector_call_re.match(m.group(2).strip()):
+                promote.add(m.group(1))
+        if not promote:
+            return block
+        for nm in sorted(promote, key=len, reverse=True):
+            block = re.sub(
+                rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.*?)(?<!\w){re.escape(nm)}(?!\w)(.*?)$",
+                lambda mm: (
+                    f"{mm.group(1)}real(kind=dp) :: "
+                    + ", ".join(p.strip() for p in (mm.group(2) + mm.group(3)).split(",") if p.strip())
+                    + f"\n{mm.group(1)}real(kind=dp), allocatable :: {nm}(:)"
+                ).replace(":: \n", ":: "),
+                block,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def promote_scalar_locals_from_rank1_rhs_text(f90: str) -> str:
+    def rhs_uses_rank1(rhs: str, rank1_names: set[str]) -> bool:
+        e = rhs.strip()
+        if not e or not rank1_names:
+            return False
+        e_test = e
+        for nm in rank1_names:
+            e_test = re.sub(
+                rf"\b(?:sum|product|maxval|minval|count|size|mean|sd|r_sd|var|r_var|dot_product)\s*\([^)]*\b{re.escape(nm)}\b[^)]*\)",
+                "0.0_dp",
+                e_test,
+                flags=re.IGNORECASE,
+            )
+            def repl_scalar_index(m: re.Match[str]) -> str:
+                idx = m.group(1).strip()
+                if "," in idx or ":" in idx:
+                    return m.group(0)
+                if re.search(r"\b(?:r_seq_\w*|pack|spread|which|merge)\s*\(", idx, re.IGNORECASE):
+                    return m.group(0)
+                return "0.0_dp"
+
+            e_test = re.sub(rf"\b{re.escape(nm)}\s*\(\s*([^()]*)\)", repl_scalar_index, e_test)
+        for nm in rank1_names:
+            if re.search(rf"\b{re.escape(nm)}\b", e_test):
+                return True
+        return False
+
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        rank1_names: set[str] = set()
+        for dm in re.finditer(
+            r"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)(?:\s*,\s*[^:]*)?::\s*(.+)$",
+            block,
+            re.IGNORECASE,
+        ):
+            for item in split_top_level_commas(dm.group(1)):
+                item_s = item.strip()
+                m_item = re.match(r"^([A-Za-z]\w*)\s*\(([^)]*)\)", item_s)
+                if m_item is None:
+                    continue
+                dims = m_item.group(2)
+                if "," not in dims:
+                    rank1_names.add(m_item.group(1))
+        if not rank1_names:
+            return block
+        promote: set[str] = set()
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", block, re.IGNORECASE):
+            scalar_names: set[str] = set()
+            for item in split_top_level_commas(dm.group(1)):
+                item_s = item.strip()
+                if re.fullmatch(r"[A-Za-z]\w*", item_s):
+                    scalar_names.add(item_s)
+            for nm in scalar_names:
+                for am in re.finditer(rf"(?m)^\s*{re.escape(nm)}\s*=\s*(.+)$", block):
+                    if rhs_uses_rank1(am.group(1), {x for x in rank1_names if x.lower() != nm.lower()}):
+                        promote.add(nm)
+                        break
+        if not promote:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m_decl is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            promoted_here: list[str] = []
+            for item in split_top_level_commas(m_decl.group(2)):
+                item_s = item.strip()
+                if item_s in promote:
+                    promoted_here.append(item_s)
+                elif item_s:
+                    kept.append(item_s)
+            if kept:
+                out.append(f"{m_decl.group(1)}real(kind=dp) :: " + ", ".join(kept))
+            for nm in promoted_here:
+                out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {nm}(:)")
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def repair_mixed_real_allocatable_declarations_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?m)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::[^\n]*,\s*&)\n\s*&\s*(real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*[A-Za-z]\w*\s*\(:\))\s*\n((?:\s*&[^\n]*\n?)+)",
+        lambda m: f"{m.group(1)}\n{m.group(3).rstrip()}\n{m.group(2)}\n",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    pat = re.compile(
+        r"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.*?),\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([A-Za-z]\w*\s*\(:\))\s*$",
+        re.IGNORECASE,
+    )
+    out = f90
+    for _ in range(10):
+        new = pat.sub(
+            lambda m: f"{m.group(1)}real(kind=dp) :: {m.group(2).rstrip()}\n{m.group(1)}real(kind=dp), allocatable :: {m.group(3).replace(' ', '')}",
+            out,
+        )
+        if new == out:
+            break
+        out = new
+    out = re.sub(
+        r"(?m)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*[^\n&]+)\n(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*[^\n]+)\n((?:\s*&[^\n]*\n?)+)",
+        lambda m: f"{m.group(1).rstrip()}, &\n{m.group(3).rstrip()}\n{m.group(2)}\n",
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
+def repair_orphan_declaration_continuations_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    decl_re = re.compile(
+        r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\(\s*kind\s*=\s*dp\s*\)|character\s*\([^)]*\)|type\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s*::",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        if re.match(r"^\s*&\s*[A-Za-z]\w*", line) and out and decl_re.match(out[-1]) and not out[-1].rstrip().endswith("&"):
+            out[-1] = out[-1].rstrip() + ", &"
+        out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_orphan_type_component_continuations_text(f90: str) -> str:
+    out: list[str] = []
+    in_type = False
+    for line in f90.splitlines():
+        if re.match(r"^\s*type\s*::\s*[A-Za-z]\w*\b", line, re.IGNORECASE):
+            in_type = True
+            out.append(line)
+            continue
+        if in_type and re.match(r"^\s*end\s+type\b", line, re.IGNORECASE):
+            in_type = False
+            out.append(line)
+            continue
+        if in_type:
+            m = re.match(r"^(\s*)&\s*([A-Za-z]\w*\s*\([^)]*\).*)$", line)
+            if m is not None and (not out or not out[-1].rstrip().endswith("&")):
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: {m.group(2)}")
+                continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def split_deferred_shape_real_declarations_text(f90: str) -> str:
+    out: list[str] = []
+    for line in f90.splitlines():
+        m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m is None:
+            out.append(line)
+            continue
+        scalars: list[str] = []
+        arrays: list[str] = []
+        for part in split_top_level_commas(m.group(2)):
+            part_s = part.strip()
+            if not part_s:
+                continue
+            if re.search(r"\([:,]", part_s):
+                arrays.append(part_s)
+            else:
+                scalars.append(part_s)
+        if arrays:
+            if scalars:
+                out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(scalars))
+            out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(arrays))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def split_scalar_items_from_allocatable_real_declarations_text(f90: str) -> str:
+    out: list[str] = []
+    for line in f90.splitlines():
+        m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m is None:
+            out.append(line)
+            continue
+        scalars: list[str] = []
+        arrays: list[str] = []
+        for part in split_top_level_commas(m.group(2)):
+            part_s = part.strip()
+            if not part_s:
+                continue
+            if "(" in part_s:
+                arrays.append(part_s)
+            else:
+                scalars.append(part_s)
+        if scalars:
+            out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(scalars))
+            if arrays:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(arrays))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def split_declarations_absorbing_executable_text(f90: str) -> str:
+    decl_heads = r"(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s*::"
+    return re.sub(
+        rf"(?im)^(\s*{decl_heads}\s*.+?),\s*(call\s+[A-Za-z]\w*\s*\(.*\))\s*$",
+        lambda m: f"{m.group(1).rstrip()}\n{m.group(2)}",
+        f90,
+    )
+
+
+def remove_program_decls_conflicting_with_used_module_specs_text(f90: str) -> str:
+    module_vars: dict[str, set[str]] = {}
+    mod_re = re.compile(r"(?ims)^\s*module\s+([A-Za-z]\w*)\b(.*?)^\s*contains\s*$")
+    decl_re = re.compile(
+        r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s*::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    for mm in mod_re.finditer(f90):
+        names: set[str] = set()
+        for line in mm.group(2).splitlines():
+            dm = decl_re.match(line)
+            if dm is None:
+                continue
+            for part in split_top_level_commas(dm.group(1)):
+                base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", base):
+                    names.add(base.lower())
+        module_vars[mm.group(1).lower()] = names
+    if not module_vars:
+        return f90
+
+    unit_re = re.compile(r"(?ims)^\s*program\s+[A-Za-z]\w*\b.*?^\s*end\s+program\b[^\n]*")
+
+    def rewrite_program(pm: re.Match[str]) -> str:
+        block = pm.group(0)
+        imported: set[str] = set()
+        for um in re.finditer(r"(?im)^\s*use\s+([A-Za-z]\w*)\b(?!\s*,\s*only\s*:)", block):
+            imported.update(module_vars.get(um.group(1).lower(), set()))
+        if not imported:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            dm = decl_re.match(line)
+            if dm is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            removed = False
+            for part in split_top_level_commas(dm.group(1)):
+                part_s = part.strip()
+                base = re.sub(r"\s*\(.*\)\s*$", "", part_s.split("=", 1)[0].strip()).strip()
+                if base.lower() in imported and "(" not in part_s:
+                    removed = True
+                    continue
+                if part_s:
+                    kept.append(part_s)
+            if not removed:
+                out.append(line)
+            elif kept:
+                prefix = line.split("::", 1)[0]
+                out.append(prefix + ":: " + ", ".join(kept))
+        return "\n".join(out)
+
+    return unit_re.sub(rewrite_program, f90)
+
+
+def demote_reals_assigned_scalar_reducers_text(f90: str) -> str:
+    scalar_names_by_unit: dict[tuple[int, int], set[str]] = {}
+    unit_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*"
+    )
+    scalar_rhs_re = re.compile(
+        r"^\s*(?:[-+]?\s*)?(?:median|maxval|minval|sum|mean|sd|var|count|dot_product|det|det_real|logdet_spd)\s*\(",
+        re.IGNORECASE,
+    )
+    for um in unit_re.finditer(f90):
+        block = um.group(0)
+        names: set[str] = set()
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+            lhs, rhs = am.group(1), am.group(2).strip()
+            if rhs.startswith("["):
+                continue
+            if re.search(r"\bdim\s*=", rhs, re.IGNORECASE):
+                continue
+            if scalar_rhs_re.match(rhs):
+                if not re.search(r"\b(?:colSums|rowSums|colMeans|rowMeans|r_matmul|matrix|reshape|pack|spread|rbind|cbind)\s*\(", rhs, re.IGNORECASE):
+                    names.add(lhs)
+        if names:
+            scalar_names_by_unit[(um.start(), um.end())] = names
+    if not scalar_names_by_unit:
+        return f90
+
+    def rewrite_unit(um: re.Match[str]) -> str:
+        names = scalar_names_by_unit.get((um.start(), um.end()), set())
+        if not names:
+            return um.group(0)
+        out: list[str] = []
+        for line in um.group(0).splitlines():
+            m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m is None:
+                out.append(line)
+                continue
+            scalars: list[str] = []
+            arrays: list[str] = []
+            for part in split_top_level_commas(m.group(2)):
+                part_s = part.strip()
+                base_m = re.match(r"^([A-Za-z]\w*)\s*\(", part_s)
+                if base_m is not None and base_m.group(1) in names:
+                    scalars.append(base_m.group(1))
+                elif part_s:
+                    arrays.append(part_s)
+            if scalars:
+                out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(scalars))
+                if arrays:
+                    out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(arrays))
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    return unit_re.sub(rewrite_unit, f90)
+
+
+def promote_scalar_reals_from_matrix_assignments_text(f90: str) -> str:
+    def rewrite_unit(um: re.Match[str]) -> str:
+        block = um.group(0)
+        scalar_reals: set[str] = set()
+        promote: set[str] = set()
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", block, re.IGNORECASE):
+            for part in split_top_level_commas(dm.group(1)):
+                part_s = part.strip()
+                if re.fullmatch(r"[A-Za-z]\w*", part_s):
+                    scalar_reals.add(part_s)
+        if not scalar_reals:
+            return block
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+            lhs, rhs = am.group(1), am.group(2).strip()
+            if lhs in scalar_reals and re.search(r"\b(?:r_matmul|solve_real|chol|cov|cor)\s*\(", rhs, re.IGNORECASE):
+                promote.add(lhs)
+        if not promote:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            moved: list[str] = []
+            for part in split_top_level_commas(m.group(2)):
+                part_s = part.strip()
+                if part_s in promote:
+                    moved.append(part_s)
+                elif part_s:
+                    kept.append(part_s)
+            if kept:
+                out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(kept))
+            if moved:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(f"{nm}(:,:)" for nm in moved))
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_unit,
+        f90,
+    )
+
+
+def demote_rank2_reals_from_vector_slice_assignments_text(f90: str) -> str:
+    def rewrite_unit(um: re.Match[str]) -> str:
+        block = um.group(0)
+        names: set[str] = set()
+        rank1_names: set[str] = set()
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", block, re.IGNORECASE):
+            for part in split_top_level_commas(dm.group(1)):
+                pm = re.match(r"^([A-Za-z]\w*)\s*\(:\s*\)$", part.strip())
+                if pm is not None:
+                    rank1_names.add(pm.group(1))
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*\(([^,\n]+),\s*:\s*\)\s*$", block):
+            first_idx = am.group(2).strip()
+            if ":" not in first_idx:
+                names.add(am.group(1))
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*r_rep_(?:real|integer|logical)\s*\(", block, re.IGNORECASE):
+            names.add(am.group(1))
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*solve_real\s*\((.+)\)\s*$", block, re.IGNORECASE):
+            args = split_top_level_commas(am.group(2))
+            if len(args) >= 2 and args[1].strip() in rank1_names:
+                names.add(am.group(1))
+        if not names:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m is None:
+                out.append(line)
+                continue
+            rank1: list[str] = []
+            kept: list[str] = []
+            for part in split_top_level_commas(m.group(2)):
+                part_s = part.strip()
+                bm = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\)$", part_s)
+                if bm is not None and bm.group(1) in names:
+                    rank1.append(f"{bm.group(1)}(:)")
+                elif part_s:
+                    kept.append(part_s)
+            if rank1:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(rank1))
+                if kept:
+                    out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept))
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_unit,
+        f90,
+    )
+
+
+def promote_matrix_reader_actuals_text(f90: str) -> str:
+    names: set[str] = set()
+    for cm in re.finditer(r"\b(?:read_csv_real_matrix|read_table_real_matrix)\s*\(([^)]*)\)", f90, re.IGNORECASE):
+        args = split_top_level_commas(cm.group(1))
+        if len(args) >= 2:
+            arg = args[1].strip()
+            if re.fullmatch(r"[A-Za-z]\w*", arg):
+                names.add(arg)
+    if not names:
+        return f90
+
+    def rewrite_unit(um: re.Match[str]) -> str:
+        block = um.group(0)
+        out: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)(\s*,\s*allocatable)?\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            moved: list[str] = []
+            for part in split_top_level_commas(m.group(3)):
+                part_s = part.strip()
+                bm = re.match(r"^([A-Za-z]\w*)(?:\s*\([^)]*\))?$", part_s)
+                if bm is not None and bm.group(1) in names:
+                    moved.append(f"{bm.group(1)}(:,:)")
+                elif part_s:
+                    kept.append(part_s)
+            if kept:
+                out.append(f"{m.group(1)}real(kind=dp){m.group(2) or ''} :: " + ", ".join(kept))
+            if moved:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(moved))
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_unit,
+        f90,
+    )
+
+
+def declare_missing_derived_field_scalar_locals_text(f90: str) -> str:
+    unit_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*"
+    )
+    decl_re = re.compile(
+        r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s*::\s*(.+)$",
+        re.IGNORECASE,
+    )
+
+    def rewrite_unit(um: re.Match[str]) -> str:
+        lines = um.group(0).splitlines()
+        declared: set[str] = set()
+        last_decl = -1
+        for i, line in enumerate(lines):
+            dm = decl_re.match(line)
+            if dm is None:
+                continue
+            last_decl = i
+            for part in split_top_level_commas(dm.group(1)):
+                base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", base):
+                    declared.add(base.lower())
+        missing_int: list[str] = []
+        missing_real: list[str] = []
+        for line in lines:
+            am = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*\s*%\s*([A-Za-z]\w*)\s*$", line)
+            if am is None:
+                continue
+            lhs, field = am.group(1), am.group(2).lower()
+            if lhs.lower() in declared or lhs.lower().endswith("_result"):
+                continue
+            declared.add(lhs.lower())
+            if re.search(r"(?:^|_)(?:p|q|n|k|i|j|order|rank|convergence|nobs|npar)$", lhs.lower()) or field in {"p", "q", "n", "k", "order", "rank", "convergence", "nobs", "npar"}:
+                missing_int.append(lhs)
+            else:
+                missing_real.append(lhs)
+        if last_decl < 0 or (not missing_int and not missing_real):
+            return um.group(0)
+        inserts: list[str] = []
+        if missing_int:
+            inserts.append("integer :: " + ", ".join(missing_int))
+        if missing_real:
+            inserts.append("real(kind=dp) :: " + ", ".join(missing_real))
+        return "\n".join(lines[: last_decl + 1] + inserts + lines[last_decl + 1 :])
+
+    return unit_re.sub(rewrite_unit, f90)
+
+
+def promote_scalar_reals_from_ranked_assignments_text(f90: str) -> str:
+    def rewrite_unit(m_unit: re.Match[str]) -> str:
+        block = m_unit.group(0)
+        rank1: set[str] = set()
+        rank2: set[str] = set()
+        scalar_reals: set[str] = set()
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,\s*[^:]*)?\s*::\s*(.+)$", block, re.IGNORECASE):
+            alloc = "allocatable" in dm.group(0).lower()
+            for part in split_top_level_commas(dm.group(1)):
+                part_s = part.strip()
+                m_name = re.match(r"^([A-Za-z]\w*)\s*(?:\(([^)]*)\))?", part_s)
+                if m_name is None:
+                    continue
+                nm = m_name.group(1)
+                dims = m_name.group(2)
+                if dims is None:
+                    if not alloc:
+                        scalar_reals.add(nm)
+                elif "," in dims:
+                    rank2.add(nm)
+                else:
+                    rank1.add(nm)
+        promote: dict[str, int] = {}
+        for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+            lhs, rhs = am.group(1), am.group(2).strip()
+            if lhs not in scalar_reals:
+                continue
+            if re.fullmatch(r"(?:[A-Za-z]\w*)_f(?:_new|_plus|_minus)?", lhs):
+                continue
+            if re.match(
+                r"^(?:sum|mean|sd|var|count|maxval|minval|dot_product|det|det_real|logdet_spd)\s*\(",
+                rhs,
+                re.IGNORECASE,
+            ):
+                continue
+            rhs_wo_reductions = re.sub(
+                r"\b(?:sum|mean|sd|var|count|size|maxval|minval|dot_product)\s*\([^)]*\)",
+                "0.0_dp",
+                rhs,
+                flags=re.IGNORECASE,
+            )
+            for nm in sorted(rank1 | rank2, key=len, reverse=True):
+                def repl_scalar_ref(mm: re.Match[str]) -> str:
+                    idx = mm.group(1).strip()
+                    if ":" in idx:
+                        return mm.group(0)
+                    if nm in rank2 and "," not in idx:
+                        return mm.group(0)
+                    if re.search(r"\b(?:r_seq_\w*|which|pack|spread)\s*\(", idx, re.IGNORECASE):
+                        return mm.group(0)
+                    return "0.0_dp"
+
+                rhs_wo_reductions = re.sub(rf"\b{re.escape(nm)}\s*\(\s*([^()]*)\)", repl_scalar_ref, rhs_wo_reductions)
+            if re.match(r"^(?:matrix|rnorm_mat|runif_mat|rbind|cbind)\s*\(", rhs, re.IGNORECASE):
+                promote[lhs] = 2
+                continue
+            if rhs.startswith("["):
+                promote[lhs] = max(promote.get(lhs, 0), 1)
+                continue
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs_wo_reductions) for nm in rank2):
+                promote[lhs] = 2
+                continue
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs_wo_reductions) for nm in rank1):
+                promote[lhs] = max(promote.get(lhs, 0), 1)
+        if not promote:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m_decl is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            promoted: list[tuple[str, int]] = []
+            for part in split_top_level_commas(m_decl.group(2)):
+                part_s = part.strip()
+                if part_s in promote:
+                    promoted.append((part_s, promote[part_s]))
+                elif part_s:
+                    kept.append(part_s)
+            if kept:
+                out.append(f"{m_decl.group(1)}real(kind=dp) :: " + ", ".join(kept))
+            for nm, rank in promoted:
+                dims = "(:,:)" if rank == 2 else "(:)"
+                out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {nm}{dims}")
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_unit,
+        f90,
+    )
+
+
+def demote_allocatable_results_from_scalar_callees_text(f90: str) -> str:
+    scalar_funcs: set[str] = set()
+    func_re = re.compile(r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b[^\n]*")
+    for fm in func_re.finditer(f90):
+        block = fm.group(0)
+        name = fm.group(1)
+        rm = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        res = rm.group(1) if rm else f"{name}_result"
+        if re.search(rf"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(res)}\b", block, re.IGNORECASE):
+            scalar_funcs.add(name.lower())
+    if not scalar_funcs:
+        return f90
+
+    def rewrite_func(fm: re.Match[str]) -> str:
+        block = fm.group(0)
+        name = fm.group(1)
+        rm = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        res = rm.group(1) if rm else f"{name}_result"
+        if not re.search(
+            rf"(?m)^\s*{re.escape(res)}\s*=\s*({'|'.join(re.escape(fn) for fn in sorted(scalar_funcs))})\s*\(",
+            block,
+            re.IGNORECASE,
+        ):
+            return block
+        return re.sub(
+            rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\s*\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return func_re.sub(rewrite_func, f90)
+
+
+def promote_reals_assigned_vector_constructors_text(f90: str) -> str:
+    def rewrite_unit(um: re.Match[str]) -> str:
+        block = um.group(0)
+        names = {
+            am.group(1)
+            for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*\[", block)
+        }
+        names.update(
+            am.group(1)
+            for am in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(?:runif_vec|rnorm_vec|rexp_vec|r_rep_real)\s*\(", block, re.IGNORECASE)
+        )
+        if not names:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            m = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m is None:
+                out.append(line)
+                continue
+            kept: list[str] = []
+            moved: list[str] = []
+            for part in split_top_level_commas(m.group(2)):
+                part_s = part.strip()
+                if part_s in names:
+                    moved.append(part_s)
+                elif part_s:
+                    kept.append(part_s)
+            if kept:
+                out.append(f"{m.group(1)}real(kind=dp) :: " + ", ".join(kept))
+            if moved:
+                out.append(f"{m.group(1)}real(kind=dp), allocatable :: " + ", ".join(f"{nm}(:)" for nm in moved))
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_unit,
+        f90,
+    )
+
+
+def demote_optimizer_callback_results_text(f90: str) -> str:
+    callback_names: set[str] = set()
+    for cm in re.finditer(r"\b(?:nlm_optimize_vec|nlm_optimize_scalar|optim_[A-Za-z]\w*|optim_stub)\s*\(\s*([A-Za-z]\w*)\s*,", f90):
+        callback_names.add(cm.group(1))
+    if not callback_names:
+        return f90
+
+    def rewrite_func(fm: re.Match[str]) -> str:
+        name = fm.group(1)
+        if name not in callback_names:
+            return fm.group(0)
+        block = fm.group(0)
+        rm = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        res = rm.group(1) if rm else f"{name}_result"
+        return re.sub(
+            rf"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\s*\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b[^\n]*",
+        rewrite_func,
+        f90,
+    )
+
+
+def declare_missing_real_scalars_from_assignments_text(f90: str) -> str:
+    unit_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*"
+    )
+    decl_re = re.compile(r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\))(?:\s*,\s*[^:]*)?\s*::\s*(.+)$", re.IGNORECASE)
+
+    def rewrite_unit(m_unit: re.Match[str]) -> str:
+        block = m_unit.group(0)
+        lines = block.splitlines()
+        declared: set[str] = set()
+        last_decl = -1
+        block_depth = 0
+        in_decl_cont = False
+        simple_decl_re = re.compile(r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\)|type\s*\([^)]*\)).*?::\s*(.+)$", re.IGNORECASE)
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*block\s*$", line, re.IGNORECASE):
+                block_depth += 1
+                continue
+            if re.match(r"^\s*end\s+block\b", line, re.IGNORECASE):
+                block_depth = max(0, block_depth - 1)
+                continue
+            if block_depth:
+                continue
+            if in_decl_cont and re.match(r"^\s*&", line):
+                last_decl = i
+                cont_rest = re.sub(r"^\s*&\s*", "", line).rstrip("&").strip()
+                for part in split_top_level_commas(cont_rest):
+                    base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                    if re.fullmatch(r"[A-Za-z]\w*", base):
+                        declared.add(base.lower())
+                in_decl_cont = line.rstrip().endswith("&")
+                continue
+            in_decl_cont = False
+            compact = line
+            if "::" not in compact:
+                continue
+            m_decl = simple_decl_re.match(compact)
+            if m_decl is None:
+                continue
+            last_decl = i
+            for part in split_top_level_commas(m_decl.group(1)):
+                base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", base):
+                    declared.add(base.lower())
+            in_decl_cont = line.rstrip().endswith("&")
+        missing: list[str] = []
+        block_depth = 0
+        for line in lines:
+            if re.match(r"^\s*block\s*$", line, re.IGNORECASE):
+                block_depth += 1
+                continue
+            if re.match(r"^\s*end\s+block\b", line, re.IGNORECASE):
+                block_depth = max(0, block_depth - 1)
+                continue
+            if block_depth:
+                continue
+            m_asn = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", line)
+            if m_asn is None:
+                continue
+            lhs = m_asn.group(1)
+            lhs_l = lhs.lower()
+            rhs = m_asn.group(2).strip()
+            if lhs_l in declared or lhs_l.endswith("_result"):
+                continue
+            if "%" in rhs:
+                continue
+            if any(tok in rhs for tok in ('"', "'", "[", "]")):
+                continue
+            if re.search(r"\b(?:matrix|reshape|pack|spread|r_seq_|r_rep_|rbind|cbind)\s*\(", rhs, re.IGNORECASE):
+                continue
+            declared.add(lhs_l)
+            missing.append(lhs)
+        if not missing or last_decl < 0:
+            return block
+        return "\n".join(lines[: last_decl + 1] + ["real(kind=dp) :: " + ", ".join(missing)] + lines[last_decl + 1 :])
+
+    return unit_re.sub(rewrite_unit, f90)
+
+
+def declare_missing_character_vectors_from_assignments_text(f90: str) -> str:
+    def rewrite_block(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        declared: set[str] = set()
+        char_vecs: set[str] = set()
+        for m_decl in re.finditer(r"(?m)^\s*character\s*\([^)]*\)(?:\s*,\s*[^:]*)?::\s*(.+)$", block, re.IGNORECASE):
+            for item in split_top_level_commas(m_decl.group(1)):
+                item_s = item.strip()
+                m_item = re.match(r"^([A-Za-z]\w*)\s*(?:\(([^)]*)\))?", item_s)
+                if m_item is None:
+                    continue
+                declared.add(m_item.group(1).lower())
+                if m_item.group(2) is not None:
+                    char_vecs.add(m_item.group(1).lower())
+        assigns: dict[str, str] = {}
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)(?:\s*\(|\s*$)", block):
+            lhs, rhs = m.group(1), m.group(2)
+            assigns[lhs.lower()] = rhs.lower()
+        missing = sorted(lhs for lhs, rhs in assigns.items() if lhs not in declared and rhs in char_vecs)
+        if not missing:
+            return block
+        m_imp = re.search(r"(?m)^implicit none\s*$", block, re.IGNORECASE)
+        if m_imp is None:
+            return block
+        insert = "\ncharacter(len=:), allocatable :: " + ", ".join(f"{nm}(:)" for nm in missing)
+        return block[:m_imp.end()] + insert + block[m_imp.end():]
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_block,
+        f90,
+    )
+
+
+def coerce_integer_params_for_real_dummy_calls_text(f90: str) -> str:
+    int_params = {
+        m.group(1).lower(): m.group(1)
+        for m in re.finditer(r"(?m)^\s*integer\s*,\s*parameter\s*::.*?\b([A-Za-z]\w*)\s*=", f90, re.IGNORECASE)
+    }
+    if not int_params:
+        return f90
+    proc_args: dict[str, list[str]] = {}
+    proc_real_scalar: dict[str, set[str]] = {}
+    proc_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine)\s+([A-Za-z]\w*)\s*\(([^)]*)\)(.*?)(?=^\s*contains\b|^\s*end\s+(?:function|subroutine)\b)",
+    )
+    for m in proc_re.finditer(f90):
+        name = m.group(1)
+        arg_src = re.sub(r"&\s*\n\s*&\s*", " ", m.group(2))
+        arg_src = arg_src.replace("&", " ")
+        args = [a.strip() for a in split_top_level_commas(arg_src) if re.fullmatch(r"[A-Za-z]\w*", a.strip())]
+        body_head = m.group(3)
+        real_scalars: set[str] = set()
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$", body_head, re.IGNORECASE):
+            for item in split_top_level_commas(dm.group(1)):
+                item = item.strip()
+                mm = re.match(r"^([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", item)
+                if mm is not None and mm.group(2) is None:
+                    real_scalars.add(mm.group(1).lower())
+        proc_args[name.lower()] = args
+        proc_real_scalar[name.lower()] = real_scalars
+    if not proc_args:
+        return f90
+
+    replacements: list[tuple[str, str]] = []
+    for callee_l, args in proc_args.items():
+        if not proc_real_scalar.get(callee_l):
+            continue
+        pat = re.compile(rf"\b{re.escape(callee_l)}\s*\(", re.IGNORECASE)
+        for m in pat.finditer(f90):
+            start = m.start()
+            line_start = f90.rfind("\n", 0, start) + 1
+            line_prefix = f90[line_start:start]
+            if re.match(
+                r"^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine)\s+$",
+                line_prefix,
+                re.IGNORECASE,
+            ):
+                continue
+            i = m.end()
+            depth = 1
+            in_str: str | None = None
+            while i < len(f90) and depth > 0:
+                ch = f90[i]
+                if in_str:
+                    if ch == in_str:
+                        in_str = None
+                else:
+                    if ch in {"'", '"'}:
+                        in_str = ch
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            txt = f90[start:i]
+            txt_norm = re.sub(r"&\s*\n\s*&\s*", " ", txt)
+            txt_norm = re.sub(r"&\s*\n\s*", " ", txt_norm)
+            ci = parse_call_text(txt_norm)
+            if ci is None:
+                continue
+            pos, kw = list(ci[1]), dict(ci[2])
+            changed = False
+            for idx, formal in enumerate(args):
+                if formal.lower() not in proc_real_scalar[callee_l]:
+                    continue
+                if idx < len(pos) and pos[idx].strip().lower() in int_params:
+                    pos[idx] = f"real({pos[idx].strip()}, kind=dp)"
+                    changed = True
+                for k in list(kw):
+                    if k.lower() == formal.lower() and kw[k].strip().lower() in int_params:
+                        kw[k] = f"real({kw[k].strip()}, kind=dp)"
+                        changed = True
+            if changed:
+                args_txt = pos + [f"{k}={v}" for k, v in kw.items()]
+                replacements.append((txt, f"{ci[0]}(" + ", ".join(args_txt) + ")"))
+    for old, new in replacements:
+        f90 = f90.replace(old, new, 1)
+    return f90
+
+
+def initialize_result_before_self_update_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        m_wrk = re.search(r"(?m)^\s*([A-Za-z]\w*_wrk)\s*=\s*([A-Za-z]\w*)\s*$", block)
+        if m_wrk is None:
+            return block
+        wrk = m_wrk.group(1)
+        lines = block.splitlines()
+        seen_result_assign = False
+        out: list[str] = []
+        inserted = False
+        for ln in lines:
+            if (
+                not inserted
+                and not seen_result_assign
+                and re.match(rf"^\s*{re.escape(res)}\s*=", ln)
+                and re.search(rf"\b{re.escape(res)}\b", ln.split("=", 1)[1])
+            ):
+                out.append(f"{res} = {wrk}")
+                inserted = True
+            if re.match(rf"^\s*{re.escape(res)}\s*=", ln):
+                seen_result_assign = True
+            out.append(ln)
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def repair_optimizer_best_null_guards_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        if not re.search(r"\btype\s*\(\s*optim_result_t\s*\)\s*::\s*best\s*,\s*opt\b", block, re.IGNORECASE):
+            return block
+        if "best%par" not in block or "best = opt" not in block:
+            return block
+        if "best_set" not in block:
+            block = re.sub(
+                r"(?m)^(\s*type\s*\(\s*optim_result_t\s*\)\s*::\s*best\s*,\s*opt\s*)$",
+                r"\1\nlogical :: best_set",
+                block,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        block = re.sub(
+            r"(?m)^(\s*best_val\s*=\s*huge\s*\(\s*1\.0_dp\s*\)\s*)$",
+            r"\1\nbest_set = .false.",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        block = re.sub(
+            r"(?m)^(\s*best\s*=\s*opt\s*)$",
+            r"\1\n   best_set = .true.",
+            block,
+            flags=re.IGNORECASE,
+        )
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        pat = re.compile(
+            rf"(?ms)^(\s*)({re.escape(res)}\s*=\s*r_rep_real\s*\(\s*\[ieee_value\(0\.0_dp,\s*&?.*?times\s*=\s*n\s*\)\s*)\n\s*return\s*\n\s*({re.escape(res)}\s*=\s*(?:stick_break_simplex|normalize_gross)\s*\(\s*best%par\s*\)\s*)",
+            re.IGNORECASE,
+        )
+
+        def guard(m: re.Match[str]) -> str:
+            indent = m.group(1)
+            return (
+                f"{indent}if (.not. best_set) then\n"
+                f"{indent}   {m.group(2).strip()}\n"
+                f"{indent}   return\n"
+                f"{indent}end if\n"
+                f"{indent}{m.group(3).strip()}\n"
+            )
+
+        block = pat.sub(guard, block, count=1)
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def rewrite_portfolio_print_labels_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        if "subroutine print_portfolio" not in block.lower():
+            return block
+        if "stat = portfolio_stats(" not in block or "call print_real_vector(stat" not in block:
+            return block
+        block = re.sub(
+            r'(?m)^(\s*)write\(\*,"\(g0\)"\)\s+"Weights:\s*"\s*\n\s*write\(\*,"\(g0\)"\)\s+r_round\(w,\s*6\)\s*$',
+            r'\1write(*,"(g0)") "Weights: "\n\1call print_named_real_vector(r_round(w, 6), price_names)',
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        block = re.sub(
+            r'(?m)^(\s*)call\s+print_real_vector\s*\(\s*stat\s*,\s*digits\s*=\s*6\s*\)\s*$',
+            (
+                r'\1call print_table2(reshape(stat(1:5), [1, 5]), [character(len=1) :: ""], '
+                r'[character(len=10) :: "mean", "sd", "ann_return", "ann_vol", "sharpe"], digits=6)\n'
+                r'\1call print_table2(reshape(stat(6:7), [1, 2]), [character(len=1) :: ""], '
+                r'[character(len=14) :: "net_exposure", "gross_exposure"], digits=6)'
+            ),
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*subroutine\s+print_portfolio\b.*?^\s*end\s+subroutine\b[^\n]*",
+        repl,
+        f90,
+    )
+
+
+def promote_dummy_ranks_from_callee_calls_text(f90: str) -> str:
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\(([^)]*)\).*?^\s*end\s+function\b[^\n]*)"
+    )
+    proc_ranks: dict[str, dict[str, int]] = {}
+    proc_args: dict[str, list[str]] = {}
+    blocks: list[tuple[str, str, list[str]]] = []
+    for m in proc_re.finditer(f90):
+        block = m.group(1)
+        name = m.group(2)
+        args = [a.strip() for a in split_top_level_commas(m.group(3)) if re.fullmatch(r"[A-Za-z]\w*", a.strip())]
+        ranks: dict[str, int] = {}
+        for dm in re.finditer(r"(?m)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$", block, re.IGNORECASE):
+            for item in split_top_level_commas(dm.group(1)):
+                item = item.strip()
+                mm = re.match(r"^([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", item)
+                if mm is None:
+                    continue
+                nm = mm.group(1)
+                dims = mm.group(2)
+                ranks[nm.lower()] = 0 if dims is None else max(1, dims.count(",") + 1)
+        proc_ranks[name.lower()] = ranks
+        proc_args[name.lower()] = args
+        blocks.append((block, name, args))
+    if not blocks:
+        return f90
+
+    def call_texts(block: str, callee: str) -> list[str]:
+        out: list[str] = []
+        pat = re.compile(rf"\b{re.escape(callee)}\s*\(", re.IGNORECASE)
+        for m in pat.finditer(block):
+            start = m.start()
+            i = m.end()
+            depth = 1
+            in_str: str | None = None
+            while i < len(block) and depth > 0:
+                ch = block[i]
+                if in_str:
+                    if ch == in_str:
+                        in_str = None
+                else:
+                    if ch in {"'", '"'}:
+                        in_str = ch
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                i += 1
+            if depth == 0:
+                out.append(block[start:i])
+        return out
+
+    replacements: dict[str, str] = {}
+    for block, name, args in blocks:
+        formals_l = {a.lower() for a in args}
+        promote: set[str] = set()
+        for callee_l, callee_args in proc_args.items():
+            if callee_l == name.lower():
+                continue
+            callee_ranks = proc_ranks.get(callee_l, {})
+            if not any(callee_ranks.get(a.lower(), 0) >= 2 for a in callee_args):
+                continue
+            for txt in call_texts(block, callee_l):
+                ci = parse_call_text(txt)
+                if ci is None:
+                    continue
+                pos, kw = ci[1], {k.lower(): v for k, v in ci[2].items()}
+                for idx, formal in enumerate(callee_args):
+                    rank = callee_ranks.get(formal.lower(), 0)
+                    if rank < 2:
+                        continue
+                    actual = kw.get(formal.lower()) or (pos[idx] if idx < len(pos) else "")
+                    actual = actual.strip()
+                    if actual.lower() in formals_l and re.fullmatch(r"[A-Za-z]\w*", actual):
+                        promote.add(actual)
+        if not promote:
+            continue
+        new_block = block
+        for actual in sorted(promote, key=len, reverse=True):
+            new_block = re.sub(
+                rf"(?m)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*.*?)(?<!\w){re.escape(actual)}(?!\s*\(|\w)",
+                lambda mm: mm.group(1) + f"{actual}(:,:)",
+                new_block,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        if new_block != block:
+            replacements[block] = new_block
+    for old, new in replacements.items():
+        f90 = f90.replace(old, new, 1)
+    return f90
+
+
+def rewrite_named_vector_result_string_indices_text(f90: str, src: str) -> str:
+    def balanced_from(text: str, start: int) -> str | None:
+        if start < 0 or start >= len(text) or text[start] != "(":
+            return None
+        depth = 1
+        i = start + 1
+        in_str: str | None = None
+        while i < len(text) and depth > 0:
+            ch = text[i]
+            if in_str:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            else:
+                if ch in {"'", '"'}:
+                    in_str = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            i += 1
+        if depth != 0:
+            return None
+        return text[start:i]
+
+    def function_bodies(text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        pat = re.compile(r"(?m)\b([A-Za-z]\w*)\s*<-\s*function\s*\([^)]*\)\s*\{")
+        for m in pat.finditer(text):
+            open_brace = text.find("{", m.end() - 1)
+            if open_brace < 0:
+                continue
+            depth = 1
+            i = open_brace + 1
+            in_str: str | None = None
+            while i < len(text) and depth > 0:
+                ch = text[i]
+                if in_str:
+                    if ch == "\\":
+                        i += 2
+                        continue
+                    if ch == in_str:
+                        in_str = None
+                else:
+                    if ch in {"'", '"'}:
+                        in_str = ch
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                i += 1
+            if depth == 0:
+                out.append((m.group(1), text[open_brace + 1 : i - 1]))
+        return out
+
+    fn_labels: dict[str, list[str]] = {}
+    for fn, body in function_bodies(src):
+        for m in re.finditer(r"\bc\s*\(", body):
+            call = balanced_from(body, m.end() - 1)
+            if call is None:
+                continue
+            ci = parse_call_text("c" + call)
+            if ci is not None and ci[2]:
+                fn_labels[fn.lower()] = [_sanitize_fortran_kwarg_name(k) for k in ci[2].keys()]
+        m_ret = re.search(r"\breturn\s*\(\s*c\s*\(", body)
+        if m_ret is not None:
+            call = balanced_from(body, body.find("(", m_ret.end() - 1))
+            if call is not None:
+                ci = parse_call_text("c" + call)
+                if ci is not None and ci[2]:
+                    fn_labels[fn.lower()] = [_sanitize_fortran_kwarg_name(k) for k in ci[2].keys()]
+    if not fn_labels:
+        return f90
+
+    def rewrite_block(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        local_labels: dict[str, list[str]] = {}
+        for fn_l, labels in fn_labels.items():
+            for m_asn in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(fn_l)}\s*\(", block, re.IGNORECASE):
+                local_labels[m_asn.group(1)] = labels
+        if not local_labels:
+            return block
+        for var, labels in local_labels.items():
+            for idx, lab in enumerate(labels, start=1):
+                block = re.sub(
+                    rf'{re.escape(var)}\s*\(\s*"{re.escape(lab)}"\s*\)',
+                    f"{var}({idx})",
+                    block,
+                    flags=re.IGNORECASE,
+                )
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_block,
+        f90,
+    )
+
+
+def rewrite_named_vector_print_labels_text(f90: str, src: str) -> str:
+    def balanced_from(text: str, start: int) -> str | None:
+        if start < 0 or start >= len(text) or text[start] != "(":
+            return None
+        depth = 1
+        i = start + 1
+        in_str: str | None = None
+        while i < len(text) and depth > 0:
+            ch = text[i]
+            if in_str:
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            else:
+                if ch in {"'", '"'}:
+                    in_str = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            i += 1
+        if depth != 0:
+            return None
+        return text[start:i]
+
+    def function_bodies(text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        pat = re.compile(r"(?m)\b([A-Za-z]\w*)\s*<-\s*function\s*\([^)]*\)\s*\{")
+        for m in pat.finditer(text):
+            open_brace = text.find("{", m.end() - 1)
+            if open_brace < 0:
+                continue
+            depth = 1
+            i = open_brace + 1
+            in_str: str | None = None
+            while i < len(text) and depth > 0:
+                ch = text[i]
+                if in_str:
+                    if ch == "\\":
+                        i += 2
+                        continue
+                    if ch == in_str:
+                        in_str = None
+                else:
+                    if ch in {"'", '"'}:
+                        in_str = ch
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                i += 1
+            if depth == 0:
+                out.append((m.group(1), text[open_brace + 1 : i - 1]))
+        return out
+
+    def strip_comment(line: str) -> str:
+        in_str: str | None = None
+        out: list[str] = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if in_str:
+                out.append(ch)
+                if ch == "\\":
+                    if i + 1 < len(line):
+                        out.append(line[i + 1])
+                        i += 2
+                        continue
+                elif ch == in_str:
+                    in_str = None
+            else:
+                if ch in {"'", '"'}:
+                    in_str = ch
+                    out.append(ch)
+                elif ch == "#":
+                    break
+                else:
+                    out.append(ch)
+            i += 1
+        return "".join(out).strip()
+
+    fn_name_exprs: dict[str, dict[str, str]] = {}
+    fn_result_labels: dict[str, list[str]] = {}
+    for fn, body in function_bodies(src):
+        fn_l = _sanitize_r_var_name(fn).lower()
+        for m_names in re.finditer(r"(?m)\bnames\s*\(\s*([A-Za-z]\w*)\s*\)\s*<-\s*([^\n]+)$", body):
+            var = _sanitize_r_var_name(m_names.group(1))
+            rhs = strip_comment(m_names.group(2))
+            if rhs:
+                fn_name_exprs.setdefault(fn_l, {})[var.lower()] = rhs
+        for m_c in re.finditer(r"\bc\s*\(", body):
+            call = balanced_from(body, m_c.end() - 1)
+            if call is None:
+                continue
+            ci = parse_call_text("c" + call)
+            if ci is not None and ci[2]:
+                fn_result_labels[fn_l] = [str(k) for k in ci[2].keys()]
+        m_ret = re.search(r"\breturn\s*\(\s*c\s*\(", body)
+        if m_ret is not None:
+            call = balanced_from(body, body.find("(", m_ret.end() - 1))
+            if call is not None:
+                ci = parse_call_text("c" + call)
+                if ci is not None and ci[2]:
+                    fn_result_labels[fn_l] = [str(k) for k in ci[2].keys()]
+    if not fn_name_exprs and not fn_result_labels:
+        return f90
+
+    def char_array_literal(labels: list[str]) -> str:
+        if not labels:
+            return "[character(len=1) :: ]"
+        width = max(1, max(len(str(x)) for x in labels))
+        vals = ", ".join('"' + str(x).replace('"', '""') + '"' for x in labels)
+        return f"[character(len={width}) :: {vals}]"
+
+    def rewrite_real_vector_prints(block: str, var: str, names_expr_f: str, labels: list[str] | None = None) -> str:
+        var_re = re.escape(var)
+        names_arg = char_array_literal(labels) if labels is not None else names_expr_f
+
+        def repl_write_round(m: re.Match[str]) -> str:
+            indent = m.group(1)
+            expr = m.group(2).strip()
+            return f"{indent}call print_named_real_vector({expr}, {names_arg})"
+
+        block = re.sub(
+            rf'(?m)^(\s*)write\(\*,"[^"\n]*"\)\s*((?:r_round\s*\(\s*)?{var_re}\b(?:\s*,\s*[^)]*)?\)?)\s*$',
+            repl_write_round,
+            block,
+            flags=re.IGNORECASE,
+        )
+
+        def repl_print_real(m: re.Match[str]) -> str:
+            indent = m.group(1)
+            expr = m.group(2).strip()
+            tail = m.group(3) or ""
+            return f"{indent}call print_named_real_vector({expr}, {names_arg}{tail})"
+
+        block = re.sub(
+            rf"(?m)^(\s*)call\s+print_real_vector\s*\(\s*((?:real\s*\(\s*)?(?:r_round\s*\(\s*)?{var_re}\b(?:[^,\n)]|\([^)]*\))*\)?(?:\s*,\s*kind\s*=\s*dp\s*\))?)\s*((?:,\s*digits\s*=\s*[^)\n]+)?)\s*\)\s*$",
+            repl_print_real,
+            block,
+            flags=re.IGNORECASE,
+        )
+        return block
+
+    def rewrite_block(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_head = re.match(
+            r"(?is)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\s+([A-Za-z]\w*)",
+            block,
+        )
+        proc_l = m_head.group(1).lower() if m_head is not None else ""
+        for var_l, name_src in fn_name_exprs.get(proc_l, {}).items():
+            name_f = r_expr_to_fortran(name_src)
+            block = rewrite_real_vector_prints(block, var_l, name_f)
+        local_labels: dict[str, list[str]] = {}
+        for fn_l, labels in fn_result_labels.items():
+            for m_asn in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(fn_l)}\s*\(", block, re.IGNORECASE):
+                local_labels[m_asn.group(1)] = labels
+        for var, labels in local_labels.items():
+            block = rewrite_real_vector_prints(block, var, "", labels=labels)
+        return block
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine|program)\b.*?^\s*end\s+(?:function|subroutine|program)\b[^\n]*",
+        rewrite_block,
+        f90,
+    )
 
 
 def demote_scalar_allocatable_function_results_text(f90: str) -> str:
@@ -43615,11 +45238,34 @@ def main() -> int:
     f90 = repair_extra_renamed_actual_arguments_text(f90)
     f90 = strip_real_wrappers_for_integer_dummy_calls_text(f90)
     f90 = format_convergence_fields_as_integer_text(f90)
+    f90 = rewrite_named_vector_result_string_indices_text(f90, src)
+    f90 = demote_scalar_allocatable_function_results_text(f90)
+    f90 = demote_scalar_reduction_result_declarations_text(f90)
+    f90 = demote_scalar_only_function_results_text(f90)
+    for _ in range(4):
+        f90_next = demote_scalar_assigned_rank1_real_locals_text(f90)
+        if f90_next == f90:
+            break
+        f90 = f90_next
+    f90 = promote_function_results_from_vector_rhs_text(f90)
+    f90 = promote_scalar_locals_from_vector_calls_text(f90)
+    f90 = promote_scalar_locals_from_rank1_rhs_text(f90)
+    f90 = repair_mixed_real_allocatable_declarations_text(f90)
+    f90 = declare_missing_character_vectors_from_assignments_text(f90)
+    f90 = coerce_integer_params_for_real_dummy_calls_text(f90)
+    f90 = initialize_result_before_self_update_text(f90)
+    f90 = repair_optimizer_best_null_guards_text(f90)
+    f90 = rewrite_named_vector_print_labels_text(f90, src)
     f90 = demote_rank2_reals_from_vector_rhs_text(f90)
     f90 = demote_rank2_reals_from_scalar_rhs_text(f90)
+    f90 = demote_dot_product_function_results_text(f90)
+    f90 = demote_optimizer_scalar_workspace_decls_text(f90)
+    f90 = repair_mixed_real_allocatable_declarations_text(f90)
+    f90 = promote_dummy_ranks_from_callee_calls_text(f90)
     f90 = rewrite_rank1_print_matrix_calls_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = demote_type_fields_from_rank1_local_assignments_text(f90)
+    f90 = promote_locals_from_derived_component_assignments_text(f90)
     if "type :: fit_ar_yw_result_t" in f90:
         f90 = f90.replace(
             "real(kind=dp), allocatable :: intercept(:), mean",
@@ -43670,14 +45316,50 @@ def main() -> int:
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = lower_supported_vapply_writes_text(f90)
         f90 = hoist_module_used_scalar_parameters_text(f90)
+        f90 = coerce_integer_params_for_real_dummy_calls_text(f90)
+        f90 = repair_mixed_real_allocatable_declarations_text(f90)
+        f90 = repair_orphan_declaration_continuations_text(f90)
+        f90 = remove_duplicate_local_declarations_text(f90)
+        f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+        f90 = split_deferred_shape_real_declarations_text(f90)
+        f90 = split_scalar_items_from_allocatable_real_declarations_text(f90)
+        f90 = declare_missing_real_scalars_from_assignments_text(f90)
+        f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+        f90 = remove_duplicate_local_declarations_text(f90)
+        f90 = repair_orphan_declaration_continuations_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     if "call print_integer_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
+    if "call print_named_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_vector"})
+    if "call print_table2(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_table2"})
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
+    f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+    f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = repair_orphan_declaration_continuations_text(f90)
+    f90 = split_declarations_absorbing_executable_text(f90)
+    f90 = repair_orphan_type_component_continuations_text(f90)
+    f90 = split_deferred_shape_real_declarations_text(f90)
+    f90 = promote_scalar_reals_from_ranked_assignments_text(f90)
+    f90 = promote_scalar_reals_from_matrix_assignments_text(f90)
+    f90 = promote_reals_assigned_vector_constructors_text(f90)
+    f90 = demote_allocatable_results_from_scalar_callees_text(f90)
+    f90 = demote_optimizer_callback_results_text(f90)
+    f90 = demote_reals_assigned_scalar_reducers_text(f90)
+    f90 = demote_rank2_reals_from_vector_slice_assignments_text(f90)
+    f90 = promote_matrix_reader_actuals_text(f90)
+    f90 = declare_missing_derived_field_scalar_locals_text(f90)
+    f90 = repair_mixed_real_allocatable_declarations_text(f90)
+    f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = repair_mixed_real_allocatable_declarations_text(f90)
+    f90 = split_declarations_absorbing_executable_text(f90)
+    f90 = remove_program_decls_conflicting_with_used_module_specs_text(f90)
+    f90 = declare_missing_derived_field_scalar_locals_text(f90)
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
