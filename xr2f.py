@@ -41433,6 +41433,16 @@ def main() -> int:
         help="aggressively fold compile-time constant IF conditions (default folds only literal .true./.false. forms)",
     )
     ap.add_argument(
+        "--no-post-repairs",
+        action="store_true",
+        help="disable the final generic post-codegen repair layer",
+    )
+    ap.add_argument(
+        "--special-repairs",
+        action="store_true",
+        help="enable corpus/example-specific compatibility repairs that are off by default",
+    )
+    ap.add_argument(
         "--real-print-fmt",
         default="f0.6",
         help='format descriptor used for real expressions when rewriting `print *` (default: "f0.6")',
@@ -43065,23 +43075,30 @@ def main() -> int:
             r"\1real(kind=dp) :: intercept",
             f90,
         )
-    f90 = demote_diag_scalar_formals_text(f90)
-    f90 = lower_result_list_assignments_text(f90)
-    f90 = promote_cluster_field_assignments_text(f90)
-    f90 = promote_vector_slice_locals_text(f90)
-    f90 = split_mixed_real_integer_declarations_text(f90)
-    f90 = repair_orphan_real_decl_continuations_text(f90)
-    f90 = fix_row_assignment_from_index_vector_text(f90)
-    f90 = rewrite_matrix_times_column_vector_text(f90)
-    f90 = repair_mvn_mixture_fit_list_text(f90)
-    f90 = repair_arma_nagarch_t_fit_grid_text(f90)
-    f90 = remove_duplicate_local_declarations_text(f90)
-    f90 = split_mixed_real_integer_declarations_text(f90)
-    f90 = repair_orphan_real_decl_continuations_text(f90)
-    f90 = repair_mvn_mixture_fit_list_text(f90)
-    f90 = repair_arma_nagarch_t_fit_grid_text(f90)
-    f90 = fix_integer_size_min_literals_text(f90)
-    f90 = avoid_allocatable_derived_merge_text(f90)
+    if not args.no_post_repairs:
+        # Generic post-codegen repairs. These compensate for known gaps in
+        # inference/codegen and should eventually move earlier in the pipeline.
+        f90 = demote_diag_scalar_formals_text(f90)
+        f90 = lower_result_list_assignments_text(f90)
+        f90 = promote_cluster_field_assignments_text(f90)
+        f90 = promote_vector_slice_locals_text(f90)
+        f90 = split_mixed_real_integer_declarations_text(f90)
+        f90 = repair_orphan_real_decl_continuations_text(f90)
+        f90 = fix_row_assignment_from_index_vector_text(f90)
+        f90 = rewrite_matrix_times_column_vector_text(f90)
+        if args.special_repairs:
+            # Corpus/example-specific compatibility repairs. Keep these opt-in
+            # so they do not hide raw translator behavior on user programs.
+            f90 = repair_mvn_mixture_fit_list_text(f90)
+            f90 = repair_arma_nagarch_t_fit_grid_text(f90)
+        f90 = remove_duplicate_local_declarations_text(f90)
+        f90 = split_mixed_real_integer_declarations_text(f90)
+        f90 = repair_orphan_real_decl_continuations_text(f90)
+        if args.special_repairs:
+            f90 = repair_mvn_mixture_fit_list_text(f90)
+            f90 = repair_arma_nagarch_t_fit_grid_text(f90)
+        f90 = fix_integer_size_min_literals_text(f90)
+        f90 = avoid_allocatable_derived_merge_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
