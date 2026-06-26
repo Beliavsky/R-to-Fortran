@@ -2126,23 +2126,26 @@ deallocate(put)
 #endif
 end subroutine set_seed_int
 
-function kmeans_vec(x, centers, nstart) result(out)
+function kmeans_vec(x, centers, nstart, iter_max) result(out)
 ! Minimal 1D k-means helper: returns centers and 1-based cluster ids.
 real(kind=dp), intent(in) :: x(:) ! input values
 integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
+integer, intent(in), optional :: iter_max
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:), c_new(:), sums(:), best_withinss(:), withinss(:), best_centers(:)
 integer, allocatable :: cnt(:), cl(:), cl_best(:), best_size(:)
 integer, allocatable :: size_tot(:)
 integer, allocatable :: order_idx(:), remap(:)
-integer :: i, j, k, n, it, jbest, nstart_loc, start, idx
+integer :: i, j, k, n, it, jbest, nstart_loc, iter_max_loc, start, idx
 integer :: t
 real(kind=dp) :: xmin, xmax, scale, d, dbest, u, best_score, score
 n = size(x)
 k = max(1, centers)
 nstart_loc = 1
 if (present(nstart)) nstart_loc = max(1, nstart)
+iter_max_loc = 50
+if (present(iter_max)) iter_max_loc = max(1, iter_max)
 allocate(c(k), c_new(k), sums(k), cnt(k), cl(n), cl_best(n))
 allocate(withinss(k), best_withinss(k), best_centers(k), best_size(k), size_tot(k))
 if (n <= 0) then
@@ -2189,7 +2192,7 @@ do start = 1, nstart_loc
          end do
       end if
    end if
-   do it = 1, 50
+   do it = 1, iter_max_loc
       do i = 1, n
          jbest = 1
          dbest = abs(x(i) - c(1))
@@ -2276,16 +2279,17 @@ out%size = best_size
 out%withinss = best_withinss
 end function kmeans_vec
 
-function kmeans_mat(x, centers, nstart) result(out)
+function kmeans_mat(x, centers, nstart, iter_max) result(out)
 ! Minimal row-wise k-means helper for matrix observations.
 real(kind=dp), intent(in) :: x(:,:) ! input data matrix
 integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
+integer, intent(in), optional :: iter_max
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:,:), c_new(:,:), sums(:,:), best_centers(:,:), best_withinss(:), withinss(:)
 integer, allocatable :: cnt(:), cl(:), cl_best(:), best_size(:), size_tot(:)
 integer, allocatable :: order_idx(:), remap(:), ci(:)
-integer :: i, j, k, n, p, it, jbest, nstart_loc, start
+integer :: i, j, k, n, p, it, jbest, nstart_loc, iter_max_loc, start
 integer :: idx
 integer :: t
 real(kind=dp) :: d, dbest, shift, u, best_score, score
@@ -2294,6 +2298,8 @@ p = size(x, 2)
 k = max(1, centers)
 nstart_loc = 1
 if (present(nstart)) nstart_loc = max(1, nstart)
+iter_max_loc = 50
+if (present(iter_max)) iter_max_loc = max(1, iter_max)
 allocate(c(k, p), c_new(k, p), sums(k, p), best_centers(k, p), withinss(k), best_withinss(k))
 allocate(cnt(k), size_tot(k), cl(n), cl_best(n), best_size(k), out%size(k), out%withinss(k))
 if (n <= 0 .or. p <= 0) then
@@ -2327,7 +2333,7 @@ do start = 1, nstart_loc
       c(1, :) = sum(x, dim=1) / real(n, kind=dp)
    end if
 
-   do it = 1, 50
+   do it = 1, iter_max_loc
       do i = 1, n
          jbest = 1
          dbest = sum((x(i, :) - c(1, :))**2)
@@ -6103,7 +6109,7 @@ do i = 1, n
 end do
 end function arima_sim_vector_vector
 
-function arima_fit(x, order, include_mean) result(fit)
+pure function arima_fit(x, order, include_mean) result(fit)
 ! Compute R-like time-series helper arima_fit.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: order(:) ! input vector
