@@ -18782,6 +18782,8 @@ def emit_stmts(
                 else:
                     raise NotImplementedError("write.table requires first argument x")
                 file_src = kw.get("file")
+                if file_src is None and len(pos) >= 2:
+                    file_src = pos[1]
                 if file_src is None:
                     raise NotImplementedError("write.table requires file= argument")
                 data_f = r_expr_to_fortran(data_src)
