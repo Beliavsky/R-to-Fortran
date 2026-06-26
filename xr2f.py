@@ -18692,7 +18692,11 @@ def emit_stmts(
                     data_src = kw["text"]
                 else:
                     raise NotImplementedError("writeLines requires text/data argument")
-                con_src = kw.get("con", '"out.txt"')
+                con_src = kw.get("con")
+                if con_src is None and len(pos) >= 2:
+                    con_src = pos[1]
+                if con_src is None:
+                    con_src = '"out.txt"'
                 data_f = r_expr_to_fortran(data_src)
                 write_fmt = "(g0.17)"
                 fmt_ci = parse_call_text(data_src)
@@ -18738,10 +18742,14 @@ def emit_stmts(
                     data_src = kw["x"]
                 else:
                     raise NotImplementedError("write requires first argument x")
-                file_src = kw.get("file", '""')
+                file_src = kw.get("file")
+                if file_src is None and len(pos) >= 2:
+                    file_src = pos[1]
+                if file_src is None:
+                    file_src = '""'
                 data_f = r_expr_to_fortran(data_src)
                 file_f = r_expr_to_fortran(file_src)
-                ncols_src = kw.get("ncolumns", kw.get("n_cols", "1"))
+                ncols_src = kw.get("ncolumns", kw.get("n_cols", pos[2] if len(pos) >= 3 else "1"))
                 ncols_f = _int_bound_expr(r_expr_to_fortran(ncols_src))
                 o.w("block")
                 o.push()
