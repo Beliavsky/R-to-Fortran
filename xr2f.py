@@ -13387,6 +13387,12 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"merge(1.0_dp, merge(-1.0_dp, 0.0_dp, ({xr}) < 0.0_dp), ({xr}) > 0.0_dp)"
 
     def _round_to_fortran(inner: str) -> str:
+        def _round_arg(x_f: str) -> str:
+            t_x = x_f.strip()
+            if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)?(?:\([^()]*\))?", t_x) or _is_int_literal(t_x) or _is_real_literal(t_x):
+                return f"real({t_x}, kind=dp)"
+            return t_x
+
         cinfo = parse_call_text("round(" + inner.strip() + ")")
         if cinfo is not None:
             _, pos_args, named_args = cinfo
@@ -13400,7 +13406,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 digits_src = named_args["digits"].strip()
             x_f = r_expr_to_fortran(x_src)
             digits_f = _int_bound_expr(r_expr_to_fortran(digits_src))
-            return f"r_round(real({x_f}, kind=dp), {digits_f})"
+            return f"r_round({_round_arg(x_f)}, {digits_f})"
         parts = split_top_level_commas(inner)
         if not parts:
             return "round()"
@@ -13408,7 +13414,7 @@ def r_expr_to_fortran(expr: str) -> str:
         digits_f = "0"
         if len(parts) >= 2 and parts[1].strip():
             digits_f = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
-        return f"r_round(real({x_f}, kind=dp), {digits_f})"
+        return f"r_round({_round_arg(x_f)}, {digits_f})"
 
     s = _replace_balanced_func_calls(s, "sign", _sign_to_fortran)
     s = _replace_balanced_func_calls(s, "round", _round_to_fortran)
@@ -22743,6 +22749,32 @@ def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) 
     return out
 
 
+def infer_main_real_params(stmts: list[object], assign_counts: dict[str, int]) -> dict[str, str]:
+    """Find conservative top-level real scalar named constants."""
+    out: dict[str, str] = {}
+    subscript_mutated: set[str] = set()
+    for txt in _stmt_texts_for_rank_scan(stmts):
+        asn = split_top_level_assignment(txt.strip())
+        if asn is None:
+            continue
+        lhs = asn[0].strip()
+        m_lhs = re.match(r"^([A-Za-z]\w*)\s*\[", lhs)
+        if m_lhs is not None:
+            subscript_mutated.add(m_lhs.group(1))
+    for st in stmts:
+        if not isinstance(st, Assign):
+            continue
+        if st.name in subscript_mutated:
+            continue
+        if assign_counts.get(st.name, 0) != 1:
+            continue
+        rhs = st.expr.strip()
+        if not _is_real_literal(rhs):
+            continue
+        out[st.name] = r_expr_to_fortran(rhs)
+    return out
+
+
 def _collect_pi_trig_array_args(stmts: list[object]) -> set[str]:
     """Collect simple array names passed to sinpi/cospi/tanpi calls."""
     out: set[str] = set()
@@ -26384,6 +26416,9 @@ def transpile_r_to_fortran(
     array_params = infer_main_array_params(main_stmts, assign_counts)
     pi_trig_args = _collect_pi_trig_array_args(main_stmts)
     array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
+    real_params = infer_main_real_params(main_stmts, assign_counts)
+    for nm_real_param in real_params:
+        real_scalars.discard(nm_real_param)
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
     for nm_date in _KNOWN_DATE_NAMES:
@@ -27026,8 +27061,10 @@ def transpile_r_to_fortran(
         _STATIC_LS_STR_LINES = [ls_lines_by_name.get(nm, f"{nm} : unknown") for nm in _STATIC_LS_NAMES]
     # Promote main-scope names referenced by local functions to module scope.
     main_name_map: dict[str, str] = {}
-    for nm in set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices | int_rank3_arrays:
+    for nm in set(params.keys()) | set(real_params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays | char_scalars | char_arrays | real_matrices | real_rank4_arrays | int_matrices | int_rank3_arrays:
         main_name_map[nm.lower()] = nm
+        if "_dot_" in nm:
+            main_name_map[nm.replace("_dot_", ".").lower()] = nm
     promoted_l: set[str] = set()
     for fn in funcs:
         free_names_l = _infer_function_free_names(fn)
@@ -27049,12 +27086,16 @@ def transpile_r_to_fortran(
                 promoted_l.add(m_actual_cl.group(0).lower())
     promoted_names: set[str] = {main_name_map[nm_l] for nm_l in promoted_l}
     promoted_params: dict[str, str] = {}
+    promoted_real_params: dict[str, str] = {}
     promoted_array_params: dict[str, tuple[str, int, str]] = {}
     promoted_kind: dict[str, str] = {}
     for nm in list(promoted_names):
         if nm in params:
             promoted_params[nm] = params.pop(nm)
             promoted_kind[nm] = "int_scalar"
+        if nm in real_params:
+            promoted_real_params[nm] = real_params.pop(nm)
+            promoted_kind[nm] = "real_scalar"
         if nm in array_params:
             promoted_array_params[nm] = array_params.pop(nm)
             promoted_kind[nm] = "array_param"
@@ -27111,7 +27152,7 @@ def transpile_r_to_fortran(
     size_groups: dict[int, list[str]] = {}
     for nm, (_knd, nsz, _expr_f) in array_params.items():
         size_groups.setdefault(nsz, []).append(nm)
-    used_names = set(params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays
+    used_names = set(params.keys()) | set(real_params.keys()) | set(array_params.keys()) | ints | real_scalars | int_arrays | real_arrays
     size_name_for_n: dict[int, str] = {}
     for nsz, names in sorted(size_groups.items()):
         if len(names) < 2:
@@ -27132,6 +27173,9 @@ def transpile_r_to_fortran(
                 pbody.w(f"integer(kind=int64), parameter :: {k} = {v}{suffix}")
             else:
                 pbody.w(f"integer, parameter :: {k} = {v}{suffix}")
+    for k, v in sorted(real_params.items()):
+        suffix = f" ! {main_param_comments[k].strip()}" if main_param_comments.get(k, "").strip() else ""
+        pbody.w(f"real(kind=dp), parameter :: {k} = {v}{suffix}")
     for nm, (knd, nsz, expr_f) in sorted(array_params.items()):
         n_decl = size_name_for_n.get(nsz, str(nsz))
         suffix = f" ! {main_param_comments[nm].strip()}" if main_param_comments.get(nm, "").strip() else ""
@@ -28384,7 +28428,14 @@ def transpile_r_to_fortran(
         pbody.w("call set_recycle_stop(.true.)")
 
     need_rnorm_main = {"used": False}
-    params_for_emit = set(params.keys()) | set(array_params.keys()) | set(promoted_params.keys()) | set(promoted_array_params.keys())
+    params_for_emit = (
+        set(params.keys())
+        | set(real_params.keys())
+        | set(array_params.keys())
+        | set(promoted_params.keys())
+        | set(promoted_real_params.keys())
+        | set(promoted_array_params.keys())
+    )
     _KNOWN_INT_NAMES = {n.lower() for n in ints}
     _KNOWN_INT_VECTOR_NAMES = {n.lower() for n in int_arrays}
     emit_stmts(
@@ -30239,12 +30290,20 @@ def transpile_r_to_fortran(
         if promoted_int64_params:
             rhs = ", ".join(f"{k} = {v}" for k, v in promoted_int64_params)
             o.w(f"integer(kind=int64), parameter :: {rhs}")
+    if promoted_real_params:
+        rhs = ", ".join(f"{k} = {v}" for k, v in sorted(promoted_real_params.items()))
+        o.w(f"real(kind=dp), parameter :: {rhs}")
     for nm, (knd, nsz, expr_f) in sorted(promoted_array_params.items()):
         if knd == "integer":
             o.w(f"integer, parameter :: {nm}({nsz}) = {expr_f}")
         else:
             o.w(f"real(kind=dp), parameter :: {nm}({nsz}) = {expr_f}")
-    promoted_nonparam = sorted(promoted_names - set(promoted_params.keys()) - set(promoted_array_params.keys()))
+    promoted_nonparam = sorted(
+        promoted_names
+        - set(promoted_params.keys())
+        - set(promoted_real_params.keys())
+        - set(promoted_array_params.keys())
+    )
     if promoted_nonparam:
         p_int_s = [n for n in promoted_nonparam if promoted_kind.get(n) == "int_scalar"]
         p_real_s = [n for n in promoted_nonparam if promoted_kind.get(n) == "real_scalar"]
@@ -30617,6 +30676,7 @@ def transpile_r_to_fortran(
         bool(mod_needed)
         or bool(need_ieee_mod)
         or bool(promoted_params)
+        or bool(promoted_real_params)
         or bool(promoted_array_params)
         or bool(promoted_nonparam)
         or bool(module_iface_lines)
@@ -38401,6 +38461,20 @@ def simplify_real_dp_casts_text(f90: str) -> str:
     )
     f90 = _replace_balanced_func_calls(
         f90,
+        "r_round",
+        lambda inner: (
+            f"r_round({real_parts[0].strip()}, {round_parts[1].strip()})"
+            if (round_parts := split_top_level_commas(inner))
+            and len(round_parts) == 2
+            and (m_real := re.match(r"(?is)^\s*real\s*\((.*)\)\s*$", round_parts[0].strip()))
+            and (real_parts := split_top_level_commas(m_real.group(1)))
+            and len(real_parts) == 2
+            and re.fullmatch(r"(?i)kind\s*=\s*dp", real_parts[1].strip())
+            else f"r_round({inner})"
+        ),
+    )
+    f90 = _replace_balanced_func_calls(
+        f90,
         "real",
         lambda inner: (
             parts[0].strip()
@@ -38499,6 +38573,116 @@ def rewrite_user_call_dotted_keyword_aliases_text(f90: str) -> str:
 
             f90 = fn_pat.sub(repl, f90)
     return f90
+
+
+def balance_print_real_vector_calls(f90_lines: list[str]) -> list[str]:
+    out = list(f90_lines)
+    i = 0
+    while i < len(out):
+        if not re.search(r"\bcall\s+print_real_vector\s*\(", out[i], re.IGNORECASE):
+            i += 1
+            continue
+        bal = out[i].count("(") - out[i].count(")")
+        j = i
+        while bal > 0 and j + 1 < len(out) and out[j + 1].lstrip().startswith("&"):
+            j += 1
+            bal += out[j].count("(") - out[j].count(")")
+        if bal == 1:
+            out[j] = out[j] + ")"
+        i = j + 1
+    return out
+
+
+def repair_character_vector_subset_renames_text(f90: str) -> str:
+    char_vecs: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"\s*character\(len=:\),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m is None:
+            continue
+        for item in split_top_level_commas(m.group(1)):
+            im = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\)\s*", item)
+            if im is not None:
+                char_vecs.add(im.group(1))
+    if not char_vecs:
+        return f90
+    bad_temps: set[str] = set()
+    lines_scan = f90.splitlines()
+    for idx_ln, ln in enumerate(lines_scan):
+        next_ln = lines_scan[idx_ln + 1] if idx_ln + 1 < len(lines_scan) else ""
+        joined = ln + "\n" + next_ln
+        for base in char_vecs:
+            m_asn = re.match(
+                rf"(?is)^\s*(?:if\s*\([^()\n]*\)\s*)?([A-Za-z]\w*)\s*=\s*(?:&\s*\n\s*&\s*)?{re.escape(base)}\s*\(",
+                joined,
+            )
+            if m_asn is not None and re.fullmatch(rf"{re.escape(base)}_\d+", m_asn.group(1)):
+                bad_temps.add(m_asn.group(1))
+    out_lines: list[str] = []
+    for ln in f90.splitlines():
+        m = re.match(r"^(\s*real\(kind=dp\),\s*allocatable\s*::\s*)(.+)$", ln, re.IGNORECASE)
+        if m is None:
+            out_lines.append(ln)
+            continue
+        kept: list[str] = []
+        for item in split_top_level_commas(m.group(2)):
+            txt = item.strip()
+            im = re.fullmatch(r"([A-Za-z]\w*)\s*\(:\)", txt)
+            if im is not None and im.group(1) in bad_temps:
+                continue
+            kept.append(txt)
+        if kept:
+            out_lines.append(m.group(1) + ", ".join(kept))
+    out = "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
+    for tmp in sorted(bad_temps, key=len, reverse=True):
+        base = re.sub(r"_\d+$", "", tmp)
+        out = re.sub(
+            rf"\b{re.escape(tmp)}\s*=\s*((?:&\s*\n\s*&\s*)?{re.escape(base)}\s*\()",
+            rf"{base} = \1",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
+            rf"\b{re.escape(tmp)}\s*=\s*&(\s*\n\s*&\s*{re.escape(base)}\s*\()",
+            rf"{base} = &\1",
+            out,
+            flags=re.IGNORECASE,
+        )
+    for base in sorted(char_vecs, key=len, reverse=True):
+        out = re.sub(
+            rf"\bcall\s+print_real_vector\s*\(\s*real\s*\(\s*{re.escape(base)}\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+            f"call print_char_vector({base})",
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
+def simplify_scalar_spread_matrix_ops_text(f90: str) -> str:
+    scalar_names: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"\s*real\(kind=dp\)\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m is None:
+            continue
+        for item in split_top_level_commas(m.group(1)):
+            nm = item.split("=", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z]\w*", nm):
+                scalar_names.add(nm)
+    if not scalar_names:
+        return f90
+
+    def repl(m: re.Match[str]) -> str:
+        mat = m.group(1)
+        scalar = m.group(2)
+        if scalar not in scalar_names:
+            return m.group(0)
+        return f"{mat} - {scalar}"
+
+    return re.sub(
+        r"\b([A-Za-z]\w*)\s*-\s*spread\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*,\s*&\s*\n\s*&\s*ncopies\s*=\s*size\s*\(\s*\1\s*,\s*1\s*\)\s*\)",
+        repl,
+        f90,
+        flags=re.IGNORECASE,
+    )
 
 
 def demote_scalarized_user_vector_assignments_text(f90: str) -> str:
@@ -42715,6 +42899,7 @@ def main() -> int:
     f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
+    f90_lines = balance_print_real_vector_calls(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     f90_lines = format_derived_type_blocks(f90_lines)
@@ -43670,14 +43855,20 @@ def main() -> int:
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = lower_supported_vapply_writes_text(f90)
         f90 = hoist_module_used_scalar_parameters_text(f90)
+    f90 = repair_character_vector_subset_renames_text(f90)
+    f90 = simplify_scalar_spread_matrix_ops_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
+    if "call print_char_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_char_vector"})
     if "call print_integer_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
+    if "call print_real_vector(" in f90:
+        f90 = "\n".join(balance_print_real_vector_calls(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
     print(f"wrote {out_path}")
