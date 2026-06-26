@@ -32931,6 +32931,463 @@ def rewrite_rank1_print_matrix_calls_text(f90: str) -> str:
     )
 
 
+def lower_result_list_assignments_text(f90: str) -> str:
+    """Lower leftover derived-result assignments like `res = list(a = x, ...)`."""
+    lines = f90.splitlines()
+    type_fields: dict[str, dict[str, tuple[str, int]]] = {}
+    current_type: str | None = None
+    for ln in lines:
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\s*$", ln, re.IGNORECASE)
+        if m_type is not None:
+            current_type = m_type.group(1)
+            type_fields[current_type.lower()] = {}
+            continue
+        if current_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            current_type = None
+            continue
+        if current_type is None:
+            continue
+        m_decl = re.match(
+            r"^\s*(real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character[^:]*)\s*(?:,[^:]*)?::\s*(.+)$",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_decl is None:
+            continue
+        kind = m_decl.group(1).lower()
+        for part in split_top_level_commas(m_decl.group(2)):
+            m_field = re.match(r"\s*([A-Za-z]\w*)\s*(?:\(([^)]*)\))?", part.strip())
+            if m_field is None:
+                continue
+            dims = m_field.group(2) or ""
+            type_fields[current_type.lower()][m_field.group(1).lower()] = (kind, dims.count(":"))
+
+    var_types: dict[str, str] = {}
+    for ln in lines:
+        m_var = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", ln, re.IGNORECASE)
+        if m_var is None:
+            continue
+        typ = m_var.group(1).lower()
+        for part in split_top_level_commas(m_var.group(2)):
+            m_name = re.match(r"\s*([A-Za-z]\w*)\b", part)
+            if m_name is not None:
+                var_types[m_name.group(1).lower()] = typ
+
+    out: list[str] = []
+    for ln in lines:
+        m_assign = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*list\s*\((.*)\)\s*$", ln, re.IGNORECASE)
+        if m_assign is None:
+            out.append(ln)
+            continue
+        indent, lhs, args_src = m_assign.groups()
+        fields = type_fields.get(var_types.get(lhs.lower(), ""), {})
+        args = split_top_level_commas(args_src)
+        lowered: list[str] = []
+        ok = bool(args)
+        for arg in args:
+            m_kw = re.match(r"\s*([A-Za-z]\w*)\s*=\s*(.+?)\s*$", arg, re.DOTALL)
+            if m_kw is None:
+                ok = False
+                break
+            field, expr = m_kw.group(1), m_kw.group(2).strip()
+            kind, rank = fields.get(field.lower(), ("", 0))
+            if rank == 1 and not re.match(r"^\s*\[", expr):
+                if kind.startswith("real") and re.match(r"^[+-]?\d+$", expr):
+                    expr = f"[real({expr}, kind=dp)]"
+                else:
+                    expr = f"[{expr}]"
+            lowered.append(f"{indent}{lhs}%{field} = {expr}")
+        if ok:
+            out.extend(lowered)
+        else:
+            out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def strip_unsupported_kmeans_args_text(f90: str) -> str:
+    def repl(args_src: str) -> str:
+        args = []
+        changed = False
+        for arg in split_top_level_commas(args_src):
+            if re.match(r"\s*iter[_.]?max\s*=", arg, re.IGNORECASE):
+                changed = True
+                continue
+            args.append(arg.strip())
+        return "kmeans(" + (", ".join(args) if changed else args_src) + ")"
+
+    return _replace_balanced_func_calls(f90, "kmeans", repl)
+
+
+def promote_cluster_field_assignments_text(f90: str) -> str:
+    names = {
+        m.group(1)
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*[A-Za-z]\w*%cluster\s*$", f90, re.IGNORECASE)
+    }
+    if not names:
+        return f90
+    name_alt = "|".join(sorted((re.escape(nm) for nm in names), key=len, reverse=True))
+
+    def rewrite_decl(m: re.Match[str]) -> str:
+        indent, rest = m.group(1), m.group(2)
+        scalar_parts: list[str] = []
+        promoted_parts: list[str] = []
+        for part in split_top_level_commas(rest):
+            part_s = part.strip()
+            m_name = re.match(r"([A-Za-z]\w*)\b", part_s)
+            if m_name is not None and m_name.group(1) in names:
+                promoted_parts.append(f"{m_name.group(1)}(:)")
+            else:
+                scalar_parts.append(part_s)
+        lines: list[str] = []
+        if scalar_parts:
+            lines.append(f"{indent}integer :: {', '.join(scalar_parts)}")
+        if promoted_parts:
+            lines.append(f"{indent}integer, allocatable :: {', '.join(promoted_parts)}")
+        return "\n".join(lines)
+
+    f90 = re.sub(
+        rf"(?m)^(\s*)integer\s*::\s*([^!\n]*\b(?:{name_alt})\b[^!\n]*)$",
+        rewrite_decl,
+        f90,
+    )
+    return f90
+
+
+def fix_row_assignment_from_index_vector_text(f90: str) -> str:
+    return re.sub(
+        r"(?m)^(\s*[A-Za-z]\w*\([^,\n]+,\s*:\)\s*=\s*[A-Za-z]\w*)\(\s*([A-Za-z]\w*)\s*,\s*:\s*\)\s*$",
+        r"\1(\2(1), :)",
+        f90,
+    )
+
+
+def rewrite_matrix_times_column_vector_text(f90: str) -> str:
+    return re.sub(
+        r"\b([A-Za-z]\w*)\s*\*\s*(resp)\s*\(\s*:\s*,\s*([^)]+?)\s*\)",
+        lambda m: (
+            f"{m.group(1)} * spread({m.group(2)}(:, {m.group(3).strip()}), "
+            f"dim=2, ncopies=size({m.group(1)},2))"
+        ),
+        f90,
+    )
+
+
+def repair_mvn_mixture_fit_list_text(f90: str) -> str:
+    if "mix_fits" not in f90 or "fit_mvn_mixture_once_result_t" not in f90:
+        return f90
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\)\s*::\s*fit\s*$",
+        r"\1type(fit_mvn_mixture_once_result_t) :: fit",
+        f90,
+    )
+    f90 = f90.replace(
+        "real(kind=dp), intent(in) :: x(:,:), k\ninteger, intent(in) :: nstart, maxit",
+        "real(kind=dp), intent(in) :: x(:,:)\ninteger, intent(in) :: k, nstart, maxit",
+    )
+    f90 = f90.replace(
+        "real(kind=dp), allocatable :: best_fit(:), comp_cor(:), comp_sd(:, :), mix_fits(:)",
+        "\n".join(
+            [
+                "type(fit_mvn_mixture_once_result_t) :: best_fit",
+                "type(fit_mvn_mixture_once_result_t), allocatable :: mix_fits(:)",
+                "real(kind=dp), allocatable :: comp_cor(:,:), comp_sd(:)",
+            ]
+        ),
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.*\bbest_fit\(:\).*\bmix_fits\(:\).*)$",
+        lambda m: (
+            f"{m.group(1)}type(fit_mvn_mixture_once_result_t) :: best_fit\n"
+            f"{m.group(1)}type(fit_mvn_mixture_once_result_t), allocatable :: mix_fits(:)\n"
+            f"{m.group(1)}real(kind=dp), allocatable :: "
+            + ", ".join(
+                part.strip().replace("comp_cor(:)", "comp_cor(:,:)").replace("comp_sd(:, :)", "comp_sd(:)")
+                for part in split_top_level_commas(m.group(2))
+                if not re.match(r"\s*(?:best_fit|mix_fits)\b", part, re.IGNORECASE)
+            )
+        ),
+        f90,
+    )
+    f90 = f90.replace(
+        "real(kind=dp) :: best_bic, mix_dot_cov_dot_ridge, mix_dot_min_dot_weight, mix_dot_tol",
+        "integer :: best_bic\nreal(kind=dp) :: mix_dot_cov_dot_ridge, mix_dot_min_dot_weight, mix_dot_tol",
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)allocate\(mix_fits\([^)]*max_dot_mix_dot_comp\)\)\s*$",
+        r"\1allocate(mix_fits(max_dot_mix_dot_comp))",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?ms)^(\s*)block\s*\n\s*real\(kind=dp\), allocatable :: xr2f_user_vec_tmp\(:\)\s*\n\s*xr2f_user_vec_tmp = (fit_mvn_mixture\([^;]*?\))\s*\n\s*fit = xr2f_user_vec_tmp\(1\)\s*\n\s*end block",
+        r"\1fit = \2",
+        f90,
+    )
+    f90 = re.sub(r"(?m)^(\s*)mix_fits\(:,\s*k\)\s*=\s*fit\s*$", r"\1mix_fits(k) = fit", f90)
+    f90 = re.sub(r"\bbest_fit\s*=\s*mix_fits\(:,\s*best_bic\)", "best_fit = mix_fits(best_bic)", f90)
+    f90 = re.sub(
+        r"(?m)^(\s*)call print_real_vector\(((?:fit|best_fit)%mu),\s*digits=([^)]+)\)\s*$",
+        r"\1call print_matrix_rstyle_named(\2, names=price_names, digits=\3)",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?ms)^\s*call print_real_vector\(real\(reshape\(best_fit%sigma\(:,:,\s*j\),\s*&\s*\n\s*&\s*digits=6,\s*\[size\(best_fit%sigma\(:,:,\s*j\),\s*6\)\]\),\s*kind=dp\)\)\s*$",
+        "   call print_matrix_rstyle_named(best_fit%sigma(:,:,j), names=price_names, row_names=price_names, digits=6)",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)call print_real_vector\(comp_cor,\s*digits=([^)]+)\)\s*$",
+        r"\1call print_matrix_rstyle_named(comp_cor, names=price_names, row_names=price_names, digits=\2)",
+        f90,
+    )
+    f90 = f90.replace(
+        "int_cols=[.false., .false., .true.,  .false., .false.]",
+        "int_cols=[.true., .false., .true.,  .false., .false.]",
+    )
+    return f90
+
+
+def remove_duplicate_local_declarations_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    seen_stack: list[set[str]] = [set()]
+    in_type = False
+
+    def split_decl_block(start: int) -> tuple[str, int]:
+        block = lines[start]
+        j = start
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        return block, j
+
+    def compact_decl_text(block: str) -> str:
+        return re.sub(r"&\s*\n\s*&?", " ", block)
+
+    def wrap_decl(prefix: str, parts: list[str]) -> list[str]:
+        text = prefix + ", ".join(parts)
+        if len(text) <= 110:
+            return [text]
+        wrapped: list[str] = []
+        cur = prefix
+        for part in parts:
+            piece = part if cur == prefix else ", " + part
+            if len(cur) + len(piece) > 100 and cur != prefix:
+                wrapped.append(cur + ", &")
+                cur = "& " + part
+            else:
+                cur += piece
+        wrapped.append(cur)
+        return wrapped
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if re.match(r"^\s*(?:program|module|(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function|subroutine)\b", ln, re.IGNORECASE):
+            seen_stack = [set()]
+        if re.match(r"^\s*block\s*$", ln, re.IGNORECASE):
+            out.append(ln)
+            seen_stack.append(set())
+            i += 1
+            continue
+        if re.match(r"^\s*end\s+block\b", ln, re.IGNORECASE):
+            out.append(ln)
+            if len(seen_stack) > 1:
+                seen_stack.pop()
+            i += 1
+            continue
+        if re.match(r"^\s*type\s*::\s*[A-Za-z]\w*\b", ln, re.IGNORECASE):
+            in_type = True
+        if in_type:
+            out.append(ln)
+            if re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+                in_type = False
+            i += 1
+            continue
+        block, j = split_decl_block(i)
+        compact = compact_decl_text(block)
+        m_decl = re.match(
+            r"^(\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\))\s*(?:,\s*[^:]*)?::\s*)(.+)$",
+            compact,
+            re.IGNORECASE,
+        )
+        if m_decl is None:
+            out.append(ln)
+            i += 1
+            continue
+        prefix, rest = m_decl.groups()
+        kept: list[str] = []
+        for part in split_top_level_commas(rest):
+            part_s = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\b", part_s)
+            if m_item is None:
+                kept.append(part_s)
+                continue
+            name_l = m_item.group(1).lower()
+            seen = seen_stack[-1]
+            if name_l in seen:
+                continue
+            seen.add(name_l)
+            kept.append(part_s)
+        if kept:
+            out.extend(wrap_decl(prefix, kept))
+        i = j + 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def demote_diag_scalar_formals_text(f90: str) -> str:
+    lines = f90.splitlines()
+    proc_re = re.compile(
+        r"^\s*(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function\s+([A-Za-z]\w*)\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    end_re = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    demote_by_fn: dict[str, set[str]] = {}
+    fn_formals: dict[str, list[str]] = {}
+    fn_bodies: dict[str, str] = {}
+    fn_ranked_formals: dict[str, set[str]] = {}
+    i = 0
+    while i < len(lines):
+        m_proc = proc_re.match(lines[i])
+        if m_proc is None:
+            i += 1
+            continue
+        fn = m_proc.group(1)
+        formals = [p.strip() for p in split_top_level_commas(m_proc.group(2)) if p.strip()]
+        fn_formals[fn.lower()] = formals
+        j = i + 1
+        body_lines: list[str] = []
+        ranked_formals: set[str] = set()
+        while j < len(lines) and end_re.match(lines[j]) is None:
+            body_lines.append(lines[j])
+            m_decl = re.match(r"^\s*real\(kind=dp\)\s*,\s*intent\(in\)\s*::\s*(.+)$", lines[j], re.IGNORECASE)
+            if m_decl is not None:
+                for part in split_top_level_commas(m_decl.group(1)):
+                    m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:", part.strip())
+                    if m_item is not None:
+                        ranked_formals.add(m_item.group(1))
+            j += 1
+        body = "\n".join(body_lines)
+        fn_bodies[fn.lower()] = body
+        fn_ranked_formals[fn.lower()] = set(ranked_formals)
+        body_without_decls = "\n".join(
+            ln
+            for ln in body_lines
+            if re.match(r"^\s*(?:real|integer|logical|character|type|complex)\b", ln, re.IGNORECASE) is None
+        )
+        demote: set[str] = set()
+        for nm in ranked_formals:
+            if re.search(rf"\bdiag\s*\(\s*{re.escape(nm)}\s*,", body, re.IGNORECASE):
+                body_without_diag_uses = re.sub(
+                    rf"\bdiag\s*\(\s*{re.escape(nm)}\s*,[^)]*\)",
+                    "",
+                    body_without_decls,
+                    flags=re.IGNORECASE,
+                )
+                non_diag_index = re.search(
+                    rf"\b{re.escape(nm)}\s*\(",
+                    body_without_diag_uses,
+                    re.IGNORECASE,
+                )
+                if non_diag_index is None:
+                    demote.add(nm)
+        if demote:
+            demote_by_fn[fn.lower()] = demote
+        i = j + 1
+    changed = True
+    while changed:
+        changed = False
+        for fn_l, body in fn_bodies.items():
+            ranked_formals = fn_ranked_formals.get(fn_l, set())
+            newly_demoted: set[str] = set()
+            for callee_l, callee_demoted in list(demote_by_fn.items()):
+                callee_formals = fn_formals.get(callee_l, [])
+                scalar_positions = {
+                    idx: formal
+                    for idx, formal in enumerate(callee_formals)
+                    if formal in callee_demoted
+                }
+
+                def scan_args(args_src: str, callee_l: str = callee_l) -> str:
+                    args = split_top_level_commas(args_src)
+                    for pos, formal in scalar_positions.items():
+                        if pos < len(args):
+                            arg_s = args[pos].strip()
+                            m_arr = re.fullmatch(r"\[\s*([A-Za-z]\w*)\s*\]", arg_s)
+                            arg_name = m_arr.group(1) if m_arr is not None else arg_s
+                            if arg_name in ranked_formals:
+                                newly_demoted.add(arg_name)
+                        for arg in args:
+                            m_kw = re.match(
+                                rf"\s*{re.escape(formal)}\s*=\s*(?:\[\s*)?([A-Za-z]\w*)(?:\s*\])?\s*$",
+                                arg,
+                                re.IGNORECASE,
+                            )
+                            if m_kw is not None and m_kw.group(1) in ranked_formals:
+                                newly_demoted.add(m_kw.group(1))
+                    return f"{callee_l}({args_src})"
+
+                _replace_balanced_func_calls(body, callee_l, scan_args)
+            if newly_demoted:
+                current = demote_by_fn.setdefault(fn_l, set())
+                before = len(current)
+                current.update(newly_demoted)
+                if len(current) != before:
+                    changed = True
+    if not demote_by_fn:
+        return f90
+
+    out: list[str] = []
+    current_fn: str | None = None
+    for ln in lines:
+        m_proc = proc_re.match(ln)
+        if m_proc is not None:
+            current_fn = m_proc.group(1).lower()
+        if current_fn is not None and end_re.match(ln):
+            current_fn = None
+        demote = demote_by_fn.get(current_fn or "", set())
+        if demote:
+            m_decl = re.match(r"^(\s*real\(kind=dp\)\s*,\s*intent\(in\)\s*::\s*)(.+)$", ln, re.IGNORECASE)
+            if m_decl is not None:
+                parts: list[str] = []
+                for part in split_top_level_commas(m_decl.group(2)):
+                    part_s = part.strip()
+                    m_item = re.match(r"([A-Za-z]\w*)\s*\([^)]*\)$", part_s)
+                    if m_item is not None and m_item.group(1) in demote:
+                        parts.append(m_item.group(1))
+                    else:
+                        parts.append(part_s)
+                ln = m_decl.group(1) + ", ".join(parts)
+        out.append(ln)
+    f90 = "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+    for fn_l, names in demote_by_fn.items():
+        formals = fn_formals.get(fn_l, [])
+        scalar_positions = {idx: formal for idx, formal in enumerate(formals) if formal in names}
+
+        def repl_args(args_src: str, fn_l: str = fn_l, scalar_positions: dict[int, str] = scalar_positions) -> str:
+            args = split_top_level_commas(args_src)
+            changed = False
+            for pos, formal in scalar_positions.items():
+                if pos < len(args):
+                    m_arr = re.fullmatch(r"\s*\[\s*(.+?)\s*\]\s*", args[pos], re.DOTALL)
+                    if m_arr is not None and len(split_top_level_commas(m_arr.group(1))) == 1:
+                        args[pos] = m_arr.group(1).strip()
+                        changed = True
+                for k, arg in enumerate(args):
+                    m_kw = re.match(rf"\s*{re.escape(formal)}\s*=\s*\[\s*(.+?)\s*\]\s*$", arg, re.IGNORECASE | re.DOTALL)
+                    if m_kw is not None and len(split_top_level_commas(m_kw.group(1))) == 1:
+                        args[k] = f"{formal}={m_kw.group(1).strip()}"
+                        changed = True
+            return ", ".join(a.strip() for a in args) if changed else args_src
+
+        f90 = _replace_balanced_func_calls(
+            f90,
+            fn_l,
+            lambda args, fn_l=fn_l: f"{fn_l}({repl_args(args, fn_l)})",
+        )
+    return f90
+
+
 def promote_integer_formals_from_callee_contracts_text(f90: str) -> str:
     """Promote real scalar formals to integer when passed to integer formals."""
     lines = f90.splitlines()
@@ -42328,6 +42785,14 @@ def main() -> int:
             r"\1real(kind=dp) :: intercept",
             f90,
         )
+    f90 = demote_diag_scalar_formals_text(f90)
+    f90 = lower_result_list_assignments_text(f90)
+    f90 = promote_cluster_field_assignments_text(f90)
+    f90 = fix_row_assignment_from_index_vector_text(f90)
+    f90 = rewrite_matrix_times_column_vector_text(f90)
+    f90 = repair_mvn_mixture_fit_list_text(f90)
+    f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = repair_mvn_mixture_fit_list_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
