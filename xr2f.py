@@ -6455,7 +6455,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^rle\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:rle|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -17527,6 +17527,12 @@ def emit_stmts(
                         _wstmt(f"call print_integrate_result({one})", st.comment)
                         need_r_mod.update({"print_integrate_result", "integrate_result_t"})
                         continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "optim_result_t":
+                        _wstmt('write(*,"(g0)") "par:"', st.comment)
+                        o.w(f'write(*,"(*(g0,:,1x))") {one}%par')
+                        o.w(f'write(*,"(*(g0,:,1x))") "value:", {one}%value')
+                        o.w(f'write(*,"(*(g0,:,1x))") "convergence:", {one}%convergence')
+                        continue
                     if c_one is not None and c_one[0].lower() == "acf":
                         _wstmt(f"call print_acf({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"r_acf", "print_acf", "acf_fit_t"})
@@ -19889,7 +19895,13 @@ def _emit_optim_bfgs_assignment(
         ordered_extra.append((idx, r_expr_to_fortran(formal_l)))
     extra_actuals = [v for _idx, v in sorted(ordered_extra, key=lambda x: x[0])]
 
+    objective_arg_ranks = _USER_FUNC_ARG_RANK.get(fn_name.lower(), {})
+    first_formal_l = next((formal_l for formal_l, idx in objective_args.items() if idx == 0), "")
+    objective_first_scalar = bool(first_formal_l) and int(objective_arg_ranks.get(first_formal_l, 1)) == 0
+
     par_f = r_expr_to_fortran(par_src)
+    if objective_first_scalar and not par_f.strip().startswith("["):
+        par_f = f"[{par_f}]"
     control_src = kw.get("control", "")
     maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
     reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
@@ -19933,7 +19945,8 @@ def _emit_optim_bfgs_assignment(
     converged = f"{prefix}_converged"
 
     def obj_call(p_expr: str) -> str:
-        args = ", ".join([p_expr] + extra_actuals)
+        first_actual = f"{p_expr}(1)" if objective_first_scalar else p_expr
+        args = ", ".join([first_actual] + extra_actuals)
         return f"{fn_name}({args})"
 
     def emit_gradient(point: str, grad: str) -> None:
@@ -27319,6 +27332,8 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "nlm":
                 nlm_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t", "print_nlm_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "optim":
+                list_vars[st.name] = "optim_result_t"
             if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
                 list_vars[st.name] = "integrate_result_t"
                 helper_ctx_main["need_r_mod"].update({"integrate", "integrate_result_t", "print_integrate_result"})
@@ -33218,6 +33233,31 @@ def format_convergence_fields_as_integer_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def scalarize_scalar_optim_par_field_text(f90: str) -> str:
+    """Use the first par component when scalar-objective optim results feed scalars."""
+    scalar_optim_vars: set[str] = set()
+    for m in re.finditer(
+        r"\b([A-Za-z]\w*)%par\s*=\s*\1_p\b",
+        f90,
+        flags=re.IGNORECASE,
+    ):
+        var = m.group(1)
+        prefix = re.escape(var)
+        start = max(0, f90.rfind("\nblock", 0, m.start()))
+        block = f90[start:m.start()]
+        if re.search(rf"\b{prefix}_p(?:_tmp|_new)?\s*\(\s*1\s*\)", block, re.IGNORECASE):
+            scalar_optim_vars.add(var)
+    for var in sorted(scalar_optim_vars, key=len, reverse=True):
+        v = re.escape(var)
+        f90 = re.sub(
+            rf"\breal\(\s*{v}%par\s*,\s*kind\s*=\s*dp\s*\)",
+            f"real({var}%par(1), kind=dp)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    return f90
+
+
 def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
     lines = f90.splitlines()
     rank1: set[str] = set()
@@ -38680,7 +38720,12 @@ def simplify_scalar_spread_matrix_ops_text(f90: str) -> str:
     return re.sub(
         r"\b([A-Za-z]\w*)\s*-\s*spread\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*,\s*&\s*\n\s*&\s*ncopies\s*=\s*size\s*\(\s*\1\s*,\s*1\s*\)\s*\)",
         repl,
-        f90,
+        re.sub(
+            r"\b([A-Za-z]\w*)\s*-\s*spread\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*,\s*ncopies\s*=\s*size\s*\(\s*\1\s*,\s*1\s*\)\s*\)",
+            repl,
+            f90,
+            flags=re.IGNORECASE,
+        ),
         flags=re.IGNORECASE,
     )
 
@@ -43794,6 +43839,7 @@ def main() -> int:
     f90 = rewrite_lowered_dataframe_prints_text(f90)
     f90 = rewrite_guarded_index_merge_assignments_text(f90)
     f90 = promote_inline_optim_result_vars_text(f90)
+    f90 = scalarize_scalar_optim_par_field_text(f90)
     if "type(optim_result_t)" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
     f90 = promote_r_sub_vector_dummy_args_text(f90)
