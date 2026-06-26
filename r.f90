@@ -1,4 +1,4 @@
-! helper functions for R-to-Fortran transpiler
+﻿! helper functions for R-to-Fortran transpiler
 module r_mod
 use, intrinsic :: iso_fortran_env, only: real64, int64
 use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, &
@@ -1699,7 +1699,7 @@ integer :: out(2)
 out = [minval(x), maxval(x)]
 end function date_range
 
-function r_character(n) result(out)
+pure function r_character(n) result(out)
 ! Allocate an R-like character vector initialized to empty strings.
 integer, intent(in) :: n ! requested vector length
 character(len=:), allocatable :: out(:)
@@ -2474,7 +2474,7 @@ end do
 if (n >= 1) out(n, n) = 0.0_dp
 end function dist_mat
 
-function hclust_complete(d, method) result(out)
+pure function hclust_complete(d, method) result(out)
 ! Minimal hierarchical clustering helper using complete linkage on a distance matrix.
 ! Valid method value: "complete" (default); other values are treated as "complete".
 real(kind=dp), intent(in) :: d(:,:) ! square distance matrix
@@ -2580,7 +2580,7 @@ do step = 1, n - 1
 end do
 end function hclust_complete
 
-function cutree_f90(fit, k) result(group)
+pure function cutree_f90(fit, k) result(group)
 ! Cut dendrogram at a target number of groups.
 ! If k is absent, return one group; provided k is clamped to the range 1:n.
 type(hclust_result_t), intent(in) :: fit ! hierarchical clustering result
@@ -2707,7 +2707,7 @@ do i = 1, n
 end do
 end function max_col
 
-function tabulate_int(x, nbins) result(out)
+pure function tabulate_int(x, nbins) result(out)
 ! Count occurrences of integer labels 1..nbins.
 integer, intent(in) :: x(:) ! input vector
 integer, intent(in) :: nbins
@@ -2721,7 +2721,7 @@ do i = 1, size(x)
 end do
 end function tabulate_int
 
-function tabulate_real(x, nbins) result(out)
+pure function tabulate_real(x, nbins) result(out)
 ! Count occurrences after integer-coding real labels.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: nbins
@@ -2735,7 +2735,7 @@ do i = 1, size(x)
 end do
 end function tabulate_real
 
-function table2_int(x, y, nx, ny) result(out)
+pure function table2_int(x, y, nx, ny) result(out)
 ! Count paired integer labels into an nx-by-ny contingency table.
 integer, intent(in) :: x(:) ! input vector
 integer, intent(in) :: y(:) ! response values
@@ -2754,7 +2754,7 @@ do i = 1, n
 end do
 end function table2_int
 
-function prop_table_int_vec(x, margin) result(out)
+pure function prop_table_int_vec(x, margin) result(out)
 ! Convert integer counts to proportions.
 integer, intent(in) :: x(:) ! input vector
 integer, intent(in), optional :: margin
@@ -2770,7 +2770,7 @@ else
 end if
 end function prop_table_int_vec
 
-function prop_table_int_mat(x, margin) result(out)
+pure function prop_table_int_mat(x, margin) result(out)
 ! Convert integer contingency tables to overall, row, or column proportions.
 integer, intent(in) :: x(:,:) ! input matrix
 integer, intent(in), optional :: margin
@@ -3535,7 +3535,7 @@ logical :: out
 out = size(setdiff_char(x, y)) == 0 .and. size(setdiff_char(y, x)) == 0
 end function setequal_char
 
-function r_format_vec(x, digits, sep) result(out)
+pure function r_format_vec(x, digits, sep) result(out)
 ! Format a real vector like paste(sprintf("%.<digits>f", x), collapse=sep).
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: digits ! number of digits
@@ -3685,7 +3685,7 @@ call print_char_vector(names)
 call print_real_vector(x, digits=digits)
 end subroutine print_named_real_vector
 
-function nlm_stub(p, hessian) result(out)
+pure function nlm_stub(p, hessian) result(out)
 ! Support nlm-style optimization for stub.
 real(kind=dp), intent(in) :: p(:) ! dimension count
 logical, intent(in), optional :: hessian
@@ -6168,7 +6168,7 @@ k = size(fit%coef)
 fit%aic = real(n, kind=dp) * log(fit%sigma2) + 2.0_dp * real(k, kind=dp)
 end function arima_fit
 
-function arima_predict(fit, n_ahead) result(pred)
+pure function arima_predict(fit, n_ahead) result(pred)
 ! Compute R-like time-series helper arima_predict.
 type(arima_fit_t), intent(in) :: fit ! input value
 integer, intent(in) :: n_ahead
@@ -6190,7 +6190,7 @@ do i = 1, n_ahead
 end do
 end function arima_predict
 
-function arima_predict_result(fit, n_ahead) result(out)
+pure function arima_predict_result(fit, n_ahead) result(out)
 ! Compute R-like time-series helper arima_predict_result.
 type(arima_fit_t), intent(in) :: fit ! input value
 integer, intent(in) :: n_ahead
@@ -6281,12 +6281,9 @@ integer, intent(in), optional :: lag_max ! maximum lag to return
 character(len=*), intent(in), optional :: type ! autocorrelation output type
 logical, intent(in), optional :: plot ! request plot warning flag
 type(acf_fit_t) :: fit
-integer :: n, p, lag_n, h, i, j, k, cnt
-real(kind=dp), allocatable :: mu(:), var0(:)
-real(kind=dp) :: s
+integer :: n, lag_n
 logical :: do_cov
 n = size(x, 1)
-p = size(x, 2)
 if (present(lag_max)) then
    lag_n = lag_max
 else
@@ -6298,6 +6295,20 @@ if (present(type)) do_cov = trim(type) == "covariance"
 if (present(plot)) then
    if (plot) write(*,*) "Warning: acf plot = TRUE requested; plots are not supported."
 end if
+fit = acf_mat_impl(x, lag_n, do_cov)
+end function acf_mat
+
+pure function acf_mat_impl(x, lag_n, do_cov) result(fit)
+! Pure worker for acf_mat after argument normalization and warning handling.
+real(kind=dp), intent(in) :: x(:,:)
+integer, intent(in) :: lag_n
+logical, intent(in) :: do_cov
+type(acf_fit_t) :: fit
+integer :: n, p, h, i, j, k, cnt
+real(kind=dp), allocatable :: mu(:), var0(:)
+real(kind=dp) :: s
+n = size(x, 1)
+p = size(x, 2)
 fit%n_used = n
 fit%type_code = merge(2, 1, do_cov)
 allocate(fit%acf(lag_n + 1, p, p), fit%lag(lag_n + 1), mu(p), var0(p))
@@ -6347,7 +6358,7 @@ do h = 0, lag_n
       end do
    end do
 end do
-end function acf_mat
+end function acf_mat_impl
 
 function acf_values_vec(x, lag_max, type, plot) result(vals)
 ! Compute R-like time-series helper acf_values_vec.
@@ -6375,7 +6386,7 @@ fit = acf_mat(x, lag_max=lag_max, type=type, plot=plot)
 vals = reshape(fit%acf, [size(fit%acf)])
 end function acf_values_mat
 
-function ARMAacf(ar, ma, lag_max) result(vals)
+pure function ARMAacf(ar, ma, lag_max) result(vals)
 ! Compute R-like time-series helper ARMAacf.
 real(kind=dp), intent(in), optional :: ar(:) ! input vector
 real(kind=dp), intent(in), optional :: ma ! input value
@@ -6411,8 +6422,7 @@ integer, intent(in), optional :: lag_max ! maximum lag to return
 character(len=*), intent(in), optional :: type ! cross-correlation output type
 logical, intent(in), optional :: plot ! request plot warning flag
 type(acf_fit_t) :: fit
-integer :: n, lag_n, h, ii, idx, cnt
-real(kind=dp) :: mux, muy, vx, vy, s
+integer :: n, lag_n
 logical :: do_cov
 n = min(size(x), size(y))
 if (present(lag_max)) then
@@ -6426,6 +6436,18 @@ if (present(type)) do_cov = trim(type) == "covariance"
 if (present(plot)) then
    if (plot) write(*,*) "Warning: ccf plot = TRUE requested; plots are not supported."
 end if
+fit = ccf_vec_impl(x, y, n, lag_n, do_cov)
+end function ccf_vec
+
+pure function ccf_vec_impl(x, y, n, lag_n, do_cov) result(fit)
+! Pure worker for ccf_vec after argument normalization and warning handling.
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in) :: y(:)
+integer, intent(in) :: n, lag_n
+logical, intent(in) :: do_cov
+type(acf_fit_t) :: fit
+integer :: h, ii, idx, cnt
+real(kind=dp) :: mux, muy, vx, vy, s
 fit%n_used = n
 fit%type_code = merge(2, 1, do_cov)
 allocate(fit%acf(2 * lag_n + 1, 1, 1), fit%lag(2 * lag_n + 1))
@@ -6453,7 +6475,7 @@ do h = -lag_n, lag_n
       fit%acf(idx, 1, 1) = s / sqrt(vx * vy)
    end if
 end do
-end function ccf_vec
+end function ccf_vec_impl
 
 subroutine print_acf(fit)
 ! Print acf values in an R-like format.
@@ -7585,7 +7607,7 @@ do i = 1, size(x)
 end do
 end function char_join
 
-function r_paste0_real(prefix, x) result(out)
+pure function r_paste0_real(prefix, x) result(out)
 ! Prefix each numeric value with a fixed string, matching paste0(prefix, x).
 character(len=*), intent(in) :: prefix ! prefix string
 real(kind=dp), intent(in) :: x(:) ! values to convert and prefix
@@ -7617,7 +7639,7 @@ do i = 1, size(x)
 end do
 end function r_paste0_real
 
-function r_paste0_int(prefix, x) result(out)
+pure function r_paste0_int(prefix, x) result(out)
 ! Prefix each integer value with a fixed string, matching paste0(prefix, x).
 character(len=*), intent(in) :: prefix ! prefix string
 integer, intent(in) :: x(:) ! values to convert and prefix
@@ -8013,7 +8035,7 @@ write(buf, "(i0)") i
 out = trim(buf)
 end function int_to_string
 
-function real_to_string_f(x, digits) result(out)
+pure function real_to_string_f(x, digits) result(out)
 ! Runtime helper for fixed-format scalar sprintf real conversion.
 real(kind=dp), intent(in) :: x
 integer, intent(in) :: digits
@@ -8025,7 +8047,7 @@ write(buf, fmt) x
 out = trim(buf)
 end function real_to_string_f
 
-function real_to_string_g(x, digits) result(out)
+pure function real_to_string_g(x, digits) result(out)
 ! Runtime helper for general-format scalar sprintf real conversion.
 real(kind=dp), intent(in) :: x
 integer, intent(in) :: digits
@@ -8041,7 +8063,7 @@ write(buf, fmt) x
 out = trim(adjustl(buf))
 end function real_to_string_g
 
-function ar_coef_names(nacf) result(out)
+pure function ar_coef_names(nacf) result(out)
 ! Runtime helper for R-compatible ar coef names.
 integer, intent(in) :: nacf ! number of autocorrelation coefficient names
 character(len=:), allocatable :: out(:)
@@ -8058,7 +8080,7 @@ out(n + 4) = "aic"
 out(n + 5) = "bic"
 end function ar_coef_names
 
-function lag_names(nlag) result(out)
+pure function lag_names(nlag) result(out)
 ! Runtime helper for R-compatible lag names.
 integer, intent(in) :: nlag ! number of lag names
 character(len=:), allocatable :: out(:)
@@ -9026,7 +9048,7 @@ out = "logical"
 if (size(x) < 0) out = ""
 end function r_typeof_logical_mat
 
-function hist_nbreaks(x, breaks, plot) result(out)
+pure function hist_nbreaks(x, breaks, plot) result(out)
 ! Compute a small R-like histogram object for numeric vector input.
 real(kind=dp), intent(in) :: x(:)
 integer, intent(in), optional :: breaks
@@ -9083,7 +9105,7 @@ if (total > 0.0_dp) out%density = real(out%counts, kind=dp) / total
 if (ignored_plot .and. size(out%counts) < 0) out%counts = out%counts
 end function hist_nbreaks
 
-function hist_breaks_real(x, breaks, plot) result(out)
+pure function hist_breaks_real(x, breaks, plot) result(out)
 ! Compute a small R-like histogram object using explicit numeric breaks.
 real(kind=dp), intent(in) :: x(:), breaks(:)
 logical, intent(in), optional :: plot
@@ -9948,7 +9970,7 @@ end do
 out = reshape(buf, [nrow, ncol])
 end function r_array_int
 
-function r_array_char(x, dim) result(out)
+pure function r_array_char(x, dim) result(out)
 ! Build 2D character array with R-like recycling.
 character(len=*), intent(in) :: x(:) ! strings recycled into the array
 integer, intent(in) :: dim(:) ! requested dimensions; first two entries are used
@@ -11430,7 +11452,7 @@ do while (i <= m)
 end do
 end subroutine print_lm_cooks_top
 
-subroutine solve_linear(a, b, x, ok)
+pure subroutine solve_linear(a, b, x, ok)
 ! Solve Ax=b by Gaussian elimination with partial pivoting.
 real(kind=dp), intent(inout) :: a(:,:) ! coefficient matrix, overwritten during factorization
 real(kind=dp), intent(inout) :: b(:) ! right-hand side vector, overwritten during factorization
@@ -11610,7 +11632,7 @@ do iter = 1, max(1, 2 * p + 2)
 end do
 end function step_lm
 
-function lm_aic_score(fit, k) result(score)
+pure function lm_aic_score(fit, k) result(score)
 ! Support linear-model helper lm_aic_score.
 type(lm_fit_t), intent(in) :: fit ! fitted linear model
 real(kind=dp), intent(in) :: k ! penalty per fitted parameter
@@ -11620,7 +11642,7 @@ rss = max(tiny(1.0_dp), sum(fit%resid**2))
 score = n * log(rss / max(1.0_dp, n)) + k * real(size(fit%coef), kind=dp)
 end function lm_aic_score
 
-subroutine build_lm_design(x, selected, out)
+pure subroutine build_lm_design(x, selected, out)
 ! Support linear-model helper build_lm_design.
 real(kind=dp), intent(in) :: x(:,:) ! full predictor matrix
 logical, intent(in) :: selected(:) ! selected predictor columns
