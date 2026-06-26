@@ -32972,6 +32972,63 @@ def rewrite_guarded_index_merge_assignments_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def lower_supported_vapply_writes_text(f90: str) -> str:
+    def vapply_expr(call_text: str) -> tuple[str, str] | None:
+        cinfo = parse_call_text(call_text)
+        if cinfo is None or cinfo[0].lower() != "vapply":
+            return None
+        pos, kw = cinfo[1], {k.lower().replace(".", "_"): v for k, v in cinfo[2].items()}
+        if len(pos) < 2:
+            return None
+        x_arg = pos[0].strip()
+        fun_arg = pos[1].strip()
+        fun_value = kw.get("fun_value", "").strip().lower().replace(" ", "")
+        if not re.fullmatch(r"[A-Za-z]\w*", x_arg):
+            return None
+        if fun_arg == "mean" and fun_value in {"numeric(1)", "double(1)"}:
+            return (
+                "real",
+                f"real(sum({x_arg}, dim=1) / real(size({x_arg}, 1), kind=dp), kind=dp)",
+            )
+        if fun_arg == "sum" and fun_value in {"numeric(1)", "double(1)"}:
+            return ("real", f"real(sum({x_arg}, dim=1), kind=dp)")
+        if fun_arg == "length" and fun_value == "integer(1)":
+            return (
+                "integer",
+                f"spread(size({x_arg}, 1), dim=1, ncopies=size({x_arg}, 2))",
+            )
+        m_any_all = re.fullmatch(
+            r"function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(any|all)\s*\(\s*\1\s*([<>]=?|==|!=)\s*([^)]+?)\s*\)",
+            fun_arg,
+            re.IGNORECASE,
+        )
+        if m_any_all is not None and fun_value == "logical(1)":
+            _formal, reducer, op, rhs = m_any_all.groups()
+            rhs_f = r_expr_to_fortran(rhs.strip())
+            if re.fullmatch(r"[0-9]+", rhs_f):
+                rhs_f = f"{rhs_f}.0_dp"
+            return ("logical", f"{reducer.lower()}({x_arg} {op} {rhs_f}, dim=1)")
+        return None
+
+    def rewrite_write(m: re.Match[str]) -> str:
+        indent, fmt, call_text = m.groups()
+        lowered = vapply_expr(call_text)
+        if lowered is None:
+            return m.group(0)
+        kind, expr = lowered
+        if kind == "integer":
+            return f"{indent}call print_integer_vector({expr})"
+        if kind == "logical":
+            return f'{indent}write(*,"(*(l1,:,1x))") {expr}'
+        return f"{indent}call print_real_vector({expr})"
+
+    return re.sub(
+        r'(?m)^(\s*)write\(\*,"([^"]+)"\)\s*(vapply\(.*\))\s*$',
+        rewrite_write,
+        f90,
+    )
+
+
 def promote_r_sub_vector_dummy_args_text(f90: str) -> str:
     lines = f90.splitlines()
     out = lines[:]
@@ -43560,8 +43617,13 @@ def main() -> int:
         f90 = lower_dataframe_minloc_row_assignments_text(f90)
         f90 = rewrite_lowered_dataframe_prints_text(f90)
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
+        f90 = lower_supported_vapply_writes_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
+    if "call print_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
+    if "call print_integer_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     out_path.write_text(f90, encoding="utf-8")
