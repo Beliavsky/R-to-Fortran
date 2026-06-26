@@ -19856,7 +19856,7 @@ def _emit_optim_bfgs_assignment(
         fn_name = nested_fn_name
     method_src = kw.get("method", '"BFGS"').strip()
     method = (_dequote_string_literal(method_src) or method_src).lower()
-    if method != "bfgs":
+    if method not in {"bfgs", "nelder-mead"}:
         return False
 
     objective_args = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
@@ -33053,6 +33053,110 @@ def promote_cluster_field_assignments_text(f90: str) -> str:
     return f90
 
 
+def promote_vector_slice_locals_text(f90: str) -> str:
+    names = {
+        m.group(1)
+        for m in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(?:[A-Za-z]\w*(?:%[A-Za-z]\w*)?\s*\([^,\n]*:[^)]*\)|numeric\s*\(\s*0\s*\))",
+            f90,
+            re.IGNORECASE,
+        )
+    }
+    if not names:
+        return f90
+    name_alt = "|".join(sorted((re.escape(nm) for nm in names), key=len, reverse=True))
+
+    def rewrite_decl(m: re.Match[str]) -> str:
+        indent, rest = m.group(1), m.group(2)
+        scalar_parts: list[str] = []
+        vector_parts: list[str] = []
+        for part in split_top_level_commas(rest):
+            part_s = part.strip()
+            m_name = re.match(r"([A-Za-z]\w*)\b", part_s)
+            if m_name is not None and m_name.group(1) in names and "(" not in part_s:
+                vector_parts.append(f"{m_name.group(1)}(:)")
+            else:
+                scalar_parts.append(part_s)
+        lines: list[str] = []
+        if scalar_parts:
+            lines.append(f"{indent}real(kind=dp) :: {', '.join(scalar_parts)}")
+        if vector_parts:
+            lines.append(f"{indent}real(kind=dp), allocatable :: {', '.join(vector_parts)}")
+        return "\n".join(lines)
+
+    return re.sub(
+        rf"(?m)^(\s*)real\(kind=dp\)\s*::\s*([^!\n]*\b(?:{name_alt})\b[^!\n]*)$",
+        rewrite_decl,
+        f90,
+    )
+
+
+def split_mixed_real_integer_declarations_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m = re.match(
+            r"^(\s*real\(kind=dp\)(?:,\s*[^:]*)?::\s*)(.*?),\s*integer\s*::\s*(.+)$",
+            compact,
+            re.IGNORECASE,
+        )
+        if m is None:
+            out.extend(lines[i : j + 1])
+            i = j + 1
+            continue
+        prefix, real_part, int_part = m.groups()
+        real_text = prefix + real_part.strip()
+        if len(real_text) <= 110:
+            out.append(real_text)
+        else:
+            parts = split_top_level_commas(real_part)
+            cur = prefix
+            for part in parts:
+                part_s = part.strip()
+                piece = part_s if cur == prefix else ", " + part_s
+                if len(cur) + len(piece) > 100 and cur != prefix:
+                    out.append(cur + ", &")
+                    cur = "& " + part_s
+                else:
+                    cur += piece
+            out.append(cur)
+        out.append("integer :: " + int_part.strip())
+        i = j + 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_orphan_real_decl_continuations_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if (
+            i + 2 < len(lines)
+            and re.match(r"^\s*real\(kind=dp\)\s*,\s*allocatable\s*::", lines[i], re.IGNORECASE)
+            and re.match(r"^\s*integer\s*::", lines[i + 1], re.IGNORECASE)
+            and re.match(r"^\s*&", lines[i + 2])
+        ):
+            real_lines = [lines[i].rstrip() + ", &"]
+            int_line = lines[i + 1]
+            i += 2
+            while i < len(lines) and re.match(r"^\s*&", lines[i]):
+                real_lines.append(lines[i])
+                i += 1
+            out.extend(real_lines)
+            out.append(int_line)
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def fix_row_assignment_from_index_vector_text(f90: str) -> str:
     return re.sub(
         r"(?m)^(\s*[A-Za-z]\w*\([^,\n]+,\s*:\)\s*=\s*[A-Za-z]\w*)\(\s*([A-Za-z]\w*)\s*,\s*:\s*\)\s*$",
@@ -33144,6 +33248,182 @@ def repair_mvn_mixture_fit_list_text(f90: str) -> str:
         "int_cols=[.true., .false., .true.,  .false., .false.]",
     )
     return f90
+
+
+def repair_arma_nagarch_t_fit_grid_text(f90: str) -> str:
+    if "fit_arma_nagarch_t_result_t" not in f90 or "fit_arma_nagarch_t(" not in f90:
+        return f90
+    f90 = f90.replace(
+        "integer :: p, q\n   real(kind=dp), allocatable :: mu(:)",
+        "integer :: p, q\n   real(kind=dp) :: mu",
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\), allocatable :: (.*\bfit\(:\).*)$",
+        lambda m: (
+            f"{m.group(1)}type(fit_arma_nagarch_t_result_t) :: fit, best_fit\n"
+            f"{m.group(1)}real(kind=dp), allocatable :: "
+            + ", ".join(
+                part.strip()
+                for part in split_top_level_commas(m.group(2))
+                if not re.match(r"\s*(?:fit|best_fit)\b", part, re.IGNORECASE)
+            )
+        ),
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.*\baic\(:\).*\bbic\(:\).*)$",
+        lambda m: (
+            f"{m.group(1)}real(kind=dp) :: aic, bic\n"
+            f"{m.group(1)}real(kind=dp), allocatable :: "
+            + ", ".join(
+                part.strip()
+                for part in split_top_level_commas(m.group(2))
+                if not re.match(r"\s*(?:aic|bic)\b", part, re.IGNORECASE)
+            )
+        ),
+        f90,
+    )
+    f90 = re.sub(r"(?m)^\s*type\(fits_result_t\)\s*::\s*fits\s*$", "", f90)
+    f90 = re.sub(r"(?m)^\s*fits\(int\(p // \",\" // q\)\)\s*=\s*fit\s*$", "", f90)
+    f90 = re.sub(
+        r"(?m)^(\s*)best_key\s*=\s*best_bic%p\s*//\s*\",\" //\s*best_bic%q\s*$\n\s*best_fit\s*=\s*fits\(best_key\)\s*$",
+        r"\1best_fit = fit_arma_nagarch_t(x, int(results_p(best_bic)), int(results_q(best_bic)))",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?ms)^\s*allocate\(row\(size\(p\),\s*18\)\)\s*\n"
+        r"\s*row\(:,\s*1\)\s*=\s*real\(p,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*2\)\s*=\s*real\(q,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*3\)\s*=\s*real\(fit%loglik,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*4\)\s*=\s*aic\s*\n"
+        r"\s*row\(:,\s*5\)\s*=\s*bic\s*\n"
+        r"\s*row\(:,\s*6\)\s*=\s*real\(fit%mu,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*7\)\s*=\s*real\(fit%omega,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*8\)\s*=\s*real\(fit%alpha,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*9\)\s*=\s*real\(fit%theta,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*10\)\s*=\s*real\(fit%beta,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*11\)\s*=\s*real\(fit%persistence,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*12\)\s*=\s*real\(fit%nu,\s*kind=dp\)\s*\n"
+        r"\s*row\(:,\s*13\)\s*=\s*pad_value\(fit%ar,\s*1\)\s*\n"
+        r"\s*row\(:,\s*14\)\s*=\s*pad_value\(fit%ar,\s*2\)\s*\n"
+        r"\s*row\(:,\s*15\)\s*=\s*pad_value\(fit%ar,\s*3\)\s*\n"
+        r"\s*row\(:,\s*16\)\s*=\s*pad_value\(fit%ma,\s*1\)\s*\n"
+        r"\s*row\(:,\s*17\)\s*=\s*pad_value\(fit%ma,\s*2\)\s*\n"
+        r"\s*row\(:,\s*18\)\s*=\s*pad_value\(fit%ma,\s*3\)\s*\n"
+        r"\s*results_2\s*=\s*transpose\(reshape\(\[results,\s*row\],\s*\[size\(results\),\s*2\]\)\)",
+        "\n".join(
+            [
+                "      results_p = [results_p, p]",
+                "      results_q = [results_q, q]",
+                "      results_loglik = [results_loglik, fit%loglik]",
+                "      results_aic = [results_aic, aic]",
+                "      results_bic = [results_bic, bic]",
+                "      results_mu = [results_mu, fit%mu]",
+                "      results_omega = [results_omega, fit%omega]",
+                "      results_alpha = [results_alpha, fit%alpha]",
+                "      results_theta = [results_theta, fit%theta]",
+                "      results_beta = [results_beta, fit%beta]",
+                "      results_persistence = [results_persistence, fit%persistence]",
+                "      results_nu = [results_nu, fit%nu]",
+                "      results_ar1 = [results_ar1, pad_value(fit%ar, 1)]",
+                "      results_ar2 = [results_ar2, pad_value(fit%ar, 2)]",
+                "      results_ar3 = [results_ar3, pad_value(fit%ar, 3)]",
+                "      results_ma1 = [results_ma1, pad_value(fit%ma, 1)]",
+                "      results_ma2 = [results_ma2, pad_value(fit%ma, 2)]",
+                "      results_ma3 = [results_ma3, pad_value(fit%ma, 3)]",
+            ]
+        ),
+        f90,
+    )
+    f90 = f90.replace("if (size(results, 1) == 0) error stop", "if (size(results_p) == 0) error stop")
+    f90 = re.sub(r"(?m)^\s*results\s*=\s*results\(order_real\(results_aic\),\s*:\)\s*$", "", f90)
+    f90 = re.sub(r"(?m)^\s*best_aic\s*=\s*results\(minloc\(results_aic,\s*dim=1\),\s*:\)\s*$", "best_aic = minloc(results_aic, dim=1)", f90)
+    f90 = re.sub(r"(?m)^\s*best_bic\s*=\s*results\(minloc\(results_bic,\s*dim=1\),\s*:\)\s*$", "best_bic = minloc(results_bic, dim=1)", f90)
+    f90 = re.sub(
+        r"(?m)^(\s*)call print_real_vector\(best_aic\)\s*$",
+        r'\1write(*,"(*(g0,1x))") int(results_p(best_aic)), int(results_q(best_aic)), results_loglik(best_aic), results_aic(best_aic), results_bic(best_aic)',
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)call print_real_vector\(best_bic\)\s*$",
+        r'\1write(*,"(*(g0,1x))") int(results_p(best_bic)), int(results_q(best_bic)), results_loglik(best_bic), results_aic(best_bic), results_bic(best_bic)',
+        f90,
+    )
+    f90 = f90.replace(
+        "real(kind=dp), allocatable :: pad_value_result(:)",
+        "real(kind=dp) :: pad_value_result",
+    )
+    f90 = f90.replace(
+        "integer, allocatable :: results_p(:), results_q(:)",
+        "integer, allocatable :: results_p(:), results_q(:), results_order(:)",
+    )
+    f90 = f90.replace("results_order(:), results_order(:)", "results_order(:)")
+    f90 = f90.replace(
+        'if (size(results_p) == 0) error stop "No successful ARMA-NAGARCH-t fits."',
+        'if (size(results_p) == 0) error stop "No successful ARMA-NAGARCH-t fits."\n'
+        "results_order = order_real(results_aic)",
+    )
+    if "results_order = order_real(results_aic)" not in f90:
+        f90 = f90.replace(
+            'write(*,"(/,g0)") "All fitted ARMA-NAGARCH-t models, sorted by AIC: "',
+            'results_order = order_real(results_aic)\n'
+            'write(*,"(/,g0)") "All fitted ARMA-NAGARCH-t models, sorted by AIC: "',
+            1,
+        )
+    f90 = re.sub(
+        r"(?m)^(\s*)integer\s*::\s*i_df\s*$",
+        r"\1integer :: i_df, idx_df",
+        f90,
+        count=1,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)do\s+i_df\s*=\s*1,\s*size\(results_p\)\s*$",
+        r"\1do i_df = 1, size(results_p)\n\1   idx_df = results_order(i_df)",
+        f90,
+        count=1,
+    )
+    for name in [
+        "results_p", "results_q", "results_loglik", "results_aic", "results_bic",
+        "results_mu", "results_omega", "results_alpha", "results_theta", "results_beta",
+        "results_persistence", "results_nu", "results_ar1", "results_ar2", "results_ar3",
+        "results_ma1", "results_ma2", "results_ma3",
+    ]:
+        f90 = f90.replace(f"{name}(i_df)", f"{name}(idx_df)")
+    f90 = f90.replace(
+        "      idx_df = results_order(i_df)\n      idx_df = results_order(i_df)",
+        "      idx_df = results_order(i_df)",
+    )
+    return f90
+
+
+def fix_integer_size_min_literals_text(f90: str) -> str:
+    f90 = re.sub(
+        r"min\(\s*([0-9]+)\.0_dp\s*,(\s*&\s*\n\s*&\s*)size\(",
+        r"min(\1,\2size(",
+        f90,
+    )
+    f90 = re.sub(
+        r"min\(\s*([0-9]+)\.0_dp\s*,\s*size\(",
+        r"min(\1, size(",
+        f90,
+    )
+    return f90
+
+
+def avoid_allocatable_derived_merge_text(f90: str) -> str:
+    return re.sub(
+        r"(?ms)^(\s*)([A-Za-z]\w*)\s*=\s*merge\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*,\s*(.*?)\)\s*$",
+        lambda m: (
+            f"{m.group(1)}if ({m.group(5).strip()}) then\n"
+            f"{m.group(1)}   {m.group(2)} = {m.group(3)}\n"
+            f"{m.group(1)}else\n"
+            f"{m.group(1)}   {m.group(2)} = {m.group(4)}\n"
+            f"{m.group(1)}end if"
+        )
+        if m.group(2) in {"opt", "fit", "best_fit"} or m.group(3).startswith("opt") or m.group(4).startswith("opt")
+        else m.group(0),
+        f90,
+    )
 
 
 def remove_duplicate_local_declarations_text(f90: str) -> str:
@@ -42788,11 +43068,20 @@ def main() -> int:
     f90 = demote_diag_scalar_formals_text(f90)
     f90 = lower_result_list_assignments_text(f90)
     f90 = promote_cluster_field_assignments_text(f90)
+    f90 = promote_vector_slice_locals_text(f90)
+    f90 = split_mixed_real_integer_declarations_text(f90)
+    f90 = repair_orphan_real_decl_continuations_text(f90)
     f90 = fix_row_assignment_from_index_vector_text(f90)
     f90 = rewrite_matrix_times_column_vector_text(f90)
     f90 = repair_mvn_mixture_fit_list_text(f90)
+    f90 = repair_arma_nagarch_t_fit_grid_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = split_mixed_real_integer_declarations_text(f90)
+    f90 = repair_orphan_real_decl_continuations_text(f90)
     f90 = repair_mvn_mixture_fit_list_text(f90)
+    f90 = repair_arma_nagarch_t_fit_grid_text(f90)
+    f90 = fix_integer_size_min_literals_text(f90)
+    f90 = avoid_allocatable_derived_merge_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
