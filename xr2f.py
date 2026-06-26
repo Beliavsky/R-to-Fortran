@@ -37488,27 +37488,78 @@ def rewrite_scalar_table_extract_decls_text(f90: str) -> str:
 
 
 def hoist_module_used_integer_parameters_text(f90: str) -> str:
-    names = {"scale_dot_ret"}
     if "module " not in f90 or "\ncontains\n" not in f90:
         return f90
-    for name in names:
-        m_param = re.search(rf"\b{name}\s*=\s*([+-]?\d+)\b", f90)
-        if m_param is None:
-            continue
-        module_head, rest = f90.split("\ncontains\n", 1)
+    literal_re = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?"
+    for m_decl in list(re.finditer(rf"(?m)^(integer|real\(kind=dp\)),\s*parameter\s*::\s*(.+)$", f90, re.IGNORECASE)):
+        kind = m_decl.group(1)
+        for item in split_top_level_commas(m_decl.group(2)):
+            m_item = re.match(rf"\s*([A-Za-z]\w*)\s*=\s*({literal_re})\s*$", item, re.IGNORECASE)
+            if m_item is None:
+                continue
+            name = m_item.group(1)
+            value = m_item.group(2)
+            module_head, rest = f90.split("\ncontains\n", 1)
+            if re.search(rf"\b{name}\b", module_head) is not None:
+                continue
+            module_body = rest.split("\nend module", 1)[0] if "\nend module" in rest else rest
+            if re.search(rf"\b{name}\b", module_body) is None:
+                continue
+            if re.search(rf"(?m)^\s*{re.escape(name)}\s*=", module_body) is not None:
+                continue
+            f90 = re.sub(rf",\s*{name}\s*=\s*{re.escape(value)}\b", "", f90)
+            f90 = re.sub(rf"\s*,\s*&\n&\s*{name}\s*=\s*{re.escape(value)}\b", "", f90)
+            f90 = re.sub(rf"(?m)^{re.escape(kind)},\s*parameter\s*::\s*{name}\s*=\s*{re.escape(value)}\s*\n", "", f90, flags=re.IGNORECASE)
+            module_head, rest = f90.split("\ncontains\n", 1)
+            module_head = re.sub(
+                r"(\nimplicit none\n)",
+                rf"\1{kind}, parameter :: {name} = {value}\n",
+                module_head,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            f90 = module_head + "\ncontains\n" + rest
+    for _ in range(3):
+        f90 = re.sub(r"(?m)^(integer|real\(kind=dp\)),\s*parameter\s*::\s*,\s*", r"\1, parameter :: ", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"(?m)^(integer|real\(kind=dp\)),\s*parameter\s*::\s*&\s*$\n&\s*", r"\1, parameter :: ", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"(?m)^(integer|real\(kind=dp\)),\s*parameter\s*::\s*$\n", "", f90, flags=re.IGNORECASE)
+    return f90
+
+
+def hoist_module_used_scalar_parameters_text(f90: str) -> str:
+    f90 = hoist_module_used_integer_parameters_text(f90)
+    if "module " not in f90 or "\ncontains\n" not in f90:
+        return f90
+    module_head, rest = f90.split("\ncontains\n", 1)
+    module_body = rest.split("\nend module", 1)[0] if "\nend module" in rest else rest
+    program_match = re.search(r"\nprogram\s+\w+\n(?P<body>.*)", f90, re.IGNORECASE | re.DOTALL)
+    if program_match is None:
+        return f90
+    program_body = program_match.group("body")
+    real_declared = {
+        nm
+        for decl in re.finditer(r"(?m)^real\(kind=dp\)\s*::\s*(.+)$", program_body, re.IGNORECASE)
+        for nm in re.findall(r"\b([A-Za-z]\w*)\b(?!\s*\()", decl.group(1))
+    }
+    for name in sorted(real_declared):
         if re.search(rf"\b{name}\b", module_head) is not None:
             continue
-        module_body = rest.split("\nend module", 1)[0] if "\nend module" in rest else rest
         if re.search(rf"\b{name}\b", module_body) is None:
             continue
-        value = m_param.group(1)
-        f90 = re.sub(rf",\s*{name}\s*=\s*{re.escape(value)}\b", "", f90)
-        f90 = re.sub(rf"\s*,\s*&\n&\s*{name}\s*=\s*{re.escape(value)}\b", "", f90)
-        f90 = re.sub(rf"integer,\s*parameter\s*::\s*{name}\s*=\s*{re.escape(value)}\n", "", f90)
+        if re.search(rf"(?m)^\s*{re.escape(name)}\s*=", module_body) is not None:
+            continue
+        m_assign = re.search(rf"(?m)^{name}\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?)\s*$", program_body)
+        if m_assign is None:
+            continue
+        value = m_assign.group(1)
+        f90 = re.sub(rf"(?m)^real\(kind=dp\)\s*::\s*{name}\s*$\n", "", f90)
+        f90 = re.sub(rf"(?m)^real\(kind=dp\)\s*::\s*{name},\s*", "real(kind=dp) :: ", f90)
+        f90 = re.sub(rf"(?m)^real\(kind=dp\)\s*::\s*(.*?)\s*,\s*{name}\s*(,.*?)?$", lambda m: "real(kind=dp) :: " + m.group(1) + (m.group(2) or ""), f90)
+        f90 = re.sub(rf"(?m)^{name}\s*=\s*{re.escape(value)}\s*$\n", "", f90, count=1)
         module_head, rest = f90.split("\ncontains\n", 1)
         module_head = re.sub(
             r"(\nimplicit none\n)",
-            rf"\1integer, parameter :: {name} = {value}\n",
+            rf"\1real(kind=dp), parameter :: {name} = {value}\n",
             module_head,
             count=1,
             flags=re.IGNORECASE,
@@ -43618,6 +43669,7 @@ def main() -> int:
         f90 = rewrite_lowered_dataframe_prints_text(f90)
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = lower_supported_vapply_writes_text(f90)
+        f90 = hoist_module_used_scalar_parameters_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
