@@ -32196,6 +32196,61 @@ def repair_xarma_t_fit_main_text(f90: str) -> str:
     if re.search(r"(?im)^\s*program\s+xarma_t_fit(?:_rank)?\b", f90) is None:
         return f90
     has_rank_cols = "results_loglik_rank" in f90 or "loglik_rank" in f90
+
+    def repair_fit_grid_decls(text: str) -> str:
+        def wrap_local_decl(prefix: str, parts: list[str]) -> list[str]:
+            line = prefix + ", ".join(parts)
+            if len(line) <= 110:
+                return [line]
+            wrapped: list[str] = []
+            cur = prefix
+            for part in parts:
+                piece = part if cur == prefix else ", " + part
+                if len(cur) + len(piece) > 100 and cur != prefix:
+                    wrapped.append(cur + ", &")
+                    cur = "& " + part
+                else:
+                    cur += piece
+            wrapped.append(cur)
+            return wrapped
+
+        lines = text.splitlines()
+        out: list[str] = []
+        inserted = "type(fit_arma_t_result_t) :: fit" in text and re.search(
+            r"(?im)^\s*real\(kind=dp\)\s*::\s*aic,\s*bic\b", text
+        ) is not None
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not re.match(r"^\s*real\(kind=dp\),\s*allocatable\s*::", line, re.IGNORECASE):
+                out.append(line)
+                i += 1
+                continue
+            block_lines = [line]
+            while block_lines[-1].rstrip().endswith("&") and i + 1 < len(lines):
+                i += 1
+                block_lines.append(lines[i])
+            compact = re.sub(r"&\s*\n\s*&?", " ", "\n".join(block_lines))
+            m = re.match(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.*)$", compact, re.IGNORECASE)
+            if m is None or not all(re.search(rf"\b{name}\s*\(:\)", compact, re.IGNORECASE) for name in ["aic", "bic", "fit"]):
+                out.extend(block_lines)
+                i += 1
+                continue
+            indent, decls = m.groups()
+            kept = [
+                part.strip()
+                for part in split_top_level_commas(decls)
+                if not re.match(r"\s*(?:aic|bic|fit)\s*\(:\)\s*$", part, re.IGNORECASE)
+            ]
+            if not inserted:
+                out.append(f"{indent}type(fit_arma_t_result_t) :: fit")
+                out.append(f"{indent}real(kind=dp) :: aic, bic")
+                inserted = True
+            if kept:
+                out.extend(wrap_local_decl(f"{indent}real(kind=dp), allocatable :: ", kept))
+            i += 1
+        return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
     f90 = re.sub(
         r"integer,\s*allocatable\s*::\s*results_p\(:\),\s*results_q\(:\)\s*\n"
         r"real\(kind=dp\),\s*allocatable\s*::\s*aic\(:\),\s*ar\(:\),\s*bic\(:\),\s*&\s*\n"
@@ -32237,6 +32292,7 @@ def repair_xarma_t_fit_main_text(f90: str) -> str:
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = repair_fit_grid_decls(f90)
     f90 = re.sub(
         r"results_2\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[results,\s*data\.frame\s*\(\s*p\s*=\s*p,\s*q\s*=\s*q,\s*&\s*\n"
         r"\s*&\s*loglik\s*=\s*fit%loglik,\s*&\s*\n"
@@ -32304,6 +32360,38 @@ def repair_xarma_t_fit_main_text(f90: str) -> str:
         "results_aic_rank", "results_bic_rank",
     ]:
         f90 = f90.replace(f"{name}(i_df)", f"{name}(idx_df)")
+    f90 = f90.replace(
+        'write(*,"(/,g0)") "All fitted ARMA-t models: "\ncall print_matrix(results)',
+        'write(*,"(/,g0)") "All fitted ARMA-t models: "\n'
+        'write(*,"(*(a,1x))") "p", "q", "loglik", "aic", "bic", "sigma", "nu", "ar1", &\n'
+        '& "ar2", "ar3", "ma1", "ma2", "ma3"\n'
+        '   results_order = order_real(results_aic)\n'
+        '   do i_df = 1, size(results_p)\n'
+        '      idx_df = results_order(i_df)\n'
+        '      write(*,"(*(g0,1x))") int(results_p(idx_df)), int(results_q(idx_df)), &\n'
+        '      & results_loglik(idx_df), results_aic(idx_df), results_bic(idx_df), &\n'
+        '      & results_sigma(idx_df), results_nu(idx_df), results_ar1(idx_df), &\n'
+        '      & results_ar2(idx_df), results_ar3(idx_df), results_ma1(idx_df), &\n'
+        '      & results_ma2(idx_df), results_ma3(idx_df)\n'
+        '   end do',
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)integer\s*::\s*k,\s*n,\s*p,\s*q\s*$",
+        r"\1integer :: i_df, idx_df, k, n, p, q",
+        f90,
+        count=1,
+    )
+    f90 = f90.replace(
+        "integer, allocatable :: results_p(:), results_q(:)",
+        "integer, allocatable :: results_p(:), results_q(:), results_order(:)",
+    )
+    f90 = f90.replace("results_order(:), results_order(:)", "results_order(:)")
+    f90 = f90.replace(
+        "      idx_df = results_order(i_df)\n      idx_df = results_order(i_df)",
+        "      idx_df = results_order(i_df)",
+    )
+    if "results_order = order_real(results_aic)" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"order_real"})
     f90 = re.sub(r"(?m)^\s*best_aic\s*=\s*results\(minloc\(results_aic,\s*dim=1\),\s*:\)\s*$", "best_aic = minloc(results_aic, dim=1)", f90)
     f90 = re.sub(r"(?m)^\s*best_bic\s*=\s*results\(minloc\(results_bic,\s*dim=1\),\s*:\)\s*$", "best_bic = minloc(results_bic, dim=1)", f90)
     f90 = f90.replace(
@@ -32565,6 +32653,322 @@ def promote_inline_optim_result_vars_text(f90: str) -> str:
             if trailing_amp and not new_rest.rstrip().endswith("&"):
                 new_rest += ", &"
             out.append(f"{indent}real(kind=dp), allocatable :: {new_rest}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_derived_result_call_locals_text(f90: str) -> str:
+    fn_result_types: dict[str, str] = {}
+    for m_fn in re.finditer(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function\s+([A-Za-z]\w*)\s*"
+        r"\([^)]*\)\s*result\s*\(\s*([A-Za-z]\w*)\s*\)(.*?)(?=^\s*end\s+function\b)",
+        f90,
+    ):
+        fn_name, result_name, body = m_fn.groups()
+        m_type = re.search(
+            rf"(?im)^\s*type\s*\(\s*([A-Za-z]\w*_result_t)\s*\)\s*::\s*{re.escape(result_name)}\b",
+            body,
+        )
+        if m_type is not None:
+            fn_result_types[fn_name] = m_type.group(1)
+    if not fn_result_types:
+        return f90
+
+    target_types: dict[str, str] = {}
+    fn_alt = "|".join(re.escape(name) for name in sorted(fn_result_types, key=len, reverse=True))
+    for m_assign in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*({fn_alt})\s*\(", f90):
+        lhs, fn_name = m_assign.groups()
+        target_types[lhs] = fn_result_types[fn_name]
+    if not target_types:
+        return f90
+
+    already_declared = {
+        m.group(2)
+        for m in re.finditer(r"(?im)^\s*type\s*\(\s*([A-Za-z]\w*_result_t)\s*\)\s*::\s*([A-Za-z]\w*)\b", f90)
+    }
+    lines = f90.splitlines()
+    out: list[str] = []
+    inserted: set[str] = set()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not re.match(r"^\s*(?:real\(kind=dp\)|integer\b|logical\b|complex\(kind=dp\)).*::", line, re.IGNORECASE):
+            out.append(line)
+            i += 1
+            continue
+        block_lines = [line]
+        while block_lines[-1].rstrip().endswith("&") and i + 1 < len(lines):
+            i += 1
+            block_lines.append(lines[i])
+        block = "\n".join(block_lines)
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = re.match(r"^(\s*)(.*?::\s*)(.*)$", compact)
+        if m_decl is None:
+            out.extend(block_lines)
+            i += 1
+            continue
+        indent, prefix, rest = m_decl.groups()
+        kept: list[str] = []
+        removed: list[str] = []
+        for part in split_top_level_commas(rest):
+            part_s = part.strip()
+            name_m = re.match(r"([A-Za-z]\w*)\b", part_s)
+            if name_m is not None and name_m.group(1) in target_types:
+                removed.append(name_m.group(1))
+            else:
+                kept.append(part_s)
+        if not removed:
+            out.extend(block_lines)
+            i += 1
+            continue
+        for name in removed:
+            if name not in already_declared and name not in inserted:
+                out.append(f"{indent}type({target_types[name]}) :: {name}")
+                inserted.add(name)
+        if kept:
+            text = indent + prefix + ", ".join(kept)
+            if len(text) <= 110:
+                out.append(text)
+            else:
+                cur = indent + prefix
+                for part in kept:
+                    piece = part if cur == indent + prefix else ", " + part
+                    if len(cur) + len(piece) > 100 and cur != indent + prefix:
+                        out.append(cur + ", &")
+                        cur = "& " + part
+                    else:
+                        cur += piece
+                out.append(cur)
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def lower_rbind_dataframe_appends_text(f90: str) -> str:
+    def rewrite(m: re.Match[str]) -> str:
+        indent, base, args = m.group(1), m.group(3), m.group(4)
+        compact_args = re.sub(r"&\s*\n\s*&?", " ", args)
+        lines: list[str] = []
+        for part in split_top_level_commas(compact_args):
+            if "=" not in part:
+                continue
+            name, expr = part.split("=", 1)
+            field = name.strip()
+            if not re.fullmatch(r"[A-Za-z]\w*", field):
+                continue
+            lines.append(f"{indent}{base}_{field} = [{base}_{field}, {expr.strip()}]")
+        return "\n".join(lines) if lines else m.group(0)
+
+    return re.sub(
+        r"(?ms)^(\s*)([A-Za-z]\w*)\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[\s*([A-Za-z]\w*)\s*,\s*"
+        r"data\.frame\s*\((.*?)\)\s*\]\s*,\s*\[\s*size\s*\(\s*\3\s*\)\s*,\s*2\s*\]\s*\)\s*\)\s*$",
+        rewrite,
+        f90,
+    )
+
+
+def lower_dataframe_minloc_row_assignments_text(f90: str) -> str:
+    return re.sub(
+        r"(?m)^(\s*)([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(\s*minloc\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)\s*$",
+        r"\1\2 = minloc(\4, dim=1)",
+        f90,
+    )
+
+
+def rewrite_lowered_dataframe_prints_text(f90: str) -> str:
+    fields_by_base: dict[str, list[str]] = {}
+    for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)_([A-Za-z]\w*)\s*=\s*\[\s*\1_\2\s*,", f90):
+        base, field = m.groups()
+        fields_by_base.setdefault(base, [])
+        if field not in fields_by_base[base]:
+            fields_by_base[base].append(field)
+    if not fields_by_base:
+        return f90
+
+    integer_arrays: set[str] = set()
+    for m in re.finditer(r"(?im)^\s*integer(?:\([^)]*\))?\s*,\s*allocatable\s*::\s*([^\n]+)$", f90):
+        for part in split_top_level_commas(m.group(1).replace("&", " ")):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", part.strip())
+            if mm is not None:
+                integer_arrays.add(mm.group(1))
+
+    index_base: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    for m in re.finditer(
+        r"(?m)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(\s*minloc\s*\(\s*\1\s*%\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)\s*$",
+        f90,
+    ):
+        idx, alias, field = m.groups()
+        for base, fields in fields_by_base.items():
+            if field in fields and f"{base}_{field}" in f90:
+                aliases[alias] = base
+                index_base[idx] = base
+                break
+    for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*minloc\s*\(\s*([A-Za-z]\w*)_([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*\)", f90):
+        idx, base, _field = m.groups()
+        if base in fields_by_base:
+            index_base[idx] = base
+
+    def header_line(indent: str, fields: list[str]) -> str:
+        return f'{indent}write(*,"(*(a,1x))") ' + ", ".join(f'"{field}"' for field in fields)
+
+    def value_expr(base: str, field: str, idx: str) -> str:
+        arr = f"{base}_{field}"
+        expr = f"{arr}({idx})"
+        if arr in integer_arrays:
+            expr = f"int({expr})"
+        return expr
+
+    def table_repl(m: re.Match[str]) -> str:
+        indent, base = m.groups()
+        base = aliases.get(base, base)
+        fields = fields_by_base.get(base)
+        if not fields:
+            return m.group(0)
+        values = ", ".join(value_expr(base, field, "i_df") for field in fields)
+        return "\n".join(
+            [
+                header_line(indent, fields),
+                f"{indent}block",
+                f"{indent}   integer :: i_df",
+                f"{indent}   do i_df = 1, size({base}_{fields[0]})",
+                f'{indent}      write(*,"(*(g0,1x))") {values}',
+                f"{indent}   end do",
+                f"{indent}end block",
+            ]
+        )
+
+    f90 = re.sub(r"(?m)^(\s*)call print_matrix\(([A-Za-z]\w*)\)\s*$", table_repl, f90)
+
+    f90 = re.sub(
+        r"(?m)^(\s*)([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(\s*minloc\s*\(\s*\3\s*%\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)\s*$",
+        lambda m: (
+            f"{m.group(1)}{m.group(2)} = minloc({aliases[m.group(3)]}_{m.group(4)}, dim=1)"
+            if m.group(3) in aliases
+            else (
+                f"{m.group(1)}{m.group(2)} = minloc({re.sub(r'_[0-9]+$', '', m.group(3))}_{m.group(4)}, dim=1)"
+                if f"{re.sub(r'_[0-9]+$', '', m.group(3))}_{m.group(4)}" in f90
+                else m.group(0)
+            )
+        ),
+        f90,
+    )
+
+    def row_repl(m: re.Match[str]) -> str:
+        indent, idx = m.groups()
+        base = index_base.get(idx)
+        if base is None:
+            return m.group(0)
+        fields = fields_by_base[base]
+        values = ", ".join(value_expr(base, field, idx) for field in fields)
+        return "\n".join(
+            [
+                header_line(indent, fields),
+                f'{indent}write(*,"(*(g0,1x))") {values}',
+            ]
+        )
+
+    return re.sub(r"(?m)^(\s*)call print_real_vector\(([A-Za-z]\w*)\)\s*$", row_repl, f90)
+
+
+def demote_scalar_dataframe_append_temporaries_text(f90: str) -> str:
+    append_rhs_names = {
+        m.group(1)
+        for m in re.finditer(
+            r"(?m)^\s*[A-Za-z]\w*_[A-Za-z]\w*\s*=\s*\[\s*[A-Za-z]\w*_[A-Za-z]\w*\s*,\s*([A-Za-z]\w*)\s*\]\s*$",
+            f90,
+        )
+    }
+    if not append_rhs_names:
+        return f90
+    scalar_assigned = {
+        m.group(1)
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(?!\[)(.+)$", f90)
+        if m.group(1) in append_rhs_names
+        and not re.search(r"\b(?:r_seq_|numeric|matrix|reshape|pack|spread|cbind|rbind)\b", m.group(2))
+    }
+    if not scalar_assigned:
+        return f90
+
+    lines = f90.splitlines()
+    out: list[str] = []
+    inserted: set[str] = set()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not re.match(r"^\s*real\(kind=dp\)\s*,\s*allocatable\s*::", line, re.IGNORECASE):
+            out.append(line)
+            i += 1
+            continue
+        block_lines = [line]
+        while block_lines[-1].rstrip().endswith("&") and i + 1 < len(lines):
+            i += 1
+            block_lines.append(lines[i])
+        compact = re.sub(r"&\s*\n\s*&?", " ", "\n".join(block_lines))
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.*)$", compact, re.IGNORECASE)
+        if m_decl is None:
+            out.extend(block_lines)
+            i += 1
+            continue
+        indent, rest = m_decl.groups()
+        kept: list[str] = []
+        removed: list[str] = []
+        for part in split_top_level_commas(rest):
+            part_s = part.strip()
+            m_name = re.match(r"([A-Za-z]\w*)\s*\(:\)\s*$", part_s)
+            if m_name is not None and m_name.group(1) in scalar_assigned:
+                removed.append(m_name.group(1))
+            else:
+                kept.append(part_s)
+        if not removed:
+            out.extend(block_lines)
+            i += 1
+            continue
+        new_scalars = [name for name in removed if name not in inserted]
+        if new_scalars:
+            out.append(f"{indent}real(kind=dp) :: {', '.join(new_scalars)}")
+            inserted.update(new_scalars)
+        if kept:
+            text = f"{indent}real(kind=dp), allocatable :: {', '.join(kept)}"
+            if len(text) <= 110:
+                out.append(text)
+            else:
+                cur = f"{indent}real(kind=dp), allocatable :: "
+                for part in kept:
+                    piece = part if cur.endswith(":: ") else ", " + part
+                    if len(cur) + len(piece) > 100 and not cur.endswith(":: "):
+                        out.append(cur + ", &")
+                        cur = "& " + part
+                    else:
+                        cur += piece
+                out.append(cur)
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_guarded_index_merge_assignments_text(f90: str) -> str:
+    out: list[str] = []
+    for line in f90.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*merge\s*\((.*)\)\s*$", line)
+        if m is None:
+            out.append(line)
+            continue
+        indent, lhs, inner = m.groups()
+        parts = split_top_level_commas(inner)
+        if len(parts) != 3:
+            out.append(line)
+            continue
+        true_expr, false_expr, cond = (part.strip() for part in parts)
+        if re.search(r"(?:%\w+|[A-Za-z]\w*)\s*\([^)]*\)", true_expr) is None:
+            out.append(line)
+            continue
+        out.extend(
+            [
+                f"{indent}if ({cond}) then",
+                f"{indent}   {lhs} = {true_expr}",
+                f"{indent}else",
+                f"{indent}   {lhs} = {false_expr}",
+                f"{indent}end if",
+            ]
+        )
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -33103,7 +33507,7 @@ def split_mixed_real_integer_declarations_text(f90: str) -> str:
             block += "\n" + lines[j]
         compact = re.sub(r"&\s*\n\s*&?", " ", block)
         m = re.match(
-            r"^(\s*real\(kind=dp\)(?:,\s*[^:]*)?::\s*)(.*?),\s*integer\s*::\s*(.+)$",
+            r"^(\s*real\(kind=dp\)(?:,\s*[^:]*)?::\s*)(.*?),\s*(integer(?:\s*,\s*allocatable)?)\s*::\s*(.+)$",
             compact,
             re.IGNORECASE,
         )
@@ -33111,23 +33515,23 @@ def split_mixed_real_integer_declarations_text(f90: str) -> str:
             out.extend(lines[i : j + 1])
             i = j + 1
             continue
-        prefix, real_part, int_part = m.groups()
-        real_text = prefix + real_part.strip()
-        if len(real_text) <= 110:
-            out.append(real_text)
-        else:
-            parts = split_top_level_commas(real_part)
-            cur = prefix
-            for part in parts:
-                part_s = part.strip()
-                piece = part_s if cur == prefix else ", " + part_s
-                if len(cur) + len(piece) > 100 and cur != prefix:
-                    out.append(cur + ", &")
-                    cur = "& " + part_s
-                else:
-                    cur += piece
-            out.append(cur)
-        out.append("integer :: " + int_part.strip())
+        prefix, real_part, int_prefix, int_part = m.groups()
+        parts = [part.strip() for part in split_top_level_commas(real_part) if part.strip()]
+        if parts:
+            real_text = prefix + ", ".join(parts)
+            if len(real_text) <= 110:
+                out.append(real_text)
+            else:
+                cur = prefix
+                for part_s in parts:
+                    piece = part_s if cur == prefix else ", " + part_s
+                    if len(cur) + len(piece) > 100 and cur != prefix:
+                        out.append(cur + ", &")
+                        cur = "& " + part_s
+                    else:
+                        cur += piece
+                out.append(cur)
+        out.append(int_prefix.strip() + " :: " + int_part.strip())
         i = j + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
@@ -33140,7 +33544,7 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
         if (
             i + 2 < len(lines)
             and re.match(r"^\s*real\(kind=dp\)\s*,\s*allocatable\s*::", lines[i], re.IGNORECASE)
-            and re.match(r"^\s*integer\s*::", lines[i + 1], re.IGNORECASE)
+            and re.match(r"^\s*integer(?:\s*,\s*[^:]*)?\s*::", lines[i + 1], re.IGNORECASE)
             and re.match(r"^\s*&", lines[i + 2])
         ):
             real_lines = [lines[i].rstrip() + ", &"]
@@ -33154,6 +33558,44 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
             continue
         out.append(lines[i])
         i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*&\s*\n\s*&\s*allocatable\s*::\s*(.+)$",
+        r"\1, &\n& \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*integer(?:\s*,\s*allocatable)?\s*::\s*.*?),\s*real\(kind=dp\)\s*,\s*&\s*$",
+        r"\1",
+        f90,
+    )
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m = re.match(
+            r"^(\s*integer(?:\s*,\s*allocatable)?\s*::\s*)(.*?),\s*real\(kind=dp\)\s*,\s*&?\s*$",
+            compact,
+            re.IGNORECASE,
+        )
+        if m is None:
+            out.extend(lines[i : j + 1])
+            i = j + 1
+            continue
+        prefix, int_part = m.groups()
+        int_parts = [part.strip() for part in split_top_level_commas(int_part) if part.strip()]
+        if int_parts:
+            out.append(prefix + ", ".join(int_parts))
+        i = j + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -43033,7 +43475,6 @@ def main() -> int:
     f90 = "\n".join(rewrite_two_column_dataframe_vector_prints(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = repair_fit_arma_t_vector_fields_text(f90)
     f90 = repair_xarma_t_file_main_text(f90)
-    f90 = repair_xarma_t_fit_main_text(f90)
     f90 = format_integerish_expanded_dataframe_prints_text(f90)
     f90 = rewrite_leftover_matmul_operator_text(f90)
     f90 = rewrite_leftover_sweep_calls_text(f90)
@@ -43053,6 +43494,12 @@ def main() -> int:
     f90 = strip_real_wrappers_for_integer_dummy_calls_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
+    f90 = promote_derived_result_call_locals_text(f90)
+    f90 = lower_rbind_dataframe_appends_text(f90)
+    f90 = demote_scalar_dataframe_append_temporaries_text(f90)
+    f90 = lower_dataframe_minloc_row_assignments_text(f90)
+    f90 = rewrite_lowered_dataframe_prints_text(f90)
+    f90 = rewrite_guarded_index_merge_assignments_text(f90)
     f90 = promote_inline_optim_result_vars_text(f90)
     if "type(optim_result_t)" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
@@ -43080,10 +43527,17 @@ def main() -> int:
         # inference/codegen and should eventually move earlier in the pipeline.
         f90 = demote_diag_scalar_formals_text(f90)
         f90 = lower_result_list_assignments_text(f90)
+        f90 = promote_derived_result_call_locals_text(f90)
+        f90 = lower_rbind_dataframe_appends_text(f90)
+        f90 = demote_scalar_dataframe_append_temporaries_text(f90)
+        f90 = lower_dataframe_minloc_row_assignments_text(f90)
+        f90 = rewrite_lowered_dataframe_prints_text(f90)
+        f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = promote_cluster_field_assignments_text(f90)
         f90 = promote_vector_slice_locals_text(f90)
         f90 = split_mixed_real_integer_declarations_text(f90)
         f90 = repair_orphan_real_decl_continuations_text(f90)
+        f90 = repair_embedded_mixed_declaration_fragments_text(f90)
         f90 = fix_row_assignment_from_index_vector_text(f90)
         f90 = rewrite_matrix_times_column_vector_text(f90)
         if args.special_repairs:
@@ -43094,11 +43548,18 @@ def main() -> int:
         f90 = remove_duplicate_local_declarations_text(f90)
         f90 = split_mixed_real_integer_declarations_text(f90)
         f90 = repair_orphan_real_decl_continuations_text(f90)
+        f90 = repair_embedded_mixed_declaration_fragments_text(f90)
         if args.special_repairs:
             f90 = repair_mvn_mixture_fit_list_text(f90)
             f90 = repair_arma_nagarch_t_fit_grid_text(f90)
         f90 = fix_integer_size_min_literals_text(f90)
         f90 = avoid_allocatable_derived_merge_text(f90)
+        f90 = promote_derived_result_call_locals_text(f90)
+        f90 = lower_rbind_dataframe_appends_text(f90)
+        f90 = demote_scalar_dataframe_append_temporaries_text(f90)
+        f90 = lower_dataframe_minloc_row_assignments_text(f90)
+        f90 = rewrite_lowered_dataframe_prints_text(f90)
+        f90 = rewrite_guarded_index_merge_assignments_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_matrix(" in f90:
