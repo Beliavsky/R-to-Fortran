@@ -6197,6 +6197,116 @@ def _replace_idents(expr: str, mapping: dict[str, str]) -> str:
     return out
 
 
+def _replace_obfuscated_idents(expr: str, mapping: dict[str, str]) -> str:
+    if not mapping:
+        return expr
+    placeholders: list[str] = []
+
+    def mask_string(m: re.Match[str]) -> str:
+        placeholders.append(m.group(0))
+        return f"__XR2F_OBF_STR_{len(placeholders) - 1}__"
+
+    out = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', mask_string, expr)
+    ident_alt = "|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True))
+    if not ident_alt:
+        return expr
+    pat = re.compile(rf"(?<![A-Za-z0-9_.$])({ident_alt})(?![A-Za-z0-9_.])")
+
+    def repl(m: re.Match[str]) -> str:
+        j = m.end()
+        while j < len(out) and out[j].isspace():
+            j += 1
+        if j < len(out) and out[j] == "=" and not (j + 1 < len(out) and out[j + 1] == "="):
+            return m.group(1)
+        return mapping.get(m.group(1), m.group(1))
+
+    out = pat.sub(repl, out)
+    for i, s in enumerate(placeholders):
+        out = out.replace(f"__XR2F_OBF_STR_{i}__", s)
+    return out
+
+
+def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+
+    def fresh(prefix: str) -> str:
+        idx = 1
+        while True:
+            cand = f"xr_obf_{prefix}_{idx}"
+            idx += 1
+            if cand.lower() not in used:
+                used.add(cand.lower())
+                return cand
+
+    def add_name(name: str, prefix: str) -> None:
+        if not name or name in mapping:
+            return
+        if name.lower() in _PARTIAL_MAIN_IGNORE_NAMES:
+            return
+        new_name = fresh(prefix)
+        mapping[name] = new_name
+        for raw_name, sanitized_name in _DOTTED_VAR_RENAMES.items():
+            if sanitized_name == name and raw_name not in mapping:
+                mapping[raw_name] = new_name
+
+    def collect(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, FuncDef):
+                add_name(st.name, "fun")
+                for arg in st.args:
+                    add_name(arg, "arg")
+                collect(st.body)
+            elif isinstance(st, Assign):
+                add_name(st.name, "var")
+            elif isinstance(st, ForStmt):
+                add_name(st.var, "idx")
+                collect(st.body)
+            elif isinstance(st, WhileStmt):
+                collect(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect(st.body)
+            elif isinstance(st, IfStmt):
+                collect(st.then_body)
+                collect(st.else_body)
+
+    collect(stmts)
+    if not mapping:
+        return stmts
+
+    def rexpr(expr: str) -> str:
+        return _replace_obfuscated_idents(expr, mapping)
+
+    def walk(st: object) -> object:
+        if isinstance(st, Assign):
+            return Assign(mapping.get(st.name, st.name), rexpr(st.expr), st.comment)
+        if isinstance(st, PrintStmt):
+            return PrintStmt([rexpr(a) for a in st.args], st.comment)
+        if isinstance(st, CallStmt):
+            return CallStmt(mapping.get(st.name, st.name), [rexpr(a) for a in st.args], st.comment)
+        if isinstance(st, ExprStmt):
+            return ExprStmt(rexpr(st.expr), st.comment)
+        if isinstance(st, ForStmt):
+            return ForStmt(mapping.get(st.var, st.var), rexpr(st.iter_expr), [walk(b) for b in st.body])
+        if isinstance(st, WhileStmt):
+            return WhileStmt(rexpr(st.cond), [walk(b) for b in st.body])
+        if isinstance(st, RepeatStmt):
+            return RepeatStmt([walk(b) for b in st.body])
+        if isinstance(st, IfStmt):
+            return IfStmt(rexpr(st.cond), [walk(b) for b in st.then_body], [walk(b) for b in st.else_body])
+        if isinstance(st, FuncDef):
+            return FuncDef(
+                name=mapping.get(st.name, st.name),
+                args=[mapping.get(a, a) for a in st.args],
+                defaults={mapping.get(k, k): rexpr(v) for k, v in st.defaults.items()},
+                body=[walk(b) for b in st.body],
+                leading_comments=st.leading_comments,
+            )
+        return st
+
+    return [walk(st) for st in stmts]
+
+
 def _qualify_lifted_sibling_calls_expr(expr: str, current_fn_name: str) -> str:
     if "_" not in current_fn_name:
         return expr
@@ -18670,7 +18780,7 @@ def emit_stmts(
                             continue
                         just_flushed_cat_line = False
                         if out_items and "Asset columns read" in out_items[-1]:
-                            out_items.append("size(price_names)")
+                            out_items.append(r_expr_to_fortran(at))
                             continue
                         sp_items = _sprintf_arg_items(at)
                         if sp_items is not None:
@@ -18681,7 +18791,7 @@ def emit_stmts(
                             and "Asset columns read" in out_items[-1]
                             and re.match(r"^length\s*\(", at, re.IGNORECASE)
                         ):
-                            out_items.append("size(price_names)")
+                            out_items.append(r_expr_to_fortran(at))
                             continue
                         lit = lit_at
                         if lit is not None:
@@ -19910,6 +20020,7 @@ def _emit_optim_bfgs_assignment(
     nested_fn_name = f"{parent_fn}_{fn_name}" if parent_fn else ""
     if nested_fn_name.lower() in _USER_FUNC_ARG_INDEX:
         fn_name = nested_fn_name
+    globals().setdefault("_OPTIM_OBJECTIVE_FUNC_NAMES", set()).add(fn_name.lower())
     method_src = kw.get("method", '"BFGS"').strip()
     method_lit = _dequote_string_literal(method_src)
     method = (method_lit or "BFGS").lower()
@@ -19924,13 +20035,28 @@ def _emit_optim_bfgs_assignment(
         kl = k.lower()
         if kl in skip:
             continue
-        idx = objective_args.get(kl)
-        if idx is None and kl.endswith("_wrk"):
-            idx = objective_args.get(kl[:-4])
+        actual_f = r_expr_to_fortran(v)
+        key_candidates = [kl]
+        sanitized_kl = _sanitize_r_var_name(kl).lower()
+        if sanitized_kl not in key_candidates:
+            key_candidates.append(sanitized_kl)
+        if kl.endswith("_wrk"):
+            key_candidates.append(kl[:-4])
+        if sanitized_kl.endswith("_wrk"):
+            key_candidates.append(sanitized_kl[:-4])
+        idx = None
+        for key_candidate in key_candidates:
+            idx = objective_args.get(key_candidate)
+            if idx is not None:
+                break
+        if idx is None:
+            actual_l = actual_f.strip().lower()
+            if re.fullmatch(r"[A-Za-z]\w*", actual_l):
+                idx = objective_args.get(actual_l)
         if idx is None:
             idx = 1000 + len(ordered_extra)
         explicit_extra_idxs.add(idx)
-        ordered_extra.append((idx, r_expr_to_fortran(v)))
+        ordered_extra.append((idx, actual_f))
     for i, v in enumerate(pos[2:], start=2):
         explicit_extra_idxs.add(i)
         ordered_extra.append((i, r_expr_to_fortran(v)))
@@ -25735,6 +25861,7 @@ def transpile_r_to_fortran(
     recycle_warn: bool = False,
     recycle_stop: bool = False,
     fortran_comments: bool = True,
+    obfuscate: bool = False,
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
@@ -25791,6 +25918,8 @@ def transpile_r_to_fortran(
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
     validate_unsupported_environment_assignment(stmts)
+    if obfuscate:
+        stmts = obfuscate_user_defined_names(stmts)
     _KNOWN_CHAR_VECTOR_NAMES.update(_collect_character0_assignments(stmts))
     _STATIC_LS_NAMES = []
     _STATIC_LS_STR_LINES = []
@@ -27288,17 +27417,42 @@ def transpile_r_to_fortran(
                     if fn_l_opt not in user_func_by_lower:
                         continue
                     objective_args = _USER_FUNC_ARG_INDEX.get(fn_l_opt, {})
+                    objective_arg_ranks = _USER_FUNC_ARG_RANK.get(fn_l_opt, {})
                     forced_ranks = _FORCED_FUNC_ARG_RANKS.setdefault(fn_l_opt, {})
                     user_ranks = _USER_FUNC_ARG_RANK.setdefault(fn_l_opt, {})
+                    parent_forced_ranks = _FORCED_FUNC_ARG_RANKS.setdefault(parent_fn.name.lower(), {})
+                    parent_user_ranks = _USER_FUNC_ARG_RANK.setdefault(parent_fn.name.lower(), {})
                     skip_opt = {"par", "fn", "gr", "method", "control", "hessian", "lower", "upper"}
                     for key_opt, actual_opt in kw_opt.items():
                         key_l_opt = key_opt.lower()
-                        if key_l_opt in skip_opt or key_l_opt not in objective_args:
+                        if key_l_opt in skip_opt:
                             continue
-                        rank_opt = _parent_actual_rank(actual_opt)
+                        key_candidates_opt = [key_l_opt]
+                        key_sanitized_opt = _sanitize_r_var_name(key_l_opt).lower()
+                        if key_sanitized_opt not in key_candidates_opt:
+                            key_candidates_opt.append(key_sanitized_opt)
+                        matched_formal_l = ""
+                        matched_idx_opt: int | None = None
+                        for key_candidate_opt in key_candidates_opt:
+                            matched_idx_opt = objective_args.get(key_candidate_opt)
+                            if matched_idx_opt is not None:
+                                matched_formal_l = key_candidate_opt
+                                break
+                        actual_f_opt = r_expr_to_fortran(actual_opt).strip()
+                        actual_l_opt = actual_f_opt.lower()
+                        if matched_idx_opt is None and re.fullmatch(r"[A-Za-z]\w*", actual_l_opt):
+                            matched_idx_opt = objective_args.get(actual_l_opt)
+                            if matched_idx_opt is not None:
+                                matched_formal_l = actual_l_opt
+                        if matched_idx_opt is None:
+                            continue
+                        rank_opt = max(_parent_actual_rank(actual_opt), int(objective_arg_ranks.get(matched_formal_l, 0)))
                         if rank_opt > 0:
-                            forced_ranks[key_l_opt] = max(forced_ranks.get(key_l_opt, 0), rank_opt)
-                            user_ranks[key_l_opt] = max(user_ranks.get(key_l_opt, 0), rank_opt)
+                            forced_ranks[matched_formal_l] = max(forced_ranks.get(matched_formal_l, 0), rank_opt)
+                            user_ranks[matched_formal_l] = max(user_ranks.get(matched_formal_l, 0), rank_opt)
+                            if re.fullmatch(r"[A-Za-z]\w*", actual_l_opt) and actual_l_opt in parent_arg_ranks:
+                                parent_forced_ranks[actual_l_opt] = max(parent_forced_ranks.get(actual_l_opt, 0), rank_opt)
+                                parent_user_ranks[actual_l_opt] = max(parent_user_ranks.get(actual_l_opt, 0), rank_opt)
 
         _walk_optim(parent_fn.body)
 
@@ -39671,7 +39825,12 @@ def demote_scalar_objective_result_decls_text(f90: str) -> str:
         fn_name = m_head.group(1)
         res = m_head.group(2)
         fn_l = fn_name.lower()
-        if "negloglik" not in fn_l and not fn_l.startswith("xr2f_nlm_"):
+        optim_objectives = globals().get("_OPTIM_OBJECTIVE_FUNC_NAMES", set())
+        if (
+            "negloglik" not in fn_l
+            and not fn_l.startswith("xr2f_nlm_")
+            and not (isinstance(optim_objectives, set) and fn_l in optim_objectives)
+        ):
             i += 1
             continue
         j = i + 1
@@ -39776,6 +39935,8 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             rhs_s = rhs.strip()
             if "[" in rhs_s or "]" in rhs_s:
                 return block
+            if re.search(r"\b([A-Za-z]\w*)\s*/\s*sum\s*\(\s*\1\s*\)", rhs_s, re.IGNORECASE):
+                return block
             if re.search(r"\bdim\s*=|\b(?:pack|r_rep_real|r_seq_int|matrix|reshape|spread)\s*\(", rhs_s, re.IGNORECASE):
                 return block
             if _array_refs_outside_scalar_reductions(rhs_s, array_names):
@@ -39856,6 +40017,98 @@ def demote_dot_product_function_results_text(f90: str) -> str:
     )
 
 
+def demote_dot_product_real_locals_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$"
+    )
+
+    def repl_block(m_block: re.Match[str]) -> str:
+        block = m_block.group(0)
+        scalar_names: set[str] = set()
+        for m_decl in re.finditer(r"(?im)^\s*real\s*\([^)]*\)\s*(?:,\s*intent\([^)]*\))?\s*::\s*(.+)$", block):
+            for part in split_top_level_commas(m_decl.group(1)):
+                p = part.strip()
+                m_name = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_name is not None and not (m_name.group(2) or "").strip():
+                    scalar_names.add(m_name.group(1).lower())
+        changed = True
+        while changed:
+            changed = False
+            for m_asn in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
+                lhs = m_asn.group(1).lower()
+                rhs = m_asn.group(2).strip()
+                rhs_flat = re.sub(r"&\s*\n\s*&?", " ", rhs)
+                if lhs in scalar_names:
+                    continue
+                if re.match(r"dot_product\s*\(", rhs_flat, re.IGNORECASE):
+                    scalar_names.add(lhs)
+                    changed = True
+                    continue
+                if re.match(r"sqrt\s*\(\s*dot_product\s*\(", rhs_flat, re.IGNORECASE):
+                    scalar_names.add(lhs)
+                    changed = True
+                    continue
+                m_sqrt_max = re.match(r"sqrt\s*\(\s*max\s*\(\s*([A-Za-z]\w*)\s*,", rhs_flat, re.IGNORECASE)
+                if m_sqrt_max is not None and m_sqrt_max.group(1).lower() in scalar_names:
+                    scalar_names.add(lhs)
+                    changed = True
+
+        if not scalar_names:
+            return block
+
+        def repl_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            scalar_parts: list[str] = []
+            kept_parts: list[str] = []
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_name = re.match(r"([A-Za-z]\w*)\s*\(:\)\s*$", p)
+                if m_name is not None and m_name.group(1).lower() in scalar_names:
+                    scalar_parts.append(m_name.group(1))
+                elif p:
+                    kept_parts.append(p)
+            if not scalar_parts:
+                return m_decl.group(0)
+            lines = [prefix + ", ".join(scalar_parts)]
+            if kept_parts:
+                lines.append(prefix + ", ".join(kept_parts))
+            return "\n".join(lines)
+
+        return re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*)(.+)$",
+            repl_decl,
+            block,
+        )
+
+    return block_pat.sub(repl_block, f90)
+
+
+def promote_normalized_vector_function_results_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(
+            rf"(?im)^\s*{re.escape(res)}\s*=\s*([A-Za-z]\w*)\s*/\s*sum\s*\(\s*\1\s*\)",
+            block,
+        ) is None:
+            return block
+        return re.sub(
+            rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(res)}\s*$",
+            rf"\1real(kind=dp), allocatable :: {res}(:)",
+            block,
+            count=1,
+        )
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
 def promote_sigma_ret_formals_text(f90: str) -> str:
     return re.sub(
         r"(?im)^(\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*.*?)(?<!\w)sigma_ret(?!\s*\()(\s*(?:,|$))",
@@ -39875,28 +40128,59 @@ def repair_portfolio_stat_named_indices_text(f90: str) -> str:
         "gross_exposure": 7,
     }
     for name, idx in stat_index.items():
-        f90 = re.sub(rf'\bstat\s*\(\s*"{re.escape(name)}"\s*\)', f"stat({idx})", f90, flags=re.IGNORECASE)
+        f90 = re.sub(
+            rf'\b([A-Za-z]\w*)\s*\(\s*"{re.escape(name)}"\s*\)',
+            rf"\1({idx})",
+            f90,
+            flags=re.IGNORECASE,
+        )
     return f90
 
 
 def repair_portfolio_stats_scalar_locals_text(f90: str) -> str:
-    f90 = re.sub(
-        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*portfolio_stats_result\(:\),\s*port_var\(:\)\s*$",
-        r"\1real(kind=dp), allocatable :: portfolio_stats_result(:)\n\1real(kind=dp) :: port_var",
+    scalar_names = {"port_var", "port_sd", "ann_vol"}
+
+    def repl_decl(m: re.Match[str]) -> str:
+        indent = m.group(1)
+        scalar_parts: list[str] = []
+        kept_parts: list[str] = []
+        for item in split_top_level_commas(m.group(2)):
+            p = item.strip()
+            base = re.sub(r"\s*\(:\)\s*$", "", p).strip()
+            if base.lower() in scalar_names:
+                scalar_parts.append(base)
+            elif p:
+                kept_parts.append(p)
+        if not scalar_parts:
+            return m.group(0)
+        lines: list[str] = []
+        if kept_parts:
+            lines.append(f"{indent}real(kind=dp), allocatable :: " + ", ".join(kept_parts))
+        lines.append(f"{indent}real(kind=dp) :: " + ", ".join(scalar_parts))
+        return "\n".join(lines)
+
+    return re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$",
+        repl_decl,
         f90,
     )
-    f90 = re.sub(
-        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*ann_vol\(:\),\s*port_sd\(:\)\s*$",
-        r"\1real(kind=dp) :: ann_vol, port_sd",
-        f90,
-    )
-    return f90
 
 
 def repair_portfolio_print_labels_text(f90: str) -> str:
+    def find_asset_names_var() -> str:
+        patterns = [
+            r"call\s+print_table2\s*\(\s*stats\s*,\s*([A-Za-z]\w*)\s*,",
+            r"call\s+print_table2\s*\(\s*cor\s*\([^)]*\)\s*,\s*([A-Za-z]\w*)\s*,\s*\1\s*,",
+            r"Assets read:.*?\n\s*call\s+print_char_vector\s*\(\s*([A-Za-z]\w*)\s*\)",
+        ]
+        for pat in patterns:
+            m_asset = re.search(pat, f90, flags=re.IGNORECASE | re.DOTALL)
+            if m_asset is not None:
+                return m_asset.group(1)
+        return "price_names"
+
     sub_pat = re.compile(
-        r"(?ims)^subroutine\s+([A-Za-z]\w*)\s*\(\s*name\s*,\s*w\s*,\s*mean_ret\s*,\s*sigma_ret\s*,\s*daily_rf\s*,\s*trading_days\s*\)"
-        r".*?\bstat\s*=\s*portfolio_stats\s*\(\s*w\s*,\s*mean_ret\s*,\s*sigma_ret\s*,\s*daily_rf\s*,\s*trading_days\s*\)"
+        r"(?ims)^subroutine\s+([A-Za-z]\w*)\s*\((.*?)\)"
         r".*?Weights:\s*.*?Statistics, in scaled return units where applicable:"
         r".*?^end\s+subroutine\s+\1\s*$"
     )
@@ -39904,31 +40188,175 @@ def repair_portfolio_print_labels_text(f90: str) -> str:
     if m_sub is None:
         return f90
     sub_name = m_sub.group(1)
+    sub_args = [
+        a.strip()
+        for a in split_top_level_commas(re.sub(r"&\s*\n\s*&?", " ", m_sub.group(2)))
+        if a.strip()
+    ]
+    if len(sub_args) < 6:
+        return f90
+    name_arg, w_arg, mean_arg, sigma_arg, daily_arg, trading_arg = sub_args[:6]
+    sub_block = m_sub.group(0)
+    sub_block_flat = re.sub(r"&\s*\n\s*&?", " ", sub_block)
+    stat_call_pat = re.compile(
+        rf"\b([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(\s*"
+        rf"{re.escape(w_arg)}\s*,\s*{re.escape(mean_arg)}\s*,\s*{re.escape(sigma_arg)}\s*,\s*"
+        rf"{re.escape(daily_arg)}\s*,\s*{re.escape(trading_arg)}\s*\)",
+        flags=re.IGNORECASE,
+    )
+    m_stat = stat_call_pat.search(sub_block_flat)
+    if m_stat is None:
+        return f90
+    stat_fun = m_stat.group(2)
+    asset_names_var = find_asset_names_var()
     stat_names = (
         '[character(len=14) :: "mean", "sd", "ann_return", "ann_vol", '
         '"sharpe", "net_exposure", "gross_exposure"]'
     )
     repl = (
-        f"subroutine {sub_name}(name, w, mean_ret, sigma_ret, daily_rf, trading_days, asset_names)\n"
-        "character(len=*), intent(in) :: name\n"
-        "real(kind=dp), intent(in) :: w(:), mean_ret(:), sigma_ret(:,:), daily_rf, trading_days\n"
+        f"subroutine {sub_name}({name_arg}, {w_arg}, {mean_arg}, {sigma_arg}, {daily_arg}, {trading_arg}, asset_names)\n"
+        f"character(len=*), intent(in) :: {name_arg}\n"
+        f"real(kind=dp), intent(in) :: {w_arg}(:), {mean_arg}(:), {sigma_arg}(:,:), {daily_arg}, {trading_arg}\n"
         "character(len=*), intent(in) :: asset_names(:)\n"
-        "real(kind=dp), allocatable :: stat(:)\n"
-        "stat = portfolio_stats(w, mean_ret, sigma_ret, daily_rf, trading_days)\n"
-        "write(*,\"(/,*(g0,:,1x))\") name\n"
+        "real(kind=dp), allocatable :: xr2f_portfolio_stat(:)\n"
+        f"xr2f_portfolio_stat = {stat_fun}({w_arg}, {mean_arg}, {sigma_arg}, {daily_arg}, {trading_arg})\n"
+        f"write(*,\"(/,*(g0,:,1x))\") {name_arg}\n"
         "write(*,\"(g0)\") \"Weights: \"\n"
-        "call print_named_real_vector(r_round(w, 6), asset_names, digits=6)\n"
+        f"call print_named_real_vector(r_round({w_arg}, 6), asset_names, digits=6)\n"
         "write(*,\"(g0)\") \"Statistics, in scaled return units where applicable: \"\n"
-        f"call print_named_real_vector(stat, {stat_names}, digits=6)\n"
+        f"call print_named_real_vector(xr2f_portfolio_stat, {stat_names}, digits=6)\n"
         f"end subroutine {sub_name}"
     )
     f90 = f90[:m_sub.start()] + repl + f90[m_sub.end():]
-    call_pat = re.compile(
-        rf"(?ims)^(\s*call\s+{re.escape(sub_name)}\s*\((?:(?!^\s*call\s+|^\s*end\s+program\b).)*?"
-        r"daily_dot_rf\s*,\s*(?:&\s*\n\s*&\s*)?trading_dot_days)(\s*\))",
-        re.MULTILINE,
+    call_start_pat = re.compile(rf"\bcall\s+{re.escape(sub_name)}\s*\(", re.IGNORECASE)
+    pieces: list[str] = []
+    pos = 0
+    while True:
+        m_call = call_start_pat.search(f90, pos)
+        if m_call is None:
+            pieces.append(f90[pos:])
+            break
+        open_idx = m_call.end() - 1
+        i = open_idx + 1
+        depth = 1
+        quote: str | None = None
+        while i < len(f90) and depth > 0:
+            ch = f90[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in {"'", '"'}:
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            pieces.append(f90[pos:])
+            break
+        call_text = f90[m_call.start():i]
+        if not re.search(rf"\b{re.escape(asset_names_var)}\b\s*\)\s*$", call_text, re.IGNORECASE):
+            call_text = call_text[:-1].rstrip() + f", {asset_names_var})"
+        pieces.append(f90[pos:m_call.start()])
+        pieces.append(call_text)
+        pos = i
+    f90 = "".join(pieces)
+    return f90
+
+
+def promote_forwarded_dummy_ranks_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\((.*?)\).*?"
+        r"^end\s+(?:function|subroutine)\s+\1\s*$"
     )
-    f90 = call_pat.sub(r"\1, price_names\2", f90)
+    proc_ranks: dict[str, dict[int, int]] = {}
+    blocks: list[re.Match[str]] = list(block_pat.finditer(f90))
+
+    def clean_args(arg_text: str) -> list[str]:
+        cleaned = re.sub(r"&\s*\n\s*&?", " ", arg_text)
+        return [a.strip().lower() for a in split_top_level_commas(cleaned) if a.strip()]
+
+    def decl_ranks(block: str) -> dict[str, int]:
+        ranks: dict[str, int] = {}
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                p = part.strip()
+                m_name = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_name is None:
+                    continue
+                dims = (m_name.group(2) or "").strip()
+                rank = 0 if not dims else dims.count(":")
+                ranks[m_name.group(1).lower()] = rank
+        return ranks
+
+    for m_block in blocks:
+        proc_name = m_block.group(1).lower()
+        args = clean_args(m_block.group(2))
+        ranks_by_name = decl_ranks(m_block.group(0))
+        proc_ranks[proc_name] = {
+            idx: ranks_by_name.get(arg, 0)
+            for idx, arg in enumerate(args)
+        }
+
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in blocks:
+        block = m_block.group(0)
+        caller_args = set(clean_args(m_block.group(2)))
+        caller_decl_ranks = decl_ranks(block)
+        needed: dict[str, int] = {}
+        flat = re.sub(r"&\s*\n\s*&?", " ", block)
+        for m_call in re.finditer(r"\b([A-Za-z]\w*)\s*\(([^()]*)\)", flat):
+            callee = m_call.group(1).lower()
+            callee_ranks = proc_ranks.get(callee)
+            if not callee_ranks:
+                continue
+            actuals = [a.strip().lower() for a in split_top_level_commas(m_call.group(2))]
+            for idx, actual in enumerate(actuals):
+                if actual not in caller_args:
+                    continue
+                required_rank = callee_ranks.get(idx, 0)
+                if required_rank > caller_decl_ranks.get(actual, 0):
+                    needed[actual] = max(needed.get(actual, 0), required_rank)
+        if not needed:
+            continue
+
+        def rewrite_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            parts_out: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_name = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_name is None:
+                    parts_out.append(p)
+                    continue
+                name = m_name.group(1)
+                need_rank = needed.get(name.lower(), 0)
+                if need_rank <= 0:
+                    parts_out.append(p)
+                    continue
+                suffix = "(:,:)" if need_rank >= 2 else "(:)"
+                parts_out.append(f"{name}{suffix}")
+                changed = True
+            if not changed:
+                return m_decl.group(0)
+            return prefix + ", ".join(parts_out)
+
+        new_block = re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*)(.+)$",
+            rewrite_decl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
     return f90
 
 
@@ -39942,25 +40370,96 @@ def repair_make_pos_def_text(f90: str) -> str:
         "make_pos_def_result = 0.5_dp * (make_pos_def_result + &\n& transpose(make_pos_def_result))",
         "make_pos_def_result = 0.5_dp * (sigma_wrk + &\n& transpose(sigma_wrk))",
     )
+    f90 = re.sub(
+        r"(?ims)^(\s*([A-Za-z]\w+_wrk)\s*=\s*[A-Za-z]\w+\s*\n)"
+        r"(\s*([A-Za-z]\w+_result)\s*=\s*0\.5_dp\s*\*\s*\(\s*)\4(\s*\+\s*&\s*\n\s*&\s*transpose\s*\(\s*)\4(\s*\)\s*\))",
+        r"\1\3\2\5\2\6",
+        f90,
+    )
     return f90
 
 
 def repair_price_names_decl_text(f90: str) -> str:
-    if re.search(r"(?m)^\s*character\(len=:\),\s*allocatable\s*::.*\bprice_names\s*\(:\)", f90, re.IGNORECASE):
-        return f90
-    return re.sub(
-        r"(?m)^(\s*character\(len=:\),\s*allocatable\s*::\s*all_price_names\(:\)\s*)$",
-        r"\1\ncharacter(len=:), allocatable :: price_names(:)",
+    declared: set[str] = set()
+    first_char_decl: re.Match[str] | None = None
+    constructor_lhs = [
+        m_ctor.group(1)
+        for m_ctor in re.finditer(
+            r"(?im)^\s*([A-Za-z]\w*)\s*=\s*\[\s*character\s*\(",
+            f90,
+        )
+    ]
+    for m_decl in re.finditer(
+        r"(?im)^(\s*character\(len=:\),\s*allocatable\s*::\s*)(.+)$",
         f90,
-        count=1,
-        flags=re.IGNORECASE,
-    )
+    ):
+        if first_char_decl is None:
+            first_char_decl = m_decl
+        for item in split_top_level_commas(m_decl.group(2)):
+            m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", item)
+            if m_item is not None:
+                declared.add(m_item.group(1).lower())
+    if first_char_decl is None:
+        missing_ctor = []
+        for lhs in constructor_lhs:
+            if lhs.lower() not in declared and lhs not in missing_ctor:
+                missing_ctor.append(lhs)
+                declared.add(lhs.lower())
+        if not missing_ctor:
+            return f90
+        insert = "\n" + "character(len=:), allocatable :: " + ", ".join(f"{name}(:)" for name in missing_ctor)
+        return re.sub(r"(?im)^(\s*implicit\s+none\s*)$", r"\1" + insert, f90, count=1)
+    missing: list[str] = []
+    for lhs in constructor_lhs:
+        if lhs.lower() not in declared and lhs not in missing:
+            missing.append(lhs)
+            declared.add(lhs.lower())
+    for m_asn in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(", f90):
+        lhs, rhs = m_asn.group(1), m_asn.group(2)
+        if lhs.lower() not in declared and rhs.lower() in declared and lhs not in missing:
+            missing.append(lhs)
+            declared.add(lhs.lower())
+    if "price_names" not in declared and re.search(r"\bprice_names\b", f90):
+        missing.append("price_names")
+    if not missing:
+        return f90
+    insert = "\n" + first_char_decl.group(1) + ", ".join(f"{name}(:)" for name in missing)
+    return f90[:first_char_decl.end()] + insert + f90[first_char_decl.end():]
 
 
 def repair_trading_days_parameter_text(f90: str) -> str:
-    return f90.replace(
+    f90 = f90.replace(
         "integer, parameter :: scale_dot_ret = 100, trading_dot_days = 252",
         "integer, parameter :: scale_dot_ret = 100\nreal(kind=dp), parameter :: trading_dot_days = 252.0_dp",
+    )
+    m_td = re.search(r'"Trading days per year:\s*",\s*([A-Za-z]\w*)', f90)
+    if m_td is None:
+        return f90
+    td_name = m_td.group(1)
+
+    def repl_param(m_param: re.Match[str]) -> str:
+        indent = m_param.group(1)
+        kept: list[str] = []
+        moved_value = ""
+        for item in split_top_level_commas(m_param.group(2)):
+            part = item.strip()
+            m_item = re.match(rf"{re.escape(td_name)}\s*=\s*([0-9]+)\s*$", part, re.IGNORECASE)
+            if m_item is not None:
+                moved_value = m_item.group(1)
+            elif part:
+                kept.append(part)
+        if not moved_value:
+            return m_param.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(f"{indent}integer, parameter :: " + ", ".join(kept))
+        lines.append(f"{indent}real(kind=dp), parameter :: {td_name} = {moved_value}.0_dp")
+        return "\n".join(lines)
+
+    return re.sub(
+        r"(?im)^(\s*)integer,\s*parameter\s*::\s*(.+)$",
+        repl_param,
+        f90,
     )
 
 
@@ -40299,7 +40798,7 @@ def promote_array_rhs_function_results_text(f90: str) -> str:
 
 
 def promote_vector_function_call_local_decls_text(f90: str) -> str:
-    vector_funcs: set[str] = set()
+    vector_funcs: set[str] = {"eigen_sym_values"}
     for fm in re.finditer(
         r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b.*?$",
         f90,
@@ -42472,6 +42971,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--allow-library")
     if args.self_contained:
         cmd.append("--self-contained")
+    if getattr(args, "obfuscate", False):
+        cmd.append("--obfuscate")
+    if getattr(args, "obfuscate_seed", 0):
+        cmd.extend(["--obfuscate-seed", str(args.obfuscate_seed)])
     if getattr(args, "r_rng", False):
         cmd.append("--r-rng")
     if args.out_dir:
@@ -42944,6 +43447,17 @@ def main() -> int:
         "--self-contained",
         action="store_true",
         help="prepend the r_mod runtime to the emitted Fortran and compile without an external r.f90 helper",
+    )
+    ap.add_argument(
+        "--obfuscate",
+        action="store_true",
+        help="rename user-defined R functions and variables before translation to expose name-specific lowering bugs",
+    )
+    ap.add_argument(
+        "--obfuscate-seed",
+        type=int,
+        default=0,
+        help="reserved seed for deterministic future obfuscation variants",
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
@@ -43447,6 +43961,7 @@ def main() -> int:
                 recycle_warn=args.recycle_warn,
                 recycle_stop=args.recycle_stop,
                 fortran_comments=(not args.no_fortran_comments),
+                obfuscate=args.obfuscate,
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
@@ -44401,6 +44916,11 @@ def main() -> int:
         r"\1real(kind=dp) :: \2_f, \2_f_new, \2_f_plus, \2_f_minus",
         f90,
     )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f\(:\),\s*\2_f_new\(:\)\s*$",
+        r"\1real(kind=dp) :: \2_f, \2_f_new",
+        f90,
+    )
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
@@ -44419,6 +44939,8 @@ def main() -> int:
     f90 = rewrite_leftover_matmul_operator_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = demote_dot_product_function_results_text(f90)
+    f90 = demote_dot_product_real_locals_text(f90)
+    f90 = promote_normalized_vector_function_results_text(f90)
     f90 = rewrite_leftover_sweep_calls_text(f90)
     f90 = repair_dropped_single_column_matmul_results_text(f90)
     for _ in range(4):
@@ -44519,6 +45041,7 @@ def main() -> int:
     f90 = repair_portfolio_stat_named_indices_text(f90)
     f90 = repair_portfolio_stats_scalar_locals_text(f90)
     f90 = repair_portfolio_print_labels_text(f90)
+    f90 = promote_forwarded_dummy_ranks_text(f90)
     f90 = repair_make_pos_def_text(f90)
     f90 = repair_price_names_decl_text(f90)
     f90 = repair_trading_days_parameter_text(f90)
@@ -44541,6 +45064,11 @@ def main() -> int:
     f90 = re.sub(
         r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f\(:\),\s*\2_f_new\(:\),\s*\2_f_plus\(:\),\s*\2_f_minus\(:\)\s*$",
         r"\1real(kind=dp) :: \2_f, \2_f_new, \2_f_plus, \2_f_minus",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f\(:\),\s*\2_f_new\(:\)\s*$",
+        r"\1real(kind=dp) :: \2_f, \2_f_new",
         f90,
     )
     if "call print_real_vector(" in f90:
