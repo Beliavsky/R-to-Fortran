@@ -37165,6 +37165,60 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
         re.IGNORECASE,
     )
     scope_end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+
+    def strip_scalar_reducer_calls(txt: str) -> str:
+        reducers = (
+            "sum",
+            "mean",
+            "prod",
+            "product",
+            "min",
+            "max",
+            "maxval",
+            "minval",
+            "dot_product",
+            "sd",
+            "r_sd",
+            "var",
+            "median",
+            "count",
+            "size",
+            "length",
+            "nrow",
+            "ncol",
+        )
+        out_txt = txt
+        for _ in range(20):
+            changed = False
+            for name in reducers:
+                m_call = re.search(rf"\b{name}\s*\(", out_txt, re.IGNORECASE)
+                while m_call is not None:
+                    depth = 1
+                    k = m_call.end()
+                    in_str = False
+                    quote = ""
+                    while k < len(out_txt) and depth > 0:
+                        ch = out_txt[k]
+                        if in_str:
+                            if ch == quote:
+                                in_str = False
+                        elif ch in {'"', "'"}:
+                            in_str = True
+                            quote = ch
+                        elif ch == "(":
+                            depth += 1
+                        elif ch == ")":
+                            depth -= 1
+                        k += 1
+                    if depth != 0:
+                        break
+                    out_txt = out_txt[: m_call.start()] + "0.0_dp" + out_txt[k:]
+                    changed = True
+                    m_call = re.search(rf"\b{name}\s*\(", out_txt, re.IGNORECASE)
+            if not changed:
+                break
+        return out_txt
+
     i = 0
     while i < len(out):
         m_fn = scope_start_pat.match(out[i])
@@ -37195,17 +37249,12 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
                 if m_asn is None:
                     continue
                 rhs = m_asn.group(1)
-                if re.match(r"^\s*-?\s*(?:sum|mean|maxval|minval|dot_product)\s*\(", rhs, re.IGNORECASE):
-                    continue
+                rhs_for_vector_check = strip_scalar_reducer_calls(rhs)
                 if not _array_refs_outside_scalar_reductions(rhs, rank1_names):
                     continue
+                if not _array_refs_outside_scalar_reductions(rhs_for_vector_check, rank1_names):
+                    continue
                 for nm in rank1_names:
-                    rhs_for_vector_check = re.sub(
-                        r"\b(?:sum|mean|maxval|minval|dot_product)\s*\([^()]*\)",
-                        "",
-                        rhs,
-                        flags=re.IGNORECASE,
-                    )
                     direct_vector_expr = (
                         re.search(rf"\breal\s*\(\s*{re.escape(nm)}\b", rhs_for_vector_check, re.IGNORECASE) is not None
                         or re.search(rf"^\s*{re.escape(nm)}\b", rhs_for_vector_check) is not None
@@ -39745,7 +39794,7 @@ def promote_vector_workvars_from_vector_assignments_text(f90: str) -> str:
         while j < len(lines) and not re.match(r"^\s*end\s+function\b", lines[j], re.IGNORECASE):
             j += 1
         block = "\n".join(lines[i:j])
-        m_result = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", lines[i], re.IGNORECASE)
+        m_result = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
         result_name = m_result.group(1) if m_result is not None else ""
         vec_names: set[str] = set()
         for m_vec in re.finditer(
@@ -42184,7 +42233,8 @@ def repair_vector_function_result_declarations_text(f90: str) -> str:
             return block
         uses_as_vector = (
             re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*numeric\s*\(", block) is not None
-            or re.search(rf"\b{re.escape(result)}\s*\(", block) is not None
+            or re.search(rf"(?m)^\s*{re.escape(result)}\s*\([^)]*\)\s*=", block) is not None
+            or re.search(rf"(?m)^\s*{re.escape(result)}\s*\([^)]*\)\s*(?:=|$)", block) is not None
             or re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*{re.escape(result)}\s*\(", block) is not None
         )
         if not uses_as_vector:
