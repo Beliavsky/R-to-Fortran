@@ -6810,6 +6810,48 @@ def lower_static_get_calls(stmts: list[object]) -> list[object]:
     return lower_list(stmts, scalar_names, char_vectors)
 
 
+def specialize_singleton_character_for_loops(stmts: list[object]) -> list[object]:
+    """Replace loop variables over one-element character vectors with literals."""
+    char_vectors: dict[str, list[str]] = {}
+
+    def repl_stmt(st: object, loop_var: str, value: str) -> object:
+        literal = f'"{value}"'
+        mapping = {loop_var: literal}
+        return _replace_name_in_stmt(st, loop_var, literal)
+
+    def walk(ss: list[object], env: dict[str, list[str]]) -> list[object]:
+        out: list[object] = []
+        for st in ss:
+            if isinstance(st, Assign):
+                vals = _static_character_vector_values(st.expr.strip())
+                if vals is not None:
+                    env = dict(env)
+                    env[st.name] = vals
+                elif st.name in env:
+                    env = dict(env)
+                    env.pop(st.name, None)
+                out.append(st)
+            elif isinstance(st, ForStmt):
+                iter_expr = st.iter_expr.strip()
+                vals = env.get(iter_expr)
+                if vals is not None and len(vals) == 1:
+                    body = [repl_stmt(b, st.var, vals[0]) for b in st.body]
+                    out.append(ForStmt(st.var, st.iter_expr, walk(body, dict(env))))
+                else:
+                    out.append(ForStmt(st.var, st.iter_expr, walk(st.body, dict(env))))
+            elif isinstance(st, IfStmt):
+                out.append(IfStmt(st.cond, walk(st.then_body, dict(env)), walk(st.else_body, dict(env))))
+            elif isinstance(st, WhileStmt):
+                out.append(WhileStmt(st.cond, walk(st.body, dict(env))))
+            elif isinstance(st, RepeatStmt):
+                out.append(RepeatStmt(walk(st.body, dict(env))))
+            else:
+                out.append(st)
+        return out
+
+    return walk(stmts, char_vectors)
+
+
 def _assigned_names_in_stmts(stmts: list[object]) -> set[str]:
     out: set[str] = set()
 
@@ -19916,6 +19958,87 @@ def _emit_optim_bfgs_assignment(
     if not prefix or prefix[0].isdigit():
         prefix = "opt_" + prefix
 
+    can_call_runtime_bfgs = (
+        method_lit is not None
+        and method == "bfgs"
+        and not objective_first_scalar
+        and not extra_actuals
+    )
+    if can_call_runtime_bfgs:
+        if helper_ctx is not None:
+            nr = helper_ctx.get("need_r_mod")
+            if isinstance(nr, set):
+                nr.update({"optim_result_t", "optim_bfgs"})
+        kwargs: list[str] = []
+        if maxit_src is not None:
+            kwargs.append(f"maxit={maxit_f}")
+        if reltol_src is not None:
+            kwargs.append(f"reltol={gtol_f}")
+        if ndeps_src is not None:
+            kwargs.append(f"ndeps={ndeps_f}")
+        tail = ", " + ", ".join(kwargs) if kwargs else ""
+        if comment:
+            cmt = comment.strip()
+            if cmt:
+                o.w(f"! {cmt}")
+        o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{tail})")
+        return True
+
+    can_call_runtime_dispatch = (
+        method_lit is None
+        and not objective_first_scalar
+        and not extra_actuals
+    )
+    if can_call_runtime_dispatch:
+        if helper_ctx is not None:
+            nr = helper_ctx.get("need_r_mod")
+            if isinstance(nr, set):
+                nr.update({
+                    "optim_result_t",
+                    "optim_bfgs",
+                    "optim_cg",
+                    "optim_sann",
+                    "optim_nelder_mead",
+                })
+        kwargs: list[str] = []
+        if maxit_src is not None:
+            kwargs.append(f"maxit={maxit_f}")
+        if reltol_src is not None:
+            kwargs.append(f"reltol={gtol_f}")
+        if ndeps_src is not None:
+            kwargs.append(f"ndeps={ndeps_f}")
+        tail = ", " + ", ".join(kwargs) if kwargs else ""
+        method_expr_f = r_expr_to_fortran(method_src)
+        if comment:
+            cmt = comment.strip()
+            if cmt:
+                o.w(f"! {cmt}")
+        o.w(f"select case (trim({method_expr_f}))")
+        o.push()
+        o.w('case ("BFGS", "bfgs")')
+        o.push()
+        o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{tail})")
+        o.pop()
+        o.w('case ("CG", "cg")')
+        o.push()
+        o.w(f"{target} = optim_cg({fn_name}, {par_f}{tail})")
+        o.pop()
+        o.w('case ("SANN", "sann")')
+        o.push()
+        o.w(f"{target} = optim_sann({fn_name}, {par_f}{tail})")
+        o.pop()
+        o.w('case ("Nelder-Mead", "nelder-mead", "Nelder Mead", "nelder Mead")')
+        o.push()
+        o.w(f"{target} = optim_nelder_mead({fn_name}, {par_f}{tail})")
+        o.pop()
+        o.w("case default")
+        o.push()
+        o.w('error stop "unsupported optim method"')
+        o.pop()
+        o.pop()
+        o.w("end select")
+        return True
+
     p = f"{prefix}_p"
     pnew = f"{prefix}_p_new"
     ptmp = f"{prefix}_p_tmp"
@@ -20023,104 +20146,7 @@ def _emit_optim_bfgs_assignment(
         o.w(f"select case (trim({method_expr}))")
         o.w('case ("BFGS", "bfgs")')
         o.push()
-        o.w(f"allocate({pnew}({np}), {ptmp}({np}), {g}({np}), {gnew}({np}), {h}({np},{np}), {d}({np}), {svec}({np}), {yvec}({np}), {amat}({np},{np}), {tmp}({np},{np}))")
-        o.w(f"{h} = 0.0_dp")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"{h}({i},{i}) = 1.0_dp")
-        o.pop()
-        o.w("end do")
-        o.w(f"{fval} = {obj_call(p)}")
-        emit_gradient(p, g)
-        o.w(f"do {iter_nm} = 1, {max_iter}")
-        o.push()
-        o.w(f"{n_iter} = {iter_nm}")
-        o.w(f"if (sqrt(sum({g}**2)) < {gtol}) then")
-        o.push()
-        o.w(f"{converged} = .true.")
-        o.w("exit")
-        o.pop()
-        o.w("end if")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"{d}({i}) = -sum({h}({i},:) * {g})")
-        o.pop()
-        o.w("end do")
-        o.w(f"if (dot_product({g}, {d}) >= 0.0_dp) then")
-        o.push()
-        o.w(f"{h} = 0.0_dp")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"{h}({i},{i}) = 1.0_dp")
-        o.pop()
-        o.w("end do")
-        o.w(f"{d} = -{g}")
-        o.pop()
-        o.w("end if")
-        o.w(f"{alpha} = 1.0_dp")
-        o.w(f"{slope} = dot_product({g}, {d})")
-        o.w(f"do {j} = 1, 60")
-        o.push()
-        o.w(f"{pnew} = {p} + {alpha} * {d}")
-        o.w(f"{fnew} = {obj_call(pnew)}")
-        o.w(f"if ({fnew} <= {fval} + 1.0e-4_dp * {alpha} * {slope}) exit")
-        o.w(f"if ({alpha} < 1.0e-12_dp) exit")
-        o.w(f"{alpha} = 0.5_dp * {alpha}")
-        o.pop()
-        o.w("end do")
-        emit_gradient(pnew, gnew)
-        o.w(f"{svec} = {pnew} - {p}")
-        o.w(f"{yvec} = {gnew} - {g}")
-        o.w(f"{sy} = dot_product({svec}, {yvec})")
-        o.w(f"{shift} = abs({fval} - {fnew})")
-        o.w(f"{p} = {pnew}")
-        o.w(f"{fval} = {fnew}")
-        o.w(f"{g} = {gnew}")
-        o.w(f"if ({sy} > 1.0e-10_dp * sqrt(sum({svec}**2)) * sqrt(sum({yvec}**2))) then")
-        o.push()
-        o.w(f"{rho} = 1.0_dp / {sy}")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"do {j} = 1, {np}")
-        o.push()
-        o.w(f"{amat}({i},{j}) = -{rho} * {svec}({i}) * {yvec}({j})")
-        o.pop()
-        o.w("end do")
-        o.w(f"{amat}({i},{i}) = {amat}({i},{i}) + 1.0_dp")
-        o.pop()
-        o.w("end do")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"do {j} = 1, {np}")
-        o.push()
-        o.w(f"{tmp}({i},{j}) = sum({h}({i},:) * {amat}({j},:))")
-        o.pop()
-        o.w("end do")
-        o.pop()
-        o.w("end do")
-        o.w(f"do {i} = 1, {np}")
-        o.push()
-        o.w(f"do {j} = 1, {np}")
-        o.push()
-        o.w(f"{h}({i},{j}) = sum({amat}({i},:) * {tmp}(:,{j})) + {rho} * {svec}({i}) * {svec}({j})")
-        o.pop()
-        o.w("end do")
-        o.pop()
-        o.w("end do")
-        o.pop()
-        o.w("end if")
-        o.w(f"if ({shift} <= {gtol} * (1.0_dp + abs({fval}))) then")
-        o.push()
-        o.w(f"{converged} = .true.")
-        o.w("exit")
-        o.pop()
-        o.w("end if")
-        o.pop()
-        o.w("end do")
-        o.w(f"{target}%par = {p}")
-        o.w(f"{target}%value = {fval}")
-        o.w(f"{target}%convergence = merge(0, 1, {converged})")
-        o.w(f"if (allocated({pnew})) deallocate({pnew}, {ptmp}, {g}, {gnew}, {h}, {d}, {svec}, {yvec}, {amat}, {tmp})")
+        o.w(f"{target} = optim_bfgs({fn_name}, {p}, maxit={max_iter}, reltol={gtol}, ndeps={ndeps})")
         o.pop()
         o.w('case ("CG", "cg")')
         o.push()
@@ -25788,6 +25814,7 @@ def transpile_r_to_fortran(
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
     stmts = lower_static_get_calls(stmts)
+    stmts = specialize_singleton_character_for_loops(stmts)
     validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
         loc = f" at R line {line_no}" if line_no is not None else ""
@@ -33077,6 +33104,10 @@ def promote_inline_optim_result_vars_text(f90: str) -> str:
         m.group(1)
         for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*%\s*par\s*=", f90)
     }
+    targets.update(
+        m.group(1)
+        for m in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*optim_bfgs\s*\(", f90)
+    )
     if not targets:
         return f90
     lines = f90.splitlines()
@@ -44236,6 +44267,14 @@ def main() -> int:
     f90 = scalarize_scalar_optim_par_field_text(f90)
     if "type(optim_result_t)" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
+    if "optim_bfgs(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_bfgs", "optim_result_t"})
+    if "optim_cg(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_cg", "optim_result_t"})
+    if "optim_sann(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_sann", "optim_result_t"})
+    if "optim_nelder_mead(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_nelder_mead", "optim_result_t"})
     f90 = promote_r_sub_vector_dummy_args_text(f90)
     f90 = repair_extra_renamed_actual_arguments_text(f90)
     f90 = strip_real_wrappers_for_integer_dummy_calls_text(f90)
