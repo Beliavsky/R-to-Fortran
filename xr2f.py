@@ -6274,8 +6274,78 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
     if not mapping:
         return stmts
 
+    func_arg_maps: dict[str, dict[str, str]] = {}
+
+    def collect_func_arg_maps(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, FuncDef):
+                amap = {arg: mapping[arg] for arg in st.args if arg in mapping}
+                for raw_name, sanitized_name in _DOTTED_VAR_RENAMES.items():
+                    if sanitized_name in amap:
+                        amap[raw_name] = amap[sanitized_name]
+                    underscored_name = sanitized_name.replace("_dot_", "_")
+                    if underscored_name != sanitized_name and sanitized_name in amap:
+                        amap[underscored_name] = amap[sanitized_name]
+                if amap:
+                    func_arg_maps[st.name] = amap
+                collect_func_arg_maps(st.body)
+            elif isinstance(st, ForStmt):
+                collect_func_arg_maps(st.body)
+            elif isinstance(st, WhileStmt):
+                collect_func_arg_maps(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect_func_arg_maps(st.body)
+            elif isinstance(st, IfStmt):
+                collect_func_arg_maps(st.then_body)
+                collect_func_arg_maps(st.else_body)
+
+    collect_func_arg_maps(stmts)
+
+    def replace_user_call_keywords(expr: str) -> str:
+        out = expr
+
+        def rewrite_keyword_parts(inner: str, amap: dict[str, str]) -> tuple[str, bool]:
+            parts = split_top_level_commas(inner)
+            changed = False
+            new_parts: list[str] = []
+            for part in parts:
+                m_kw = re.match(rf"^(\s*)({_R_IDENT_RE})\s*=(.*)$", part, re.DOTALL)
+                if m_kw is not None and m_kw.group(2) in amap:
+                    new_parts.append(f"{m_kw.group(1)}{amap[m_kw.group(2)]} ={m_kw.group(3)}")
+                    changed = True
+                else:
+                    new_parts.append(part)
+            return ", ".join(new_parts), changed
+
+        for fn_name, amap in sorted(func_arg_maps.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if not amap:
+                continue
+
+            def repl(inner: str, amap: dict[str, str] = amap, fn_name: str = fn_name) -> str:
+                new_inner, changed = rewrite_keyword_parts(inner, amap)
+                return f"{fn_name}({new_inner})" if changed else f"{fn_name}({inner})"
+
+            out = _replace_balanced_func_calls(out, fn_name, repl)
+
+        def optim_repl(inner: str) -> str:
+            parts = split_top_level_commas(inner)
+            callback_name = ""
+            for part in parts:
+                m_kw = re.match(rf"^\s*fn\s*=\s*({_R_IDENT_RE})\s*$", part)
+                if m_kw is not None:
+                    callback_name = m_kw.group(1)
+                    break
+            amap = func_arg_maps.get(callback_name)
+            if not amap:
+                return f"optim({inner})"
+            new_inner, changed = rewrite_keyword_parts(inner, amap)
+            return f"optim({new_inner})" if changed else f"optim({inner})"
+
+        out = _replace_balanced_func_calls(out, "optim", optim_repl)
+        return out
+
     def rexpr(expr: str) -> str:
-        return _replace_obfuscated_idents(expr, mapping)
+        return _replace_obfuscated_idents(replace_user_call_keywords(expr), mapping)
 
     def walk(st: object) -> object:
         if isinstance(st, Assign):
@@ -6305,6 +6375,75 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
         return st
 
     return [walk(st) for st in stmts]
+
+
+def _render_r_stmts(stmts: list[object], indent: str = "") -> list[str]:
+    def r_comment(text: str) -> str:
+        t = text.strip()
+        if not t:
+            return ""
+        return t if t.startswith("#") else "# " + t
+
+    def suffix(comment: str) -> str:
+        c = r_comment(comment)
+        return f" {c}" if c else ""
+
+    out: list[str] = []
+    for st in stmts:
+        if isinstance(st, CommentStmt):
+            out.append(indent + r_comment(st.text))
+        elif isinstance(st, Assign):
+            out.append(f"{indent}{st.name} <- {st.expr}" + suffix(st.comment))
+        elif isinstance(st, PrintStmt):
+            out.append(f"{indent}print({', '.join(st.args)})" + suffix(st.comment))
+        elif isinstance(st, CallStmt):
+            out.append(f"{indent}{st.name}({', '.join(st.args)})" + suffix(st.comment))
+        elif isinstance(st, ExprStmt):
+            out.append(indent + st.expr + suffix(st.comment))
+        elif isinstance(st, ForStmt):
+            out.append(f"{indent}for ({st.var} in {st.iter_expr}) {{")
+            out.extend(_render_r_stmts(st.body, indent + "  "))
+            out.append(f"{indent}}}")
+        elif isinstance(st, WhileStmt):
+            out.append(f"{indent}while ({st.cond}) {{")
+            out.extend(_render_r_stmts(st.body, indent + "  "))
+            out.append(f"{indent}}}")
+        elif isinstance(st, RepeatStmt):
+            out.append(f"{indent}repeat {{")
+            out.extend(_render_r_stmts(st.body, indent + "  "))
+            out.append(f"{indent}}}")
+        elif isinstance(st, IfStmt):
+            out.append(f"{indent}if ({st.cond}) {{")
+            out.extend(_render_r_stmts(st.then_body, indent + "  "))
+            if st.else_body:
+                out.append(f"{indent}}} else {{")
+                out.extend(_render_r_stmts(st.else_body, indent + "  "))
+            out.append(f"{indent}}}")
+        elif isinstance(st, FuncDef):
+            for c in st.leading_comments:
+                out.append(indent + c)
+            args: list[str] = []
+            for arg in st.args:
+                if arg in st.defaults:
+                    args.append(f"{arg} = {st.defaults[arg]}")
+                else:
+                    args.append(arg)
+            out.append(f"{indent}{st.name} <- function({', '.join(args)}) {{")
+            out.extend(_render_r_stmts(st.body, indent + "  "))
+            out.append(f"{indent}}}")
+        else:
+            out.append(indent + str(st))
+    return out
+
+
+def obfuscate_r_source(src: str) -> str:
+    comment_lookup = build_r_comment_lookup(src)
+    lines = preprocess_r_lines(src)
+    stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+    if i != len(lines):
+        raise NotImplementedError("could not parse full source for obfuscation")
+    stmts = obfuscate_user_defined_names(stmts)
+    return "\n".join(_render_r_stmts(stmts)) + ("\n" if src.endswith("\n") else "")
 
 
 def _qualify_lifted_sibling_calls_expr(expr: str, current_fn_name: str) -> str:
@@ -42989,6 +43128,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--self-contained")
     if getattr(args, "obfuscate", False):
         cmd.append("--obfuscate")
+    if getattr(args, "obfuscate_r", None):
+        cmd.extend(["--obfuscate-r", args.obfuscate_r])
+    if getattr(args, "check_obfuscated_r", False):
+        cmd.append("--check-obfuscated-r")
     if getattr(args, "obfuscate_seed", 0):
         cmd.extend(["--obfuscate-seed", str(args.obfuscate_seed)])
     if getattr(args, "r_rng", False):
@@ -43470,6 +43613,16 @@ def main() -> int:
         help="rename user-defined R functions and variables before translation to expose name-specific lowering bugs",
     )
     ap.add_argument(
+        "--obfuscate-r",
+        metavar="OUT.r",
+        help="write the obfuscated R source to OUT.r; with --obfuscate and no OUT.r, writes <input>_obfuscated.r",
+    )
+    ap.add_argument(
+        "--check-obfuscated-r",
+        action="store_true",
+        help="write and run the obfuscated R source with Rscript before translation; implies --obfuscate",
+    )
+    ap.add_argument(
         "--obfuscate-seed",
         type=int,
         default=0,
@@ -43477,6 +43630,8 @@ def main() -> int:
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
+    if args.check_obfuscated_r:
+        args.obfuscate = True
     global _SUPPRESS_WARNINGS
     _SUPPRESS_WARNINGS = bool(args.no_warn)
     if args.run_repeat < 1:
@@ -43726,6 +43881,43 @@ def main() -> int:
 
     t0 = time.perf_counter()
     src = in_path.read_text(encoding="utf-8-sig")
+    source_already_obfuscated = False
+    if args.obfuscate:
+        try:
+            src = obfuscate_r_source(src)
+        except NotImplementedError as e:
+            print(f"Obfuscate R: FAIL ({e})")
+            return 1
+        obf_path: Path
+        if args.obfuscate_r:
+            obf_cand = Path(args.obfuscate_r)
+            if args.out_dir and not obf_cand.is_absolute():
+                obf_path = (Path(args.out_dir) / obf_cand).resolve()
+            else:
+                obf_path = obf_cand.resolve()
+        else:
+            obf_path = in_path.with_name(f"{in_path.stem}_obfuscated.r").resolve()
+        obf_path.parent.mkdir(parents=True, exist_ok=True)
+        obf_path.write_text(src, encoding="utf-8")
+        print(f"wrote {obf_path}")
+        if args.check_obfuscated_r:
+            cmd = [args.rscript, str(obf_path)]
+            print("Run (obfuscated r):", " ".join(cmd))
+            obf_run = _run_capture(cmd, cwd=run_cwd)
+            if obf_run.returncode != 0:
+                print(f"Run (obfuscated r): FAIL (exit {obf_run.returncode})")
+                _print_captured(obf_run, round_digits=args.round_both, strip_quotes=args.strip_quotes)
+                if not (obf_run.stdout or "").strip() and not (obf_run.stderr or "").strip():
+                    print("Run (obfuscated r): no stdout/stderr captured; process may have crashed before producing output.")
+                return obf_run.returncode
+            print("Run (obfuscated r): PASS")
+            _print_captured(
+                obf_run,
+                pretty=args.pretty,
+                strip_r_indices=args.pretty,
+                round_digits=args.round_both,
+            )
+        source_already_obfuscated = True
     if args.partial:
         if args.verbose:
             print("Partial: parsing input", flush=True)
@@ -43977,7 +44169,7 @@ def main() -> int:
                 recycle_warn=args.recycle_warn,
                 recycle_stop=args.recycle_stop,
                 fortran_comments=(not args.no_fortran_comments),
-                obfuscate=args.obfuscate,
+                obfuscate=(args.obfuscate and not source_already_obfuscated),
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
