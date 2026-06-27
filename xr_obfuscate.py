@@ -25,6 +25,7 @@ class Result:
     ok: bool
     stage: str
     message: str = ""
+    skipped: bool = False
 
 
 def _is_r_file(path: Path) -> bool:
@@ -111,10 +112,26 @@ def process_one(item: WorkItem, out_path: Path, args: argparse.Namespace) -> Res
             check=False,
         )
         if proc.returncode != 0:
-            if not args.quiet:
-                print("Run (obfuscated r):", " ".join(cmd))
-                print(f"Run (obfuscated r): FAIL (exit {proc.returncode})")
-                print_captured(proc)
+            orig_cmd = [args.rscript, str(item.src)]
+            orig_proc = subprocess.run(
+                orig_cmd,
+                cwd=check_cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if orig_proc.returncode != 0:
+                return Result(
+                    item.src,
+                    out_path,
+                    True,
+                    "original-fail",
+                    f"original exit {orig_proc.returncode}",
+                    skipped=True,
+                )
+            print("Run (obfuscated r):", " ".join(cmd))
+            print(f"Run (obfuscated r): FAIL (exit {proc.returncode})")
+            print_captured(proc)
             return Result(item.src, out_path, False, "check", f"exit {proc.returncode}")
         if args.verbose:
             print("Run (obfuscated r):", " ".join(cmd))
@@ -124,21 +141,25 @@ def process_one(item: WorkItem, out_path: Path, args: argparse.Namespace) -> Res
     return Result(item.src, out_path, True, "ok")
 
 
-def print_summary(results: list[Result]) -> None:
+def print_summary(results: list[Result], failures_only: bool = False) -> None:
     print("")
     print("Summary:")
     for result in results:
-        status = "PASS" if result.ok else "FAIL"
+        if failures_only and result.ok:
+            continue
+        status = "SKIP" if result.skipped else ("PASS" if result.ok else "FAIL")
         if result.out is not None:
             line = f"{status} {result.src} -> {result.out}"
         else:
             line = f"{status} {result.src}"
-        if not result.ok:
+        if not result.ok or result.skipped:
             line += f" [{result.stage}: {result.message}]"
         print(line)
     n = len(results)
-    n_pass = sum(1 for r in results if r.ok)
-    print(f"Totals: {n} files, {n_pass} pass, {n - n_pass} fail")
+    n_skip = sum(1 for r in results if r.skipped)
+    n_pass = sum(1 for r in results if r.ok and not r.skipped)
+    n_fail = sum(1 for r in results if not r.ok)
+    print(f"Totals: {n} files, {n_pass} pass, {n_skip} skip, {n_fail} fail")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--keep-going", action="store_true", help="continue after failures")
     ap.add_argument("--summary", action="store_true", help="print a compact pass/fail summary")
-    ap.add_argument("--quiet", action="store_true", help="suppress per-file PASS lines and check failure output")
+    ap.add_argument("--quiet", action="store_true", help="suppress per-file PASS lines; failures and summaries are still printed")
     ap.add_argument("--verbose", action="store_true", help="print Rscript output for passing --check runs")
     args = ap.parse_args(argv)
 
@@ -178,19 +199,19 @@ def main(argv: list[str] | None = None) -> int:
     for item, out_path in zip(items, out_paths):
         result = process_one(item, out_path, args)
         results.append(result)
-        if not args.quiet:
-            status = "PASS" if result.ok else "FAIL"
+        if not args.quiet or not result.ok:
+            status = "SKIP" if result.skipped else ("PASS" if result.ok else "FAIL")
             if result.out is not None:
                 print(f"{status} {result.src} -> {result.out}")
             else:
                 print(f"{status} {result.src}")
-            if not result.ok:
+            if not result.ok or result.skipped:
                 print(f"  {result.stage}: {result.message}")
         if not result.ok and not args.keep_going:
             break
 
     if args.summary or len(results) != 1:
-        print_summary(results)
+        print_summary(results, failures_only=args.quiet)
     return 0 if all(r.ok for r in results) else 1
 
 
