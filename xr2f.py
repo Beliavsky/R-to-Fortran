@@ -27604,6 +27604,12 @@ def transpile_r_to_fortran(
                 return 1 if _formal_is_flattened_vector(formal_name) else 2
             if actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES or actual_l in _KNOWN_CHAR_VECTOR_NAMES:
                 return 1
+            if re.match(
+                r"^(?:c|numeric|integer|logical|rep|seq|seq_len|rnorm|runif|sample|sample\.int)\s*\(",
+                actual_l,
+                re.IGNORECASE,
+            ):
+                return 1
             rank_actual = _infer_assignment_rank_hint(actual_src, {nm: 1 for nm in _KNOWN_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES})
             if rank_actual >= 2 and _formal_is_flattened_vector(formal_name):
                 return 1
