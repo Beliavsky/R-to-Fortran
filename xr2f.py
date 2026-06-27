@@ -41269,6 +41269,24 @@ def promote_integer_maxval_locals_text(f90: str) -> str:
 
 def repair_trend_results_dataframe_text(f90: str) -> str:
     """Materialize the expanded trend-results data frame before matrix operations."""
+    label_call_fns = {
+        m.group(1)
+        for m in re.finditer(r'\bcall\s+([A-Za-z]\w*)\s*\(\s*"', f90, re.IGNORECASE)
+    }
+    for fn in sorted(label_call_fns, key=len, reverse=True):
+        m_proc = re.search(rf"\bsubroutine\s+{re.escape(fn)}\s*\(([^)]*)\)", f90, re.IGNORECASE)
+        if m_proc is None:
+            continue
+        args = [a.strip() for a in split_top_level_commas(m_proc.group(1)) if a.strip()]
+        if not args:
+            continue
+        label_arg = args[0]
+        f90 = re.sub(
+            rf"(?m)^(\s*)real\(kind=dp\),\s*intent\(in\)\s*::\s*{re.escape(label_arg)}\s*\(:\)\s*,\s*(.+)$",
+            rf"\1character(len=*), intent(in) :: {label_arg}\n\1real(kind=dp), intent(in) :: \2",
+            f90,
+            count=1,
+        )
     f90 = re.sub(
         r"(?m)^real\(kind=dp\),\s*intent\(in\)\s*::\s*label\(:\),\s*r\(:\),\s*risk_free,\s*trading_days\s*$",
         "character(len=*), intent(in) :: label\nreal(kind=dp), intent(in) :: r(:), risk_free, trading_days",
@@ -41282,6 +41300,172 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
     f90 = re.sub(r"\bsignal\(:\)", "signal(:,:)", f90)
     f90 = re.sub(r"\bstrat_rets_asset\(:\)", "strat_rets_asset(:,:)", f90)
     f90 = re.sub(r"\basset_tf_stats\(:\)", "asset_tf_stats(:,:)", f90)
+    trend_matrix_targets: set[str] = set()
+    for mm in re.finditer(
+        r"(?m)^\s*([A-Za-z]\w*)\s*=\s*matrix\s*\(\s*\[[^\]]+\]\s*,\s*[^,\n]+\s*,\s*[^)\n]+\)",
+        f90,
+    ):
+        trend_matrix_targets.add(mm.group(1))
+        f90 = re.sub(rf"\b{re.escape(mm.group(1))}\s*\(:\)", f"{mm.group(1)}(:,:)", f90)
+
+    int_second_arg_fns: set[str] = set()
+    for fm in re.finditer(
+        r"(?ims)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\(([^)]*)\)(.*?)^\s*end\s+function\b",
+        f90,
+    ):
+        fn = fm.group(1)
+        args = [a.strip() for a in split_top_level_commas(fm.group(2)) if a.strip()]
+        if len(args) < 2:
+            continue
+        body = fm.group(3)
+        if re.search(
+            rf"(?im)^\s*integer\s*(?:,\s*[^:]*)?::\s*(?:[^!\n,]*,\s*)*{re.escape(args[1])}\b",
+            body,
+        ):
+            int_second_arg_fns.add(fn)
+    for fn in sorted(int_second_arg_fns, key=len, reverse=True):
+        f90 = re.sub(
+            rf"(?<!function\s)\b{re.escape(fn)}\s*\(\s*([^,\n()]+?)\s*,\s*&\s*\n\s*&\s*(?!int\s*\()([A-Za-z]\w*)\s*\)",
+            rf"{fn}(\1, &\n& int(\2))",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            rf"(?m)^((?!\s*(?:pure\s+|elemental\s+|recursive\s+)*function\b).*\b{re.escape(fn)}\s*\(\s*[^,\n()]+?\s*,\s*)(?!int\s*\()([A-Za-z]\w*)(\s*\).*)$",
+            rf"\1int(\2)\3",
+            f90,
+            flags=re.IGNORECASE,
+        )
+
+    def clean_df_expr(expr: str) -> str:
+        expr = re.sub(r"&\s*\n\s*&?", " ", expr)
+        expr = re.sub(r"\s+", " ", expr).strip()
+        stat_index = {"ann_return": 3, "ann_vol": 4, "sharpe": 5, "min": 6, "max": 7}
+        for stat_name, stat_pos in stat_index.items():
+            expr = re.sub(rf'\(\s*"{re.escape(stat_name)}"\s*\)', f"({stat_pos})", expr)
+        return expr
+
+    trend_append_re = re.compile(
+        r"(?ms)^(\s*)([A-Za-z]\w*)\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[\s*([A-Za-z]\w*)\s*,\s*&\s*\n"
+        r"\s*&\s*data\.frame\s*\(\s*short_ma\s*=\s*(.*?)\s*,\s*long_ma\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*n_days\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*avg_assets_long\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*ann_return\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*ann_vol\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*sharpe\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*min_daily\s*=\s*(.*?)\s*,\s*&\s*\n"
+        r"\s*&\s*max_daily\s*=\s*(.*?)\s*\)\s*\]\s*,\s*\[\s*size\s*\(\s*\3\s*\)\s*,\s*2\s*\]\s*\)\s*\)",
+    )
+    trend_materialized: list[tuple[str, str]] = []
+
+    def trend_append_repl(m: re.Match[str]) -> str:
+        indent = m.group(1)
+        mat = m.group(2)
+        base = m.group(3)
+        short_ma = clean_df_expr(m.group(4))
+        long_ma = clean_df_expr(m.group(5))
+        n_days = clean_df_expr(m.group(6))
+        avg_assets_long = clean_df_expr(m.group(7))
+        ann_return = clean_df_expr(m.group(8))
+        ann_vol = clean_df_expr(m.group(9))
+        sharpe = clean_df_expr(m.group(10))
+        min_daily = clean_df_expr(m.group(11))
+        max_daily = clean_df_expr(m.group(12))
+        trend_materialized.append((base, mat))
+        return "\n".join(
+            [
+                f"{indent}{base}_short_ma = [{base}_short_ma, int({short_ma})]",
+                f"{indent}{base}_long_ma = [{base}_long_ma, int({long_ma})]",
+                f"{indent}{base}_n_days = [{base}_n_days, int({n_days})]",
+                f"{indent}{base}_avg_assets_long = [{base}_avg_assets_long, {avg_assets_long}]",
+                f"{indent}{base}_ann_return = [{base}_ann_return, {ann_return}]",
+                f"{indent}{base}_ann_vol = [{base}_ann_vol, {ann_vol}]",
+                f"{indent}{base}_sharpe = [{base}_sharpe, {sharpe}]",
+                f"{indent}{base}_min_daily = [{base}_min_daily, {min_daily}]",
+                f"{indent}{base}_max_daily = [{base}_max_daily, {max_daily}]",
+            ]
+        )
+
+    f90 = trend_append_re.sub(trend_append_repl, f90)
+    for base, mat in trend_materialized:
+        f90 = re.sub(rf"\b{re.escape(mat)}\s*\(:\)", f"{mat}(:,:)", f90)
+        f90 = re.sub(rf"\b{re.escape(mat)}%sharpe\b", f"{base}_sharpe", f90)
+        f90 = re.sub(
+            rf"(?m)^(\s*){re.escape(mat)}\s*=\s*{re.escape(mat)}\s*\(\s*order_real\s*\(\s*-{re.escape(base)}_sharpe\s*\)\s*,\s*:\s*\)\s*$",
+            "\n".join(
+                [
+                    rf"\1{mat} = reshape([real({base}_short_ma, kind=dp), real({base}_long_ma, kind=dp), &",
+                    rf"\1& real({base}_n_days, kind=dp), {base}_avg_assets_long, {base}_ann_return, &",
+                    rf"\1& {base}_ann_vol, {base}_sharpe, {base}_min_daily, {base}_max_daily], &",
+                    rf"\1& [size({base}_sharpe), 9])",
+                    rf"\1{mat} = {mat}(order_real(-{base}_sharpe), :)",
+                ]
+            ),
+            f90,
+        )
+        f90 = re.sub(rf"\bmaxloc\s*\(\s*{re.escape(base)}_sharpe\s*,\s*dim\s*=\s*1\s*\)", f"maxloc({base}_sharpe, dim=1)", f90)
+        best_match = re.search(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(mat)}\s*\(\s*maxloc\s*\(\s*{re.escape(base)}_sharpe\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)", f90)
+        best_var = best_match.group(1) if best_match is not None else ""
+        field_index = {
+            "short_ma": 1,
+            "long_ma": 2,
+            "n_days": 3,
+            "avg_assets_long": 4,
+            "ann_return": 5,
+            "ann_vol": 6,
+            "sharpe": 7,
+            "min_daily": 8,
+            "max_daily": 9,
+        }
+        if best_var:
+            for fld, idx in field_index.items():
+                f90 = re.sub(rf"\b{re.escape(best_var)}%{re.escape(fld)}\b", f"{best_var}({idx})", f90)
+        f90 = re.sub(
+            rf"(?m)^(\s*)call\s+print_real_vector\s*\(\s*{re.escape(mat)}\s*,\s*digits\s*=\s*6\s*\)\s*$",
+            rf'\1call print_matrix_rstyle_named({mat}, names=[character(len=15) :: "short_ma", "long_ma", "n_days", "avg_assets_long", "ann_return", "ann_vol", "sharpe", "min_daily", "max_daily"], digits=6)',
+            f90,
+        )
+    f90 = re.sub(
+        r"(?ims)^(\s*)([A-Za-z]\w*)\s*=\s*r_add\s*\(\s*real\s*\(\s*r_mul\s*\(\s*real\s*\(\s*([A-Za-z]\w*)\s*,.*?kind=dp\s*\)\s*,\s*real\s*\(\s*([A-Za-z]\w*)\s*,\s*kind=dp\s*\)\s*\)\s*,.*?kind=dp\s*\)\s*,\s*real\s*\(\s*\(1\.0_dp\s*-\s*\3\s*\)\s*\*\s*([A-Za-z]\w*)\s*,.*?kind=dp\s*\)\s*\)",
+        r"\1\2 = \3 * \4 + (1.0_dp - \3) * \5",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)([A-Za-z]\w*)\s*=\s*r_mul\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*$",
+        r"\1\2 = \3 * \4",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?ims)^(\s*)([A-Za-z]\w*)\s*=\s*r_mul\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*\+\s*\(\(\s*1\.0_dp\s*-\s*&?\s*\n?\s*&?\s*\3\s*\)\s*\*\s*([A-Za-z]\w*)\s*\)",
+        r"\1\2 = \3 * \4 + (1.0_dp - \3) * \5",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?ims)^(\s*)([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\*\s*spread\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*2\s*,\s*&\s*\n\s*&\s*ncopies\s*=\s*size\s*\(\s*\3\s*,\s*2\s*\)\s*\)",
+        r"\1\2 = \3 * \4",
+        f90,
+    )
+    for tm in sorted(trend_matrix_targets, key=len, reverse=True):
+        for am in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(tm)}\s*\*", f90):
+            lhs = am.group(1)
+            f90 = re.sub(rf"\b{re.escape(lhs)}\s*\(:\)", f"{lhs}(:,:)", f90)
+    for alloc_m in re.finditer(
+        r"(?im)^\s*allocate\s*\(\s*([A-Za-z]\w*)\s*\(\s*size\s*\([^)]*\)\s*,\s*&\s*$",
+        f90,
+    ):
+        alloc_name = alloc_m.group(1)
+        f90 = re.sub(rf"\b{re.escape(alloc_name)}\s*\(:\)", f"{alloc_name}(:,:)", f90)
+    f90 = re.sub(
+        r'(?ims)^(\s*)write\(\*,"\(/,g0\)"\)\s*r_round\s*\(\s*cbind\s*\(\s*([A-Za-z]\w*)\s*,\s*sum\s*\(\s*([A-Za-z]\w*)\s*,\s*&\s*\n\s*&\s*dim=1\s*\)\s*/\s*real\s*\(\s*real\s*\(\s*size\s*\(\s*\3\s*,\s*1\s*\)\s*,\s*kind=dp\s*\)\s*,\s*kind=dp\s*\)\s*\)\s*,\s*6\s*\)',
+        "\n".join(
+            [
+                r"\1\2 = reshape([sum(\3, dim=1) / real(size(\3, 1), kind=dp), &",
+                r"\1& reshape(\2, [size(\2)])], [size(\2, 1), size(\2, 2) + 1])",
+                r'\1call print_matrix_rstyle_named(\2, names=[character(len=13) :: "pct_days_long", "mean_daily", "sd_daily", "ann_return", "ann_vol", "sharpe", "min", "max"], digits=6)',
+            ]
+        ),
+        f90,
+    )
     required = (
         "results_short_ma",
         "results_long_ma",
@@ -41340,10 +41524,20 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
         flags=re.IGNORECASE,
     )
     f90 = re.sub(
+        r"(?ims)^(\s*)([A-Za-z]\w*)\s*=\s*r_add\s*\(\s*real\s*\(\s*r_mul\s*\(\s*real\s*\(\s*([A-Za-z]\w*)\s*,.*?kind=dp\s*\)\s*,\s*real\s*\(\s*([A-Za-z]\w*)\s*,\s*kind=dp\s*\)\s*\)\s*,.*?kind=dp\s*\)\s*,\s*real\s*\(\s*\(1\.0_dp\s*-\s*\3\s*\)\s*\*\s*([A-Za-z]\w*)\s*,.*?kind=dp\s*\)\s*\)",
+        r"\1\2 = \3 * \4 + (1.0_dp - \3) * \5",
+        f90,
+    )
+    f90 = re.sub(
         r"strat_rets_asset\s*=\s*r_mul\s*\(\s*signal\s*,\s*rets\s*\)",
         "strat_rets_asset = signal * rets",
         f90,
         flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)([A-Za-z]\w*)\s*=\s*r_mul\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*$",
+        r"\1\2 = \3 * \4",
+        f90,
     )
     f90 = re.sub(
         r"best_asset_rets\s*=\s*r_mul\s*\(\s*best_signal\s*,\s*rets\s*\)",
@@ -41356,6 +41550,11 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
         "best_asset_rets = best_signal * rets",
         f90,
         flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?ims)^(\s*)([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\*\s*spread\s*\(\s*([A-Za-z]\w*)\s*,\s*dim\s*=\s*2\s*,\s*&\s*\n\s*&\s*ncopies\s*=\s*size\s*\(\s*\3\s*,\s*2\s*\)\s*\)",
+        r"\1\2 = \3 * \4",
+        f90,
     )
     f90 = re.sub(r"results_short_ma\s*=\s*\[results_short_ma,\s*short_ma\]", "results_short_ma = [results_short_ma, int(short_ma)]", f90)
     f90 = re.sub(r"results_long_ma\s*=\s*\[results_long_ma,\s*long_ma\]", "results_long_ma = [results_long_ma, int(long_ma)]", f90)
