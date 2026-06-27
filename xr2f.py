@@ -13587,6 +13587,16 @@ def r_expr_to_fortran(expr: str) -> str:
         _median_to_fortran,
     )
 
+    def _sd_to_fortran(inner: str) -> str:
+        x_src, na_rm = _split_reduction_args(inner)
+        x_f = r_expr_to_fortran(x_src)
+        if na_rm:
+            x_f = _non_na_pack_expr(x_f)
+        return f"{_R_SD_CALL_NAME}({x_f})"
+
+    s = _replace_balanced_func_calls(s, "sd", _sd_to_fortran)
+    s = _replace_balanced_func_calls(s, "r_sd", _sd_to_fortran)
+
     def _is_logical_reduction_arg(x_src: str, x_f: str) -> bool:
         root_l = x_f.strip().split("%")[-1].lower()
         if re.match(r"^\s*merge\s*\(\s*1\s*,\s*0\s*,", x_f, re.IGNORECASE):
