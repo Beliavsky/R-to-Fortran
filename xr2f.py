@@ -14123,6 +14123,67 @@ def r_expr_to_fortran(expr: str) -> str:
     if m_paren_drop_one is not None:
         return f"r_drop_index({m_paren_drop_one.group(1).strip()}, 1)"
     # Negative subscripts: x[-k], x[-c(i,j)], x[-[i,j]] -> helper calls.
+    def _replace_negative_call_subscripts(expr_neg: str) -> str:
+        out_neg = expr_neg
+        changed_neg = True
+        while changed_neg:
+            changed_neg = False
+            pos = 0
+            while pos < len(out_neg):
+                b = out_neg.find("[", pos)
+                if b < 0:
+                    break
+                j = b + 1
+                while j < len(out_neg) and out_neg[j].isspace():
+                    j += 1
+                if j >= len(out_neg) or out_neg[j] != "-":
+                    pos = b + 1
+                    continue
+                k = j + 1
+                depth_sq = 1
+                while k < len(out_neg) and depth_sq > 0:
+                    if out_neg[k] == "[":
+                        depth_sq += 1
+                    elif out_neg[k] == "]":
+                        depth_sq -= 1
+                    k += 1
+                if depth_sq != 0:
+                    break
+                idx_src = out_neg[j + 1 : k - 1].strip()
+                left = b - 1
+                while left >= 0 and out_neg[left].isspace():
+                    left -= 1
+                if left < 0 or out_neg[left] != ")":
+                    pos = k
+                    continue
+                depth_par = 1
+                p = left - 1
+                while p >= 0 and depth_par > 0:
+                    if out_neg[p] == ")":
+                        depth_par += 1
+                    elif out_neg[p] == "(":
+                        depth_par -= 1
+                    p -= 1
+                if depth_par != 0:
+                    pos = k
+                    continue
+                name_end = p + 1
+                name_start = name_end - 1
+                while name_start >= 0 and (out_neg[name_start].isalnum() or out_neg[name_start] == "_"):
+                    name_start -= 1
+                call_start = name_start + 1
+                if call_start >= name_end or not re.fullmatch(r"[A-Za-z]\w*", out_neg[call_start:name_end]):
+                    pos = k
+                    continue
+                call_expr = out_neg[call_start:b].strip()
+                repl = f"r_drop_index({call_expr}, int({r_expr_to_fortran(idx_src)}))"
+                out_neg = out_neg[:call_start] + repl + out_neg[k:]
+                changed_neg = True
+                pos = call_start + len(repl)
+                break
+        return out_neg
+
+    s = _replace_negative_call_subscripts(s)
     prev_neg = None
     pat_neg_vec = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*-\s*c\(([^][]+)\)\s*\]")
     pat_neg_vec_lit = re.compile(r"([A-Za-z]\w*(?:%[A-Za-z]\w*)*)\s*\[\s*-\s*\[([^\[\]]+)\]\s*\]")
@@ -39725,6 +39786,18 @@ def demote_scalar_reduction_result_declarations_text(f90: str) -> str:
         if m_decl is None:
             continue
         res = m_decl.group(2)
+        fn_result = ""
+        k = i - 1
+        while k >= 0:
+            if re.match(r"^\s*end\s+function\b", lines[k], re.IGNORECASE):
+                break
+            m_fn = re.search(r"\bfunction\b.*\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", lines[k], re.IGNORECASE)
+            if m_fn is not None:
+                fn_result = m_fn.group(1)
+                break
+            k -= 1
+        if not fn_result or res.lower() != fn_result.lower():
+            continue
         j = i + 1
         block_lines: list[str] = []
         while j < len(lines) and not re.match(r"^\s*end\s+function\b", lines[j], re.IGNORECASE):
@@ -39791,6 +39864,32 @@ def demote_scalar_reduction_local_declarations_text(f90: str) -> str:
 def promote_vector_workvars_from_vector_assignments_text(f90: str) -> str:
     lines = f90.splitlines()
     out = list(lines)
+    scalar_return_funcs: set[str] = set()
+    scan_i = 0
+    while scan_i < len(lines):
+        if re.match(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\b", lines[scan_i], re.IGNORECASE) is None:
+            scan_i += 1
+            continue
+        scan_j = scan_i + 1
+        while scan_j < len(lines) and not re.match(r"^\s*end\s+function\b", lines[scan_j], re.IGNORECASE):
+            scan_j += 1
+        scan_block = "\n".join(lines[scan_i:scan_j])
+        m_scan_fn = re.match(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\b", lines[scan_i], re.IGNORECASE)
+        m_scan_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", scan_block, re.IGNORECASE)
+        if m_scan_fn is not None and m_scan_res is not None:
+            res_scan = m_scan_res.group(1)
+            m_scan_decl = re.search(
+                rf"(?m)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)[^:\n]*::[^\n]*\b{re.escape(res_scan)}\b[^\n]*$",
+                scan_block,
+                re.IGNORECASE,
+            )
+            if (
+                m_scan_decl is not None
+                and "allocatable" not in m_scan_decl.group(0).lower()
+                and not re.search(rf"\b{re.escape(res_scan)}\s*\(", m_scan_decl.group(0), re.IGNORECASE)
+            ):
+                scalar_return_funcs.add(m_scan_fn.group(1).lower())
+        scan_i = scan_j + 1
     i = 0
     while i < len(lines):
         if re.match(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\b", lines[i], re.IGNORECASE) is None:
@@ -39823,6 +39922,15 @@ def promote_vector_workvars_from_vector_assignments_text(f90: str) -> str:
                     continue
                 nm = m_decl.group(2)
                 if result_name and nm.lower() == result_name.lower():
+                    continue
+                m_nm_asn = re.search(rf"(?m)^\s*{re.escape(nm)}\s*=\s*([A-Za-z]\w*)\s*\(", block, re.IGNORECASE)
+                if (
+                    m_nm_asn is not None
+                    and (
+                        m_nm_asn.group(1).lower() in scalar_return_funcs
+                        or _USER_FUNC_RETURN_RANK.get(m_nm_asn.group(1).lower(), 0) == 0
+                    )
+                ):
                     continue
                 for vec in vec_names:
                     if re.search(rf"(?m)^\s*{re.escape(nm)}\s*=.*\b{re.escape(vec)}\b", block):
@@ -40786,9 +40894,12 @@ def repair_trading_days_parameter_text(f90: str) -> str:
         "integer, parameter :: scale_dot_ret = 100\nreal(kind=dp), parameter :: trading_dot_days = 252.0_dp",
     )
     m_td = re.search(r'"Trading days per year:\s*",\s*([A-Za-z]\w*)', f90)
-    if m_td is None:
+    if m_td is None and re.search(r"\btrading_dot_days\b", f90):
+        td_name = "trading_dot_days"
+    elif m_td is None:
         return f90
-    td_name = m_td.group(1)
+    else:
+        td_name = m_td.group(1)
 
     def repl_param(m_param: re.Match[str]) -> str:
         indent = m_param.group(1)
@@ -41020,6 +41131,135 @@ def promote_integer_maxval_locals_text(f90: str) -> str:
     return re.sub(
         r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
         repl,
+        f90,
+    )
+
+
+def repair_trend_results_dataframe_text(f90: str) -> str:
+    """Materialize the expanded trend-results data frame before matrix operations."""
+    f90 = re.sub(
+        r"(?m)^real\(kind=dp\),\s*intent\(in\)\s*::\s*label\(:\),\s*r\(:\),\s*risk_free,\s*trading_days\s*$",
+        "character(len=*), intent(in) :: label\nreal(kind=dp), intent(in) :: r(:), risk_free, trading_days",
+        f90,
+    )
+    f90 = re.sub(r"\bsignal\(:\)", "signal(:,:)", f90)
+    f90 = re.sub(r"\bstrat_rets_asset\(:\)", "strat_rets_asset(:,:)", f90)
+    f90 = re.sub(r"\basset_tf_stats\(:\)", "asset_tf_stats(:,:)", f90)
+    required = (
+        "results_short_ma",
+        "results_long_ma",
+        "results_n_days",
+        "results_avg_assets_long",
+        "results_ann_return",
+        "results_ann_vol",
+        "results_sharpe",
+        "results_min_daily",
+        "results_max_daily",
+    )
+    if not all(name in f90 for name in required):
+        return f90
+    if "results_2%sharpe" not in f90 and "call print_real_vector(results_2" not in f90:
+        return f90
+    f90 = re.sub(r"\bresults_2\s*\(:\)", "results_2(:,:)", f90)
+    materialize = "\n".join(
+        [
+            "results_2 = reshape([real(results_short_ma, kind=dp), real(results_long_ma, kind=dp), &",
+            "& real(results_n_days, kind=dp), results_avg_assets_long, results_ann_return, &",
+            "& results_ann_vol, results_sharpe, results_min_daily, results_max_daily], &",
+            "& [size(results_sharpe), 9])",
+        ]
+    )
+    f90 = re.sub(
+        r"(?m)^results_2\s*=\s*results_2\s*\(\s*order_real\s*\(\s*-results_2%sharpe\s*\)\s*,\s*:\s*\)\s*$",
+        materialize + "\nresults_2 = results_2(order_real(-results_sharpe), :)",
+        f90,
+    )
+    f90 = re.sub(r"\bmaxloc\s*\(\s*results_2%sharpe\s*,\s*dim\s*=\s*1\s*\)", "maxloc(results_sharpe, dim=1)", f90)
+    f90 = f90.replace("results_2%sharpe", "results_sharpe")
+    best_fields = {
+        "short_ma": 1,
+        "long_ma": 2,
+        "n_days": 3,
+        "avg_assets_long": 4,
+        "ann_return": 5,
+        "ann_vol": 6,
+        "sharpe": 7,
+        "min_daily": 8,
+        "max_daily": 9,
+    }
+    for fld, idx in best_fields.items():
+        f90 = re.sub(rf"\bbest%{re.escape(fld)}\b", f"best({idx})", f90)
+    for win_name in ("short_ma", "long_ma", "best_short", "best_long"):
+        f90 = re.sub(
+            rf"moving_average\s*\(\s*px\s*,\s*(?:&\s*\n\s*&\s*)?{win_name}\s*\)",
+            f"moving_average(px, int({win_name}))",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    f90 = re.sub(
+        r"strat_rets_asset\s*=\s*r_add\s*\(\s*real\s*\(\s*r_mul\s*\(\s*real\s*\(\s*signal\s*,\s*&\s*\n\s*&\s*kind=dp\s*\)\s*,\s*real\s*\(\s*rets\s*,\s*kind=dp\s*\)\s*\)\s*,\s*&\s*\n\s*&\s*kind=dp\s*\)\s*,\s*real\s*\(\s*\(1\.0_dp\s*-\s*signal\)\s*\*\s*daily_dot_rf\s*,\s*kind=dp\s*\)\s*\)",
+        "strat_rets_asset = signal * rets + (1.0_dp - signal) * daily_dot_rf",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"strat_rets_asset\s*=\s*r_mul\s*\(\s*signal\s*,\s*rets\s*\)",
+        "strat_rets_asset = signal * rets",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"best_asset_rets\s*=\s*r_mul\s*\(\s*best_signal\s*,\s*rets\s*\)",
+        "best_asset_rets = best_signal * rets",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"best_asset_rets\s*=\s*best_signal\s*\*\s*spread\s*\(\s*rets\s*,\s*dim\s*=\s*2\s*,\s*&\s*\n\s*&\s*ncopies\s*=\s*size\s*\(\s*best_signal\s*,\s*2\s*\)\s*\)",
+        "best_asset_rets = best_signal * rets",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(r"results_short_ma\s*=\s*\[results_short_ma,\s*short_ma\]", "results_short_ma = [results_short_ma, int(short_ma)]", f90)
+    f90 = re.sub(r"results_long_ma\s*=\s*\[results_long_ma,\s*long_ma\]", "results_long_ma = [results_long_ma, int(long_ma)]", f90)
+    stat_index = {
+        "mean_daily": 1,
+        "sd_daily": 2,
+        "ann_return": 3,
+        "ann_vol": 4,
+        "sharpe": 5,
+        "min": 6,
+        "max": 7,
+    }
+    for stat_name, stat_pos in stat_index.items():
+        f90 = re.sub(rf'\bs\s*\(\s*"{re.escape(stat_name)}"\s*\)', f"s({stat_pos})", f90)
+    f90 = re.sub(
+        r'write\(\*,"\(/,g0\)"\)\s*r_round\s*\(\s*cbind\s*\(\s*asset_tf_stats\s*,\s*sum\s*\(\s*best_signal\s*,\s*&\s*\n\s*&\s*dim=1\s*\)\s*/\s*real\s*\(\s*real\s*\(\s*size\s*\(\s*best_signal\s*,\s*1\s*\)\s*,\s*kind=dp\s*\)\s*,\s*kind=dp\s*\)\s*\)\s*,\s*6\s*\)',
+        "\n".join(
+            [
+                "asset_tf_stats = reshape([sum(best_signal, dim=1) / real(size(best_signal, 1), kind=dp), &",
+                "& reshape(asset_tf_stats, [size(asset_tf_stats)])], [size(asset_tf_stats, 1), &",
+                "& size(asset_tf_stats, 2) + 1])",
+                'call print_matrix_rstyle_named(asset_tf_stats, names=[character(len=13) :: "pct_days_long", "mean_daily", "sd_daily", "ann_return", "ann_vol", "sharpe", "min", "max"], row_names=asset_dot_names, digits=6)',
+            ]
+        ),
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*results_2\s*,\s*digits\s*=\s*6\s*\)\s*$",
+        r'\1call print_matrix_rstyle_named(results_2, names=[character(len=15) :: "short_ma", "long_ma", "n_days", "avg_assets_long", "ann_return", "ann_vol", "sharpe", "min_daily", "max_daily"], digits=6)',
+        f90,
+    )
+    return f90
+
+
+def repair_coef_row_vector_intercept_text(f90: str) -> str:
+    if "function coef_row(" not in f90 or "fit%intercept" not in f90:
+        return f90
+    return re.sub(
+        r"(?m)^(\s*coef_row_result\s*\(\s*2\s*\)\s*=\s*)fit%intercept\s*$",
+        r"\1fit%intercept(1)",
         f90,
     )
 
@@ -42065,6 +42305,26 @@ def repair_apply_callback_vector_dummies_text(f90: str) -> str:
 def promote_vector_locals_from_rank1_dummy_exprs_text(f90: str) -> str:
     """Promote scalar real locals assigned expressions over rank-1 dummies."""
     callbacks = _marked_apply_callbacks(f90)
+    scalar_return_funcs: set[str] = set()
+    for fm in re.finditer(
+        r"(?ims)^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b[^\n]*",
+        f90,
+    ):
+        fblock = fm.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", fblock, re.IGNORECASE)
+        if m_res is None:
+            continue
+        res = m_res.group(1)
+        m_res_decl = re.search(
+            rf"(?im)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)[^:\n]*::[^\n]*\b{re.escape(res)}\b[^\n]*$",
+            fblock,
+        )
+        if (
+            m_res_decl is not None
+            and "allocatable" not in m_res_decl.group(0).lower()
+            and not re.search(rf"\b{re.escape(res)}\s*\(", m_res_decl.group(0), re.IGNORECASE)
+        ):
+            scalar_return_funcs.add(fm.group(1).lower())
     proc_re = re.compile(
         r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+([A-Za-z]\w*)\b.*?^\s*end\s+(?:function|subroutine)\b[^\n]*\n?)"
     )
@@ -42096,6 +42356,9 @@ def promote_vector_locals_from_rank1_dummy_exprs_text(f90: str) -> str:
         for ma in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block):
             lhs = ma.group(1)
             rhs = ma.group(2)
+            m_scalar_call = re.match(r"\s*([A-Za-z]\w*)\s*\(", rhs, re.IGNORECASE)
+            if m_scalar_call is not None and m_scalar_call.group(1).lower() in scalar_return_funcs:
+                continue
             if any(re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE) for nm in rank1_dummies):
                 if not re.match(r"\s*(?:sum|mean|median|sd|var|maxval|minval|count|size|maxloc|minloc)\s*\(", rhs, re.IGNORECASE):
                     vector_locals.add(lhs.lower())
@@ -44861,13 +45124,13 @@ def main() -> int:
     f90 = re.sub(r"\b((?:ccc|dcc|dcc_t)_last_vol)\(:\s*,\s*:\)", r"\1(:)", f90)
     f90 = re.sub(
         r"\br_seq_int\(\s*1\s*,\s*n\s*\)\s*(&\s*\n\s*&\s*)?-\s*lag",
-        "1:n - lag",
+        "1:(n - lag)",
         f90,
         flags=re.IGNORECASE,
     )
     f90 = re.sub(
         r"lag\s*\+\s*r_seq_int\(\s*1\s*,\s*n\s*\)",
-        "lag + 1:n",
+        "(lag + 1):n",
         f90,
         flags=re.IGNORECASE,
     )
@@ -45460,6 +45723,8 @@ def main() -> int:
     f90 = repair_trading_days_parameter_text(f90)
     f90 = repair_unconditional_null_optim_returns_text(f90)
     f90 = demote_named_element_function_results_text(f90)
+    f90 = repair_trend_results_dataframe_text(f90)
+    f90 = repair_coef_row_vector_intercept_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
