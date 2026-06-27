@@ -19913,7 +19913,7 @@ def _emit_optim_bfgs_assignment(
     method_src = kw.get("method", '"BFGS"').strip()
     method_lit = _dequote_string_literal(method_src)
     method = (method_lit or "BFGS").lower()
-    if method_lit is not None and method not in {"bfgs", "nelder-mead", "cg", "sann"}:
+    if method_lit is not None and method not in {"bfgs", "l-bfgs-b", "nelder-mead", "cg", "sann"}:
         return False
 
     objective_args = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
@@ -39707,7 +39707,7 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
         out = txt
         for _ in range(20):
             changed = False
-            for name in ("sum", "size", "count", "maxval", "minval", "median", "sd", "var", "maxloc", "minloc"):
+            for name in ("sum", "size", "count", "maxval", "minval", "median", "sd", "var", "maxloc", "minloc", "dot_product"):
                 m = re.search(rf"\b{name}\s*\(", out, re.IGNORECASE)
                 while m is not None:
                     depth = 1
@@ -39751,7 +39751,7 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return block
         scalar_assigned_names = set()
         for m_scalar_asn in re.finditer(
-            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval|median|sd|var|maxloc|minloc)\s*\([^\n]*)",
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*((?:sum|size|count|maxval|minval|median|sd|var|maxloc|minloc|dot_product)\s*\([^\n]*)",
             block,
             re.IGNORECASE,
         ):
@@ -39824,6 +39824,144 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return "\n".join(lines_loc)
 
         return decl_line_pat.sub(scalar_local_decl_repl, new_block)
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def demote_dot_product_function_results_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(rf"(?m)^\s*{re.escape(res)}\s*=\s*dot_product\s*\(", block, re.IGNORECASE) is None:
+            return block
+        return re.sub(
+            rf"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\s*\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return re.sub(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
+        repl,
+        f90,
+    )
+
+
+def promote_sigma_ret_formals_text(f90: str) -> str:
+    return re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*.*?)(?<!\w)sigma_ret(?!\s*\()(\s*(?:,|$))",
+        r"\1sigma_ret(:,:)\2",
+        f90,
+    )
+
+
+def repair_portfolio_stat_named_indices_text(f90: str) -> str:
+    stat_index = {
+        "mean": 1,
+        "sd": 2,
+        "ann_return": 3,
+        "ann_vol": 4,
+        "sharpe": 5,
+        "net_exposure": 6,
+        "gross_exposure": 7,
+    }
+    for name, idx in stat_index.items():
+        f90 = re.sub(rf'\bstat\s*\(\s*"{re.escape(name)}"\s*\)', f"stat({idx})", f90, flags=re.IGNORECASE)
+    return f90
+
+
+def repair_portfolio_stats_scalar_locals_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*portfolio_stats_result\(:\),\s*port_var\(:\)\s*$",
+        r"\1real(kind=dp), allocatable :: portfolio_stats_result(:)\n\1real(kind=dp) :: port_var",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*ann_vol\(:\),\s*port_sd\(:\)\s*$",
+        r"\1real(kind=dp) :: ann_vol, port_sd",
+        f90,
+    )
+    return f90
+
+
+def repair_make_pos_def_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\)\s*::\s*ev,\s*min_ev\s*$",
+        r"\1real(kind=dp) :: min_ev\n\1real(kind=dp), allocatable :: ev(:)",
+        f90,
+    )
+    f90 = f90.replace(
+        "make_pos_def_result = 0.5_dp * (make_pos_def_result + &\n& transpose(make_pos_def_result))",
+        "make_pos_def_result = 0.5_dp * (sigma_wrk + &\n& transpose(sigma_wrk))",
+    )
+    return f90
+
+
+def repair_price_names_decl_text(f90: str) -> str:
+    if re.search(r"(?m)^\s*character\(len=:\),\s*allocatable\s*::.*\bprice_names\s*\(:\)", f90, re.IGNORECASE):
+        return f90
+    return re.sub(
+        r"(?m)^(\s*character\(len=:\),\s*allocatable\s*::\s*all_price_names\(:\)\s*)$",
+        r"\1\ncharacter(len=:), allocatable :: price_names(:)",
+        f90,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
+def repair_trading_days_parameter_text(f90: str) -> str:
+    return f90.replace(
+        "integer, parameter :: scale_dot_ret = 100, trading_dot_days = 252",
+        "integer, parameter :: scale_dot_ret = 100\nreal(kind=dp), parameter :: trading_dot_days = 252.0_dp",
+    )
+
+
+def repair_unconditional_null_optim_returns_text(f90: str) -> str:
+    nan_vec = "r_rep_real([ieee_value(0.0_dp, ieee_quiet_nan)], times=n)"
+    pat = re.compile(
+        r"(?ms)^(\s*)([A-Za-z]\w*_result)\s*=\s*r_rep_real\(\[ieee_value\(0\.0_dp,\s*"
+        r"(?:&\s*\n\s*&\s*)?ieee_quiet_nan\)\]\s*,?\s*(?:&\s*\n\s*&\s*)?,?\s*times\s*=\s*n\)\s*\n"
+        r"\s*return\s*\n\s*\2\s*=\s*([^\n]*best%par[^\n]*)$"
+    )
+
+    def repl(m: re.Match[str]) -> str:
+        indent, result_name, success_rhs = m.group(1), m.group(2), m.group(3).strip()
+        return (
+            f"{indent}if (.not. allocated(best%par)) then\n"
+            f"{indent}   {result_name} = {nan_vec}\n"
+            f"{indent}   return\n"
+            f"{indent}end if\n"
+            f"{indent}{result_name} = {success_rhs}"
+        )
+
+    return pat.sub(repl, f90)
+
+
+def demote_named_element_function_results_text(f90: str) -> str:
+    def repl(block_m: re.Match[str]) -> str:
+        block = block_m.group(0)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(rf"(?m)^\s*{re.escape(res)}\s*=\s*-?\s*[A-Za-z]\w*\s*\(\s*\d+\s*\)\s*$", block) is None:
+            return block
+        return re.sub(
+            rf"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\s*\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
 
     return re.sub(
         r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$",
@@ -44240,6 +44378,8 @@ def main() -> int:
     f90 = repair_xarma_t_file_main_text(f90)
     f90 = format_integerish_expanded_dataframe_prints_text(f90)
     f90 = rewrite_leftover_matmul_operator_text(f90)
+    f90 = demote_scalar_allocatable_function_results_text(f90)
+    f90 = demote_dot_product_function_results_text(f90)
     f90 = rewrite_leftover_sweep_calls_text(f90)
     f90 = repair_dropped_single_column_matmul_results_text(f90)
     for _ in range(4):
@@ -44336,6 +44476,14 @@ def main() -> int:
         f90 = hoist_module_used_scalar_parameters_text(f90)
     f90 = repair_character_vector_subset_renames_text(f90)
     f90 = simplify_scalar_spread_matrix_ops_text(f90)
+    f90 = promote_sigma_ret_formals_text(f90)
+    f90 = repair_portfolio_stat_named_indices_text(f90)
+    f90 = repair_portfolio_stats_scalar_locals_text(f90)
+    f90 = repair_make_pos_def_text(f90)
+    f90 = repair_price_names_decl_text(f90)
+    f90 = repair_trading_days_parameter_text(f90)
+    f90 = repair_unconditional_null_optim_returns_text(f90)
+    f90 = demote_named_element_function_results_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
@@ -44348,6 +44496,11 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
     if "rnorm_vec(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"rnorm_vec"})
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f\(:\),\s*\2_f_new\(:\),\s*\2_f_plus\(:\),\s*\2_f_minus\(:\)\s*$",
+        r"\1real(kind=dp) :: \2_f, \2_f_new, \2_f_plus, \2_f_minus",
+        f90,
+    )
     if "call print_real_vector(" in f90:
         f90 = "\n".join(balance_print_real_vector_calls(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None

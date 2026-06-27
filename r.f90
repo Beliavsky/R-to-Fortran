@@ -13,7 +13,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -243,6 +243,14 @@ type :: optim_result_t
    real(kind=dp) :: value
    integer :: convergence
 end type optim_result_t
+
+abstract interface
+   pure function optim_vec_objective(par) result(value)
+      import :: dp
+      real(kind=dp), intent(in) :: par(:)
+      real(kind=dp) :: value
+   end function optim_vec_objective
+end interface
 
 type :: nlm_result_t
 ! Container for R-like nlm result results.
@@ -1236,6 +1244,314 @@ interface r_typeof
 end interface r_typeof
 
 contains
+
+function optim_bfgs(fn, par, maxit, reltol, ndeps) result(out)
+! Quasi-Newton optimizer for vector-valued parameter objectives.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: par(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out
+integer :: n, max_iter, n_iter, i, j, iter
+logical :: converged
+real(kind=dp) :: f, f_new, step_eps, gtol
+real(kind=dp) :: alpha, slope, sy, rho, shift
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:)
+real(kind=dp), allocatable :: h(:,:), d(:), s(:), y(:), a(:,:), tmp(:,:)
+n = size(par)
+max_iter = 100
+if (present(maxit)) max_iter = maxit
+step_eps = 1.0e-3_dp
+if (present(ndeps)) step_eps = ndeps
+gtol = 1.0e-8_dp
+if (present(reltol)) gtol = reltol
+gtol = max(gtol, sqrt(epsilon(1.0_dp)))
+allocate(p(n), p_new(n), g(n), g_new(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
+p = par
+h = 0.0_dp
+do i = 1, n
+   h(i,i) = 1.0_dp
+end do
+f = fn(p)
+call optim_fd_gradient(fn, p, step_eps, g)
+converged = .false.
+n_iter = 0
+do iter = 1, max_iter
+   n_iter = iter
+   if (sqrt(sum(g**2)) < gtol) then
+      converged = .true.
+      exit
+   end if
+   do i = 1, n
+      d(i) = -sum(h(i,:) * g)
+   end do
+   if (dot_product(g, d) >= 0.0_dp) then
+      h = 0.0_dp
+      do i = 1, n
+         h(i,i) = 1.0_dp
+      end do
+      d = -g
+   end if
+   alpha = 1.0_dp
+   slope = dot_product(g, d)
+   do j = 1, 60
+      p_new = p + alpha * d
+      f_new = fn(p_new)
+      if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
+      if (alpha < 1.0e-12_dp) exit
+      alpha = 0.5_dp * alpha
+   end do
+   call optim_fd_gradient(fn, p_new, step_eps, g_new)
+   s = p_new - p
+   y = g_new - g
+   sy = dot_product(s, y)
+   shift = abs(f - f_new)
+   p = p_new
+   f = f_new
+   g = g_new
+   if (sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
+      rho = 1.0_dp / sy
+      do i = 1, n
+         do j = 1, n
+            a(i,j) = -rho * s(i) * y(j)
+         end do
+         a(i,i) = a(i,i) + 1.0_dp
+      end do
+      do i = 1, n
+         do j = 1, n
+            tmp(i,j) = sum(h(i,:) * a(j,:))
+         end do
+      end do
+      do i = 1, n
+         do j = 1, n
+            h(i,j) = sum(a(i,:) * tmp(:,j)) + rho * s(i) * s(j)
+         end do
+      end do
+   end if
+   if (shift <= gtol * (1.0_dp + abs(f))) then
+      converged = .true.
+      exit
+   end if
+end do
+out%par = p
+out%value = f
+out%convergence = merge(0, 1, converged)
+end function optim_bfgs
+
+function optim_cg(fn, par, maxit, reltol, ndeps) result(out)
+! Nonlinear conjugate-gradient optimizer for vector-valued parameters.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: par(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out
+integer :: n, max_iter, iter, j
+logical :: converged
+real(kind=dp) :: f, f_new, step_eps, gtol, alpha, slope, beta, shift
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), d(:), y(:)
+n = size(par)
+max_iter = 100
+if (present(maxit)) max_iter = maxit
+step_eps = 1.0e-3_dp
+if (present(ndeps)) step_eps = ndeps
+gtol = 1.0e-8_dp
+if (present(reltol)) gtol = reltol
+gtol = max(gtol, sqrt(epsilon(1.0_dp)))
+allocate(p(n), p_new(n), g(n), g_new(n), d(n), y(n))
+p = par
+f = fn(p)
+call optim_fd_gradient(fn, p, step_eps, g)
+d = -g
+converged = .false.
+do iter = 1, max_iter
+   if (sqrt(sum(g**2)) < gtol) then
+      converged = .true.
+      exit
+   end if
+   slope = dot_product(g, d)
+   if (slope >= 0.0_dp) then
+      d = -g
+      slope = -dot_product(g, g)
+   end if
+   alpha = 1.0_dp
+   do j = 1, 60
+      p_new = p + alpha * d
+      f_new = fn(p_new)
+      if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
+      if (alpha < 1.0e-12_dp) exit
+      alpha = 0.5_dp * alpha
+   end do
+   call optim_fd_gradient(fn, p_new, step_eps, g_new)
+   shift = abs(f - f_new)
+   y = g_new - g
+   beta = max(0.0_dp, dot_product(g_new, y) / max(dot_product(g, g), tiny(1.0_dp)))
+   d = -g_new + beta * d
+   p = p_new
+   f = f_new
+   g = g_new
+   if (shift <= gtol * (1.0_dp + abs(f))) then
+      converged = .true.
+      exit
+   end if
+end do
+out%par = p
+out%value = f
+out%convergence = merge(0, 1, converged)
+end function optim_cg
+
+function optim_sann(fn, par, maxit, reltol, ndeps) result(out)
+! Simulated annealing optimizer for vector-valued parameters.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: par(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out
+integer :: n, max_iter, iter, tmax
+real(kind=dp) :: f, f_new, best_f, temp, prob, u
+real(kind=dp), allocatable :: p(:), p_new(:), z(:), best_p(:)
+n = size(par)
+max_iter = 10000
+if (present(maxit)) max_iter = maxit
+tmax = 10
+allocate(p(n), p_new(n), z(n), best_p(n))
+p = par
+f = fn(p)
+best_p = p
+best_f = f
+do iter = 1, max_iter
+   temp = 10.0_dp / log(real(((iter - 1) / tmax) * tmax, kind=dp) + exp(1.0_dp))
+   z = rnorm_vec(n)
+   p_new = p + 0.1_dp * temp * z
+   f_new = fn(p_new)
+   if (f_new < f) then
+      p = p_new
+      f = f_new
+   else
+      prob = exp(min(0.0_dp, (f - f_new) / max(temp, tiny(1.0_dp))))
+      call random_number(u)
+      if (u < prob) then
+         p = p_new
+         f = f_new
+      end if
+   end if
+   if (f < best_f) then
+      best_p = p
+      best_f = f
+   end if
+end do
+out%par = best_p
+out%value = best_f
+out%convergence = 0
+end function optim_sann
+
+function optim_nelder_mead(fn, par, maxit, reltol, ndeps) result(out)
+! Nelder-Mead simplex optimizer for vector-valued parameters.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: par(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out
+integer :: n, max_iter, iter, i, j, best, worst, second
+logical :: converged
+real(kind=dp) :: gtol, step, fr, fe, fc, spread
+real(kind=dp), allocatable :: simplex(:,:), fvals(:), centroid(:), xr(:), xe(:), xc(:)
+n = size(par)
+max_iter = 100
+if (present(maxit)) max_iter = maxit
+gtol = 1.0e-8_dp
+if (present(reltol)) gtol = reltol
+gtol = max(gtol, sqrt(epsilon(1.0_dp)))
+allocate(simplex(n,n+1), fvals(n+1), centroid(n), xr(n), xe(n), xc(n))
+simplex(:,1) = par
+do i = 1, n
+   simplex(:,i+1) = par
+   step = 0.05_dp * (abs(par(i)) + 1.0_dp)
+   simplex(i,i+1) = simplex(i,i+1) + step
+end do
+do j = 1, n + 1
+   fvals(j) = fn(simplex(:,j))
+end do
+converged = .false.
+do iter = 1, max_iter
+   best = 1
+   worst = 1
+   do j = 2, n + 1
+      if (fvals(j) < fvals(best)) best = j
+      if (fvals(j) > fvals(worst)) worst = j
+   end do
+   second = merge(2, 1, worst == 1)
+   do j = 1, n + 1
+      if (j /= worst .and. fvals(j) > fvals(second)) second = j
+   end do
+   spread = maxval(abs(fvals - fvals(best)))
+   if (spread <= gtol * (1.0_dp + abs(fvals(best)))) then
+      converged = .true.
+      exit
+   end if
+   centroid = 0.0_dp
+   do j = 1, n + 1
+      if (j /= worst) centroid = centroid + simplex(:,j)
+   end do
+   centroid = centroid / real(n, kind=dp)
+   xr = centroid + (centroid - simplex(:,worst))
+   fr = fn(xr)
+   if (fr < fvals(best)) then
+      xe = centroid + 2.0_dp * (xr - centroid)
+      fe = fn(xe)
+      if (fe < fr) then
+         simplex(:,worst) = xe
+         fvals(worst) = fe
+      else
+         simplex(:,worst) = xr
+         fvals(worst) = fr
+      end if
+   else if (fr < fvals(second)) then
+      simplex(:,worst) = xr
+      fvals(worst) = fr
+   else
+      xc = centroid + 0.5_dp * (simplex(:,worst) - centroid)
+      fc = fn(xc)
+      if (fc < fvals(worst)) then
+         simplex(:,worst) = xc
+         fvals(worst) = fc
+      else
+         do j = 1, n + 1
+            if (j /= best) then
+               simplex(:,j) = simplex(:,best) + 0.5_dp * (simplex(:,j) - simplex(:,best))
+               fvals(j) = fn(simplex(:,j))
+            end if
+         end do
+      end if
+   end if
+end do
+best = 1
+do j = 2, n + 1
+   if (fvals(j) < fvals(best)) best = j
+end do
+out%par = simplex(:,best)
+out%value = fvals(best)
+out%convergence = merge(0, 1, converged)
+end function optim_nelder_mead
+
+subroutine optim_fd_gradient(fn, p, step_eps, g)
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: p(:), step_eps
+real(kind=dp), intent(out) :: g(:)
+real(kind=dp), allocatable :: p_tmp(:)
+real(kind=dp) :: eps, f_plus, f_minus
+integer :: i
+allocate(p_tmp(size(p)))
+do i = 1, size(p)
+   eps = step_eps * (abs(p(i)) + 1.0_dp)
+   p_tmp = p
+   p_tmp(i) = p_tmp(i) + eps
+   f_plus = fn(p_tmp)
+   p_tmp = p
+   p_tmp(i) = p_tmp(i) - eps
+   f_minus = fn(p_tmp)
+   g(i) = (f_plus - f_minus) / (2.0_dp * eps)
+end do
+end subroutine optim_fd_gradient
 
 function integrate(fn, lower, upper, rel_tol, subdivisions) result(out)
 ! Approximate R integrate() for smooth scalar functions using composite Simpson rules.
