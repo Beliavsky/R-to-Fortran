@@ -2801,6 +2801,7 @@ def parse_block(
                 for part in split_top_level_commas(arg_txt):
                     pt = part.strip()
                     if pt == "...":
+                        args.append(pt)
                         continue
                     m_ap = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*=\s*(.+)$", pt)
                     if m_ap:
@@ -6229,6 +6230,62 @@ def _replace_obfuscated_idents(expr: str, mapping: dict[str, str]) -> str:
 def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
     mapping: dict[str, str] = {}
     used: set[str] = set()
+    protected_func_names: set[str] = set()
+
+    def collect_protected_func_names(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, FuncDef):
+                body_text = "\n".join(_stmt_to_text_for_scan(b) for b in st.body)
+                for m_use in re.finditer(r'UseMethod\s*\(\s*["\']([^"\']+)["\']', body_text):
+                    generic = m_use.group(1)
+                    protected_func_names.add(generic)
+                    for cand in _collect_function_names(stmts):
+                        if cand.startswith(generic + "."):
+                            protected_func_names.add(cand)
+                collect_protected_func_names(st.body)
+            elif isinstance(st, ForStmt):
+                collect_protected_func_names(st.body)
+            elif isinstance(st, WhileStmt):
+                collect_protected_func_names(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect_protected_func_names(st.body)
+            elif isinstance(st, IfStmt):
+                collect_protected_func_names(st.then_body)
+                collect_protected_func_names(st.else_body)
+
+    def _stmt_to_text_for_scan(st: object) -> str:
+        if isinstance(st, Assign):
+            return f"{st.name} <- {st.expr}"
+        if isinstance(st, ExprStmt):
+            return st.expr
+        if isinstance(st, PrintStmt):
+            return "print(" + ", ".join(st.args) + ")"
+        if isinstance(st, CallStmt):
+            return st.name + "(" + ", ".join(st.args) + ")"
+        if isinstance(st, IfStmt):
+            return "\n".join(_stmt_to_text_for_scan(b) for b in st.then_body + st.else_body)
+        if isinstance(st, (ForStmt, WhileStmt, RepeatStmt)):
+            return "\n".join(_stmt_to_text_for_scan(b) for b in st.body)
+        if isinstance(st, FuncDef):
+            return "\n".join(_stmt_to_text_for_scan(b) for b in st.body)
+        return str(st)
+
+    def _collect_function_names(ss: list[object]) -> set[str]:
+        out: set[str] = set()
+        for st in ss:
+            if isinstance(st, FuncDef):
+                out.add(st.name)
+                out.update(_collect_function_names(st.body))
+            elif isinstance(st, ForStmt):
+                out.update(_collect_function_names(st.body))
+            elif isinstance(st, WhileStmt):
+                out.update(_collect_function_names(st.body))
+            elif isinstance(st, RepeatStmt):
+                out.update(_collect_function_names(st.body))
+            elif isinstance(st, IfStmt):
+                out.update(_collect_function_names(st.then_body))
+                out.update(_collect_function_names(st.else_body))
+        return out
 
     def fresh(prefix: str) -> str:
         idx = 1
@@ -6241,6 +6298,8 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
 
     def add_name(name: str, prefix: str) -> None:
         if not name or name in mapping:
+            return
+        if name == "...":
             return
         if name.lower() in _PARTIAL_MAIN_IGNORE_NAMES:
             return
@@ -6271,6 +6330,9 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
                 collect(st.else_body)
 
     collect(stmts)
+    collect_protected_func_names(stmts)
+    for protected in protected_func_names:
+        mapping.pop(protected, None)
     if not mapping:
         return stmts
 
@@ -6304,14 +6366,25 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
     def replace_user_call_keywords(expr: str) -> str:
         out = expr
 
-        def rewrite_keyword_parts(inner: str, amap: dict[str, str]) -> tuple[str, bool]:
+        def rewrite_keyword_parts(
+            inner: str,
+            amap: dict[str, str],
+            protected_keywords: set[str] | None = None,
+        ) -> tuple[str, bool]:
+            protected = protected_keywords or set()
             parts = split_top_level_commas(inner)
             changed = False
             new_parts: list[str] = []
             for part in parts:
                 m_kw = re.match(rf"^(\s*)({_R_IDENT_RE})\s*=(.*)$", part, re.DOTALL)
-                if m_kw is not None and m_kw.group(2) in amap:
-                    new_parts.append(f"{m_kw.group(1)}{amap[m_kw.group(2)]} ={m_kw.group(3)}")
+                if (
+                    m_kw is not None
+                    and m_kw.group(2) in amap
+                    and m_kw.group(2) not in protected
+                ):
+                    new_parts.append(
+                        f"{m_kw.group(1)}{amap[m_kw.group(2)]} ={m_kw.group(3)}"
+                    )
                     changed = True
                 else:
                     new_parts.append(part)
@@ -6338,10 +6411,54 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
             amap = func_arg_maps.get(callback_name)
             if not amap:
                 return f"optim({inner})"
-            new_inner, changed = rewrite_keyword_parts(inner, amap)
+            optim_keywords = {
+                "par",
+                "fn",
+                "gr",
+                "method",
+                "lower",
+                "upper",
+                "control",
+                "hessian",
+            }
+            new_inner, changed = rewrite_keyword_parts(inner, amap, optim_keywords)
             return f"optim({new_inner})" if changed else f"optim({inner})"
 
         out = _replace_balanced_func_calls(out, "optim", optim_repl)
+
+        def nlm_repl(inner: str) -> str:
+            parts = split_top_level_commas(inner)
+            callback_name = ""
+            for part in parts:
+                m_f = re.match(rf"^\s*f\s*=\s*({_R_IDENT_RE})\s*$", part)
+                if m_f is not None:
+                    callback_name = m_f.group(1)
+                    break
+                if "=" not in part and not callback_name:
+                    m_pos = re.match(rf"^\s*({_R_IDENT_RE})\s*$", part)
+                    if m_pos is not None:
+                        callback_name = m_pos.group(1)
+            amap = func_arg_maps.get(callback_name)
+            if not amap:
+                return f"nlm({inner})"
+            nlm_keywords = {
+                "f",
+                "p",
+                "hessian",
+                "typsize",
+                "fscale",
+                "print.level",
+                "ndigit",
+                "gradtol",
+                "stepmax",
+                "steptol",
+                "iterlim",
+                "check.analyticals",
+            }
+            new_inner, changed = rewrite_keyword_parts(inner, amap, nlm_keywords)
+            return f"nlm({new_inner})" if changed else f"nlm({inner})"
+
+        out = _replace_balanced_func_calls(out, "nlm", nlm_repl)
         return out
 
     def rexpr(expr: str) -> str:
@@ -6437,6 +6554,10 @@ def _render_r_stmts(stmts: list[object], indent: str = "") -> list[str]:
 
 
 def obfuscate_r_source(src: str) -> str:
+    global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
+    _DOTTED_VAR_RENAMES = {}
+    _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
+    _SANITIZED_R_NAME_BY_RAW = {}
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
@@ -20831,7 +20952,8 @@ def emit_function(
             and _branch_has_expr_tail(tail_if.then_body)
             and _branch_has_expr_tail(tail_if.else_body)
         ):
-            inferred_tail_ranks = {a.lower(): infer_arg_rank(fn, a) for a in fn.args}
+            f_args = [a for a in fn.args if a != "..."]
+            inferred_tail_ranks = {a.lower(): infer_arg_rank(fn, a) for a in f_args}
             tail_if_result_rank = max(
                 _branch_tail_rank(tail_if.then_body, inferred_tail_ranks),
                 _branch_tail_rank(tail_if.else_body, inferred_tail_ranks),
@@ -20848,8 +20970,9 @@ def emit_function(
                     ExprStmt(ret_tmp),
                 ]
             )
+    f_args = [a for a in fn.args if a != "..."]
     emit_as_subroutine = _stmt_tree_has_output_ops(fn_body) and _function_has_void_return(
-        FuncDef(name=fn.name, args=fn.args, defaults=fn.defaults, body=fn_body)
+        FuncDef(name=fn.name, args=f_args, defaults=fn.defaults, body=fn_body)
     )
     def _lower_local_scalar_closures(
         body_in: list[object],
@@ -21120,7 +21243,7 @@ def emit_function(
 
     rk = _expr_kind_simple(last_expr_for_ret)
     rdecl = "real(kind=dp)"
-    ret_rank = 0
+    ret_rank = _USER_FUNC_RETURN_RANK.get(fn.name.lower(), 0)
     ret_expr_src = last_expr_for_ret
     ret_is_char = _expr_returns_character(ret_expr_src)
     if ret_is_char:
@@ -21227,6 +21350,10 @@ def emit_function(
         ret_expr_src.startswith("c(")
         or (ret_expr_src.startswith("[") and ret_expr_src.endswith("]"))
         or direct_vector_subset_ret
+        or (
+            re.fullmatch(r"[A-Za-z]\w*", ret_expr_src) is not None
+            and _USER_FUNC_RETURN_RANK.get(fn.name.lower(), 0) > 0
+        )
         or re.search(
             r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul)\s*\(",
             ret_expr_src,
@@ -21286,18 +21413,18 @@ def emit_function(
         rdecl = f"type({_type_name_for_path(fn.name, ())})"
     rname = f"{fn.name}_result"
     s3_receiver_type: str | None = None
-    if "_" in fn.name and fn.args:
+    if "_" in fn.name and f_args:
         for spec_name in sorted(list_specs, key=len, reverse=True):
             if fn.name.endswith("_" + spec_name):
                 s3_receiver_type = _type_name_for_path(spec_name, ())
                 break
-    arg_rank = {a: infer_arg_rank(fn, a) for a in fn.args}
+    arg_rank = {a: infer_arg_rank(fn, a) for a in f_args}
     fn_l_for_helper_rank = fn.name.lower()
     for helper_l_for_rank, helper_fn_for_rank in _FUNC_DEFS_BY_NAME.items():
         if not helper_l_for_rank.startswith(fn_l_for_helper_rank + "_"):
             continue
         helper_arg_ranks_for_rank = _USER_FUNC_ARG_RANK.get(helper_l_for_rank, {})
-        for a in fn.args:
+        for a in f_args:
             a_l_for_rank = a.lower()
             if not any(h_arg.lower() == a_l_for_rank for h_arg in getattr(helper_fn_for_rank, "args", [])):
                 continue
@@ -21307,13 +21434,13 @@ def emit_function(
             )
             if helper_rank_for_rank > arg_rank.get(a, 0):
                 arg_rank[a] = helper_rank_for_rank
-    if s3_receiver_type is not None and fn.args:
-        arg_rank[fn.args[0]] = 0
+    if s3_receiver_type is not None and f_args:
+        arg_rank[f_args[0]] = 0
     if fn.name.lower() == "print_matrix" and "x" in arg_rank:
         arg_rank["x"] = 2
     if fn.name.lower() == "print_stats" and "stats" in arg_rank:
         arg_rank["stats"] = 1
-    if fn.name.lower() == "replace_literal_first" and fn.args == ["s", "old", "new"]:
+    if fn.name.lower() == "replace_literal_first" and f_args == ["s", "old", "new"]:
         o.w(f"function {fn.name}(s, old, new) result({rname})")
         o.w("character(len=*), intent(in) :: s, old, new")
         o.w(f"character(len=:), allocatable :: {rname}")
@@ -21330,7 +21457,7 @@ def emit_function(
         o.w(f"{rname} = s(1:first - 1) // new // s(last + 1:len(s))")
         o.w(f"end function {fn.name}")
         return False
-    if fn.name.lower() == "starts_with_simple" and fn.args == ["s", "prefix"]:
+    if fn.name.lower() == "starts_with_simple" and f_args == ["s", "prefix"]:
         o.w(f"pure elemental function {fn.name}(s, prefix) result({rname})")
         o.w("character(len=*), intent(in) :: s, prefix")
         o.w(f"logical :: {rname}")
@@ -21351,7 +21478,7 @@ def emit_function(
         o.w("end if")
         o.w(f"end function {fn.name}")
         return False
-    if fn.name.lower() == "ends_with_simple" and fn.args == ["s", "suffix"]:
+    if fn.name.lower() == "ends_with_simple" and f_args == ["s", "suffix"]:
         o.w(f"pure function {fn.name}(s, suffix) result({rname})")
         o.w("character(len=*), intent(in) :: s(:)")
         o.w("character(len=*), intent(in) :: suffix")
@@ -21376,13 +21503,13 @@ def emit_function(
         ex_last = last.expr.strip()
         if (
             not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE)
-            and _infer_assignment_rank_hint(ex_last, {a.lower(): 0 for a in fn.args}) > 0
+            and _infer_assignment_rank_hint(ex_last, {a.lower(): 0 for a in f_args}) > 0
             and _array_refs_outside_scalar_reductions(
             ex_last,
             {a for a, rk_arg in arg_rank.items() if rk_arg > 0},
             )
         ):
-            for a in fn.args:
+            for a in f_args:
                 if arg_rank.get(a, 0) < 1:
                     continue
                 if (
@@ -21400,7 +21527,7 @@ def emit_function(
         can_be_pure
         and list_spec is None
         and ret_rank == 0
-        and all(arg_rank.get(a, 0) == 0 for a in fn.args)
+        and all(arg_rank.get(a, 0) == 0 for a in f_args)
         and fn.name.lower() not in _NLM_OBJECTIVE_NAMES
         and fn.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
     )
@@ -21423,9 +21550,9 @@ def emit_function(
         if c:
             o.w(f"! {c}")
     if emit_as_subroutine:
-        o.w(f"subroutine {fn.name}({', '.join(fn.args)})")
+        o.w(f"subroutine {fn.name}({', '.join(f_args)})")
     else:
-        o.w(f"{pref}function {fn.name}({', '.join(fn.args)}) result({rname})")
+        o.w(f"{pref}function {fn.name}({', '.join(f_args)}) result({rname})")
     for cmt in opening_comments:
         c = cmt.strip()
         if c:
@@ -21462,12 +21589,12 @@ def emit_function(
                 return _type_name_for_path(spec_name, ())
         return None
 
-    for a in fn.args:
+    for a in f_args:
         dflt = fn.defaults.get(a, "")
         intent = "in"
         opt = ", optional" if dflt.strip() else ""
         scalar_value_attr = ", value" if a in written_args and not opt else ""
-        if s3_receiver_type is not None and a == fn.args[0]:
+        if s3_receiver_type is not None and a == f_args[0]:
             o.w(f"type({s3_receiver_type}), intent(in){opt} :: {a}")
             arg_type[a] = "s3_object"
             continue
@@ -21567,7 +21694,7 @@ def emit_function(
     if _parse_reduce_call(reduce_ret_expr_decl_global) is not None:
         o.w("integer :: xr2f_reduce_i")
 
-    for a in fn.args:
+    for a in f_args:
         dflt = fn.defaults.get(a, "").strip()
         if dflt:
             loc = f"{a}_def"
@@ -21624,7 +21751,7 @@ def emit_function(
             arg_local_init_lines.append(f"{loc} = {dflt_f}")
             arg_local_init_lines.append("end if")
 
-    for a in fn.args:
+    for a in f_args:
         if a not in written_args:
             continue
         if a in arg_local_map:
@@ -26876,7 +27003,10 @@ def transpile_r_to_fortran(
                 ret_last_vec_ret = ret_last_vec_ret.strip()
             if ret_last_vec_ret is not None and re.fullmatch(r"[A-Za-z]\w*", ret_last_vec_ret):
                 ret_l_vec_ret = ret_last_vec_ret.lower()
-                if ret_l_vec_ret not in _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {}):
+                if (
+                    _USER_FUNC_RETURN_RANK.get(fn_l_vec_ret, 0) <= 0
+                    and ret_l_vec_ret not in _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {})
+                ):
                     local_array_names_vec_ret = {
                         x.lower()
                         for x in (
@@ -27625,7 +27755,10 @@ def transpile_r_to_fortran(
                 ret_last_vec_ret = ret_last_vec_ret.strip()
             if ret_last_vec_ret is not None and re.fullmatch(r"[A-Za-z]\w*", ret_last_vec_ret):
                 ret_l_vec_ret = ret_last_vec_ret.lower()
-                if ret_l_vec_ret not in _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {}):
+                if (
+                    _USER_FUNC_RETURN_RANK.get(fn_l_vec_ret, 0) <= 0
+                    and ret_l_vec_ret not in _USER_FUNC_ARG_RANK.get(fn_l_vec_ret, {})
+                ):
                     local_array_names_vec_ret = {
                         x.lower()
                         for x in (
@@ -42050,6 +42183,12 @@ def repair_vector_function_result_declarations_text(f90: str) -> str:
             rf"(?im)^(\s*)real\(kind=dp\)\s*::\s*{re.escape(result)}\s*$",
             rf"\1real(kind=dp), allocatable :: {result}(:)",
             block,
+            count=1,
+        )
+        new = re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(result)}\s*$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)",
+            new,
             count=1,
         )
         new = re.sub(
