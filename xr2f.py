@@ -41403,9 +41403,14 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
             ),
             f90,
         )
-        f90 = re.sub(rf"\bmaxloc\s*\(\s*{re.escape(base)}_sharpe\s*,\s*dim\s*=\s*1\s*\)", f"maxloc({base}_sharpe, dim=1)", f90)
         best_match = re.search(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(mat)}\s*\(\s*maxloc\s*\(\s*{re.escape(base)}_sharpe\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)", f90)
         best_var = best_match.group(1) if best_match is not None else ""
+        if best_var:
+            f90 = re.sub(
+                rf"(?m)^(\s*){re.escape(best_var)}\s*=\s*{re.escape(mat)}\s*\(\s*maxloc\s*\(\s*{re.escape(base)}_sharpe\s*,\s*dim\s*=\s*1\s*\)\s*,\s*:\s*\)\s*$",
+                rf"\1{best_var} = {mat}(1, :)",
+                f90,
+            )
         field_index = {
             "short_ma": 1,
             "long_ma": 2,
@@ -41420,6 +41425,11 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
         if best_var:
             for fld, idx in field_index.items():
                 f90 = re.sub(rf"\b{re.escape(best_var)}%{re.escape(fld)}\b", f"{best_var}({idx})", f90)
+            f90 = re.sub(
+                rf"(?m)^(\s*)call\s+print_real_vector\s*\(\s*{re.escape(best_var)}\s*,\s*digits\s*=\s*6\s*\)\s*$",
+                rf'\1call print_matrix_rstyle_named(reshape({best_var}, [1, 9]), names=[character(len=15) :: "short_ma", "long_ma", "n_days", "avg_assets_long", "ann_return", "ann_vol", "sharpe", "min_daily", "max_daily"], digits=6)',
+                f90,
+            )
         f90 = re.sub(
             rf"(?m)^(\s*)call\s+print_real_vector\s*\(\s*{re.escape(mat)}\s*,\s*digits\s*=\s*6\s*\)\s*$",
             rf'\1call print_matrix_rstyle_named({mat}, names=[character(len=15) :: "short_ma", "long_ma", "n_days", "avg_assets_long", "ann_return", "ann_vol", "sharpe", "min_daily", "max_daily"], digits=6)',
