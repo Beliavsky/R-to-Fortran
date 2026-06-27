@@ -26156,6 +26156,70 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def integerize_r_source(src: str) -> str:
+    """Rewrite safe integer-context numeric literal assignments as R integer literals."""
+    int_context_names: set[str] = set()
+    code_no_comments = "\n".join(split_r_code_comment(raw)[0] for raw in src.splitlines())
+
+    def add_name(name: str) -> None:
+        if re.fullmatch(r"[A-Za-z.]\w*(?:\.[A-Za-z]\w*)*", name.strip()):
+            int_context_names.add(name.strip())
+
+    for m in re.finditer(
+        r"\b(?:runif|rnorm|rexp|rpois|numeric|integer|logical|vector|seq_len|seq_along)\s*\(\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\b",
+        code_no_comments,
+        re.IGNORECASE,
+    ):
+        add_name(m.group(1))
+    for m in re.finditer(
+        r"\b(?:nrow|ncol|length\.out|times|size)\s*=\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\b",
+        code_no_comments,
+        re.IGNORECASE,
+    ):
+        add_name(m.group(1))
+    for m in re.finditer(
+        r"\bmatrix\s*\([^)]*\b(?:nrow|ncol)\s*=\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\b",
+        code_no_comments,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        add_name(m.group(1))
+    for m in re.finditer(
+        r"\bfor\s*\(\s*[A-Za-z.]\w*\s+in\s+(?:[A-Za-z.]\w*|\d+L?)\s*:\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\b",
+        code_no_comments,
+        re.IGNORECASE,
+    ):
+        add_name(m.group(1))
+    for m in re.finditer(
+        r"(?<![A-Za-z0-9_.])(?:\d+L?|[A-Za-z.]\w*)\s*:\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\b",
+        code_no_comments,
+    ):
+        add_name(m.group(1))
+    for m in re.finditer(
+        r"\[\s*(?:[A-Za-z.]\w*\s*:)?\s*([A-Za-z.]\w*(?:\.[A-Za-z]\w*)*)\s*(?:,|\])",
+        code_no_comments,
+    ):
+        add_name(m.group(1))
+    if not int_context_names:
+        return src
+
+    int_name_alt = "|".join(re.escape(nm) for nm in sorted(int_context_names, key=len, reverse=True))
+    assign_pat = re.compile(
+        rf"^(\s*)({int_name_alt})(\s*(?:<-|=)\s*)([+-]?(?:0|[1-9][0-9]*))(\s*)(#.*)?$"
+    )
+    out_lines: list[str] = []
+    for raw in src.splitlines():
+        m = assign_pat.match(raw)
+        if m is None:
+            out_lines.append(raw)
+            continue
+        prefix, name, op, value, gap, comment = m.groups()
+        if value.endswith(("L", "l")):
+            out_lines.append(raw)
+            continue
+        out_lines.append(f"{prefix}{name}{op}{value}L{gap}{comment or ''}")
+    return "\n".join(out_lines) + ("\n" if src.endswith("\n") else "")
+
+
 def _rewrite_simple_anonymous_apply_functions(src: str) -> str:
     """Lift simple apply(..., function(x) { expr }) callbacks into named helpers."""
     lines = src.splitlines()
@@ -43556,6 +43620,10 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--annotate-r-args")
         if args.annotate_r_args:
             cmd.append(args.annotate_r_args)
+    if getattr(args, "integerize_r", None) is not None:
+        cmd.append("--integerize-r")
+        if args.integerize_r:
+            cmd.append(args.integerize_r)
     if args.if_const_aggressive:
         cmd.append("--if-const-aggressive")
     if args.no_format_print:
@@ -43900,6 +43968,13 @@ def main() -> int:
         metavar="OUT.r",
         help="write an R copy annotated only with inferred declare(type(...)) statements for function arguments",
     )
+    ap.add_argument(
+        "--integerize-r",
+        nargs="?",
+        const="",
+        metavar="OUT.r",
+        help="write an R copy with safe integer-context numeric literal assignments rewritten with L suffixes; default: <input>_integerized.r",
+    )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
     ap.add_argument(
@@ -44200,6 +44275,9 @@ def main() -> int:
             if getattr(args, "annotate_r_args", None):
                 print("When input uses globbing with multiple matches, explicit --annotate-r-args OUT.r is not supported.")
                 return 1
+            if getattr(args, "integerize_r", None):
+                print("When input uses globbing with multiple matches, explicit --integerize-r OUT.r is not supported.")
+                return 1
             rc = 0
             summary_rows: list[dict[str, object]] = []
             total = len(matches)
@@ -44267,6 +44345,7 @@ def main() -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     annotate_r_path: Path | None = None
     annotate_r_args_only = False
+    integerize_r_path: Path | None = None
     if args.annotate_r is not None:
         if args.annotate_r:
             ann_cand = Path(args.annotate_r)
@@ -44286,6 +44365,15 @@ def main() -> int:
                 annotate_r_path = ann_cand.resolve()
         else:
             annotate_r_path = (artifact_dir / f"{in_path.stem}_annotated_args.r").resolve()
+    if getattr(args, "integerize_r", None) is not None:
+        if args.integerize_r:
+            int_cand = Path(args.integerize_r)
+            if args.out_dir and not int_cand.is_absolute():
+                integerize_r_path = (Path(args.out_dir) / int_cand).resolve()
+            else:
+                integerize_r_path = int_cand.resolve()
+        else:
+            integerize_r_path = (artifact_dir / f"{in_path.stem}_integerized.r").resolve()
     py_out_path: Path | None = None
     if args.via_python:
         if args.out_python:
@@ -44349,6 +44437,15 @@ def main() -> int:
 
     t0 = time.perf_counter()
     src = in_path.read_text(encoding="utf-8-sig")
+    if integerize_r_path is not None:
+        try:
+            src = integerize_r_source(src)
+        except NotImplementedError as e:
+            print(f"Integerize R: FAIL ({e})")
+            return 1
+        integerize_r_path.parent.mkdir(parents=True, exist_ok=True)
+        integerize_r_path.write_text(src, encoding="utf-8")
+        print(f"wrote {integerize_r_path}")
     source_already_obfuscated = False
     if args.obfuscate:
         try:
