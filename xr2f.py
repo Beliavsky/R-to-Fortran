@@ -40381,7 +40381,12 @@ def repair_make_pos_def_text(f90: str) -> str:
 
 def repair_price_names_decl_text(f90: str) -> str:
     declared: set[str] = set()
+    scalar_declared: set[str] = set()
     first_char_decl: re.Match[str] | None = None
+    char_decl_pat = re.compile(
+        r"(?im)^(\s*character\(len=:\),\s*allocatable\s*::\s*)"
+        r"(.+(?:\n\s*&.+)*)"
+    )
     constructor_lhs = [
         m_ctor.group(1)
         for m_ctor in re.finditer(
@@ -40389,16 +40394,18 @@ def repair_price_names_decl_text(f90: str) -> str:
             f90,
         )
     ]
-    for m_decl in re.finditer(
-        r"(?im)^(\s*character\(len=:\),\s*allocatable\s*::\s*)(.+)$",
-        f90,
-    ):
+    for m_decl in char_decl_pat.finditer(f90):
         if first_char_decl is None:
             first_char_decl = m_decl
-        for item in split_top_level_commas(m_decl.group(2)):
+        decl_items = re.sub(r"\n\s*&\s*", " ", m_decl.group(2)).replace("&", " ")
+        for item in split_top_level_commas(decl_items):
             m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", item)
             if m_item is not None:
                 declared.add(m_item.group(1).lower())
+                continue
+            m_scalar_item = re.match(r"\s*([A-Za-z]\w*)\s*$", item)
+            if m_scalar_item is not None:
+                scalar_declared.add(m_scalar_item.group(1).lower())
     if first_char_decl is None:
         missing_ctor = []
         for lhs in constructor_lhs:
@@ -40411,15 +40418,24 @@ def repair_price_names_decl_text(f90: str) -> str:
         return re.sub(r"(?im)^(\s*implicit\s+none\s*)$", r"\1" + insert, f90, count=1)
     missing: list[str] = []
     for lhs in constructor_lhs:
-        if lhs.lower() not in declared and lhs not in missing:
+        if (
+            lhs.lower() not in declared
+            and lhs.lower() not in scalar_declared
+            and lhs.lower() not in {m.lower() for m in missing}
+        ):
             missing.append(lhs)
             declared.add(lhs.lower())
     for m_asn in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(", f90):
         lhs, rhs = m_asn.group(1), m_asn.group(2)
-        if lhs.lower() not in declared and rhs.lower() in declared and lhs not in missing:
+        if (
+            lhs.lower() not in declared
+            and lhs.lower() not in scalar_declared
+            and rhs.lower() in declared
+            and lhs.lower() not in {m.lower() for m in missing}
+        ):
             missing.append(lhs)
             declared.add(lhs.lower())
-    if "price_names" not in declared and re.search(r"\bprice_names\b", f90):
+    if "price_names" not in declared and "price_names" not in scalar_declared and re.search(r"\bprice_names\b", f90):
         missing.append("price_names")
     if not missing:
         return f90
