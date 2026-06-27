@@ -4239,6 +4239,28 @@ def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
         return names
 
     module_int_names = collect_module_spec_integer_names()
+
+    def logical_statement_at(start: int, end: int) -> tuple[str, int] | None:
+        code = code_only(out[start]).rstrip()
+        if not code.strip():
+            return None
+        if not code.rstrip().endswith("&"):
+            return code, start
+        pieces = [re.sub(r"&\s*$", "", code).rstrip()]
+        j_stmt = start + 1
+        while j_stmt < end:
+            nxt = code_only(out[j_stmt]).strip()
+            if nxt.startswith("&"):
+                nxt = nxt[1:].lstrip()
+            continued = nxt.rstrip().endswith("&")
+            if continued:
+                nxt = re.sub(r"&\s*$", "", nxt).rstrip()
+            pieces.append(nxt)
+            if not continued:
+                return " ".join(p for p in pieces if p), j_stmt
+            j_stmt += 1
+        return " ".join(p for p in pieces if p), min(j_stmt - 1, len(out) - 1)
+
     i = 0
     while i < len(out):
         txt = code_only(out[i]).strip()
@@ -4275,14 +4297,20 @@ def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
                     pos_i += 1
                 return f"{fn_name}({', '.join(out_parts)})"
 
-            for j in range(i + 1, end):
-                code = code_only(out[j])
+            j = i + 1
+            while j < end:
+                stmt_info = logical_statement_at(j, end)
+                if stmt_info is None:
+                    j += 1
+                    continue
+                code, stmt_end = stmt_info
                 if not code.strip() or re.match(
                     r"^\s*(?:(?:pure|elemental|recursive)\s+)*(?:!|use\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|"
                     r"module\b|program\b|subroutine\b|function\b|end\b)",
                     code,
                     re.IGNORECASE,
                 ):
+                    j = stmt_end + 1
                     continue
                 new_code = code
                 for fn_name in sorted(_USER_FUNC_ARG_KIND, key=len, reverse=True):
@@ -4293,9 +4321,12 @@ def coerce_user_call_integer_actuals_by_decl(lines: list[str]) -> list[str]:
                     )
                 if new_code != code:
                     suffix = ""
-                    if "!" in out[j]:
+                    if stmt_end == j and "!" in out[j]:
                         suffix = "!" + out[j].split("!", 1)[1]
                     out[j] = new_code.rstrip() + (" " + suffix if suffix else "")
+                    for k in range(j + 1, stmt_end + 1):
+                        out[k] = ""
+                j = stmt_end + 1
         i = end + 1
     return out
 
@@ -6342,6 +6373,18 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
         for st in ss:
             if isinstance(st, FuncDef):
                 amap = {arg: mapping[arg] for arg in st.args if arg in mapping}
+                for arg in st.args:
+                    if arg not in mapping:
+                        continue
+                    dotted_arg = arg.replace("_dot_", ".")
+                    if dotted_arg != arg:
+                        amap[dotted_arg] = mapping[arg]
+                    underscored_arg = arg.replace("_dot_", "_")
+                    if underscored_arg != arg:
+                        amap[underscored_arg] = mapping[arg]
+                    dotted_from_underscore_arg = arg.replace("_", ".")
+                    if dotted_from_underscore_arg != arg:
+                        amap[dotted_from_underscore_arg] = mapping[arg]
                 for raw_name, sanitized_name in _DOTTED_VAR_RENAMES.items():
                     if sanitized_name in amap:
                         amap[raw_name] = amap[sanitized_name]
@@ -6350,6 +6393,9 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
                         amap[underscored_name] = amap[sanitized_name]
                 if amap:
                     func_arg_maps[st.name] = amap
+                    mapped_fn_name = mapping.get(st.name)
+                    if mapped_fn_name is not None:
+                        func_arg_maps[mapped_fn_name] = amap
                 collect_func_arg_maps(st.body)
             elif isinstance(st, ForStmt):
                 collect_func_arg_maps(st.body)
@@ -6425,6 +6471,28 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
             return f"optim({new_inner})" if changed else f"optim({inner})"
 
         out = _replace_balanced_func_calls(out, "optim", optim_repl)
+
+        def apply_repl(inner: str) -> str:
+            parts = split_top_level_commas(inner)
+            callback_name = ""
+            if len(parts) >= 3:
+                callback_name = parts[2].strip()
+            for part in parts:
+                m_fun = re.match(rf"^\s*(?:FUN|f)\s*=\s*({_R_IDENT_RE})\s*$", part)
+                if m_fun is not None:
+                    callback_name = m_fun.group(1)
+                    break
+            callback_candidates = [callback_name]
+            if callback_name in mapping:
+                callback_candidates.append(mapping[callback_name])
+            amap = next((func_arg_maps.get(cand) for cand in callback_candidates if func_arg_maps.get(cand)), None)
+            if not amap:
+                return f"apply({inner})"
+            apply_keywords = {"X", "x", "MARGIN", "margin", "FUN", "fun", "simplify"}
+            new_inner, changed = rewrite_keyword_parts(inner, amap, apply_keywords)
+            return f"apply({new_inner})" if changed else f"apply({inner})"
+
+        out = _replace_balanced_func_calls(out, "apply", apply_repl)
 
         def nlm_repl(inner: str) -> str:
             parts = split_top_level_commas(inner)
@@ -41206,6 +41274,11 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
         "character(len=*), intent(in) :: label\nreal(kind=dp), intent(in) :: r(:), risk_free, trading_days",
         f90,
     )
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*s\s*,\s*digits\s*=\s*6\s*\)\s*$",
+        r'\1call print_named_real_vector(s, [character(len=10) :: "mean_daily", "sd_daily", "ann_return", "ann_vol", "sharpe", "min", "max"], digits=6)',
+        f90,
+    )
     f90 = re.sub(r"\bsignal\(:\)", "signal(:,:)", f90)
     f90 = re.sub(r"\bstrat_rets_asset\(:\)", "strat_rets_asset(:,:)", f90)
     f90 = re.sub(r"\basset_tf_stats\(:\)", "asset_tf_stats(:,:)", f90)
@@ -45588,6 +45661,7 @@ def main() -> int:
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90_lines = coerce_user_call_integer_actuals_by_decl(f90_lines)
+    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     for _ in range(4):
         next_lines = promote_size_dim2_dummy_arguments(f90_lines)
         if next_lines == f90_lines:
