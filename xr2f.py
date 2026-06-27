@@ -39893,6 +39893,45 @@ def repair_portfolio_stats_scalar_locals_text(f90: str) -> str:
     return f90
 
 
+def repair_portfolio_print_labels_text(f90: str) -> str:
+    sub_pat = re.compile(
+        r"(?ims)^subroutine\s+([A-Za-z]\w*)\s*\(\s*name\s*,\s*w\s*,\s*mean_ret\s*,\s*sigma_ret\s*,\s*daily_rf\s*,\s*trading_days\s*\)"
+        r".*?\bstat\s*=\s*portfolio_stats\s*\(\s*w\s*,\s*mean_ret\s*,\s*sigma_ret\s*,\s*daily_rf\s*,\s*trading_days\s*\)"
+        r".*?Weights:\s*.*?Statistics, in scaled return units where applicable:"
+        r".*?^end\s+subroutine\s+\1\s*$"
+    )
+    m_sub = sub_pat.search(f90)
+    if m_sub is None:
+        return f90
+    sub_name = m_sub.group(1)
+    stat_names = (
+        '[character(len=14) :: "mean", "sd", "ann_return", "ann_vol", '
+        '"sharpe", "net_exposure", "gross_exposure"]'
+    )
+    repl = (
+        f"subroutine {sub_name}(name, w, mean_ret, sigma_ret, daily_rf, trading_days, asset_names)\n"
+        "character(len=*), intent(in) :: name\n"
+        "real(kind=dp), intent(in) :: w(:), mean_ret(:), sigma_ret(:,:), daily_rf, trading_days\n"
+        "character(len=*), intent(in) :: asset_names(:)\n"
+        "real(kind=dp), allocatable :: stat(:)\n"
+        "stat = portfolio_stats(w, mean_ret, sigma_ret, daily_rf, trading_days)\n"
+        "write(*,\"(/,*(g0,:,1x))\") name\n"
+        "write(*,\"(g0)\") \"Weights: \"\n"
+        "call print_named_real_vector(r_round(w, 6), asset_names, digits=6)\n"
+        "write(*,\"(g0)\") \"Statistics, in scaled return units where applicable: \"\n"
+        f"call print_named_real_vector(stat, {stat_names}, digits=6)\n"
+        f"end subroutine {sub_name}"
+    )
+    f90 = f90[:m_sub.start()] + repl + f90[m_sub.end():]
+    call_pat = re.compile(
+        rf"(?ims)^(\s*call\s+{re.escape(sub_name)}\s*\((?:(?!^\s*call\s+|^\s*end\s+program\b).)*?"
+        r"daily_dot_rf\s*,\s*(?:&\s*\n\s*&\s*)?trading_dot_days)(\s*\))",
+        re.MULTILINE,
+    )
+    f90 = call_pat.sub(r"\1, price_names\2", f90)
+    return f90
+
+
 def repair_make_pos_def_text(f90: str) -> str:
     f90 = re.sub(
         r"(?m)^(\s*)real\(kind=dp\)\s*::\s*ev,\s*min_ev\s*$",
@@ -44479,6 +44518,7 @@ def main() -> int:
     f90 = promote_sigma_ret_formals_text(f90)
     f90 = repair_portfolio_stat_named_indices_text(f90)
     f90 = repair_portfolio_stats_scalar_locals_text(f90)
+    f90 = repair_portfolio_print_labels_text(f90)
     f90 = repair_make_pos_def_text(f90)
     f90 = repair_price_names_decl_text(f90)
     f90 = repair_trading_days_parameter_text(f90)
@@ -44488,6 +44528,8 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
+    if "call print_named_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_vector"})
     if "call print_char_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_char_vector"})
     if "call print_integer_vector(" in f90:
