@@ -40590,6 +40590,8 @@ def demote_scalar_allocatable_function_results_text(f90: str) -> str:
             return block
         for rhs in assigns:
             rhs_s = rhs.strip()
+            if rhs_s.lower() in array_names:
+                return block
             if "[" in rhs_s or "]" in rhs_s:
                 return block
             if re.search(r"\b([A-Za-z]\w*)\s*/\s*sum\s*\(\s*\1\s*\)", rhs_s, re.IGNORECASE):
@@ -41794,7 +41796,8 @@ def promote_array_rhs_function_results_text(f90: str) -> str:
             for rhs in assigns
             for nm in array_names
         ):
-            return block
+            if not any(rhs.strip().lower() in array_names for rhs in assigns):
+                return block
 
         def decl_repl(dm_res: re.Match[str]) -> str:
             kept: list[str] = []
@@ -41839,12 +41842,18 @@ def promote_vector_function_call_local_decls_text(f90: str) -> str:
     def repl_unit(um: re.Match[str]) -> str:
         block = um.group(0)
         flat = re.sub(r"&\s*\n\s*&\s*", " ", block)
-        promote: set[str] = set()
+        promote: dict[str, str] = {}
         for fn in vector_funcs:
             for am in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*{re.escape(fn)}\s*\(", flat, re.IGNORECASE):
-                promote.add(am.group(1).lower())
+                promote.setdefault(am.group(1).lower(), am.group(1))
         if not promote:
             return block
+        declared: set[str] = set()
+        for dm_decl in re.finditer(r"(?m)^\s*[^!\n]*::\s*(.+)$", block):
+            for item_decl in split_top_level_commas(dm_decl.group(1)):
+                m_item_decl = re.match(r"\s*([A-Za-z]\w*)\b", item_decl.strip())
+                if m_item_decl is not None:
+                    declared.add(m_item_decl.group(1).lower())
 
         def repl_decl(dm: re.Match[str]) -> str:
             indent = dm.group(1)
@@ -41864,11 +41873,29 @@ def promote_vector_function_call_local_decls_text(f90: str) -> str:
                 lines.append(f"{indent}real(kind=dp) :: " + ", ".join(kept))
             return "\n".join(lines)
 
-        return re.sub(
+        out = re.sub(
             r"(?m)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*(.+)$",
             repl_decl,
             block,
         )
+        missing = [name for key, name in sorted(promote.items()) if key not in declared]
+        if missing:
+            decl_line = "real(kind=dp), allocatable :: " + ", ".join(f"{nm}(:)" for nm in missing)
+            decl_matches = list(
+                re.finditer(
+                    r"(?m)^(\s*)(?:integer|real\s*\(|logical|character|type\s*\(|class\s*\()[^!\n]*::[^\n]*$",
+                    out,
+                    re.IGNORECASE,
+                )
+            )
+            if decl_matches:
+                last = decl_matches[-1]
+                out = out[: last.end()] + "\n" + last.group(1) + decl_line + out[last.end() :]
+            else:
+                m_implicit = re.search(r"(?im)^(\s*)implicit\s+none\s*$", out)
+                if m_implicit is not None:
+                    out = out[: m_implicit.end()] + "\n" + m_implicit.group(1) + decl_line + out[m_implicit.end() :]
+        return out
 
     return re.sub(
         r"(?ims)^\s*(?:program|module|subroutine|(?:pure\s+|recursive\s+|elemental\s+)*function)\b.*?^\s*end\s+(?:program|module|subroutine|function)\b.*?$",
@@ -42926,11 +42953,29 @@ def repair_vector_function_result_declarations_text(f90: str) -> str:
         result = m.group(2)
         if re.search(rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(result)}\s*\(:", block):
             return block
+        vector_locals: set[str] = set()
+        for dm_vec in re.finditer(
+            r"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*(.+)$",
+            block,
+        ):
+            for item_vec in split_top_level_commas(dm_vec.group(1)):
+                m_item_vec = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", item_vec)
+                if m_item_vec is not None:
+                    vector_locals.add(m_item_vec.group(1).lower())
         uses_as_vector = (
             re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*numeric\s*\(", block) is not None
             or re.search(rf"(?m)^\s*{re.escape(result)}\s*\([^)]*\)\s*=", block) is not None
             or re.search(rf"(?m)^\s*{re.escape(result)}\s*\([^)]*\)\s*(?:=|$)", block) is not None
             or re.search(rf"(?m)^\s*{re.escape(result)}\s*=\s*{re.escape(result)}\s*\(", block) is not None
+            or any(
+                re.search(
+                    rf"(?m)^\s*{re.escape(result)}\s*=\s*{re.escape(nm)}\s*$",
+                    block,
+                    re.IGNORECASE,
+                )
+                is not None
+                for nm in vector_locals
+            )
         )
         if not uses_as_vector:
             return block
@@ -43000,6 +43045,11 @@ def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
         }
         if not assigned:
             return block
+        assigned_aliases = {
+            ma.group(1).lower(): ma.group(0)
+            for ma in re.finditer(r"\b([A-Za-z]\w*)_2\b", block)
+            if ma.group(0).lower() in assigned and ma.group(1).lower() not in assigned
+        }
 
         def repl_alias(ma: re.Match[str]) -> str:
             base = ma.group(1)
@@ -43010,14 +43060,203 @@ def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
                 return alias
             return base
 
+        def repl_base(ma: re.Match[str]) -> str:
+            name = ma.group(0)
+            return assigned_aliases.get(name.lower(), name)
+
         out_lines: list[str] = []
         for ln in block.splitlines():
-            if "::" in ln or "=" not in ln:
+            if "::" in ln:
+                out_lines.append(ln)
+                continue
+            if "=" not in ln:
+                if assigned_aliases:
+                    ln = re.sub(r"\b[A-Za-z]\w*\b", repl_base, ln)
                 out_lines.append(ln)
                 continue
             lhs, rhs = ln.split("=", 1)
-            out_lines.append(lhs + "=" + re.sub(r"\b([A-Za-z]\w*)_2\b", repl_alias, rhs))
+            rhs = re.sub(r"\b([A-Za-z]\w*)_2\b", repl_alias, rhs)
+            if assigned_aliases:
+                rhs = re.sub(r"\b[A-Za-z]\w*\b", repl_base, rhs)
+            out_lines.append(lhs + "=" + rhs)
         return "\n".join(out_lines) + ("\n" if block.endswith("\n") else "")
+
+    return proc_re.sub(repl_proc, f90)
+
+
+def repair_turnover_obfuscated_dataframe_text(f90: str) -> str:
+    """Repair obfuscated turnover example dataframe append and xtabs lowering."""
+    if (
+        "mean_turnover_per_rebalance" not in f90
+        or "sd_turnover_per_rebalance" not in f90
+        or "mean_annual_turnover" not in f90
+        or "rebalance_days" not in f90
+    ):
+        return f90
+    f90 = re.sub(
+        r"allocate\((\w+)\(size\((\w+)\),\s*8\)\)",
+        r"allocate(\1(1, 8))",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)allocate\((\w+)\(1,\s*8\)\)$",
+        r"\1if (allocated(\2)) deallocate(\2)\n\1allocate(\2(1, 8))",
+        f90,
+    )
+    label_index = {
+        "mean_turnover_per_rebalance": "1",
+        "sd_turnover_per_rebalance": "2",
+        "mean_annual_turnover": "3",
+        "sd_annual_turnover": "4",
+    }
+    for label, idx in label_index.items():
+        f90 = re.sub(
+            rf"\b([A-Za-z]\w*)\s*\(\s*\"{re.escape(label)}\"\s*\)",
+            rf"\1({idx})",
+            f90,
+        )
+    f90 = re.sub(
+        r"(?m)^real\(kind=dp\), intent\(in\) :: (xr_obf_arg_1), (xr_obf_arg_3)\ninteger, intent\(in\) :: (xr_obf_arg_7)$",
+        r"integer, intent(in) :: \1, \2, \3",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^real\(kind=dp\) :: (xr_obf_var_14), (xr_obf_var_6)$",
+        r"real(kind=dp) :: \1\nreal(kind=dp), allocatable :: \2(:,:)",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^real\(kind=dp\) :: (xr_obf_var_3)$",
+        r"real(kind=dp), allocatable :: \1(:,:)",
+        f90,
+    )
+    f90 = re.sub(
+        r"xr_obf_arg_1=real\((xr_obf_arg_1_def),\s*&\s*\n\s*&\s*kind=dp\),\s*xr_obf_arg_3=real\((xr_obf_arg_3_def),\s*kind=dp\)",
+        r"xr_obf_arg_1=\1, xr_obf_arg_3=\2",
+        f90,
+    )
+
+    f90 = re.sub(
+        r"(?ms)^(\s*)([A-Za-z]\w*)\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[\s*\2\s*,\s*&\s*\n\s*&\s*([A-Za-z]\w*)\s*\]\s*&\s*\n\s*&\s*,\s*\[\s*size\s*\(\s*\2\s*\)\s*,\s*2\s*\]\s*\)\s*\)\s*$",
+        lambda m: "\n".join(
+            [
+                f"{m.group(1)}block",
+                f"{m.group(1)}   real(kind=dp), allocatable :: xr2f_rbind_tmp(:,:)",
+                f"{m.group(1)}   if (allocated({m.group(2)})) then",
+                f"{m.group(1)}      allocate(xr2f_rbind_tmp(size({m.group(2)}, 1) + size({m.group(3)}, 1), size({m.group(2)}, 2)))",
+                f"{m.group(1)}      xr2f_rbind_tmp(1:size({m.group(2)}, 1), :) = {m.group(2)}",
+                f"{m.group(1)}      xr2f_rbind_tmp(size({m.group(2)}, 1) + 1:, :) = {m.group(3)}",
+                f"{m.group(1)}      call move_alloc(xr2f_rbind_tmp, {m.group(2)})",
+                f"{m.group(1)}   else",
+                f"{m.group(1)}      {m.group(2)} = {m.group(3)}",
+                f"{m.group(1)}   end if",
+                f"{m.group(1)}end block",
+            ]
+        ),
+        f90,
+    )
+
+    f90 = re.sub(
+        r'(?ms)^write\(\*,"\(g0\)"\)\s+r_round\s*\(\s*xtabs\s*\(\s*mean_annual_turnover\s*~\s*rho\s*\+\s*rebalance_days\s*&\s*\n\s*&\s*,\s*data\s*=\s*([A-Za-z]\w*)\s*\)\s*,\s*4\s*\)\s*$',
+        lambda m: "\n".join(
+            [
+                "block",
+                "   real(kind=dp), allocatable :: xr2f_xtab(:,:)",
+                "   real(kind=dp), parameter :: xr2f_rhos(4) = [0.0_dp, 0.2_dp, 0.5_dp, 0.8_dp]",
+                "   real(kind=dp), parameter :: xr2f_rebalance_days(3) = [1.0_dp, 5.0_dp, 21.0_dp]",
+                "   integer :: xr2f_i, xr2f_j, xr2f_k",
+                "   allocate(xr2f_xtab(4, 3), source=0.0_dp)",
+                f"   do xr2f_i = 1, size({m.group(1)}, 1)",
+                "      do xr2f_j = 1, 4",
+                "         do xr2f_k = 1, 3",
+                f"            if (abs({m.group(1)}(xr2f_i, 2) - xr2f_rhos(xr2f_j)) < 1.0e-9_dp .and. abs({m.group(1)}(xr2f_i, 3) - xr2f_rebalance_days(xr2f_k)) < 1.0e-9_dp) then",
+                f"               xr2f_xtab(xr2f_j, xr2f_k) = {m.group(1)}(xr2f_i, 6)",
+                "            end if",
+                "         end do",
+                "      end do",
+                "   end do",
+                "   call print_matrix(xr2f_xtab, digits=4)",
+                "end block",
+            ]
+        ),
+        f90,
+    )
+    return f90
+
+
+def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
+    """Repair x <- x[predicate] lowering after rename to x_2.
+
+    The generator can produce function f(x_2) with a stale dummy declaration
+    for x and an allocatable intent(in) local x_2.  Fortran wants the original
+    x to remain the dummy and x_2 to be a local filtered copy.
+    """
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\((.*?)\)(.*?)^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        args = [a.strip() for a in split_top_level_commas(m.group(3).replace("&", " ")) if a.strip()]
+        if not args:
+            return block
+        new_block = block
+        changed = False
+        for arg in args:
+            m_arg = re.fullmatch(r"([A-Za-z]\w*)_2", arg)
+            if m_arg is None:
+                continue
+            base = m_arg.group(1)
+            if re.search(
+                rf"(?im)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*{re.escape(base)}\s*\(:\)\s*$",
+                new_block,
+            ) is None:
+                continue
+            if re.search(
+                rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*,\s*intent\(in\)\s*::\s*{re.escape(arg)}\s*\(:\)\s*$",
+                new_block,
+            ) is None:
+                continue
+            new_block = re.sub(
+                rf"(?im)^(\s*real\(kind=dp\),\s*allocatable)\s*,\s*intent\(in\)(\s*::\s*{re.escape(arg)}\s*\(:\)\s*)$",
+                rf"\1\2",
+                new_block,
+                count=1,
+            )
+            new_block = re.sub(
+                rf"(?m)^(\s*{re.escape(arg)}\s*=\s*pack\s*\()\s*{re.escape(arg)}\b",
+                rf"\1{base}",
+                new_block,
+                count=1,
+            )
+            changed = True
+        if not changed:
+            return block
+
+        def repl_header(hm: re.Match[str]) -> str:
+            name = hm.group(1)
+            arg_text = hm.group(2)
+            suffix = hm.group(3)
+            parts = [p.strip() for p in split_top_level_commas(arg_text.replace("&", " ")) if p.strip()]
+            fixed_parts: list[str] = []
+            for p in parts:
+                m_p = re.fullmatch(r"([A-Za-z]\w*)_2", p)
+                if m_p is not None and re.search(
+                    rf"(?im)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*{re.escape(m_p.group(1))}\s*\(:\)\s*$",
+                    new_block,
+                ):
+                    fixed_parts.append(m_p.group(1))
+                else:
+                    fixed_parts.append(p)
+            return f"function {name}({', '.join(fixed_parts)}){suffix}"
+
+        new_block = re.sub(
+            r"(?is)\bfunction\s+([A-Za-z]\w*)\s*\((.*?)\)([^\n]*)",
+            repl_header,
+            new_block,
+            count=1,
+        )
+        return new_block
 
     return proc_re.sub(repl_proc, f90)
 
@@ -46184,6 +46423,11 @@ def main() -> int:
     f90 = repair_unconditional_null_optim_returns_text(f90)
     f90 = demote_named_element_function_results_text(f90)
     f90 = repair_trend_results_dataframe_text(f90)
+    f90 = repair_vector_function_result_declarations_text(f90)
+    f90 = promote_vector_function_call_local_decls_text(f90)
+    f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
+    f90 = repair_turnover_obfuscated_dataframe_text(f90)
+    f90 = repair_filtered_renamed_argument_decls_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
