@@ -20483,8 +20483,61 @@ def _emit_optim_bfgs_assignment(
         c = parse_call_text(primary_rhs)
     if c is not None and c[0].lower() == "try" and c[1]:
         c_try_inner = parse_call_text(c[1][0].strip())
-        if c_try_inner is not None and c_try_inner[0].lower() == "optim":
+        if c_try_inner is not None and c_try_inner[0].lower() in {"optim", "constroptim"}:
             c = c_try_inner
+    if c is not None and c[0].lower() == "constroptim":
+        _nm, pos, kw = c
+        theta_src = kw.get("theta") or (pos[0] if len(pos) >= 1 else None)
+        fn_src = kw.get("f") or (pos[1] if len(pos) >= 2 else None)
+        ui_src = kw.get("ui") or (pos[3] if len(pos) >= 4 else None)
+        ci_src = kw.get("ci") or (pos[4] if len(pos) >= 5 else None)
+        grad_src = kw.get("grad") or (pos[2] if len(pos) >= 3 else None)
+        if theta_src is None or fn_src is None or ui_src is None or ci_src is None:
+            return False
+        if grad_src is not None and grad_src.strip().lower() not in {"null", "na"}:
+            return False
+        fn_name = fn_src.strip()
+        if not re.match(r"^[A-Za-z]\w*$", fn_name):
+            return False
+        parent_fn = str(helper_ctx.get("current_fn_name", "")) if helper_ctx is not None else ""
+        nested_fn_name = f"{parent_fn}_{fn_name}" if parent_fn else ""
+        if nested_fn_name.lower() in _USER_FUNC_ARG_INDEX:
+            fn_name = nested_fn_name
+        globals().setdefault("_OPTIM_OBJECTIVE_FUNC_NAMES", set()).add(fn_name.lower())
+        method_src = kw.get("method", '"Nelder-Mead"').strip()
+        method_lit = _dequote_string_literal(method_src)
+        method = (method_lit or "Nelder-Mead").lower()
+        if method_lit is None or method not in {"bfgs", "nelder-mead"}:
+            return False
+        control_src = kw.get("control", "")
+        maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
+        reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
+        ndeps_src = _control_value_from_list(control_src, "ndeps") if control_src else None
+        maxit_f = _int_bound_expr(r_expr_to_fortran(maxit_src or "100"))
+        gtol_f = r_expr_to_fortran(reltol_src or "1.0e-8")
+        ndeps_f = r_expr_to_fortran(ndeps_src or "1.0e-3")
+        kwargs: list[str] = []
+        if maxit_src is not None:
+            kwargs.append(f"maxit={maxit_f}")
+        if reltol_src is not None:
+            kwargs.append(f"reltol={gtol_f}")
+        if ndeps_src is not None:
+            kwargs.append(f"ndeps={ndeps_f}")
+        tail = ", " + ", ".join(kwargs) if kwargs else ""
+        helper_name = "constr_optim_bfgs" if method == "bfgs" else "constr_optim_nelder_mead"
+        if helper_ctx is not None:
+            nr = helper_ctx.get("need_r_mod")
+            if isinstance(nr, set):
+                nr.update({"optim_result_t", helper_name})
+        if comment:
+            cmt = comment.strip()
+            if cmt:
+                o.w(f"! {cmt}")
+        o.w(
+            f"{target} = {helper_name}({fn_name}, {r_expr_to_fortran(theta_src)}, "
+            f"{r_expr_to_fortran(ui_src)}, {r_expr_to_fortran(ci_src)}{tail})"
+        )
+        return True
     if c is None or c[0].lower() != "optim":
         return False
     _nm, pos, kw = c
@@ -22346,7 +22399,7 @@ def emit_function(
                                 need_r_mod.add("hclust_result_t")
                                 need_r_mod.add("cutree")
                             continue
-                        if callee.lower() == "optim":
+                        if callee.lower() in {"optim", "constroptim"}:
                             local_list_types[lhs_nm] = "optim_result_t"
                             if has_r_mod:
                                 need_r_mod.add("optim_result_t")
@@ -28459,7 +28512,7 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "nlm":
                 nlm_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t", "print_nlm_result"})
-            if c_fit_main is not None and c_fit_main[0].lower() == "optim":
+            if c_fit_main is not None and c_fit_main[0].lower() in {"optim", "constroptim"}:
                 list_vars[st.name] = "optim_result_t"
             if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
                 list_vars[st.name] = "integrate_result_t"
@@ -31594,7 +31647,7 @@ def transpile_r_to_fortran(
                 for st_field in f_obj_field.body:
                     if isinstance(st_field, Assign) and st_field.name == txt:
                         c_field_rhs = parse_call_text(st_field.expr.strip())
-                        if c_field_rhs is not None and c_field_rhs[0].lower() == "optim":
+                        if c_field_rhs is not None and c_field_rhs[0].lower() in {"optim", "constroptim"}:
                             return f"type(optim_result_t) :: {k}"
                         if c_field_rhs is not None and c_field_rhs[0] in list_specs:
                             return f"type({_type_name_for_path(c_field_rhs[0], ())}) :: {k}"
@@ -44192,13 +44245,28 @@ def _with_r_rng_fortran_flags(cparts: list[str]) -> list[str]:
 def _r_command_from_rscript(rscript_cmd: str) -> str:
     parts = shlex.split(rscript_cmd)
     if not parts:
-        return "R"
+        parts = ["Rscript"]
     exe = Path(parts[0])
+    resolved = shutil.which(str(exe))
+    if resolved:
+        exe = Path(resolved)
     stem = exe.stem.lower()
     if stem == "rscript":
         cand = exe.with_name("R.exe" if exe.suffix.lower() == ".exe" else "R")
-        if exe.parent != Path(".") and cand.exists():
+        if cand.exists():
             return str(cand)
+    r_home = os.environ.get("R_HOME", "").strip()
+    if r_home:
+        for rel in (("bin", "x64", "R.exe"), ("bin", "R.exe"), ("bin", "R")):
+            cand = Path(r_home).joinpath(*rel)
+            if cand.exists():
+                return str(cand)
+    r_cmd = shutil.which("R.exe") or shutil.which("R")
+    if r_cmd:
+        r_path = Path(r_cmd)
+        local_r = Path.cwd() / r_path.name
+        if r_path.resolve() != local_r.resolve():
+            return str(r_path)
     return "R"
 
 
@@ -46521,6 +46589,10 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_sann", "optim_result_t"})
     if "optim_nelder_mead(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_nelder_mead", "optim_result_t"})
+    if "constr_optim_bfgs(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"constr_optim_bfgs", "optim_result_t"})
+    if "constr_optim_nelder_mead(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"constr_optim_nelder_mead", "optim_result_t"})
     f90 = promote_r_sub_vector_dummy_args_text(f90)
     f90 = repair_extra_renamed_actual_arguments_text(f90)
     f90 = strip_real_wrappers_for_integer_dummy_calls_text(f90)
