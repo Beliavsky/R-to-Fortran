@@ -37614,6 +37614,62 @@ def remove_module_globals_redeclared_in_program(lines: list[str]) -> list[str]:
     return out
 
 
+def hoist_module_used_real_matrix_globals(lines: list[str]) -> list[str]:
+    contains_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*contains\s*$", ln, re.IGNORECASE)), -1)
+    end_mod_idx = next((i for i, ln in enumerate(lines) if contains_idx >= 0 and i > contains_idx and re.match(r"^\s*end\s+module\b", ln, re.IGNORECASE)), -1)
+    prog_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*program\b", ln, re.IGNORECASE)), -1)
+    if contains_idx < 0 or end_mod_idx < 0 or prog_idx < 0:
+        return lines
+
+    module_head = "\n".join(lines[:contains_idx])
+    module_body = "\n".join(lines[contains_idx + 1 : end_mod_idx])
+    program_text = "\n".join(lines[prog_idx:])
+    program_matrices: dict[str, str] = {}
+    for m_decl in re.finditer(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$",
+        program_text,
+    ):
+        for part in split_top_level_commas(m_decl.group(2)):
+            m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)\s*$", part)
+            if m_item is not None:
+                name = m_item.group(1)
+                program_matrices[name.lower()] = name
+    if not program_matrices:
+        return lines
+
+    hoist = [
+        name
+        for key, name in sorted(program_matrices.items())
+        if re.search(rf"\b{re.escape(name)}\b", module_body)
+        and re.search(rf"\b{re.escape(name)}\b", module_head) is None
+    ]
+    if not hoist:
+        return lines
+    hoist_l = {name.lower() for name in hoist}
+
+    out: list[str] = []
+    inserted = False
+    for i, ln in enumerate(lines):
+        if i == contains_idx and not inserted:
+            out.append("real(kind=dp), allocatable :: " + ", ".join(f"{name}(:,:)" for name in hoist))
+            inserted = True
+        if i >= prog_idx:
+            m_decl = re.match(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+            if m_decl is not None:
+                kept: list[str] = []
+                for part in split_top_level_commas(m_decl.group(2)):
+                    base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                    if base.lower() not in hoist_l:
+                        kept.append(part.strip())
+                if not kept:
+                    continue
+                if len(kept) != len(split_top_level_commas(m_decl.group(2))):
+                    out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(kept)}")
+                    continue
+        out.append(ln)
+    return out
+
+
 def promote_logical_function_result_assignments(lines: list[str]) -> list[str]:
     logical_funcs: set[str] = set()
     current_fn: str | None = None
@@ -46204,6 +46260,7 @@ def main() -> int:
     f90_tmp_after_promote = promote_scalar_pure_functions_to_elemental_text(f90_tmp_after_promote)
     f90_tmp_after_promote = demote_elemental_allocatable_result_functions_text(f90_tmp_after_promote)
     f90_lines = f90_tmp_after_promote.splitlines()
+    f90_lines = hoist_module_used_real_matrix_globals(f90_lines)
     f90_lines = remove_module_globals_redeclared_in_program(f90_lines)
     f90_lines = promote_logical_function_result_assignments(f90_lines)
     f90_lines = rewrite_sum_logical_arrays(f90_lines)
@@ -46455,6 +46512,8 @@ def main() -> int:
     )
     if "call print_real_vector(" in f90:
         f90 = "\n".join(balance_print_real_vector_calls(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90_lines = hoist_module_used_real_matrix_globals(f90.splitlines())
+    f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
