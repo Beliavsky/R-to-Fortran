@@ -37624,47 +37624,59 @@ def hoist_module_used_real_matrix_globals(lines: list[str]) -> list[str]:
     module_head = "\n".join(lines[:contains_idx])
     module_body = "\n".join(lines[contains_idx + 1 : end_mod_idx])
     program_text = "\n".join(lines[prog_idx:])
-    program_matrices: dict[str, str] = {}
+    program_arrays: dict[str, tuple[str, str, str]] = {}
     for m_decl in re.finditer(
-        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$",
+        r"(?im)^(\s*)((?:real|complex)\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|character\s*\([^)]*\))\s*,\s*allocatable\s*::\s*(.+)$",
         program_text,
     ):
-        for part in split_top_level_commas(m_decl.group(2)):
-            m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)\s*$", part)
+        decl_type = re.sub(r"\s+", "", m_decl.group(2).lower())
+        decl_type = decl_type.replace("real(kind=dp)", "real(kind=dp)")
+        decl_type = decl_type.replace("complex(kind=dp)", "complex(kind=dp)")
+        for part in split_top_level_commas(m_decl.group(3)):
+            m_item = re.match(r"\s*([A-Za-z]\w*)\s*(\((?:\s*:\s*,?)+\s*\))\s*$", part)
             if m_item is not None:
                 name = m_item.group(1)
-                program_matrices[name.lower()] = name
-    if not program_matrices:
+                shape = re.sub(r"\s+", "", m_item.group(2))
+                program_arrays[name.lower()] = (name, decl_type, shape)
+    if not program_arrays:
         return lines
 
-    hoist = [
-        name
-        for key, name in sorted(program_matrices.items())
-        if re.search(rf"\b{re.escape(name)}\b", module_body)
-        and re.search(rf"\b{re.escape(name)}\b", module_head) is None
-    ]
+    hoist = {
+        key: info
+        for key, info in sorted(program_arrays.items())
+        if re.search(rf"\b{re.escape(info[0])}\b", module_body)
+        and re.search(rf"\b{re.escape(info[0])}\b", module_head) is None
+    }
     if not hoist:
         return lines
-    hoist_l = {name.lower() for name in hoist}
+    hoist_l = set(hoist)
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for name, decl_type, shape in hoist.values():
+        grouped.setdefault((decl_type, shape), []).append(name)
 
     out: list[str] = []
     inserted = False
     for i, ln in enumerate(lines):
         if i == contains_idx and not inserted:
-            out.append("real(kind=dp), allocatable :: " + ", ".join(f"{name}(:,:)" for name in hoist))
+            for (decl_type, shape), names in sorted(grouped.items()):
+                out.append(f"{decl_type}, allocatable :: " + ", ".join(f"{name}{shape}" for name in names))
             inserted = True
         if i >= prog_idx:
-            m_decl = re.match(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+            m_decl = re.match(
+                r"^(\s*)((?:real|complex)\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|character\s*\([^)]*\))\s*,\s*allocatable\s*::\s*(.+)$",
+                ln,
+                re.IGNORECASE,
+            )
             if m_decl is not None:
                 kept: list[str] = []
-                for part in split_top_level_commas(m_decl.group(2)):
+                for part in split_top_level_commas(m_decl.group(3)):
                     base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
                     if base.lower() not in hoist_l:
                         kept.append(part.strip())
                 if not kept:
                     continue
-                if len(kept) != len(split_top_level_commas(m_decl.group(2))):
-                    out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(kept)}")
+                if len(kept) != len(split_top_level_commas(m_decl.group(3))):
+                    out.append(f"{m_decl.group(1)}{m_decl.group(2)}, allocatable :: {', '.join(kept)}")
                     continue
         out.append(ln)
     return out
