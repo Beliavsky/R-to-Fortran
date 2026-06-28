@@ -37670,6 +37670,90 @@ def hoist_module_used_real_matrix_globals(lines: list[str]) -> list[str]:
     return out
 
 
+def promote_rank3_decls_from_references_text(f90: str) -> str:
+    rank3_names = {
+        m.group(1)
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\([^()\n]*,[^()\n]*,[^()\n]*\)", f90)
+    }
+    if not rank3_names:
+        return f90
+
+    def repl_decl(m: re.Match[str]) -> str:
+        prefix = m.group(1)
+        decls = m.group(2)
+        changed = False
+        out_parts: list[str] = []
+        for part in split_top_level_commas(decls):
+            p = part.strip()
+            m_item = re.fullmatch(r"([A-Za-z]\w*)\s*\(:\s*\)", p)
+            if m_item is not None and m_item.group(1) in rank3_names:
+                out_parts.append(f"{m_item.group(1)}(:,:,:)")
+                changed = True
+            else:
+                out_parts.append(p)
+        if not changed:
+            return m.group(0)
+        return prefix + ", ".join(out_parts)
+
+    return re.sub(
+        r"(?im)^(\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character\([^)]*\))\s*,\s*allocatable\s*::\s*)(.+)$",
+        repl_decl,
+        f90,
+    )
+
+
+def demote_scalar_reducer_allocatable_results_text(f90: str) -> str:
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\b.*?^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if m_res is None:
+            return block
+        res = m_res.group(1)
+        if re.search(
+            rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\)\s*$",
+            block,
+        ) is None:
+            return block
+        flat = re.sub(r"&\s*\n\s*&\s*", " ", block)
+        rank_names: set[str] = set()
+        for decl_m in re.finditer(
+            r"(?im)^\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\)|character\([^)]*\))\s*(?:,\s*[^:]*)?::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(decl_m.group(1)):
+                lhs = part.split("=", 1)[0].strip()
+                name_m = re.match(r"^([A-Za-z]\w*)\s*\(", lhs)
+                if name_m is not None and ":" in lhs:
+                    rank_names.add(name_m.group(1))
+        for ref_m in re.finditer(r"\b([A-Za-z]\w*)\s*\([^()\n]*:[^()\n]*\)", flat):
+            rank_names.add(ref_m.group(1))
+        assigns = re.findall(rf"(?m)^\s*{re.escape(res)}\s*=\s*(.+)$", flat)
+        if not assigns:
+            return block
+        for rhs in assigns:
+            rhs_s = rhs.strip()
+            if "[" in rhs_s or "]" in rhs_s:
+                return block
+            if re.search(r"\b(?:pack|reshape|spread|matrix|r_rep_|r_seq_|rbind|cbind)\s*\(", rhs_s, re.IGNORECASE):
+                return block
+            if re.search(r"\b(?:sum|maxval|minval|dot_product|size|count|sd|var|mean)\s*\(", rhs_s, re.IGNORECASE) is None:
+                return block
+            if _array_refs_outside_scalar_reductions(rhs_s, rank_names):
+                return block
+        return re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\)\s*$",
+            rf"\1real(kind=dp) :: {res}",
+            block,
+            count=1,
+        )
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def promote_logical_function_result_assignments(lines: list[str]) -> list[str]:
     logical_funcs: set[str] = set()
     current_fn: str | None = None
@@ -40495,14 +40579,23 @@ def demote_elemental_allocatable_result_functions_text(f90: str) -> str:
     i = 0
     while i < len(lines):
         m_head = re.match(
-            r"^(\s*pure\s+)elemental\s+((?:recursive\s+)?function\s+[A-Za-z]\w*\s*\([^)]*\)\s*result\s*\(\s*([A-Za-z]\w*)\s*\).*)$",
+            r"^(\s*pure\s+)elemental\s+((?:recursive\s+)?function\s+[A-Za-z]\w*\s*\([^)]*\).*)$",
             lines[i],
             re.IGNORECASE,
         )
         if m_head is None:
             i += 1
             continue
-        result_name = m_head.group(3)
+        header_text = lines[i]
+        k = i + 1
+        while "result" not in header_text.lower() and k < len(lines) and lines[k - 1].rstrip().endswith("&"):
+            header_text += " " + lines[k].lstrip("&").strip()
+            k += 1
+        m_result = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", header_text, re.IGNORECASE)
+        if m_result is None:
+            i += 1
+            continue
+        result_name = m_result.group(1)
         j = i + 1
         has_alloc_result = False
         while j < len(lines):
@@ -40515,9 +40608,10 @@ def demote_elemental_allocatable_result_functions_text(f90: str) -> str:
             )
             if m_decl is not None:
                 has_alloc_result = True
-                out[j] = f"{m_decl.group(1)}{m_decl.group(2)} :: {result_name}"
                 break
             j += 1
+        if has_alloc_result:
+            out[i] = re.sub(r"^(\s*pure\s+)elemental\s+", r"\1", out[i], count=1, flags=re.IGNORECASE)
         i = max(j + 1, i + 1)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
@@ -41250,11 +41344,18 @@ def promote_scalar_pure_functions_to_elemental_text(f90: str) -> str:
             return block
         if not re.search(r"^\s*pure\s+function\b", first, re.IGNORECASE):
             return block
-        m_args = re.match(r"^\s*pure\s+function\s+([A-Za-z]\w*)\s*\(([^)]*)\)", first, re.IGNORECASE)
+        header_lines: list[str] = []
+        for header_ln in block.splitlines()[:6]:
+            header_lines.append(header_ln)
+            if re.search(r"\bresult\s*\(", header_ln, re.IGNORECASE):
+                break
+        header_flat = re.sub(r"&\s*\n\s*&?\s*", " ", "\n".join(header_lines))
+        header_flat = re.sub(r"\s+", " ", header_flat).strip()
+        m_args = re.match(r"^\s*pure\s+function\s+([A-Za-z]\w*)\s*\(([^)]*)\)", header_flat, re.IGNORECASE)
         if m_args is None:
             return block
         fn_name = m_args.group(1)
-        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", first, re.IGNORECASE)
+        m_res = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", header_flat, re.IGNORECASE)
         if m_res is not None:
             res_name = m_res.group(1)
             m_res_decl = re.search(
@@ -46512,8 +46613,12 @@ def main() -> int:
     )
     if "call print_real_vector(" in f90:
         f90 = "\n".join(balance_print_real_vector_calls(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = promote_scalar_pure_functions_to_elemental_text(f90)
+    f90 = demote_elemental_allocatable_result_functions_text(f90)
+    f90 = demote_scalar_reducer_allocatable_results_text(f90)
     f90_lines = hoist_module_used_real_matrix_globals(f90.splitlines())
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = promote_rank3_decls_from_references_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
