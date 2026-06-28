@@ -33,6 +33,7 @@ import fortran_scan as fscan
 
 _HAS_R_MOD = False
 _FORTRAN_COMMENTS = True
+EMIT_PRIVATE_MODULE_PUBLICS = True
 _RAW_FORTRAN_TAG = "xr2f_raw_fortran"
 _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
@@ -444,7 +445,10 @@ def helper_modules_from_files(paths: list[Path]) -> set[str]:
 
 
 def _wrapped_public_line(names: set[str]) -> list[str]:
-    vals = sorted(names)
+    unique: dict[str, str] = {}
+    for nm in sorted(names):
+        unique.setdefault(nm.lower(), nm)
+    vals = list(unique.values())
     if not vals:
         return []
     out: list[str] = []
@@ -458,6 +462,273 @@ def _wrapped_public_line(names: set[str]) -> list[str]:
             cur += piece
     out.append(cur)
     return out
+
+
+def add_private_publics_to_generated_modules_text(f90: str) -> str:
+    """Make generated modules private by default and publicize used module entities."""
+    if not EMIT_PRIVATE_MODULE_PUBLICS:
+        return f90
+    lines = f90.splitlines()
+    modules: list[dict[str, object]] = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^\s*module\s+([A-Za-z]\w*)\s*$", lines[i], re.IGNORECASE)
+        if m is None:
+            i += 1
+            continue
+        mod_name = m.group(1)
+        if mod_name.lower() == "r_mod":
+            i += 1
+            continue
+        end_i = next((j for j in range(i + 1, len(lines)) if re.match(r"^\s*end\s+module\b", lines[j], re.IGNORECASE)), -1)
+        if end_i < 0:
+            i += 1
+            continue
+        contains_i = next((j for j in range(i + 1, end_i) if re.match(r"^\s*contains\s*$", lines[j], re.IGNORECASE)), end_i)
+        modules.append({"name": mod_name, "start": i, "contains": contains_i, "end": end_i})
+        i = end_i + 1
+    if not modules:
+        return f90
+
+    text = "\n".join(lines)
+    first_program_i = next((j for j, ln in enumerate(lines) if re.match(r"^\s*program\b", ln, re.IGNORECASE)), len(lines))
+    program_text = "\n".join(lines[first_program_i:])
+    used_by_module: dict[str, set[str]] = {}
+    for mod in modules:
+        mod_name = str(mod["name"])
+        used: set[str] = set()
+        for um in re.finditer(rf"(?im)^\s*use\s+{re.escape(mod_name)}\s*(?:,\s*only\s*:\s*(.*))?$", text):
+            only = (um.group(1) or "").strip()
+            if only:
+                for part in split_top_level_commas(only):
+                    nm = part.split("=>", 1)[-1].strip()
+                    if re.match(r"^[A-Za-z]\w*$", nm):
+                        used.add(nm)
+        used_by_module[mod_name.lower()] = used
+
+    out = list(lines)
+    offset = 0
+    for mod in modules:
+        mod_name = str(mod["name"])
+        start = int(mod["start"]) + offset
+        contains = int(mod["contains"]) + offset
+        end = int(mod["end"]) + offset
+        header_range = out[start + 1 : contains]
+        if any(re.match(r"^\s*private\s*$", ln, re.IGNORECASE) for ln in header_range):
+            continue
+        public_names = set(used_by_module.get(mod_name.lower(), set()))
+        for ln in out[contains + 1 : end]:
+            fm = re.match(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+            if fm is not None:
+                public_names.add(fm.group(1))
+        for ln in header_range:
+            tm = re.match(r"^\s*type\s*(?:,\s*[^:]*)?::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+            if tm is not None:
+                public_names.add(tm.group(1))
+            pm = re.match(r"^\s*(?:integer|real\s*\([^)]*\)|logical|complex\s*\([^)]*\)|character\s*\([^)]*\))\s*,\s*parameter\s*::\s*(.+)$", ln, re.IGNORECASE)
+            if pm is not None:
+                for part in split_top_level_commas(pm.group(1)):
+                    nm_m = re.match(r"\s*([A-Za-z]\w*)\b", part)
+                    if nm_m is not None:
+                        public_names.add(nm_m.group(1))
+        header_top_level = re.sub(
+            r"(?ims)^\s*type(?:\s*,[^:]*)?\s*::\s*[A-Za-z]\w*\b.*?^\s*end\s+type\b[^\n]*",
+            "",
+            "\n".join(header_range),
+        )
+        flat_header = re.sub(r"&\s*\n\s*&?\s*", " ", header_top_level)
+        for dm in re.finditer(
+            r"(?im)^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*(?:\([^)]*\))?)(?:\s*,\s*[^:]*)?::\s*(.+)$",
+            flat_header,
+        ):
+            if re.search(r"\bparameter\b", dm.group(0), re.IGNORECASE):
+                continue
+            for part in split_top_level_commas(dm.group(1)):
+                nm_m = re.match(r"\s*([A-Za-z]\w*)\b", part)
+                if nm_m is None:
+                    continue
+                nm = nm_m.group(1)
+                if re.search(rf"\b{re.escape(nm)}\b", program_text):
+                    public_names.add(nm)
+        insert_at = start + 1
+        while insert_at < contains:
+            line = out[insert_at]
+            if re.match(r"^\s*use\b", line, re.IGNORECASE):
+                insert_at += 1
+                while insert_at < contains and out[insert_at - 1].rstrip().endswith("&"):
+                    insert_at += 1
+                continue
+            if re.match(r"^\s*implicit\s+none\b", line, re.IGNORECASE):
+                insert_at += 1
+                continue
+            if line.lstrip().startswith("&"):
+                insert_at += 1
+                continue
+            break
+        insert_lines = ["private"] + _wrapped_public_line(public_names)
+        out[insert_at:insert_at] = insert_lines
+        offset += len(insert_lines)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def declare_missing_matrix_aliases_text(f90: str) -> str:
+    """Declare simple matrix aliases assigned from already-declared matrices."""
+    lines = f90.splitlines()
+    out = list(lines)
+    i = 0
+    offset = 0
+    while i < len(lines):
+        start_m = re.match(r"^\s*(?:program|(?:pure\s+|elemental\s+|recursive\s+)*function|subroutine)\b", lines[i], re.IGNORECASE)
+        if start_m is None:
+            i += 1
+            continue
+        end_i = next((j for j in range(i + 1, len(lines)) if re.match(r"^\s*end\s+(?:program|function|subroutine)\b", lines[j], re.IGNORECASE)), -1)
+        if end_i < 0:
+            i += 1
+            continue
+        block = "\n".join(lines[i:end_i + 1])
+        flat_block = re.sub(r"&\s*\n\s*&?\s*", " ", block)
+        matrix_names: set[str] = set()
+        declared: set[str] = set()
+        for dm in re.finditer(
+            r"(?im)^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*(?:\([^)]*\))?|type\s*\([^)]*\))[^:]*::\s*(.+)$",
+            flat_block,
+        ):
+            for item in split_top_level_commas(dm.group(1)):
+                nm_m = re.match(r"\s*([A-Za-z]\w*)", item)
+                if nm_m is not None:
+                    declared.add(nm_m.group(1).lower())
+                if re.search(r"\(:\s*,\s*:\)", item):
+                    if nm_m is not None:
+                        matrix_names.add(nm_m.group(1))
+        first_exec = end_i
+        for j in range(i + 1, end_i):
+            ln = lines[j]
+            if "::" in ln:
+                for item in split_top_level_commas(ln.split("::", 1)[1]):
+                    nm_m = re.match(r"\s*([A-Za-z]\w*)", item)
+                    if nm_m is not None:
+                        declared.add(nm_m.group(1).lower())
+                    if re.search(r"\(:\s*,\s*:\)", item):
+                        if nm_m is not None:
+                            matrix_names.add(nm_m.group(1))
+                continue
+            if ln.lstrip().startswith("&"):
+                continue
+            if re.match(r"^\s*(?:use\b|implicit\s+none\b|public\b|private\b|contains\b|interface\b|end\s+interface\b|module\s+procedure\b|!)", ln, re.IGNORECASE):
+                continue
+            if ln.strip() == "":
+                continue
+            first_exec = j
+            break
+        missing: list[str] = []
+        matrix_l = {nm.lower() for nm in matrix_names}
+        for am in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$", block):
+            lhs = am.group(1)
+            rhs = am.group(2)
+            if lhs.lower() not in declared and rhs.lower() in matrix_l:
+                missing.append(lhs)
+                declared.add(lhs.lower())
+        if missing:
+            out.insert(first_exec + offset, "real(kind=dp), allocatable :: " + ", ".join(f"{nm}(:,:)" for nm in missing))
+            offset += 1
+        i = end_i + 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def remove_program_decls_for_public_module_vars_text(f90: str) -> str:
+    """Remove program declarations that duplicate public module variables."""
+    lines = f90.splitlines()
+    module_vars_by_mod: dict[str, set[str]] = {}
+    i = 0
+    while i < len(lines):
+        mm = re.match(r"^\s*module\s+([A-Za-z]\w*)\s*$", lines[i], re.IGNORECASE)
+        if mm is None:
+            i += 1
+            continue
+        mod_name = mm.group(1)
+        end_i = next((j for j in range(i + 1, len(lines)) if re.match(r"^\s*end\s+module\b", lines[j], re.IGNORECASE)), -1)
+        contains_i = next((j for j in range(i + 1, end_i if end_i >= 0 else len(lines)) if re.match(r"^\s*contains\s*$", lines[j], re.IGNORECASE)), -1)
+        if end_i < 0 or contains_i < 0:
+            i += 1
+            continue
+        header = "\n".join(lines[i + 1 : contains_i])
+        public_names: set[str] = set()
+        flat_header = re.sub(r"&\s*\n\s*&?\s*", " ", header)
+        for pm in re.finditer(r"(?im)^\s*public\s*::\s*(.+)$", flat_header):
+            for part in split_top_level_commas(pm.group(1)):
+                nm = part.strip()
+                if re.match(r"^[A-Za-z]\w*$", nm):
+                    public_names.add(nm.lower())
+        header_top_level = re.sub(
+            r"(?ims)^\s*type(?:\s*,[^:]*)?\s*::\s*[A-Za-z]\w*\b.*?^\s*end\s+type\b[^\n]*",
+            "",
+            header,
+        )
+        flat_top = re.sub(r"&\s*\n\s*&?\s*", " ", header_top_level)
+        module_vars: set[str] = set()
+        for dm in re.finditer(
+            r"(?im)^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*(?:\([^)]*\))?)(?:\s*,\s*[^:]*)?::\s*(.+)$",
+            flat_top,
+        ):
+            if re.search(r"\bparameter\b", dm.group(0), re.IGNORECASE):
+                continue
+            for part in split_top_level_commas(dm.group(1)):
+                nm_m = re.match(r"\s*([A-Za-z]\w*)\b", part)
+                if nm_m is not None and nm_m.group(1).lower() in public_names:
+                    module_vars.add(nm_m.group(1).lower())
+        if module_vars:
+            module_vars_by_mod[mod_name.lower()] = module_vars
+        i = end_i + 1
+    if not module_vars_by_mod:
+        return f90
+
+    prog_i = next((j for j, ln in enumerate(lines) if re.match(r"^\s*program\b", ln, re.IGNORECASE)), -1)
+    if prog_i < 0:
+        return f90
+    visible_vars: set[str] = set()
+    for ln in lines[prog_i:]:
+        um = re.match(r"^\s*use\s+([A-Za-z]\w*)\s*(?:,\s*only\s*:\s*(.*))?$", ln, re.IGNORECASE)
+        if um is None:
+            continue
+        mod_vars = module_vars_by_mod.get(um.group(1).lower(), set())
+        if not mod_vars:
+            continue
+        only = (um.group(2) or "").strip()
+        if only:
+            only_names = {p.split("=>", 1)[-1].strip().lower() for p in split_top_level_commas(only)}
+            visible_vars.update(mod_vars & only_names)
+        else:
+            visible_vars.update(mod_vars)
+    if not visible_vars:
+        return f90
+
+    out: list[str] = []
+    for j, ln in enumerate(lines):
+        if j < prog_i:
+            out.append(ln)
+            continue
+        m_decl = re.match(
+            r"^(\s*)((?:real|complex)\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|character\s*\([^)]*\))(\s*,\s*[^:]*)?::\s*(.+)$",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_decl is None:
+            out.append(ln)
+            continue
+        kept: list[str] = []
+        parts = split_top_level_commas(m_decl.group(4))
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base.lower() not in visible_vars:
+                kept.append(part.strip())
+        if not kept:
+            continue
+        if len(kept) != len(parts):
+            out.append(f"{m_decl.group(1)}{m_decl.group(2)}{m_decl.group(3) or ''}:: {', '.join(kept)}")
+        else:
+            out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def _r_mod_needed_public_names(f90: str) -> set[str]:
@@ -26458,6 +26729,7 @@ def transpile_r_to_fortran(
     src: str,
     stem: str,
     helper_modules: set[str] | None = None,
+    external_procedures: dict[str, str] | None = None,
     int_like_print: bool = True,
     no_recycle: bool = False,
     recycle_warn: bool = False,
@@ -26561,6 +26833,10 @@ def transpile_r_to_fortran(
         )
 
     funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    external_procedures = {k.lower(): v for k, v in (external_procedures or {}).items()}
+    external_func_names_l = {f.name.lower() for f in funcs if f.name.lower() in external_procedures}
+    if external_func_names_l:
+        funcs = [f for f in funcs if f.name.lower() not in external_func_names_l]
     program_name = unit_name
     if unit_name.lower() in {f.name.lower() for f in funcs}:
         used_program_names = {f.name.lower() for f in funcs} | {module_name.lower()}
@@ -31378,6 +31654,18 @@ def transpile_r_to_fortran(
         main_needed.add("set_recycle_stop")
     mod_text_now = "\n".join(mprocs.lines)
     main_text_now = "\n".join(pbody.lines)
+    def _external_import_lines(text: str) -> list[str]:
+        by_mod: dict[str, list[str]] = {}
+        for proc_l, mod_name_ext in external_procedures.items():
+            if re.search(rf"\b{re.escape(proc_l)}\s*\(", text, re.IGNORECASE):
+                by_mod.setdefault(mod_name_ext, []).append(proc_l)
+        return [
+            f"use {mod_name_ext}, only: " + ", ".join(sorted(names))
+            for mod_name_ext, names in sorted(by_mod.items())
+        ]
+
+    external_mod_use_lines = _external_import_lines(mod_text_now)
+    external_main_use_lines = _external_import_lines(main_text_now)
     ieee_pat = re.compile(r"\bieee_(?:is_finite|value|quiet_nan)\b", re.IGNORECASE)
     mod_decl_text = " ".join(params.values()) + " " + " ".join(v[2] for v in array_params.values()) + " " + " ".join(
         promoted_params.values()
@@ -31473,6 +31761,8 @@ def transpile_r_to_fortran(
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
     if ("r_mod" in helper_modules) and mod_needed:
         o.w("use r_mod, only: " + _render_r_mod_only(mod_needed))
+    for use_ln in external_mod_use_lines:
+        o.w(use_ln)
     o.w("implicit none")
     if need_pi_mod:
         o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
@@ -31892,6 +32182,8 @@ def transpile_r_to_fortran(
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
             o.w("use r_mod, only: " + _render_r_mod_only(main_needed))
+        for use_ln in external_main_use_lines:
+            o.w(use_ln)
         o.w("implicit none")
         o.lines.extend(pbody.lines)
         o.w(f"end program {program_name}")
@@ -31917,6 +32209,8 @@ def transpile_r_to_fortran(
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
         if ("r_mod" in helper_modules) and main_needed:
             o.w("use r_mod, only: " + _render_r_mod_only(main_needed))
+        for use_ln in external_main_use_lines:
+            o.w(use_ln)
         o.w("implicit none")
         if main_needs_pi:
             o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
@@ -43737,6 +44031,22 @@ def _split_module_program_source(src_path: Path, work_dir: Path) -> tuple[Path, 
     return mod_path, prog_path
 
 
+def _split_module_program_text(f90: str) -> tuple[str, str] | None:
+    lines = f90.splitlines()
+    end_idx: int | None = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*end\s+module\b", line, re.IGNORECASE):
+            end_idx = i
+            break
+    if end_idx is None:
+        return None
+    if not any(re.match(r"^\s*program\b", line, re.IGNORECASE) for line in lines[end_idx + 1 :]):
+        return None
+    mod_text = "\n".join(lines[: end_idx + 1]) + "\n"
+    prog_text = "\n".join(lines[end_idx + 1 :]) + "\n"
+    return mod_text, prog_text
+
+
 def _include_dirs_without_j(include_dirs: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
@@ -43760,6 +44070,53 @@ def _module_names_in_source(src_path: Path) -> list[str]:
         if m is not None:
             names.append(m.group(1))
     return names
+
+
+def _scan_external_fortran_modules(src_path: Path) -> tuple[dict[str, str], str | None]:
+    """Return sanitized public procedure -> module for supported external module files."""
+    try:
+        text = src_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        return {}, str(exc)
+    if re.search(r"(?im)^\s*program\s+[A-Za-z]\w*\b", text):
+        return {}, f"external Fortran source {src_path} contains a main program; only module files are supported"
+    modules = list(re.finditer(r"(?im)^\s*module\s+([A-Za-z]\w*)\s*$", text))
+    if not modules:
+        if re.search(r"(?im)^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+[A-Za-z]\w*\b", text):
+            return {}, f"external Fortran source {src_path} contains top-level procedures; put reusable procedures in a module"
+        return {}, f"external Fortran source {src_path} contains no module"
+    spans: list[tuple[int, int, str]] = []
+    for m in modules:
+        mod_name = m.group(1)
+        end_m = re.search(rf"(?im)^\s*end\s+module(?:\s+{re.escape(mod_name)})?\s*$", text[m.end() :])
+        if end_m is None:
+            return {}, f"external Fortran source {src_path} has unterminated module {mod_name}"
+        spans.append((m.start(), m.end() + end_m.end(), mod_name))
+    top = text
+    for start, end, _mod_name in sorted(spans, reverse=True):
+        top = top[:start] + "\n" + top[end:]
+    if re.search(r"(?im)^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+[A-Za-z]\w*\b", top):
+        return {}, f"external Fortran source {src_path} contains top-level procedures; put reusable procedures in a module"
+
+    provided: dict[str, str] = {}
+    for start, end, mod_name in spans:
+        block = text[start:end]
+        private_default = re.search(r"(?im)^\s*private\s*$", block) is not None
+        public_names: set[str] = set()
+        for pub in re.finditer(r"(?im)^\s*public\s*(?:::)?\s*(.*)$", block):
+            names = pub.group(1).strip()
+            if names:
+                public_names.update(n.strip().lower() for n in split_top_level_commas(names) if re.match(r"^[A-Za-z]\w*$", n.strip()))
+        contains = re.search(r"(?im)^\s*contains\s*$", block)
+        if contains is None:
+            continue
+        body = block[contains.end() :]
+        for pm in re.finditer(r"(?im)^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\s+([A-Za-z]\w*)\b", body):
+            proc = pm.group(1)
+            if private_default and proc.lower() not in public_names:
+                continue
+            provided[proc.lower()] = mod_name
+    return provided, None
 
 
 def _sha256_file(path: Path) -> str:
@@ -44783,6 +45140,11 @@ def main() -> int:
     ap.add_argument("--out", help="output .f90 path (default: <input>_r.f90)")
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
     ap.add_argument(
+        "--split-module",
+        action="store_true",
+        help="write generated module code to <output-stem>_mod.f90 and the main program to the output file",
+    )
+    ap.add_argument(
         "--partial",
         action="store_true",
         help="translate the R functions that can be translated into one Fortran module and report skipped functions",
@@ -45153,7 +45515,11 @@ def main() -> int:
     if not in_path.exists():
         print(f"Missing file: {in_path}")
         return 1
-    helper_paths = [Path(h) for h in args.helpers]
+    helper_args = [Path(h) for h in args.helpers]
+    positional_out: Path | None = None
+    if not args.out and helper_args and helper_args[0].suffix.lower() == ".f90" and not helper_args[0].exists():
+        positional_out = helper_args.pop(0)
+    helper_paths = list(helper_args)
 
     def _same_path(a: Path, b: Path) -> bool:
         try:
@@ -45165,6 +45531,18 @@ def main() -> int:
     if default_r_helper.exists() and not any(_same_path(default_r_helper, hp) for hp in helper_paths):
         helper_paths.insert(0, default_r_helper)
 
+    user_helper_paths = [hp for hp in helper_paths if not _same_path(default_r_helper, hp)]
+    external_procedures: dict[str, str] = {}
+    for hp in user_helper_paths:
+        if hp.suffix.lower() != ".f90":
+            print(f"Unsupported helper file: {hp}; external helpers must be .f90 module files")
+            return 1
+        provided, err = _scan_external_fortran_modules(hp)
+        if err is not None:
+            print(f"Error: {err}")
+            return 1
+        external_procedures.update(provided)
+
     for hp in helper_paths:
         if not hp.exists():
             print(f"Missing helper file: {hp}")
@@ -45175,6 +45553,11 @@ def main() -> int:
             out_path = Path(args.out_dir) / out_cand
         else:
             out_path = out_cand
+    elif positional_out is not None:
+        if args.out_dir and not positional_out.is_absolute():
+            out_path = Path(args.out_dir) / positional_out
+        else:
+            out_path = positional_out
     else:
         out_path = (Path(args.out_dir) / f"{in_path.stem}_r.f90") if args.out_dir else in_path.with_name(f"{in_path.stem}_r.f90")
     out_path = out_path.resolve()
@@ -45567,6 +45950,7 @@ def main() -> int:
                 src,
                 in_path.stem,
                 helper_modules=helper_modules,
+                external_procedures=external_procedures,
                 int_like_print=(not args.disp_real),
                 no_recycle=args.no_recycle,
                 recycle_warn=args.recycle_warn,
@@ -46043,6 +46427,14 @@ def main() -> int:
         f90,
         flags=re.IGNORECASE,
     )
+    f90 = re.sub(
+        r"(?ims)^(\s*good_z\s*=\s*all\s*\(\s*ieee_is_finite\s*\(\s*([A-Za-z]\w*)\s*\)\s*,\s*dim\s*=\s*2\s*\)\s*\n)"
+        r"\s*do\s+([A-Za-z]\w*)\s*=\s*1\s*,\s*size\s*\(\s*\2\s*,\s*2\s*\)\s*\n"
+        r"\s*good_z\s*=\s*good_z\s*\.and\.\s*ieee_is_finite\s*\(\s*\2\s*\(:\s*,\s*\3\s*\)\s*\)\s*\n"
+        r"\s*end\s+do\s*\n",
+        r"\1",
+        f90,
+    )
     f90 = re.sub(r"\bQt_\d+\b", "Qt", f90)
     f90 = re.sub(
         r"\bQt\(:\s*,\s*:\),\s*Qt\(:\s*,\s*:\)",
@@ -46379,6 +46771,8 @@ def main() -> int:
         extra_use_names.append("r_matrix_row_filter")
     if "r_matrix_col_filter(" in f90:
         extra_use_names.append("r_matrix_col_filter")
+    if "replace(" in f90:
+        extra_use_names.append("replace")
     if "which_first(" in f90:
         extra_use_names.append("which_first")
     if "which_last(" in f90:
@@ -46703,13 +47097,29 @@ def main() -> int:
     f90_lines = hoist_module_used_real_matrix_globals(f90.splitlines())
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = promote_rank3_decls_from_references_text(f90)
+    f90 = declare_missing_matrix_aliases_text(f90)
+    f90 = add_private_publics_to_generated_modules_text(f90)
+    f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
         if hp.name.lower() != "r.f90" or uses_r_mod
     ]
-    out_path.write_text(f90, encoding="utf-8")
+    split_module_path: Path | None = None
+    if args.split_module:
+        split_text = _split_module_program_text(f90)
+        if split_text is not None:
+            split_module_path = out_path.with_name(f"{out_path.stem}_mod.f90")
+            mod_text, prog_text = split_text
+            split_module_path.write_text(mod_text, encoding="utf-8")
+            out_path.write_text(prog_text, encoding="utf-8")
+        else:
+            out_path.write_text(f90, encoding="utf-8")
+    else:
+        out_path.write_text(f90, encoding="utf-8")
     timings["transpile"] = time.perf_counter() - t0
+    if split_module_path is not None:
+        print(f"wrote {split_module_path}")
     print(f"wrote {out_path}")
 
     if args.tee_both:
@@ -46781,6 +47191,104 @@ def main() -> int:
                     stale_mod.unlink()
                 except FileNotFoundError:
                     pass
+        module_name_sources = [out_path]
+        if split_module_path is not None:
+            module_name_sources.insert(0, split_module_path)
+        for module_name_source in module_name_sources:
+            for mod_name in _module_names_in_source(module_name_source):
+                for stale_mod in (artifact_dir / f"{mod_name.lower()}.mod", artifact_dir / f"{mod_name.upper()}.mod"):
+                    try:
+                        stale_mod.unlink()
+                    except FileNotFoundError:
+                        pass
+        if (args.debug or split_module_path is not None):
+            split_dir = artifact_dir / f".{out_path.stem}_debug_mod" if args.debug else artifact_dir
+            split_dir.mkdir(exist_ok=True)
+            if split_module_path is not None:
+                split_src = (split_module_path, out_path)
+            else:
+                split_src = _split_module_program_source(out_path, split_dir)
+            if split_src is not None:
+                mod_src, prog_src = split_src
+                mod_obj = split_dir / f"{out_path.stem}_modpart.o"
+                prog_obj = split_dir / f"{out_path.stem}_progpart.o"
+                split_includes = (
+                    _fortran_module_output_flags(cparts, split_dir)
+                    + _fortran_module_include_flags(cparts, split_dir)
+                    + _include_dirs_without_j(include_dirs)
+                )
+                mod_cmd = cparts + split_includes + ["-c", str(mod_src), "-o", str(mod_obj)]
+                print("Build module:", " ".join(mod_cmd))
+                cp_mod = _run_capture(mod_cmd, cwd=split_dir)
+                if cp_mod.returncode != 0:
+                    timings["compile"] = time.perf_counter() - t0
+                    print(f"Build: FAIL (exit {cp_mod.returncode})")
+                    _print_captured(cp_mod)
+                    return cp_mod.returncode
+                prog_cmd = cparts + split_includes + ["-c", str(prog_src), "-o", str(prog_obj)]
+                print("Build program:", " ".join(prog_cmd))
+                cp_prog = _run_capture(prog_cmd, cwd=split_dir)
+                if cp_prog.returncode != 0:
+                    timings["compile"] = time.perf_counter() - t0
+                    print(f"Build: FAIL (exit {cp_prog.returncode})")
+                    _print_captured(cp_prog)
+                    return cp_prog.returncode
+                link_cmd = cparts + build_helpers + [str(mod_obj), str(prog_obj)] + r_rng_ldflags
+                if args.run:
+                    link_cmd += ["-o", str(exe)]
+                print("Build:", " ".join(link_cmd))
+                cp_link = _run_capture(link_cmd, cwd=split_dir)
+                timings["compile"] = time.perf_counter() - t0
+                if cp_link.returncode != 0:
+                    print(f"Build: FAIL (exit {cp_link.returncode})")
+                    _print_captured(cp_link)
+                    return cp_link.returncode
+                print("Build: PASS")
+
+                if args.run:
+                    t0 = time.perf_counter()
+                    fruns = []
+                    frun_times = []
+                    for _ in range(args.run_repeat):
+                        t_run = time.perf_counter()
+                        fruns.append(_run_capture([str(exe.resolve())], cwd=run_cwd))
+                        frun_times.append(time.perf_counter() - t_run)
+                    frun = fruns[0]
+                    timings["fortran_run"] = time.perf_counter() - t0
+                    if args.run_repeat != 1:
+                        timings["fortran_run_mean"], timings["fortran_run_sd"] = _mean_sd(frun_times)
+                    failed_frun = next((ff for ff in fruns if ff.returncode != 0), None)
+                    if failed_frun is not None:
+                        print(f"Run: FAIL (exit {failed_frun.returncode})")
+                        _print_captured(
+                            failed_frun,
+                            normalize_num_output=args.normalize_num_output,
+                            pretty=args.pretty,
+                            round_digits=fortran_round_digits,
+                            trim_zero_decimals=args.trim_zero_decimals,
+                            strip_quotes=args.strip_quotes,
+                            strip_r_indices=args.pretty,
+                            wrap_out=args.wrap_out,
+                        )
+                        return failed_frun.returncode
+                    print("Run: PASS")
+                    if args.run_repeat == 1 or args.verbose_runs:
+                        for idx, one_run in enumerate(fruns, start=1):
+                            if args.run_repeat != 1:
+                                print(f"Run #{idx}:")
+                            _print_captured(
+                                one_run,
+                                normalize_num_output=args.normalize_num_output,
+                                pretty=args.pretty,
+                                round_digits=fortran_round_digits,
+                                trim_zero_decimals=args.trim_zero_decimals,
+                                strip_quotes=args.strip_quotes,
+                                strip_r_indices=args.pretty,
+                                wrap_out=args.wrap_out,
+                            )
+                if args.time:
+                    _print_timings(timings)
+                return 0
         for mod_name in _module_names_in_source(out_path):
             for stale_mod in (artifact_dir / f"{mod_name.lower()}.mod", artifact_dir / f"{mod_name.upper()}.mod"):
                 try:
