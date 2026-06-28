@@ -6530,7 +6530,53 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
         return out
 
     def rexpr(expr: str) -> str:
-        return _replace_obfuscated_idents(replace_user_call_keywords(expr), mapping)
+        formula_placeholders: list[str] = []
+
+        def protect_formula_calls(src: str) -> str:
+            formula_calls = {
+                "xtabs",
+                "lm",
+                "glm",
+                "aov",
+                "loess",
+                "kruskal.test",
+                "kruskal_test",
+            }
+
+            def mask_formula_arg(arg: str) -> str:
+                formula_placeholders.append(arg)
+                return f"__XR2F_OBF_FORMULA_{len(formula_placeholders) - 1}__"
+
+            out_formula = src
+            for fn in sorted(formula_calls, key=len, reverse=True):
+                def repl(inner: str, fn: str = fn) -> str:
+                    parts = split_top_level_commas(inner)
+                    changed = False
+                    new_parts: list[str] = []
+                    for i_part, part in enumerate(parts):
+                        m_kw = re.match(r"^(\s*formula\s*=\s*)(.+)$", part, re.IGNORECASE | re.DOTALL)
+                        if m_kw is not None and _split_top_level_token(m_kw.group(2), "~", from_right=False) is not None:
+                            new_parts.append(m_kw.group(1) + mask_formula_arg(m_kw.group(2)))
+                            changed = True
+                            continue
+                        if i_part == 0 and _split_top_level_token(part, "~", from_right=False) is not None:
+                            new_parts.append(mask_formula_arg(part))
+                            changed = True
+                        else:
+                            new_parts.append(part)
+                    return f"{fn}({', '.join(new_parts)})" if changed else f"{fn}({inner})"
+
+                out_formula = _replace_balanced_func_calls(out_formula, fn, repl)
+            return out_formula
+
+        def restore_formula_calls(src: str) -> str:
+            out_restore = src
+            for i_formula, formula in enumerate(formula_placeholders):
+                out_restore = out_restore.replace(f"__XR2F_OBF_FORMULA_{i_formula}__", formula)
+            return out_restore
+
+        protected = protect_formula_calls(replace_user_call_keywords(expr))
+        return restore_formula_calls(_replace_obfuscated_idents(protected, mapping))
 
     def walk(st: object) -> object:
         if isinstance(st, Assign):
@@ -10339,6 +10385,14 @@ def r_expr_to_fortran(expr: str) -> str:
                 return max(arg_ranks or [0])
         return 0
 
+    for op_l, op_f in [("||", ".or."), ("&&", ".and."), ("|", ".or."), ("&", ".and.")]:
+        mm_logical_early = _split_top_level_token(s, op_l, from_right=True)
+        if mm_logical_early is not None:
+            lhs_src = mm_logical_early[0].strip()
+            rhs_src = mm_logical_early[1].strip()
+            if lhs_src and rhs_src:
+                return f"{r_expr_to_fortran(lhs_src)} {op_f} {r_expr_to_fortran(rhs_src)}"
+
     for op_r, op_f in [("==", "=="), ("!=", "/="), (">=", ">="), ("<=", "<="), (">", ">"), ("<", "<")]:
         mm_cmp_early = _split_top_level_token(s, op_r, from_right=True)
         if mm_cmp_early is not None:
@@ -12062,6 +12116,13 @@ def r_expr_to_fortran(expr: str) -> str:
             or _real_vector_constructor_from_mixed_c(data_src.strip())
             or r_expr_to_fortran(data_src)
         )
+        scalar_fill = (
+            not data_f.strip().startswith("[")
+            and not re.match(r"^[A-Za-z]\w*\s*\(", data_f.strip())
+            and data_f.strip().lower() not in _KNOWN_VECTOR_NAMES
+            and data_f.strip().lower() not in _KNOWN_MATRIX_NAMES
+        )
+        scalar_data_f = data_f
         if data_f.strip().startswith("ieee_value("):
             data_f = f"[{data_f}]"
         elif not (
@@ -12086,6 +12147,8 @@ def r_expr_to_fortran(expr: str) -> str:
             else:
                 nc_f = _int_bound_expr(r_expr_to_fortran(nc_src))
         if _HAS_R_MOD and not byrow_true:
+            if scalar_fill and nr_src is not None and nc_src is not None:
+                return f"spread(spread({scalar_data_f}, dim=1, ncopies={nr_f}), dim=2, ncopies={nc_f})"
             return f"matrix({data_f}, {nr_f}, {nc_f})"
         if byrow_true:
             return f"transpose(reshape({data_f}, [{nc_f}, {nr_f}], pad={data_f}))"
@@ -16952,6 +17015,13 @@ def emit_stmts(
                         or _real_vector_constructor_from_mixed_c(data_src.strip())
                         or r_expr_to_fortran(data_src)
                     )
+                    scalar_fill = (
+                        not data_f.strip().startswith("[")
+                        and not re.match(r"^[A-Za-z]\w*\s*\(", data_f.strip())
+                        and data_f.strip().lower() not in _KNOWN_VECTOR_NAMES
+                        and data_f.strip().lower() not in _KNOWN_MATRIX_NAMES
+                    )
+                    scalar_data_f = data_f
                     data_size_f = data_f
                     data_cast = parse_call_text(data_src.strip())
                     if data_cast is not None and data_cast[0].lower() == "as.double" and data_cast[1]:
@@ -16994,8 +17064,18 @@ def emit_stmts(
                         data_f = f"[{data_f}]"
                     if st.name in real_matrix_vars:
                         data_f = _coerce_array_constructor_real(data_f)
+                        if scalar_fill:
+                            scalar_data_f = _coerce_array_constructor_real(f"[{scalar_data_f}]").strip()
+                            if scalar_data_f.startswith("[") and scalar_data_f.endswith("]"):
+                                scalar_data_f = scalar_data_f[1:-1].strip()
                     byrow_true = str(byrow_src).strip().upper() in {"TRUE", ".TRUE.", "T", "1"} if byrow_src is not None else False
                     if has_r_mod and not byrow_true:
+                        if scalar_fill and nrow_src is not None and ncol_src is not None:
+                            _wstmt(
+                                f"{st.name} = spread(spread({scalar_data_f}, dim=1, ncopies={nr_f}), dim=2, ncopies={nc_f})",
+                                st.comment,
+                            )
+                            continue
                         if ncol_src is None:
                             _wstmt(f"{st.name} = matrix({data_f}, {nr_f})", st.comment)
                         else:
