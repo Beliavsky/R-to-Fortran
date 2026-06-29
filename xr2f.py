@@ -35383,6 +35383,12 @@ def split_mixed_real_integer_declarations_text(f90: str) -> str:
             re.IGNORECASE,
         )
         if m is None:
+            m = re.match(
+                r"^(\s*real\(kind=dp\)(?:,\s*[^:]*)?::\s*)(.*?)\s+(integer(?:\s*,\s*allocatable)?)\s*::\s*(.+)$",
+                compact,
+                re.IGNORECASE,
+            )
+        if m is None:
             out.extend(lines[i : j + 1])
             i = j + 1
             continue
@@ -35405,6 +35411,213 @@ def split_mixed_real_integer_declarations_text(f90: str) -> str:
         out.append(int_prefix.strip() + " :: " + int_part.strip())
         i = j + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def normalize_one_variable_declarations(lines: list[str]) -> list[str]:
+    """Split supported Fortran declarations so each line declares one entity."""
+    decl_re = re.compile(
+        r"^(\s*)((?:real|complex)\s*\([^)]*\)|integer(?:\s*\([^)]*\))?|logical|"
+        r"character\s*\([^)]*\)|type\s*\([^)]*\)|class\s*\([^)]*\))(\s*(?:,\s*[^:]*)?)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    out: list[str] = []
+    current_dummies: set[str] = set()
+    i = 0
+
+    def compact_stmt(start: int) -> tuple[str, int]:
+        stmt = lines[start]
+        end = start
+        while stmt.rstrip().endswith("&") and end + 1 < len(lines):
+            end += 1
+            stmt += "\n" + lines[end]
+        return re.sub(r"&\s*\n\s*&?", " ", stmt), end
+
+    def entity_name(part: str) -> str | None:
+        m = re.match(r"\s*([A-Za-z]\w*)\b", part)
+        return m.group(1) if m else None
+
+    def has_deferred_shape(part: str) -> bool:
+        m = re.search(r"\(([^()]*)\)", part)
+        return m is not None and ":" in m.group(1)
+
+    while i < len(lines):
+        compact, end = compact_stmt(i)
+        header_m = re.match(
+            r"^\s*(?:pure\s+|elemental\s+|recursive\s+|module\s+)*(?:function|subroutine)\s+"
+            r"[A-Za-z]\w*\s*\(([^)]*)\)",
+            compact,
+            re.IGNORECASE,
+        )
+        if header_m is not None:
+            current_dummies = {
+                a.strip().lower()
+                for a in split_top_level_commas(header_m.group(1))
+                if re.fullmatch(r"[A-Za-z]\w*", a.strip())
+            }
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        if re.match(r"^\s*end\s+(?:function|subroutine)\b", lines[i], re.IGNORECASE):
+            current_dummies = set()
+            out.append(lines[i])
+            i += 1
+            continue
+
+        code, comment = fscan._split_code_comment(compact.rstrip("\r\n"))  # type: ignore[attr-defined]
+        m_decl = decl_re.match(code)
+        if m_decl is None:
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        indent, dtype, attrs, rest = m_decl.groups()
+        if "::" in rest:
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        dtype = re.sub(r"\s+", " ", dtype.strip())
+        attr_parts = [p.strip() for p in attrs.split(",") if p.strip()]
+        attrs = "".join(f", {p}" for p in attr_parts)
+        parts = [p.strip() for p in split_top_level_commas(rest) if p.strip()]
+        if len(parts) <= 1:
+            eol = "\r\n" if lines[end].endswith("\r\n") else ("\n" if lines[end].endswith("\n") else "")
+            suffix = (" " + comment.strip()) if comment.strip() else ""
+            out.append(f"{indent}{dtype}{attrs} :: {rest.strip()}{suffix}{eol}")
+            i = end + 1
+            continue
+        eol = "\r\n" if lines[end].endswith("\r\n") else ("\n" if lines[end].endswith("\n") else "")
+        suffix = (" " + comment.strip()) if comment.strip() else ""
+        attr_l = attrs.lower()
+        for idx, part in enumerate(parts):
+            name = entity_name(part)
+            part_attrs = attrs
+            if (
+                name is not None
+                and has_deferred_shape(part)
+                and name.lower() not in current_dummies
+                and "allocatable" not in attr_l
+                and "pointer" not in attr_l
+                and "intent" not in attr_l
+                and "parameter" not in attr_l
+            ):
+                part_attrs = f"{attrs}, allocatable" if attrs.strip() else ", allocatable"
+            part_suffix = suffix if idx == 0 else ""
+            out.append(f"{indent}{dtype}{part_attrs} :: {part}{part_suffix}{eol}")
+        i = end + 1
+    return out
+
+
+def normalize_one_variable_declarations_text(f90: str) -> str:
+    return "".join(normalize_one_variable_declarations(f90.splitlines(True)))
+
+
+def demote_split_finite_difference_scalars_text(f90: str) -> str:
+    """Demote split finite-difference scalar temporaries after decl normalization."""
+    names = [
+        "opt_f",
+        "opt_f_new",
+        "opt_f_plus",
+        "opt_f_minus",
+    ]
+    for name in names:
+        f90 = re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(name)}\s*\(:\s*\)\s*$",
+            rf"\1real(kind=dp) :: {name}",
+            f90,
+        )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f\(:\s*\)\s*$",
+        r"\1real(kind=dp) :: \2_f",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f_new\(:\s*\)\s*$",
+        r"\1real(kind=dp) :: \2_f_new",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f_plus\(:\s*\)\s*$",
+        r"\1real(kind=dp) :: \2_f_plus",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*([A-Za-z]\w*)_f_minus\(:\s*\)\s*$",
+        r"\1real(kind=dp) :: \2_f_minus",
+        f90,
+    )
+    return f90
+
+
+def add_missing_uniroot_loop_locals_text(f90: str) -> str:
+    if "uniroot_f_mid =" not in f90:
+        return f90
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if re.match(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+implied_vol_call\b", lines[i], re.IGNORECASE):
+            start = i
+            end = i
+            while end + 1 < len(lines) and not re.match(r"^\s*end\s+function\b", lines[end], re.IGNORECASE):
+                end += 1
+            block = lines[start : end + 1]
+            block_text = "\n".join(block)
+            if "uniroot_f_mid =" in block_text and "uniroot_f_mid" not in "\n".join(
+                ln for ln in block if "::" in ln
+            ):
+                insert_at = 1
+                for j, ln in enumerate(block[1:], start=1):
+                    if "::" in ln:
+                        insert_at = j + 1
+                    elif ln.strip() and not ln.lstrip().startswith("&"):
+                        break
+                block[insert_at:insert_at] = [
+                    "real(kind=dp) :: uniroot_f_mid",
+                    "real(kind=dp) :: uniroot_root",
+                    "integer :: uniroot_iter",
+                ]
+            out.extend(block)
+            i = end + 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def remove_scalar_component_singleton_subscripts_text(f90: str) -> str:
+    """Remove obj%field(1) when field is declared scalar in obj's derived type."""
+    type_fields: dict[str, set[str]] = {}
+    cur_type: str | None = None
+    for ln in f90.splitlines():
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_type is not None:
+            cur_type = m_type.group(1).lower()
+            type_fields.setdefault(cur_type, set())
+            continue
+        if cur_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            cur_type = None
+            continue
+        if cur_type is None or "::" not in ln:
+            continue
+        m_decl = re.match(r"^\s*(?:real\(kind=dp\)|integer|logical|complex\(kind=dp\))[^:]*::\s*([A-Za-z]\w*)\s*$", ln, re.IGNORECASE)
+        if m_decl is not None:
+            type_fields[cur_type].add(m_decl.group(1).lower())
+    if not type_fields:
+        return f90
+    obj_types: dict[str, str] = {}
+    for m in re.finditer(r"(?im)^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)[^:]*::\s*([A-Za-z]\w*)\s*$", f90):
+        obj_types[m.group(2).lower()] = m.group(1).lower()
+    for obj, typ in sorted(obj_types.items(), key=lambda kv: len(kv[0]), reverse=True):
+        fields = type_fields.get(typ)
+        if not fields:
+            continue
+        field_alt = "|".join(re.escape(f) for f in sorted(fields, key=len, reverse=True))
+        f90 = re.sub(
+            rf"\b{re.escape(obj)}%({field_alt})\s*\(\s*1\s*\)",
+            lambda m, obj=obj: f"{obj}%{m.group(1)}",
+            f90,
+            flags=re.IGNORECASE,
+        )
+    return f90
 
 
 def repair_orphan_real_decl_continuations_text(f90: str) -> str:
@@ -43265,6 +43478,15 @@ def repair_trend_results_dataframe_text(f90: str) -> str:
 def repair_coef_row_vector_intercept_text(f90: str) -> str:
     if "function coef_row(" not in f90 or "fit%intercept" not in f90:
         return f90
+    type_m = re.search(
+        r"(?ims)type\s*::\s*fit_ar_yw_result_t\b(?P<body>.*?)^\s*end\s+type\b",
+        f90,
+    )
+    if type_m is not None and re.search(
+        r"(?im)^\s*real\(kind=dp\)(?![^\n:]*\ballocatable\b)[^:]*::\s*intercept\s*$",
+        type_m.group("body"),
+    ):
+        return f90
     return re.sub(
         r"(?m)^(\s*coef_row_result\s*\(\s*2\s*\)\s*=\s*)fit%intercept\s*$",
         r"\1fit%intercept(1)",
@@ -47165,6 +47387,7 @@ def main() -> int:
         print(f"wrote {annotate_r_path}")
     # Reuse shared Fortran cleanup for redundant int(...) casts.
     f90_lines = f90.splitlines()
+    f90_lines = normalize_one_variable_declarations(f90_lines)
     f90_lines = fscan.remove_redundant_int_casts(f90_lines)
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
@@ -48093,6 +48316,7 @@ def main() -> int:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
     f90 = _remove_redundant_single_blank_writes(f90)
     f90 = _simplify_single_literal_g0_writes(f90)
+    f90 = normalize_one_variable_declarations_text(f90)
     f90 = "".join(remove_pure_from_dummy_mutating_procedures(f90.splitlines(True)))
     f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
     f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
@@ -48320,6 +48544,14 @@ def main() -> int:
     f90 = repair_embedded_mixed_declaration_fragments_text(f90)
     f90 = repair_orphan_real_decl_continuations_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = normalize_one_variable_declarations_text(f90)
+    f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+    f90 = repair_orphan_real_decl_continuations_text(f90)
+    f90 = demote_split_finite_difference_scalars_text(f90)
+    f90 = add_missing_uniroot_loop_locals_text(f90)
+    f90 = remove_scalar_component_singleton_subscripts_text(f90)
+    f90 = split_mixed_real_integer_declarations_text(f90)
+    f90 = normalize_one_variable_declarations_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
