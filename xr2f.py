@@ -1703,10 +1703,19 @@ def _parse_named_c_vector(expr: str) -> tuple[list[str], list[str]] | None:
     if cinfo is None or cinfo[0].lower() != "c":
         return None
     _nm, pos, kw = cinfo
-    if pos or not kw:
+    if not pos and not kw:
         return None
     labels: list[str] = []
     values: list[str] = []
+    for raw in pos:
+        asn = split_top_level_assignment(raw.strip())
+        if asn is None:
+            return None
+        lab, val = asn[0].strip(), asn[1].strip()
+        if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", lab):
+            return None
+        labels.append(lab)
+        values.append(val)
     for lab, val in kw.items():
         if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", lab):
             return None
@@ -1727,6 +1736,84 @@ def _parse_string_c_vector(expr: str) -> list[str] | None:
             return None
         labels.append(lab)
     return labels
+
+
+def collect_named_c_labels(stmts: list[object]) -> dict[str, list[str]]:
+    labels_by_name: dict[str, list[str]] = {}
+    conflicted: set[str] = set()
+    function_returns: dict[str, list[str]] = {}
+
+    def expr_labels(expr: str) -> list[str] | None:
+        parsed = _parse_named_c_vector(expr.strip())
+        if parsed is not None:
+            return parsed[0]
+        c_ret = parse_call_text(expr.strip())
+        if c_ret is not None and c_ret[0].lower() == "return" and c_ret[1]:
+            parsed_ret = _parse_named_c_vector(c_ret[1][0].strip())
+            if parsed_ret is not None:
+                return parsed_ret[0]
+        return None
+
+    def collect_function_returns(items: list[object]) -> None:
+        for st in items:
+            if isinstance(st, FuncDef):
+                for inner in reversed(st.body):
+                    if isinstance(inner, ExprStmt):
+                        labs = expr_labels(inner.expr)
+                        if labs is not None:
+                            function_returns[st.name.lower()] = labs
+                        break
+                    if isinstance(inner, Assign):
+                        break
+                    if isinstance(inner, CommentStmt):
+                        continue
+                collect_function_returns(st.body)
+            elif isinstance(st, IfStmt):
+                collect_function_returns(st.then_body)
+                collect_function_returns(st.else_body)
+            elif isinstance(st, ForStmt):
+                collect_function_returns(st.body)
+            elif isinstance(st, WhileStmt):
+                collect_function_returns(st.body)
+            elif isinstance(st, RepeatStmt):
+                collect_function_returns(st.body)
+
+    def add(name: str, labels: list[str]) -> None:
+        key = name.lower()
+        if key in conflicted:
+            return
+        prev = labels_by_name.get(key)
+        if prev is None:
+            labels_by_name[key] = list(labels)
+        elif prev != labels:
+            labels_by_name.pop(key, None)
+            conflicted.add(key)
+
+    def walk(items: list[object]) -> None:
+        for st in items:
+            if isinstance(st, Assign):
+                labs = expr_labels(st.expr.strip())
+                if labs is None:
+                    c_assign = parse_call_text(st.expr.strip())
+                    if c_assign is not None:
+                        labs = function_returns.get(c_assign[0].lower())
+                if labs is not None:
+                    add(st.name, labs)
+            elif isinstance(st, FuncDef):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+
+    collect_function_returns(stmts)
+    walk(stmts)
+    return labels_by_name
 
 
 def _array_dim_parts(expr: str) -> list[str] | None:
@@ -27081,6 +27168,8 @@ def transpile_r_to_fortran(
         labs_name_src = _parse_string_c_vector(expr_name_src.strip())
         if labs_name_src is not None:
             _NAMED_VECTOR_LABELS[nm_name_src.lower()] = labs_name_src
+    for nm_named_c, labs_named_c in collect_named_c_labels(stmts).items():
+        _NAMED_VECTOR_LABELS.setdefault(nm_named_c.lower(), labs_named_c)
     _NAMED_VECTOR_LABELS.update(collect_colname_labels(stmts))
     for st_adl in main_stmts:
         if isinstance(st_adl, Assign):
@@ -42865,8 +42954,8 @@ def repair_portfolio_print_labels_text(f90: str) -> str:
 def promote_forwarded_dummy_ranks_text(f90: str) -> str:
     block_pat = re.compile(
         r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
-        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\((.*?)\).*?"
-        r"^end\s+(?:function|subroutine)\s+\1\s*$"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\((.*?)\)(?:\s+result\s*\(\s*[A-Za-z]\w*\s*\))?.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
     )
     proc_ranks: dict[str, dict[int, int]] = {}
     proc_formals: dict[str, list[str]] = {}
@@ -42966,6 +43055,140 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
 
         new_block = re.sub(
             r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,\s*intent\s*\(\s*in\s*\))?\s*::\s*)(.+)$",
+            rewrite_decl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
+    return f90
+
+
+def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\((.*?)\)(?:\s+result\s*\(\s*[A-Za-z]\w*\s*\))?.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
+    )
+    blocks = list(block_pat.finditer(f90))
+    proc_formals: dict[str, list[str]] = {}
+
+    def clean_args(arg_text: str) -> list[str]:
+        cleaned = re.sub(r"&\s*\n\s*&?", " ", arg_text)
+        return [a.strip().lower() for a in split_top_level_commas(cleaned) if a.strip()]
+
+    def real_decl_ranks(block: str) -> dict[str, int]:
+        ranks: dict[str, int] = {}
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*(?:\(([^)]*)\))?", part.strip())
+                if m_item is None:
+                    continue
+                dims = (m_item.group(2) or "").strip()
+                ranks[m_item.group(1).lower()] = 0 if not dims else dims.count(":")
+        return ranks
+
+    for m_block in blocks:
+        proc_formals[m_block.group(1).lower()] = clean_args(m_block.group(2))
+
+    required: dict[tuple[str, int], int] = {}
+    conflicts: set[tuple[str, int]] = set()
+    for m_block in blocks:
+        local_ranks = real_decl_ranks(m_block.group(0))
+        flat = re.sub(r"&\s*\n\s*&?", " ", m_block.group(0))
+        flat_scan = re.sub(
+            r"^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine)\s+[A-Za-z]\w*\s*\([^)]*\)",
+            "",
+            flat,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+        def observe_call(callee: str, args_src: str) -> None:
+            callee_l = callee.lower()
+            formals = proc_formals.get(callee_l)
+            if not formals:
+                return
+            pos_i = 0
+            for actual_src in split_top_level_commas(args_src):
+                actual = actual_src.strip()
+                formal_i = pos_i
+                asn = split_top_level_assignment(actual)
+                if asn is not None:
+                    key = _sanitize_fortran_kwarg_name(asn[0].strip()).lower()
+                    try:
+                        formal_i = formals.index(key)
+                    except ValueError:
+                        continue
+                    actual = asn[1].strip()
+                else:
+                    pos_i += 1
+                if formal_i >= len(formals):
+                    continue
+                actual_l = actual.lower()
+                if actual_l in local_ranks:
+                    rank = local_ranks[actual_l]
+                    key = (callee_l, formal_i)
+                    if rank > 0:
+                        required[key] = max(required.get(key, 0), rank)
+                    elif key in required:
+                        conflicts.add(key)
+                elif re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", actual_l):
+                    conflicts.add((callee_l, formal_i))
+
+        for callee in proc_formals:
+            def observe_balanced(args_src: str, callee: str = callee) -> str:
+                observe_call(callee, args_src)
+                return f"{callee}({args_src})"
+            _replace_balanced_func_calls(flat_scan, callee, observe_balanced)
+
+    required = {k: v for k, v in required.items() if k not in conflicts and v > 0}
+    if not required:
+        return f90
+
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in blocks:
+        fn_l = m_block.group(1).lower()
+        formals = proc_formals.get(fn_l, [])
+        needed_by_name = {
+            formals[idx]: rank
+            for (callee_l, idx), rank in required.items()
+            if callee_l == fn_l and idx < len(formals)
+        }
+        if not needed_by_name:
+            continue
+        block = m_block.group(0)
+
+        def rewrite_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            out_parts: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_item = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_item is None:
+                    out_parts.append(p)
+                    continue
+                name = m_item.group(1)
+                need_rank = needed_by_name.get(name.lower(), 0)
+                dims = (m_item.group(2) or "").strip()
+                cur_rank = 0 if not dims else dims.count(":")
+                if need_rank > cur_rank:
+                    out_parts.append(f"{name}{'(:,:)' if need_rank >= 2 else '(:)'}")
+                    changed = True
+                else:
+                    out_parts.append(p)
+            if not changed:
+                return m_decl.group(0)
+            return prefix + ", ".join(out_parts)
+
+        new_block = re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?::\s*)(.+)$",
             rewrite_decl,
             block,
         )
@@ -49703,4 +49926,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
