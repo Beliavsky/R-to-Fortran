@@ -31995,6 +31995,27 @@ def transpile_r_to_fortran(
         if txt in f_obj.args:
             return infer_arg_rank(f_obj, txt)
         body_no_ret = (f_obj.body[:-1] if isinstance(f_obj.body[-1], ExprStmt) else f_obj.body) if f_obj.body else []
+        direct_rank = 0
+        for st_rank in body_no_ret:
+            if isinstance(st_rank, Assign) and st_rank.name == txt:
+                rhs_rank = _infer_assignment_rank_hint(
+                    st_rank.expr.strip(),
+                    {a.lower(): infer_arg_rank(f_obj, a) for a in f_obj.args},
+                )
+                c_rhs_rank = parse_call_text(st_rank.expr.strip())
+                if c_rhs_rank is not None and c_rhs_rank[0].lower() in {"matrix", "array", "cbind", "cbind2", "rbind"}:
+                    rhs_rank = max(rhs_rank, 2)
+                direct_rank = max(direct_rank, rhs_rank)
+            elif isinstance(st_rank, ExprStmt):
+                m_subassign = re.match(
+                    rf"^\s*{re.escape(txt)}\s*\[\s*(.*?)\s*\]\s*(?:<-|=)",
+                    st_rank.expr.strip(),
+                    re.IGNORECASE,
+                )
+                if m_subassign is not None and len(_split_index_dims(m_subassign.group(1))) >= 2:
+                    direct_rank = max(direct_rank, 2)
+        if direct_rank > 0:
+            return direct_rank
         return _infer_local_array_rank(body_no_ret, txt)
 
     def _emit_real_field_decl(k: str, rank: int) -> None:
@@ -48935,6 +48956,7 @@ def main() -> int:
     f90 = rewrite_rank1_print_matrix_calls_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = demote_type_fields_from_rank1_local_assignments_text(f90)
+    f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     if "type :: fit_ar_yw_result_t" in f90:
         f90 = f90.replace(
             "real(kind=dp), allocatable :: intercept(:), mean",
