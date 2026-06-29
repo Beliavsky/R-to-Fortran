@@ -35801,6 +35801,16 @@ def compact_orphan_declaration_continuations_text(f90: str) -> str:
 
 def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
     f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*::\s*real\(kind=dp\)\s*::\s*(.+)$",
+        r"\1real(kind=dp) :: \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)integer\s*::\s*integer\s*::\s*(.+)$",
+        r"\1integer :: \2",
+        f90,
+    )
+    f90 = re.sub(
         r"(?im)^(\s*)real\(kind=dp\)\s*::\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
         r"\1real(kind=dp), allocatable :: \2",
         f90,
@@ -44292,6 +44302,15 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             return m_type_block.group(0)
         out_lines: list[str] = []
         inserted: set[str] = set()
+        def clean_field_name(name: str) -> str:
+            name = re.sub(
+                r"^\s*(?:real\(kind=dp\)|integer(?:\(kind=int64\))?)\s*(?:,\s*[^:]*)?::\s*",
+                "",
+                name.strip(),
+                flags=re.IGNORECASE,
+            )
+            return name.strip()
+
         for line in m_type_block.group(0).splitlines():
             m_decl = re.match(
                 r"(\s*)(real\(kind=dp\)|integer(?:\(kind=int64\))?),\s*allocatable\s*::\s*(.+)$",
@@ -44317,9 +44336,9 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
                 else:
                     kept.append(p)
             if new_real:
-                out_lines.append(indent + "real(kind=dp) :: " + ", ".join(sorted(new_real)))
+                out_lines.append(indent + "real(kind=dp) :: " + ", ".join(sorted(clean_field_name(x) for x in new_real)))
             if new_int:
-                out_lines.append(indent + "integer :: " + ", ".join(sorted(new_int)))
+                out_lines.append(indent + "integer :: " + ", ".join(sorted(clean_field_name(x) for x in new_int)))
             if kept:
                 out_lines.append(f"{indent}{_kind}, allocatable :: " + ", ".join(kept))
         return "\n".join(out_lines)
