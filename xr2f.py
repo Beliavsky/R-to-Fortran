@@ -37189,7 +37189,30 @@ def coerce_named_integer_actuals_from_decls_text(f90: str) -> str:
             return m.group(0)
         return f"{m.group(1)}=int({val})"
 
-    return pat.sub(repl, f90)
+    f90 = pat.sub(repl, f90)
+
+    lines = f90.splitlines(True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stmt = lines[i]
+        end = i
+        while stmt.rstrip().endswith("&") and end + 1 < len(lines):
+            end += 1
+            stmt += lines[end]
+        if end == i:
+            out.append(lines[i])
+            i += 1
+            continue
+        compact = re.sub(r"&\s*\r?\n\s*&?", " ", stmt)
+        fixed = pat.sub(repl, compact)
+        if fixed == compact:
+            out.extend(lines[i : end + 1])
+        else:
+            eol = "\r\n" if lines[end].endswith("\r\n") else ("\n" if lines[end].endswith("\n") else "")
+            out.append(fixed.rstrip() + eol)
+        i = end + 1
+    return "".join(out)
 
 
 def rewrite_invalid_rank2_double_spread_text(f90: str) -> str:
@@ -48640,6 +48663,7 @@ def main() -> int:
     f90 = split_mixed_real_integer_declarations_text(f90)
     f90 = normalize_one_variable_declarations_text(f90)
     f90 = unroll_multi_allocate_statements_text(f90)
+    f90 = coerce_named_integer_actuals_from_decls_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
