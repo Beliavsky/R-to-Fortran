@@ -34906,23 +34906,34 @@ def repair_extra_renamed_actual_arguments_text(f90: str) -> str:
     if not formals_by_fn:
         return f90
 
-    def renamed_base(actual: str) -> str | None:
-        m = re.fullmatch(r"\s*([A-Za-z]\w*?)_(?:\d+(?:_\d+)*)\s*", actual)
-        return m.group(1).lower() if m is not None else None
+    def renamed_base(actual: str, formals: list[str]) -> str | None:
+        t = actual.strip().lower()
+        if t.endswith("_def") and t[:-4] in formals:
+            return t[:-4]
+        while True:
+            m = re.fullmatch(r"([A-Za-z]\w*)_\d+", t)
+            if m is None:
+                return None
+            t = m.group(1)
+            if t in formals:
+                return t
 
     for fn, formals in sorted(formals_by_fn.items(), key=lambda kv: len(kv[0]), reverse=True):
         def repl(args_src: str, fn: str = fn, formals: list[str] = formals) -> str:
             args = split_top_level_commas(args_src)
-            if len(args) != len(formals) + 1:
+            if len(args) <= len(formals):
                 return f"{fn}({args_src})"
-            extra = args[-1].strip()
-            base = renamed_base(extra)
-            if base is None or base not in formals:
+            replacement_args = [a.strip() for a in args[: len(formals)]]
+            changed = False
+            for extra in args[len(formals):]:
+                base = renamed_base(extra.strip(), formals)
+                if base is None or base not in formals:
+                    return f"{fn}({args_src})"
+                replacement_args[formals.index(base)] = extra.strip()
+                changed = True
+            if not changed:
                 return f"{fn}({args_src})"
-            idx = formals.index(base)
-            args[idx] = extra
-            args = args[:-1]
-            return f"{fn}({', '.join(a.strip() for a in args)})"
+            return f"{fn}({', '.join(replacement_args)})"
         f90 = _replace_balanced_func_calls(f90, fn, repl)
     return f90
 
@@ -42858,6 +42869,7 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
         r"^end\s+(?:function|subroutine)\s+\1\s*$"
     )
     proc_ranks: dict[str, dict[int, int]] = {}
+    proc_formals: dict[str, list[str]] = {}
     blocks: list[re.Match[str]] = list(block_pat.finditer(f90))
 
     def clean_args(arg_text: str) -> list[str]:
@@ -42867,7 +42879,7 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
     def decl_ranks(block: str) -> dict[str, int]:
         ranks: dict[str, int] = {}
         for m_decl in re.finditer(
-            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$",
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,\s*intent\s*\(\s*in\s*\))?\s*::\s*(.+)$",
             block,
         ):
             for part in split_top_level_commas(m_decl.group(1)):
@@ -42883,6 +42895,7 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
     for m_block in blocks:
         proc_name = m_block.group(1).lower()
         args = clean_args(m_block.group(2))
+        proc_formals[proc_name] = args
         ranks_by_name = decl_ranks(m_block.group(0))
         proc_ranks[proc_name] = {
             idx: ranks_by_name.get(arg, 0)
@@ -42896,18 +42909,36 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
         caller_decl_ranks = decl_ranks(block)
         needed: dict[str, int] = {}
         flat = re.sub(r"&\s*\n\s*&?", " ", block)
-        for m_call in re.finditer(r"\b([A-Za-z]\w*)\s*\(([^()]*)\)", flat):
-            callee = m_call.group(1).lower()
+        def observe_call(callee: str, args_src: str) -> None:
+            callee = callee.lower()
             callee_ranks = proc_ranks.get(callee)
             if not callee_ranks:
-                continue
-            actuals = [a.strip().lower() for a in split_top_level_commas(m_call.group(2))]
-            for idx, actual in enumerate(actuals):
-                if actual not in caller_args:
+                return
+            callee_formals = proc_formals.get(callee, [])
+            for idx, actual_src in enumerate(split_top_level_commas(args_src)):
+                actual_txt = actual_src.strip()
+                actual_l = actual_txt.lower()
+                formal_idx = idx
+                m_named = split_top_level_assignment(actual_txt)
+                if m_named is not None:
+                    key_l = _sanitize_fortran_kwarg_name(m_named[0].strip()).lower()
+                    try:
+                        formal_idx = callee_formals.index(key_l)
+                    except ValueError:
+                        continue
+                    actual_l = m_named[1].strip().lower()
+                if actual_l not in caller_args:
                     continue
-                required_rank = callee_ranks.get(idx, 0)
-                if required_rank > caller_decl_ranks.get(actual, 0):
-                    needed[actual] = max(needed.get(actual, 0), required_rank)
+                required_rank = callee_ranks.get(formal_idx, 0)
+                if required_rank > caller_decl_ranks.get(actual_l, 0):
+                    needed[actual_l] = max(needed.get(actual_l, 0), required_rank)
+        for m_call in re.finditer(r"\b([A-Za-z]\w*)\s*\(([^()]*)\)", flat):
+            observe_call(m_call.group(1), m_call.group(2))
+        for callee in proc_ranks:
+            def observe_balanced(args_src: str, callee: str = callee) -> str:
+                observe_call(callee, args_src)
+                return f"{callee}({args_src})"
+            _replace_balanced_func_calls(flat, callee, observe_balanced)
         if not needed:
             continue
 
@@ -42934,7 +42965,7 @@ def promote_forwarded_dummy_ranks_text(f90: str) -> str:
             return prefix + ", ".join(parts_out)
 
         new_block = re.sub(
-            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*)(.+)$",
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,\s*intent\s*\(\s*in\s*\))?\s*::\s*)(.+)$",
             rewrite_decl,
             block,
         )
