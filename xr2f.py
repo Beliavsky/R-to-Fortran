@@ -35427,12 +35427,38 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
             out.extend(real_lines)
             out.append(int_line)
             continue
+        if (
+            i + 1 < len(lines)
+            and re.match(r"^\s*real\(kind=dp\)\s*::\s*[^!\n&]+$", lines[i], re.IGNORECASE)
+            and re.match(r"^\s*&\s*[A-Za-z]\w*", lines[i + 1])
+        ):
+            out.append(lines[i].rstrip() + ", &")
+            i += 1
+            while i < len(lines) and re.match(r"^\s*&", lines[i]):
+                out.append(lines[i])
+                i += 1
+            continue
         out.append(lines[i])
         i += 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*::\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
+        r"\1real(kind=dp), allocatable :: \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*::\s*([^:\n]*?),\s*real\(kind=dp\)\s*::\s*(.+)$",
+        r"\1real(kind=dp) :: \2\n\1real(kind=dp) :: \3",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*::\s*([^:\n]*?)\s*,\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
+        r"\1real(kind=dp) :: \2\n\1real(kind=dp), allocatable :: \3",
+        f90,
+    )
     f90 = re.sub(
         r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*,\s*&\s*\n\s*&\s*([A-Za-z]\w*(?:\s*\([^)\n]*\))?)\s*\n\s*&\s*",
         r"\1, &\n& \2, &\n& ",
