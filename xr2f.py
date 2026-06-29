@@ -1758,11 +1758,26 @@ def collect_named_c_labels(stmts: list[object]) -> dict[str, list[str]]:
         for st in items:
             if isinstance(st, FuncDef):
                 local_labels: dict[str, list[str]] = {}
-                for inner_assign in st.body:
-                    if isinstance(inner_assign, Assign):
+                changed_local_labels = True
+                while changed_local_labels:
+                    changed_local_labels = False
+                    for inner_assign in st.body:
+                        if not isinstance(inner_assign, Assign):
+                            continue
+                        lhs_l = inner_assign.name.lower()
+                        if lhs_l in local_labels:
+                            continue
                         parsed_assign = _parse_named_c_vector(inner_assign.expr.strip())
                         if parsed_assign is not None:
-                            local_labels[inner_assign.name.lower()] = parsed_assign[0]
+                            local_labels[lhs_l] = parsed_assign[0]
+                            changed_local_labels = True
+                            continue
+                        rhs_s = inner_assign.expr.strip()
+                        if re.fullmatch(r"[A-Za-z]\w*", rhs_s):
+                            rhs_labels = local_labels.get(rhs_s.lower())
+                            if rhs_labels is not None:
+                                local_labels[lhs_l] = list(rhs_labels)
+                                changed_local_labels = True
                 for inner in reversed(st.body):
                     if isinstance(inner, ExprStmt):
                         labs = expr_labels(inner.expr)
