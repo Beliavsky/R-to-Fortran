@@ -27396,6 +27396,22 @@ def transpile_r_to_fortran(
                 re.IGNORECASE,
             ):
                 inferred_ret_ranks.setdefault(st_vec_ret.name.lower(), 1)
+        changed_ret_ranks = True
+        while changed_ret_ranks:
+            changed_ret_ranks = False
+            for st_vec_ret in fn_rank_tail.body:
+                if not isinstance(st_vec_ret, Assign):
+                    continue
+                lhs_ret_rank = st_vec_ret.name.lower()
+                expr_ret_rank = st_vec_ret.expr.strip()
+                alias_ret_rank = re.fullmatch(r"[A-Za-z]\w*", expr_ret_rank)
+                if alias_ret_rank is not None:
+                    rr_alias_ret = inferred_ret_ranks.get(alias_ret_rank.group(0).lower(), 0)
+                else:
+                    rr_alias_ret = _infer_assignment_rank_hint(expr_ret_rank, inferred_ret_ranks)
+                if rr_alias_ret > inferred_ret_ranks.get(lhs_ret_rank, 0):
+                    inferred_ret_ranks[lhs_ret_rank] = rr_alias_ret
+                    changed_ret_ranks = True
 
         def stmt_rank(st_rank_tail: object) -> int | None:
             if isinstance(st_rank_tail, ExprStmt):
