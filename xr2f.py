@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import shlex
@@ -6529,10 +6530,11 @@ def _replace_obfuscated_idents(expr: str, mapping: dict[str, str]) -> str:
     return out
 
 
-def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
+def obfuscate_user_defined_names(stmts: list[object], seed: int | None = None) -> list[object]:
     mapping: dict[str, str] = {}
     used: set[str] = set()
     protected_func_names: set[str] = set()
+    rng = random.Random(seed) if seed is not None else None
 
     def collect_protected_func_names(ss: list[object]) -> None:
         for st in ss:
@@ -6592,7 +6594,10 @@ def obfuscate_user_defined_names(stmts: list[object]) -> list[object]:
     def fresh(prefix: str) -> str:
         idx = 1
         while True:
-            cand = f"xr_obf_{prefix}_{idx}"
+            if rng is None:
+                cand = f"xr_obf_{prefix}_{idx}"
+            else:
+                cand = f"xr_obf_{prefix}_{rng.randrange(1, 1_000_000_000)}"
             idx += 1
             if cand.lower() not in used:
                 used.add(cand.lower())
@@ -6938,7 +6943,7 @@ def _render_r_stmts(stmts: list[object], indent: str = "") -> list[str]:
     return out
 
 
-def obfuscate_r_source(src: str) -> str:
+def obfuscate_r_source(src: str, seed: int | None = None) -> str:
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _DOTTED_VAR_RENAMES = {}
     _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
@@ -6948,7 +6953,7 @@ def obfuscate_r_source(src: str) -> str:
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for obfuscation")
-    stmts = obfuscate_user_defined_names(stmts)
+    stmts = obfuscate_user_defined_names(stmts, seed=seed)
     return "\n".join(_render_r_stmts(stmts)) + ("\n" if src.endswith("\n") else "")
 
 
@@ -34841,9 +34846,17 @@ def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
         rank = 0 if not dims else max(1, dims.count(",") + 1, dims.count(":"))
         return m.group(1), rank
 
-    for ln in lines:
-        m_decl = decl_re.match(ln)
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = decl_re.match(compact)
         if m_decl is None:
+            i = j + 1
             continue
         for part in split_top_level_commas(m_decl.group(1)):
             item = item_name_rank(part)
@@ -34853,11 +34866,15 @@ def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
                 rank1.add(item[0])
             elif item[1] == 2:
                 rank2.add(item[0])
+        i = j + 1
 
     demote: set[str] = set()
 
     def rhs_is_vector(rhs: str) -> bool:
         rhs_s = rhs.strip()
+        m_diag_name = re.search(r"\bdiag\s*\(\s*([A-Za-z]\w*)\s*\)", rhs_s, re.IGNORECASE)
+        if m_diag_name is not None and m_diag_name.group(1) in rank2:
+            return True
         if re.match(r"^(?:r_rep_real|r_rep_int|r_seq_int|r_seq_len|pack|tail|head)\s*\(", rhs_s, re.IGNORECASE):
             return True
         if re.match(r"^reshape\s*\(", rhs_s, re.IGNORECASE):
@@ -34897,11 +34914,36 @@ def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
 
     if not demote:
         return f90
+
+    def wrap_decl(prefix: str, parts: list[str]) -> list[str]:
+        text = prefix + ", ".join(parts)
+        if len(text) <= 110:
+            return [text]
+        wrapped: list[str] = []
+        cur = prefix
+        for part in parts:
+            piece = part if cur == prefix else ", " + part
+            if len(cur) + len(piece) > 100 and cur != prefix:
+                wrapped.append(cur + ", &")
+                cur = "& " + part
+            else:
+                cur += piece
+        wrapped.append(cur)
+        return wrapped
+
     out: list[str] = []
-    for ln in lines:
-        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln, re.IGNORECASE)
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", compact, re.IGNORECASE)
         if m_decl is None:
-            out.append(ln)
+            out.extend(lines[i : j + 1])
+            i = j + 1
             continue
         changed = False
         parts: list[str] = []
@@ -34914,9 +34956,10 @@ def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
             else:
                 parts.append(part_s)
         if changed:
-            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(parts)}")
+            out.extend(wrap_decl(f"{m_decl.group(1)}real(kind=dp), allocatable :: ", parts))
         else:
-            out.append(ln)
+            out.extend(lines[i : j + 1])
+        i = j + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -35289,6 +35332,26 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
 
 def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
     f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*,\s*&\s*\n\s*&\s*([A-Za-z]\w*(?:\s*\([^)\n]*\))?)\s*\n\s*&\s*",
+        r"\1, &\n& \2, &\n& ",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*,\s*&\s*\n\s*&\s*([A-Za-z]\w*(?:\s*\([^)\n]*\))?)\s*$",
+        r"\1, &\n& \2",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*$\s*\n\s*&\s*",
+        r"\1, &\n& ",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*$",
+        r"\1",
+        f90,
+    )
+    f90 = re.sub(
         r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*&\s*\n\s*&\s*allocatable\s*::\s*(.+)$",
         r"\1, &\n& \2",
         f90,
@@ -35322,6 +35385,80 @@ def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
         if int_parts:
             out.append(prefix + ", ".join(int_parts))
         i = j + 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def lower_selected_derived_list_field_copies_text(f90: str) -> str:
+    """Lower short-lived selected derived lists into branch-local field copies."""
+    lines = f90.splitlines()
+    out: list[str] = []
+    remove_allocates: set[str] = set()
+    i = 0
+
+    def collect_statement(start: int) -> tuple[str, int]:
+        stmt_lines = [lines[start]]
+        j = start
+        while stmt_lines[-1].rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            stmt_lines.append(lines[j])
+        stmt = "\n".join(stmt_lines)
+        compact = re.sub(r"&\s*\n\s*&?", " ", stmt)
+        return compact, j
+
+    assign_re = re.compile(
+        r"^\s*([A-Za-z]\w*)\s*\(\s*:\s*,\s*([A-Za-z]\w*)\s*\)\s*=\s*"
+        r"([A-Za-z]\w*)\s*\(\s*\2\s*\)\s*$",
+        re.IGNORECASE,
+    )
+
+    while i < len(lines):
+        if i + 4 < len(lines) and re.match(r"^\s*if\s*\(.+\)\s*then\s*$", lines[i], re.IGNORECASE):
+            m_then = assign_re.match(lines[i + 1])
+            if (
+                m_then is not None
+                and re.match(r"^\s*else\s*$", lines[i + 2], re.IGNORECASE)
+                and (m_else := assign_re.match(lines[i + 3])) is not None
+                and re.match(r"^\s*end\s+if\s*$", lines[i + 4], re.IGNORECASE)
+                and m_else.group(1) == m_then.group(1)
+                and m_else.group(2) == m_then.group(2)
+            ):
+                list_name, idx_name, then_src = m_then.groups()
+                else_src = m_else.group(3)
+                copies: list[tuple[str, str, str]] = []
+                j = i + 5
+                while j < len(lines):
+                    stmt, end_j = collect_statement(j)
+                    m_copy = re.match(
+                        rf"^(\s*)(.+?=\s*){re.escape(list_name)}\s*\(\s*:\s*,\s*"
+                        rf"{re.escape(idx_name)}\s*\)\s*%\s*([A-Za-z]\w*)\s*$",
+                        stmt,
+                        re.IGNORECASE,
+                    )
+                    if m_copy is None:
+                        break
+                    copies.append((m_copy.group(1), m_copy.group(2), m_copy.group(3)))
+                    j = end_j + 1
+                if copies:
+                    out.append(lines[i])
+                    for indent, lhs, field in copies:
+                        out.append(f"{indent}{lhs}{then_src}({idx_name})%{field}")
+                    out.append(lines[i + 2])
+                    for indent, lhs, field in copies:
+                        out.append(f"{indent}{lhs}{else_src}({idx_name})%{field}")
+                    out.append(lines[i + 4])
+                    remove_allocates.add(list_name)
+                    i = j
+                    continue
+        out.append(lines[i])
+        i += 1
+
+    if remove_allocates:
+        alloc_alt = "|".join(re.escape(name) for name in sorted(remove_allocates, key=len, reverse=True))
+        out = [
+            ln
+            for ln in out
+            if re.match(rf"^\s*allocate\s*\(\s*(?:{alloc_alt})\s*\(", ln, re.IGNORECASE) is None
+        ]
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -38419,6 +38556,106 @@ def promote_character_constructor_assignments(lines: list[str]) -> list[str]:
     return out
 
 
+def promote_character_merge_assignments(lines: list[str]) -> list[str]:
+    char_names: set[str] = set()
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = re.match(r"^\s*character(?:\([^)]*\))?\s*(?:,\s*[^:]*)?::\s*(.+)$", compact, re.IGNORECASE)
+        if m_decl is None:
+            i = j + 1
+            continue
+        for part in split_top_level_commas(m_decl.group(1)):
+            m_name = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+            if m_name is not None:
+                char_names.add(m_name.group(1))
+        i = j + 1
+
+    def is_char_arg(arg: str) -> bool:
+        arg_s = arg.strip()
+        return (
+            arg_s.startswith('"')
+            or arg_s.startswith("'")
+            or re.match(r"^[A-Za-z]\w*$", arg_s) is not None
+            and arg_s in char_names
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(lines):
+            stmt = lines[i]
+            j = i
+            while stmt.rstrip().endswith("&") and j + 1 < len(lines):
+                j += 1
+                stmt += "\n" + lines[j]
+            compact = re.sub(r"&\s*\n\s*&?", " ", stmt)
+            m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*merge\s*\((.*)\)\s*$", compact, re.IGNORECASE)
+            if m_assign is not None:
+                target, args_text = m_assign.groups()
+                args = split_top_level_commas(args_text)
+                if len(args) >= 2 and is_char_arg(args[0]) and is_char_arg(args[1]) and target not in char_names:
+                    char_names.add(target)
+                    changed = True
+            i = j + 1
+
+    if not char_names:
+        return lines
+
+    def wrap_decl(prefix: str, parts: list[str]) -> list[str]:
+        text = prefix + ", ".join(parts)
+        if len(text) <= 110:
+            return [text]
+        wrapped: list[str] = []
+        cur = prefix
+        for part in parts:
+            piece = part if cur == prefix else ", " + part
+            if len(cur) + len(piece) > 100 and cur != prefix:
+                wrapped.append(cur + ", &")
+                cur = "& " + part
+            else:
+                cur += piece
+        wrapped.append(cur)
+        return wrapped
+
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)([^:]*)::\s*(.+)$", compact, re.IGNORECASE)
+        if m_decl is None:
+            out.extend(lines[i : j + 1])
+            i = j + 1
+            continue
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(3))]
+        kept: list[str] = []
+        chars: list[str] = []
+        for part in parts:
+            base = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if base in char_names:
+                dims = "(:)" if "(" in part else ""
+                chars.append(f"{base}{dims}")
+            else:
+                kept.append(part)
+        if kept:
+            out.extend(wrap_decl(f"{m_decl.group(1)}real(kind=dp){m_decl.group(2)}:: ", kept))
+        if chars:
+            out.extend(wrap_decl(f"{m_decl.group(1)}character(len=:), allocatable :: ", chars))
+        i = j + 1
+    return out
+
+
 def promote_rank3_dummy_arguments(lines: list[str]) -> list[str]:
     use_pat = re.compile(r"\b([A-Za-z]\w*)\s*\(\s*:\s*,\s*:\s*,")
     proc_start = re.compile(r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:function|subroutine)\b", re.IGNORECASE)
@@ -38537,11 +38774,36 @@ def promote_rank3_slice_matrix_assignments(lines: list[str]) -> list[str]:
             names.add(m.group(1))
     if not names:
         return lines
+
+    def wrap_decl(prefix: str, parts: list[str]) -> list[str]:
+        text = prefix + ", ".join(parts)
+        if len(text) <= 110:
+            return [text]
+        wrapped: list[str] = []
+        cur = prefix
+        for part in parts:
+            piece = part if cur == prefix else ", " + part
+            if len(cur) + len(piece) > 100 and cur != prefix:
+                wrapped.append(cur + ", &")
+                cur = "& " + part
+            else:
+                cur += piece
+        wrapped.append(cur)
+        return wrapped
+
     out: list[str] = []
-    for ln in lines:
-        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", ln)
+    i = 0
+    while i < len(lines):
+        block = lines[i]
+        j = i
+        while block.rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            block += "\n" + lines[j]
+        compact = re.sub(r"&\s*\n\s*&?", " ", block)
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", compact)
         if m_decl is None:
-            out.append(ln)
+            out.extend(lines[i : j + 1])
+            i = j + 1
             continue
         parts = [p.strip() for p in split_top_level_commas(m_decl.group(2))]
         changed = False
@@ -38554,9 +38816,10 @@ def promote_rank3_slice_matrix_assignments(lines: list[str]) -> list[str]:
             else:
                 new_parts.append(part)
         if changed:
-            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(new_parts)}")
+            out.extend(wrap_decl(f"{m_decl.group(1)}real(kind=dp), allocatable :: ", new_parts))
         else:
-            out.append(ln)
+            out.extend(lines[i : j + 1])
+        i = j + 1
     return out
 
 
@@ -38786,7 +39049,7 @@ def rewrite_print_mat_vector_actuals(lines: list[str]) -> list[str]:
                 if re.match(rf"^\s*call\s+print_matrix\s*\(\s*(?:real\s*\(\s*)?[\( ]*(?:anint\s*\(\s*)?[\( ]*(?:real\s*\(\s*)?[\( ]*\b{re.escape(nm)}\b", block_txt, re.IGNORECASE)
             ), None)
             vector_expr = (
-                "shape(" in block_txt.lower()
+                re.search(r"\bshape\s*\(", block_txt, re.IGNORECASE) is not None
                 or re.search(r"\bsum\s*\(.+\bdim\s*=\s*1\b", block_txt, re.IGNORECASE) is not None
                 or re.search(r"\bapply_col_sd\s*\(", block_txt, re.IGNORECASE) is not None
             )
@@ -39932,16 +40195,31 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
             out.append(ln)
             continue
         if current_type is not None:
-            single_decl_line = "::" in ln and len(split_top_level_commas(ln.split("::", 1)[1])) == 1
-            m_single_field = re.match(
-                r"^(\s*)(?:type\s*\([^)]+\)|real\(kind=dp\)|integer|logical|character\(len=:\))\s*(?:,[^:]*)?::\s*([A-Za-z]\w*)\s*(?:\(.*\))?\s*$",
+            m_decl_line = re.match(
+                r"^(\s*)((?:type\s*\([^)]+\)|real\(kind=dp\)|integer|logical|character\(len=:\))\s*(?:,[^:]*)?::\s*)(.+)$",
                 ln,
                 re.IGNORECASE,
-            ) if single_decl_line else None
-            if m_single_field is not None:
-                replacement = replacements.get((current_type, m_single_field.group(2).lower()))
-                if replacement is not None:
-                    out.append(m_single_field.group(1) + replacement)
+            )
+            if m_decl_line is not None:
+                indent, prefix, rest = m_decl_line.groups()
+                kept: list[str] = []
+                replacement_lines: list[str] = []
+                for part in split_top_level_commas(rest):
+                    part_s = part.strip()
+                    m_field = re.match(r"([A-Za-z]\w*)\s*(?:\(.*\))?\s*$", part_s)
+                    replacement = (
+                        replacements.get((current_type, m_field.group(1).lower()))
+                        if m_field is not None
+                        else None
+                    )
+                    if replacement is None:
+                        kept.append(part_s)
+                    else:
+                        replacement_lines.append(indent + replacement)
+                if replacement_lines:
+                    if kept:
+                        out.append(indent + prefix + ", ".join(kept))
+                    out.extend(replacement_lines)
                     continue
         out.append(ln)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
@@ -40323,6 +40601,19 @@ def rewrite_rank1_component_matrix_prints_text(f90: str) -> str:
             tname = var_types.get(obj)
             if tname is not None and type_field_rank.get((tname, field.lower())) == 1:
                 out.append(f"{m_print.group(1)}call print_real_vector({obj}%{field})")
+                continue
+        m_vec_print = re.match(
+            r"^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*(,.*)?\)\s*$",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_vec_print is not None:
+            obj = m_vec_print.group(2)
+            field = m_vec_print.group(3)
+            rest = m_vec_print.group(4) or ""
+            tname = var_types.get(obj)
+            if tname is not None and type_field_rank.get((tname, field.lower())) == 2:
+                out.append(f"{m_vec_print.group(1)}call print_matrix({obj}%{field}{rest})")
                 continue
         out.append(ln)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
@@ -46389,7 +46680,7 @@ def main() -> int:
     source_already_obfuscated = False
     if args.obfuscate:
         try:
-            src = obfuscate_r_source(src)
+            src = obfuscate_r_source(src, seed=(args.obfuscate_seed or None))
         except NotImplementedError as e:
             print(f"Obfuscate R: FAIL ({e})")
             return 1
@@ -47561,6 +47852,7 @@ def main() -> int:
     f90_lines = promote_logical_function_result_assignments(f90_lines)
     f90_lines = rewrite_sum_logical_arrays(f90_lines)
     f90_lines = promote_character_constructor_assignments(f90_lines)
+    f90_lines = promote_character_merge_assignments(f90_lines)
     f90_lines = add_missing_iso_fortran_env_dp_imports(f90_lines)
     f90_lines = remove_redundant_procedure_iso_fortran_env_dp_imports(f90_lines)
     f90_lines = remove_unused_iso_fortran_env_dp_imports(f90_lines)
@@ -47834,6 +48126,15 @@ def main() -> int:
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = promote_rank3_decls_from_references_text(f90)
     f90 = declare_missing_matrix_aliases_text(f90)
+    f90_lines = promote_rank3_slice_matrix_assignments(f90.splitlines())
+    f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
+    f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = demote_rank2_reals_from_vector_rhs_text(f90)
+    f90 = rewrite_rank1_component_matrix_prints_text(f90)
+    f90 = lower_selected_derived_list_field_copies_text(f90)
+    f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+    f90 = repair_orphan_real_decl_continuations_text(f90)
+    f90 = remove_duplicate_local_declarations_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
