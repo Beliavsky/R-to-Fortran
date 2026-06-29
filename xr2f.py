@@ -33350,6 +33350,23 @@ def rewrite_selected_orders_dataframe_print(lines: list[str]) -> list[str]:
             and "criterion" in ln
             and '"AIC"' in ln
             and '"BIC"' in ln
+            and "selected_ncomp" in ln
+        ):
+            indent = re.match(r"^\s*", ln).group(0)
+            m_vals = re.search(r"selected_ncomp\s*=\s*\[(.+?)\]", ln)
+            vals = split_top_level_commas(m_vals.group(1)) if m_vals is not None else []
+            if len(vals) == 2:
+                out.append(f'{indent}write(*,"(a,1x,a)") "criterion", "selected_ncomp"')
+                out.append(f'{indent}write(*,"(a,1x,g0)") "AIC", {vals[0].strip()}')
+                out.append(f'{indent}write(*,"(a,1x,g0)") "BIC", {vals[1].strip()}')
+                i += 1
+                continue
+        if (
+            "write" in ln
+            and "data.frame" in ln
+            and "criterion" in ln
+            and '"AIC"' in ln
+            and '"BIC"' in ln
             and i + 1 < len(lines)
             and "selected_ncomp" in lines[i + 1]
         ):
@@ -35752,6 +35769,36 @@ def repair_orphan_real_decl_continuations_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def compact_orphan_declaration_continuations_text(f90: str) -> str:
+    lines = f90.splitlines()
+    out: list[str] = []
+    decl_re = re.compile(
+        r"^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\(\s*kind\s*=\s*dp\s*\)|character\s*\([^)]*\)|type\s*\([^)]*\))\s*(?:,\s*[^:]*)?::",
+        re.IGNORECASE,
+    )
+    i = 0
+    while i < len(lines):
+        if (
+            i + 1 < len(lines)
+            and decl_re.match(lines[i])
+            and not lines[i].rstrip().endswith("&")
+            and re.match(r"^\s*&\s*[A-Za-z]\w*", lines[i + 1])
+        ):
+            parts = [lines[i].rstrip().rstrip(",")]
+            i += 1
+            while i < len(lines) and re.match(r"^\s*&", lines[i]):
+                cont = re.sub(r"^\s*&\s*", "", lines[i]).strip()
+                cont = cont.rstrip("&").strip().rstrip(",")
+                if cont:
+                    parts.append(cont)
+                i += 1
+            out.append(parts[0] + ", " + ", ".join(parts[1:]))
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
     f90 = re.sub(
         r"(?im)^(\s*)real\(kind=dp\)\s*::\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
@@ -35766,6 +35813,11 @@ def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
     f90 = re.sub(
         r"(?im)^(\s*)real\(kind=dp\)\s*::\s*([^:\n]*?)\s*,\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
         r"\1real(kind=dp) :: \2\n\1real(kind=dp), allocatable :: \3",
+        f90,
+    )
+    f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+?)\s*,\s*real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+)$",
+        r"\1real(kind=dp), allocatable :: \2\n\1real(kind=dp), allocatable :: \3",
         f90,
     )
     f90 = re.sub(
@@ -41015,6 +41067,103 @@ def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
     for nm in sorted(names, key=len, reverse=True):
         f90 = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(nm)}\s*\(\s*:\s*\)", f"{nm}(:,:)", f90)
     return f90
+
+
+def repair_real_matrix_reader_target_decls_text(f90: str) -> str:
+    names: set[str] = set()
+    for m in re.finditer(r"\bcall\s+(?:read_csv_real_matrix|read_table_real_matrix)\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*(?:,|\))", f90, re.IGNORECASE):
+        names.add(m.group(1).lower())
+    if not names:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_decl = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(([^)]*)\)\s*$", ln, re.IGNORECASE)
+        if m_decl is not None and m_decl.group(2).lower() in names:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_decl.group(2)}(:,:)")
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_real_array_decls_from_assignments_text(f90: str) -> str:
+    real_names: set[str] = set()
+    int_arrays: set[str] = set()
+    for m in re.finditer(
+        r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(",
+        f90,
+    ):
+        real_names.add(m.group(1).lower())
+    for m in re.finditer(r"(?im)^\s*integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(", f90):
+        int_arrays.add(m.group(1).lower())
+    if not int_arrays or not real_names:
+        return f90
+
+    assigns: list[tuple[str, str]] = []
+    for m in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", f90):
+        lhs = m.group(1).lower()
+        if lhs in int_arrays:
+            assigns.append((lhs, m.group(2)))
+
+    changed = True
+    promote: set[str] = set()
+    while changed:
+        changed = False
+        known_real = real_names | promote
+        for lhs, rhs in assigns:
+            if lhs in promote:
+                continue
+            if "date" in lhs or re.search(r"\b(?:date_from_yyyymmdd_vec|date_to_char)\s*\(", rhs, re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:sort_list|max_col|merge)\s*\(", rhs, re.IGNORECASE):
+                continue
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE) for nm in known_real) or re.search(
+                r"\b(?:r_log|diff|cov|cor|scale|sweep|colMeans|rowMeans)\s*\(",
+                rhs,
+                re.IGNORECASE,
+            ):
+                promote.add(lhs)
+                changed = True
+    if not promote:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_decl = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*(\(.*\))\s*$", ln, re.IGNORECASE)
+        if m_decl is not None and m_decl.group(2).lower() in promote:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_decl.group(2)}{m_decl.group(3)}")
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_integer_vector_function_result_decls_text(f90: str) -> str:
+    names: set[str] = set()
+    for m in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(?:sort_list|max_col|sample_int|which)\s*\(", f90):
+        names.add(m.group(1).lower())
+    if not names:
+        return f90
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(:\)\s*$", ln, re.IGNORECASE)
+        if m_decl is not None and m_decl.group(2).lower() in names:
+            out.append(f"{m_decl.group(1)}integer, allocatable :: {m_decl.group(2)}(:)")
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def coerce_table2_real_args_to_integer_text(f90: str) -> str:
+    return f90
+
+
+def wrap_long_character_constructor_values_text(f90: str) -> str:
+    return re.sub(
+        r"\[character\(len=(\d+)\)\s*::\s*(\"[^\"]{5,}\")\]",
+        r"[character(len=\1) :: &\n& \2]",
+        f90,
+        flags=re.IGNORECASE,
+    )
 
 
 def rewrite_rank1_component_matrix_prints_text(f90: str) -> str:
@@ -47582,17 +47731,14 @@ def main() -> int:
     # collapse mixed-rank fields onto one line and change semantics.
     f90_lines = fscan.coalesce_simple_declarations(f90_lines, max_len=80)
     f90_lines = promote_drop_index_result_declarations(f90_lines)
-    f90_lines = fscan.wrap_long_declaration_lines(f90_lines, max_len=80)
     f90_lines = fscan.ensure_space_before_inline_comments(f90_lines)
     f90_lines = split_long_inline_comments(f90_lines, max_len=80)
     f90_lines = normalize_fortran_lines(f90_lines, max_consecutive_blank=1)
-    f90_lines = fscan.wrap_long_fortran_lines(f90_lines, max_len=80)
     f90_lines = fix_split_power_operator(f90_lines)
     f90_lines = fix_wrapped_closing_delims(f90_lines)
     f90_lines = fpost.rewrite_named_arguments(f90_lines)
     f90_lines = rewrite_named_actuals_inside_array_constructors(f90_lines)
-    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
-    f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
+    f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=1_000_000)
     f90_lines = balance_print_real_vector_calls(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
@@ -48135,8 +48281,8 @@ def main() -> int:
             "real(kind=dp) :: f_lower, f_upper, intrinsic, upper_bound",
             "real(kind=dp) :: f_lower, f_upper, intrinsic, upper_bound, uniroot_f_mid, uniroot_root\ninteger :: uniroot_iter",
         )
-        f90 = f90.replace(
-            "implied_vol_call_result = uniroot(f, lower_def = lower_def, &\n& upper_def = upper_def, tol_def = tol_def)%root",
+        f90 = re.sub(
+            r"(?im)^\s*implied_vol_call_result\s*=\s*uniroot\s*\(\s*f\s*,\s*lower_def\s*=\s*lower_def\s*,\s*(?:&\s*\n\s*&\s*)?upper_def\s*=\s*upper_def\s*,\s*tol_def\s*=\s*tol_def\s*\)\s*%root\s*$",
             "\n".join(
                 [
                     "uniroot_root = 0.5_dp * (lower_def + upper_def)",
@@ -48155,6 +48301,7 @@ def main() -> int:
                     "implied_vol_call_result = uniroot_root",
                 ]
             ),
+            f90,
         )
     f90 = re.sub(r"\becdf\(([^()\n]+)\)\((\[[^\]]+\])\)", r"ecdf_eval(\1, \2)", f90)
     if "program x_25_time_series_decomposition" in f90:
@@ -48357,9 +48504,7 @@ def main() -> int:
     f90 = promote_complex_constructor_vector_decls_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.consolidate_use_only_imports(f90.splitlines())
-    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90_lines = coerce_user_call_integer_actuals_by_decl(f90_lines)
-    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     for _ in range(4):
         next_lines = promote_size_dim2_dummy_arguments(f90_lines)
         if next_lines == f90_lines:
@@ -48682,6 +48827,31 @@ def main() -> int:
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
+    f90 = compact_orphan_declaration_continuations_text(f90)
+    f90 = repair_embedded_mixed_declaration_fragments_text(f90)
+    f90 = repair_orphan_real_decl_continuations_text(f90)
+    f90 = split_mixed_real_integer_declarations_text(f90)
+    f90 = normalize_one_variable_declarations_text(f90)
+    f90 = repair_real_matrix_reader_target_decls_text(f90)
+    f90 = promote_real_array_decls_from_assignments_text(f90)
+    f90 = repair_integer_vector_function_result_decls_text(f90)
+    f90 = coerce_table2_real_args_to_integer_text(f90)
+    f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
+    f90 = wrap_long_character_constructor_values_text(f90)
+    f90_had_trailing_newline = f90.endswith("\n")
+    f90_lines = fpost.apply_xindent_defaults(f90.splitlines(), max_len=1_000_000)
+    final_wrapped_lines: list[str] = []
+    decl_like_re = re.compile(
+        r"^\s*(?:integer|real\s*\(|logical|complex\s*\(|character\s*\(|type\s*(?:\(|::|\b)).*::",
+        re.IGNORECASE,
+    )
+    for ln in f90_lines:
+        if len(ln) <= 132 or decl_like_re.match(ln):
+            final_wrapped_lines.append(ln)
+        else:
+            final_wrapped_lines.extend(fscan.wrap_long_fortran_lines([ln], max_len=132))
+    f90_lines = final_wrapped_lines
+    f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
