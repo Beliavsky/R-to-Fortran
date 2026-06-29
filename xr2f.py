@@ -6945,6 +6945,7 @@ def _render_r_stmts(stmts: list[object], indent: str = "") -> list[str]:
 
 def obfuscate_r_source(src: str, seed: int | None = None) -> str:
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
+    src = _rewrite_simple_transposed_sapply_field(src)
     _DOTTED_VAR_RENAMES = {}
     _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
     _SANITIZED_R_NAME_BY_RAW = {}
@@ -26730,6 +26731,106 @@ def _rewrite_simple_anonymous_apply_functions(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _rewrite_simple_transposed_sapply_field(src: str) -> str:
+    """Lower t(sapply(xs, function(f) { f$field })) into an explicit row loop."""
+    lines = src.splitlines()
+    static_list_lengths: dict[str, int] = {}
+    j = 0
+    while j < len(lines):
+        m_list = re.match(r"^\s*([A-Za-z.]\w*)\s*(?:<-|=)\s*list\s*\(\s*$", lines[j])
+        if m_list is None:
+            j += 1
+            continue
+        name = m_list.group(1)
+        depth = 1
+        count = 0
+        k = j + 1
+        while k < len(lines) and depth > 0:
+            ln = lines[k]
+            stripped = ln.strip()
+            if depth == 1 and stripped and not stripped.startswith("#") and not stripped.startswith(")"):
+                count += 1
+            depth += ln.count("(") - ln.count(")")
+            k += 1
+        if count > 0:
+            static_list_lengths[name] = count
+        j = k
+
+    out: list[str] = []
+    i = 0
+    n_rewrite = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(
+            r"^(\s*)([A-Za-z.]\w*)\s*(<-|=)\s*t\s*\(\s*sapply\s*\(\s*(.+?)\s*,\s*function\s*\(\s*([A-Za-z.]\w*)\s*\)\s*\{\s*$",
+            line,
+        )
+        if m is None or i + 2 >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+        indent, target, op, list_expr, arg_name = m.groups()
+        body = lines[i + 1].strip()
+        close = lines[i + 2].strip()
+        m_body = re.match(rf"^{re.escape(arg_name)}\s*\$\s*([A-Za-z.]\w*)\s*$", body)
+        c_items: list[str] | None = None
+        close_offset = 2
+        if m_body is None:
+            if body != "c(":
+                out.append(line)
+                i += 1
+                continue
+            c_lines: list[str] = []
+            k = i + 2
+            while k < len(lines) and lines[k].strip() != ")":
+                c_lines.append(lines[k].strip().rstrip(","))
+                k += 1
+            if k + 1 >= len(lines) or lines[k].strip() != ")" or re.match(r"^\}\s*\)\s*\)\s*$", lines[k + 1].strip()) is None:
+                out.append(line)
+                i += 1
+                continue
+            c_items = [item for item in c_lines if item]
+            close_offset = k + 1 - i
+        elif re.match(r"^\}\s*\)\s*\)\s*$", close) is None:
+            out.append(line)
+            i += 1
+            continue
+        field = m_body.group(1) if m_body is not None else ""
+        n_rewrite += 1
+        idx = f"xr2f_sapply_i_{n_rewrite}"
+        list_expr_s = list_expr.strip()
+        static_len = static_list_lengths.get(list_expr_s)
+        ncol_expr = str(len(c_items)) if c_items is not None else f"length({list_expr_s}[[1]]${field})"
+        def row_expr(item_exprs: list[str] | None, row_ref: str) -> str:
+            if item_exprs is None:
+                return f"{row_ref}${field}"
+            vals: list[str] = []
+            for item in item_exprs:
+                expr = item.split("=", 1)[1].strip() if "=" in item else item.strip()
+                vals.append("as.numeric(" + re.sub(rf"\b{re.escape(arg_name)}\s*\$", row_ref + "$", expr) + ")")
+            return "c(" + ", ".join(vals) + ")"
+
+        if static_len is not None:
+            out.append(
+                f"{indent}{target} {op} matrix(NA_real_, nrow = {static_len}, "
+                f"ncol = {ncol_expr})"
+            )
+            for row_i in range(1, static_len + 1):
+                ref = f"{list_expr_s}[[{row_i}]]"
+                out.append(f"{indent}{target}[{row_i}, ] <- {row_expr(c_items, ref)}")
+        else:
+            out.append(
+                f"{indent}{target} {op} matrix(NA_real_, nrow = length({list_expr}), "
+                f"ncol = {ncol_expr})"
+            )
+            out.append(f"{indent}for ({idx} in seq_along({list_expr})) {{")
+            ref = f"{list_expr}[[{idx}]]"
+            out.append(f"{indent}  {target}[{idx}, ] <- {row_expr(c_items, ref)}")
+            out.append(f"{indent}}}")
+        i += close_offset + 1
+    return "\n".join(out) + ("\n" if src.endswith("\n") else "")
+
+
 def transpile_r_to_fortran(
     src: str,
     stem: str,
@@ -26755,6 +26856,7 @@ def transpile_r_to_fortran(
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
     src = _rewrite_simple_anonymous_apply_functions(src)
+    src = _rewrite_simple_transposed_sapply_field(src)
     _DOTTED_VAR_RENAMES = {}
     _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
     _SANITIZED_R_NAME_BY_RAW = {}
