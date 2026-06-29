@@ -35329,11 +35329,22 @@ def promote_cluster_field_assignments_text(f90: str) -> str:
 
 
 def promote_vector_slice_locals_text(f90: str) -> str:
+    logical_stmts: list[str] = []
+    raw_lines = f90.splitlines()
+    i_stmt = 0
+    while i_stmt < len(raw_lines):
+        stmt = raw_lines[i_stmt]
+        while stmt.rstrip().endswith("&") and i_stmt + 1 < len(raw_lines):
+            i_stmt += 1
+            stmt += "\n" + raw_lines[i_stmt]
+        logical_stmts.append(re.sub(r"&\s*\n\s*&?", " ", stmt))
+        i_stmt += 1
+    logical_text = "\n".join(logical_stmts)
     names = {
         m.group(1)
         for m in re.finditer(
             r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(?:[A-Za-z]\w*(?:%[A-Za-z]\w*)?\s*\([^,\n]*:[^)]*\)|numeric\s*\(\s*0\s*\))",
-            f90,
+            logical_text,
             re.IGNORECASE,
         )
     }
@@ -48644,6 +48655,7 @@ def main() -> int:
     f90_lines = hoist_module_used_real_matrix_globals(f90.splitlines())
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = promote_rank3_decls_from_references_text(f90)
+    f90 = demote_scalar_reducer_allocatable_results_text(f90)
     f90 = declare_missing_matrix_aliases_text(f90)
     f90_lines = promote_rank3_slice_matrix_assignments(f90.splitlines())
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
@@ -48663,7 +48675,11 @@ def main() -> int:
     f90 = split_mixed_real_integer_declarations_text(f90)
     f90 = normalize_one_variable_declarations_text(f90)
     f90 = unroll_multi_allocate_statements_text(f90)
+    f90 = promote_vector_slice_locals_text(f90)
+    f90 = normalize_one_variable_declarations_text(f90)
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
+    f90 = demote_scalar_reducer_allocatable_results_text(f90)
+    f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
