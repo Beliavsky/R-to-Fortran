@@ -42058,6 +42058,458 @@ def promote_integer_maxval_locals_text(f90: str) -> str:
     )
 
 
+def lower_function_dataframe_returns_text(f90: str) -> str:
+    """Lower simple named numeric data.frame function results to derived types."""
+    func_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b.*?^\s*end\s+function\b.*?$"
+    )
+    specs: dict[str, dict[str, object]] = {}
+
+    def _normalize_expr(txt: str) -> str:
+        return re.sub(r"&\s*\n\s*&\s*", " ", txt).strip()
+
+    def _field_expr(src: str) -> str:
+        src = _normalize_expr(src)
+        m_seq = re.fullmatch(r"seq_along\s*\(\s*([A-Za-z]\w*)\s*\)", src, re.IGNORECASE)
+        if m_seq is not None:
+            return f"r_seq_len(size({m_seq.group(1)}))"
+        return src
+
+    def _field_kind(src: str) -> str:
+        return "integer" if re.match(r"\s*(?:seq_along|r_seq_len|r_seq_int)\s*\(", src, re.IGNORECASE) else "real"
+
+    def repl_func(m: re.Match[str]) -> str:
+        block = m.group(0)
+        fn = m.group(1)
+        res_m = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if res_m is None:
+            return block
+        res = res_m.group(1)
+        flat = _normalize_expr(block)
+        assign_m = re.search(rf"\b{re.escape(res)}\s*=\s*(data\.frame\s*\(.+\))\s*end\s+function\b", flat, re.IGNORECASE)
+        if assign_m is None:
+            return block
+        c_df = parse_call_text(assign_m.group(1))
+        if c_df is None or c_df[0].lower() != "data.frame" or c_df[1]:
+            return block
+        fields: list[tuple[str, str, str]] = []
+        for name, src in c_df[2].items():
+            if name.lower() in {"stringsasfactors", "check.names", "fix.empty.names"}:
+                continue
+            field = _sanitize_fortran_kwarg_name(name)
+            expr = _field_expr(src)
+            kind = _field_kind(expr)
+            fields.append((field, expr, kind))
+        if not fields:
+            return block
+        type_name = f"{fn}_result_t"
+        specs[fn.lower()] = {"type": type_name, "fields": fields}
+        new_block = re.sub(r"(?im)^(\s*)(pure\s+)?elemental\s+", r"\1\2", block, count=1)
+        new_block = re.sub(
+            rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(res)}\s*\(:\s*\)\s*$",
+            rf"\1type({type_name}) :: {res}",
+            new_block,
+            count=1,
+        )
+        out_decl_lines: list[str] = []
+        for line in new_block.splitlines():
+            decl_m = re.match(
+                r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if decl_m is None:
+                out_decl_lines.append(line)
+                continue
+            kept: list[str] = []
+            moved = False
+            for item in split_top_level_commas(decl_m.group(2)):
+                if re.fullmatch(rf"\s*{re.escape(res)}\s*\(:\s*\)\s*", item, re.IGNORECASE):
+                    moved = True
+                else:
+                    kept.append(item.strip())
+            if moved:
+                out_decl_lines.append(f"{decl_m.group(1)}type({type_name}) :: {res}")
+                if kept:
+                    out_decl_lines.append(f"{decl_m.group(1)}real(kind=dp), allocatable :: {', '.join(kept)}")
+            else:
+                out_decl_lines.append(line)
+        new_block = "\n".join(out_decl_lines) + ("\n" if new_block.endswith("\n") else "")
+        candidates: set[str] = set()
+        for decl_m in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            new_block,
+        ):
+            for item in split_top_level_commas(decl_m.group(1)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None:
+                    candidates.add(item_m.group(1))
+        if candidates:
+            field_expr_text = " ".join(expr for _field, expr, _kind in fields)
+            field_expr_names = {
+                nm.group(0)
+                for nm in re.finditer(r"\b[A-Za-z]\w*\b", field_expr_text)
+            }
+            usage_block = re.sub(
+                r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*.+$",
+                "",
+                new_block,
+            )
+            scalar_candidates = {
+                name for name in candidates
+                if name not in field_expr_names
+                if re.search(rf"(?m)^\s*{re.escape(name)}\s*=", usage_block)
+                and re.search(rf"(?m)^\s*{re.escape(name)}\s*=\s*\[", usage_block) is None
+                and re.search(rf"\b{re.escape(name)}\s*\(", usage_block) is None
+                and re.search(rf"\b(?:sum|mean|sd|size|pack|print_real_vector)\s*\(\s*{re.escape(name)}\b", usage_block, re.IGNORECASE) is None
+            }
+            if scalar_candidates:
+                fixed_lines: list[str] = []
+                for line in new_block.splitlines():
+                    decl_m = re.match(
+                        r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+                        line,
+                        re.IGNORECASE,
+                    )
+                    if decl_m is None:
+                        fixed_lines.append(line)
+                        continue
+                    keep_parts: list[str] = []
+                    scalar_parts: list[str] = []
+                    for item in split_top_level_commas(decl_m.group(2)):
+                        item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                        if item_m is not None and item_m.group(1) in scalar_candidates:
+                            scalar_parts.append(item_m.group(1))
+                        else:
+                            keep_parts.append(item.strip())
+                    if scalar_parts:
+                        fixed_lines.append(f"{decl_m.group(1)}real(kind=dp) :: {', '.join(scalar_parts)}")
+                        if keep_parts:
+                            fixed_lines.append(f"{decl_m.group(1)}real(kind=dp), allocatable :: {', '.join(keep_parts)}")
+                    else:
+                        fixed_lines.append(line)
+                new_block = "\n".join(fixed_lines) + ("\n" if new_block.endswith("\n") else "")
+        assign_re = re.compile(
+            rf"(?ms)^(\s*){re.escape(res)}\s*=\s*data\.frame\s*\(.+?\)\s*$",
+            re.IGNORECASE,
+        )
+        repl_lines = []
+        for field, expr, _kind in fields:
+            repl_lines.append(rf"\g<1>{res}%{field} = {expr}")
+        new_block = assign_re.sub("\n".join(repl_lines), new_block, count=1)
+        return new_block
+
+    f90_new = func_re.sub(repl_func, f90)
+    if not specs:
+        return f90_new
+
+    def _type_block(type_name: str, fields: list[tuple[str, str, str]]) -> str:
+        lines = [f"type :: {type_name}"]
+        for field, _expr, kind in fields:
+            if kind == "integer":
+                lines.append(f"   integer, allocatable :: {field}(:)")
+            else:
+                lines.append(f"   real(kind=dp), allocatable :: {field}(:)")
+        lines.append(f"end type {type_name}")
+        return "\n".join(lines)
+
+    def _head_helper(fn: str, type_name: str, fields: list[tuple[str, str, str]]) -> str:
+        helper = f"print_{fn}_result_head"
+        first_field = fields[0][0]
+        header = " ".join(field for field, _expr, _kind in fields)
+        values = ", ".join(f"df%{field}(i)" for field, _expr, _kind in fields)
+        return "\n".join(
+            [
+                f"subroutine {helper}(df, n_head)",
+                f"type({type_name}), intent(in) :: df",
+                "integer, intent(in) :: n_head",
+                "integer :: i, nshow",
+                f"nshow = min(max(0, n_head), size(df%{first_field}))",
+                f'write(*,"(a)") "{header}"',
+                "do i = 1, nshow",
+                f'   write(*,"(*(g0,1x))") {values}',
+                "end do",
+                f"end subroutine {helper}",
+            ]
+        )
+
+    contains_m = re.search(r"(?im)^\s*contains\s*$", f90_new)
+    if contains_m is not None:
+        insert = []
+        for spec in specs.values():
+            insert.append(_type_block(str(spec["type"]), spec["fields"]))  # type: ignore[arg-type]
+        f90_new = f90_new[:contains_m.start()] + "\n".join(insert) + "\n" + f90_new[contains_m.start():]
+
+    for fn, spec in specs.items():
+        type_name = str(spec["type"])
+        fields = spec["fields"]  # type: ignore[assignment]
+        helper = f"print_{fn}_result_head"
+        end_pat = re.compile(rf"(?im)^(\s*end\s+function\s+{re.escape(fn)}\s*)$", re.IGNORECASE)
+        f90_new = end_pat.sub(r"\1\n" + _head_helper(fn, type_name, fields), f90_new, count=1)
+        f90_new = re.sub(
+            rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(:\s*\)\s*$",
+            lambda dm, fn=fn, type_name=type_name: (
+                f"{dm.group(1)}type({type_name}) :: {dm.group(2)}"
+                if re.search(rf"(?m)^\s*{re.escape(dm.group(2))}\s*=\s*{re.escape(fn)}\s*\(", f90_new, re.IGNORECASE)
+                else dm.group(0)
+            ),
+            f90_new,
+        )
+        typed_vars = {
+            vm.group(1)
+            for vm in re.finditer(
+                rf"(?im)^\s*type\s*\(\s*{re.escape(type_name)}\s*\)\s*::\s*([A-Za-z]\w*)\s*$",
+                f90_new,
+            )
+        }
+        vector_field_names = {field for field, _expr, _kind in fields}
+        for lhs_m in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)%([A-Za-z]\w*)\s*$", f90_new):
+            lhs, obj, field = lhs_m.group(1), lhs_m.group(2), lhs_m.group(3)
+            if obj not in typed_vars or field not in vector_field_names:
+                continue
+            f90_new = re.sub(
+                rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(lhs)}\s*$",
+                rf"\1real(kind=dp), allocatable :: {lhs}(:)",
+                f90_new,
+                count=1,
+            )
+        f90_new = re.sub(
+            rf"(?ims)^(\s*)call\s+print_real_vector\s*\(\s*real\s*\(\s*r_head\s*\(\s*([A-Za-z]\w*)\s*,\s*([^)]+)\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*$",
+            lambda pm, helper=helper: (
+                f"{pm.group(1)}call {helper}({pm.group(2)}, {pm.group(3).strip()})"
+                if re.search(rf"(?m)^\s*type\s*\(\s*{re.escape(type_name)}\s*\)\s*::\s*{re.escape(pm.group(2))}\b", f90_new, re.IGNORECASE)
+                else pm.group(0)
+            ),
+            f90_new,
+        )
+        f90_new = re.sub(
+            rf"(?im)^(\s*)call\s+print_real_vector\s*\(\s*r_head\s*\(\s*([A-Za-z]\w*)\s*,\s*([^)]+)\)\s*\)\s*$",
+            lambda pm, helper=helper: (
+                f"{pm.group(1)}call {helper}({pm.group(2)}, {pm.group(3).strip()})"
+                if re.search(rf"(?m)^\s*type\s*\(\s*{re.escape(type_name)}\s*\)\s*::\s*{re.escape(pm.group(2))}\b", f90_new, re.IGNORECASE)
+                else pm.group(0)
+            ),
+            f90_new,
+        )
+        f90_new = re.sub(
+            rf"(?m)^(\s*public\s*::[^\n]*\b{re.escape(fn)}\b[^\n]*)$",
+            lambda pm, type_name=type_name, helper=helper: (
+                pm.group(1)
+                if type_name in pm.group(1)
+                else pm.group(1) + f", {type_name}, {helper}"
+            ),
+            f90_new,
+            count=1,
+        )
+    if "r_seq_len(" in f90_new:
+        f90_new = add_missing_r_mod_uses_per_scope_text(f90_new, {"r_seq_len"})
+    return f90_new
+
+
+def demote_locals_from_scalar_derived_components_text(f90: str) -> str:
+    """Demote locals copied from scalar derived-type fields when never indexed."""
+    scalar_fields: set[tuple[str, str]] = set()
+    cur_type: str | None = None
+    for line in f90.splitlines():
+        m_type = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", line, re.IGNORECASE)
+        if m_type is not None:
+            cur_type = m_type.group(1).lower()
+            continue
+        if cur_type is not None and re.match(r"^\s*end\s+type\b", line, re.IGNORECASE):
+            cur_type = None
+            continue
+        if cur_type is None:
+            continue
+        m_decl = re.match(r"^\s*(real\(kind=dp\)|integer|logical)\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        for item in split_top_level_commas(m_decl.group(2)):
+            nm = re.match(r"\s*([A-Za-z]\w*)\b", item)
+            if nm is not None:
+                scalar_fields.add((cur_type, nm.group(1).lower()))
+    if not scalar_fields:
+        return f90
+
+    def repl_unit(m_unit: re.Match[str]) -> str:
+        unit = m_unit.group(0)
+        var_type: dict[str, str] = {}
+        for dm in re.finditer(r"(?im)^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", unit):
+            typ = dm.group(1).lower()
+            for item in split_top_level_commas(dm.group(2)):
+                nm = re.match(r"\s*([A-Za-z]\w*)\b", item)
+                if nm is not None:
+                    var_type[nm.group(1).lower()] = typ
+        if not var_type:
+            return unit
+        unit_usage = re.sub(
+            r"(?im)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical)\s*,\s*allocatable\s*::\s*.+$",
+            "",
+            unit,
+        )
+        demote_names: set[str] = set()
+        for am in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)%([A-Za-z]\w*)\s*$", unit):
+            lhs, obj, field = am.group(1), am.group(2), am.group(3)
+            if (var_type.get(obj.lower(), ""), field.lower()) not in scalar_fields:
+                continue
+            if re.search(rf"\b{re.escape(lhs)}\s*\(", unit_usage) is not None:
+                continue
+            if re.search(rf"\b(?:size|minval|maxval|sum|mean|sd|pack|print_real_vector)\s*\(\s*{re.escape(lhs)}\b", unit_usage, re.IGNORECASE):
+                continue
+            demote_names.add(lhs)
+        candidates: set[str] = set()
+        for dm in re.finditer(r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", unit):
+            for item in split_top_level_commas(dm.group(1)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None:
+                    candidates.add(item_m.group(1))
+        changed = True
+        while changed:
+            changed = False
+            for am in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", unit):
+                lhs, rhs = am.group(1), am.group(2).strip()
+                if lhs in demote_names or lhs not in candidates:
+                    continue
+                if re.search(rf"\b{re.escape(lhs)}\s*\(", unit_usage) is not None:
+                    continue
+                if re.search(rf"\b(?:size|minval|maxval|sum|mean|sd|pack|print_real_vector)\s*\(\s*{re.escape(lhs)}\b", unit_usage, re.IGNORECASE):
+                    continue
+                if re.search(r"\(:|\[[^\]]*,|r_seq_|_vec\s*\(|pack\s*\(|reshape\s*\(|spread\s*\(", rhs, re.IGNORECASE):
+                    continue
+                names_rhs = {
+                    nm.group(0)
+                    for nm in re.finditer(r"\b[A-Za-z]\w*\b", rhs)
+                    if nm.group(0).lower() not in {"real", "kind", "dp", "sqrt", "exp", "log", "r_log", "tanh", "max", "min"}
+                }
+                if names_rhs and not names_rhs.issubset(demote_names | {lhs}):
+                    continue
+                demote_names.add(lhs)
+                changed = True
+        if not demote_names:
+            return unit
+        out: list[str] = []
+        for line in unit.splitlines():
+            m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+            if m_decl is None:
+                out.append(line)
+                continue
+            keep: list[str] = []
+            demoted: list[str] = []
+            for item in split_top_level_commas(m_decl.group(2)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None and item_m.group(1) in demote_names:
+                    demoted.append(item_m.group(1))
+                else:
+                    keep.append(item.strip())
+            if demoted:
+                out.append(f"{m_decl.group(1)}real(kind=dp) :: {', '.join(demoted)}")
+                if keep:
+                    out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    return re.sub(
+        r"(?ims)^\s*(?:program|subroutine|(?:pure\s+|recursive\s+|elemental\s+)*function)\b.*?^\s*end\s+(?:program|subroutine|function)\b.*?$",
+        repl_unit,
+        f90,
+    )
+
+
+def demote_unindexed_locals_in_scalar_functions_text(f90: str) -> str:
+    """Demote unindexed rank-1 real locals inside scalar-result functions."""
+    func_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\b.*?^\s*end\s+function\b.*?$"
+    )
+
+    def repl_func(m: re.Match[str]) -> str:
+        block = m.group(0)
+        res_m = re.search(r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\)", block, re.IGNORECASE)
+        if res_m is None:
+            return block
+        res = res_m.group(1)
+        if re.search(rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::[^\n]*\b{re.escape(res)}\b", block) is None:
+            return block
+        candidates: set[str] = set()
+        for dm in re.finditer(r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", block):
+            for item in split_top_level_commas(dm.group(1)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None:
+                    candidates.add(item_m.group(1))
+        if not candidates:
+            return block
+        array_names: set[str] = set(candidates)
+        for dm in re.finditer(r"(?im)^\s*[^!\n:]+,\s*allocatable\s*::\s*(.+)$", block):
+            for item in split_top_level_commas(dm.group(1)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None:
+                    array_names.add(item_m.group(1))
+        for dm in re.finditer(r"(?im)^\s*[^!\n:]+,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$", block):
+            for item in split_top_level_commas(dm.group(1)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None:
+                    array_names.add(item_m.group(1))
+        usage = re.sub(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*.+$",
+            "",
+            block,
+        )
+        demote: set[str] = set()
+        deps: dict[str, set[str]] = {}
+        for name in sorted(candidates):
+            assigns = [am.group(1).strip() for am in re.finditer(rf"(?im)^\s*{re.escape(name)}\s*=\s*(.+)$", usage)]
+            if not assigns:
+                continue
+            if any("%" in rhs for rhs in assigns):
+                continue
+            if re.search(rf"\b{re.escape(name)}\s*\(", usage) is not None:
+                continue
+            if re.search(rf"\b(?:size|minval|maxval|sum|mean|sd|pack|print_real_vector|dot_product)\s*\(\s*{re.escape(name)}\b", usage, re.IGNORECASE):
+                continue
+            if any(re.search(r"\([^)]*:|\(:|\[[^\]]*,|r_seq_|_vec\s*\(|pack\s*\(|reshape\s*\(|spread\s*\(|diag\s*\(|dim\s*=", rhs, re.IGNORECASE) for rhs in assigns):
+                continue
+            bare_vector_deps: set[str] = set()
+            for rhs in assigns:
+                for other in array_names - {name}:
+                    if re.search(rf"\b{re.escape(other)}\b(?!\s*\()", rhs):
+                        bare_vector_deps.add(other)
+            if any(other not in candidates for other in bare_vector_deps):
+                continue
+            demote.add(name)
+            deps[name] = bare_vector_deps & candidates
+        changed = True
+        while changed:
+            changed = False
+            for name in sorted(demote):
+                if not deps.get(name, set()).issubset(demote):
+                    demote.remove(name)
+                    changed = True
+        if not demote:
+            return block
+        out: list[str] = []
+        for line in block.splitlines():
+            dm = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+            if dm is None:
+                out.append(line)
+                continue
+            keep: list[str] = []
+            scalars: list[str] = []
+            for item in split_top_level_commas(dm.group(2)):
+                item_m = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*", item)
+                if item_m is not None and item_m.group(1) in demote:
+                    scalars.append(item_m.group(1))
+                else:
+                    keep.append(item.strip())
+            if scalars:
+                out.append(f"{dm.group(1)}real(kind=dp) :: {', '.join(scalars)}")
+                if keep:
+                    out.append(f"{dm.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+            else:
+                out.append(line)
+        return "\n".join(out) + ("\n" if block.endswith("\n") else "")
+
+    return func_re.sub(repl_func, f90)
+
+
 def repair_trend_results_dataframe_text(f90: str) -> str:
     """Materialize the expanded trend-results data frame before matrix operations."""
     label_call_fns = {
@@ -42858,6 +43310,7 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             continue
         real_scalar_locals: set[str] = set()
         int_scalar_locals: set[str] = set()
+        array_locals: set[str] = set()
         for decl_m in re.finditer(r"(?m)^\s*real\(kind=dp\)\s*::\s*(.+)$", body, re.IGNORECASE):
             real_scalar_locals.update(
                 p.strip() for p in decl_m.group(1).split(",") if re.fullmatch(r"[A-Za-z]\w*", p.strip())
@@ -42866,6 +43319,11 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             int_scalar_locals.update(
                 p.strip() for p in decl_m.group(1).split(",") if re.fullmatch(r"[A-Za-z]\w*", p.strip())
             )
+        for decl_m in re.finditer(r"(?m)^\s*[^!\n:]+(?:,\s*(?:allocatable|intent\s*\(\s*in\s*\))[^:]*)?::\s*(.+)$", body, re.IGNORECASE):
+            for part in split_top_level_commas(decl_m.group(1)):
+                pm = re.fullmatch(r"\s*([A-Za-z]\w*)\s*\([^)]*:\s*(?:,[^)]*)?\)\s*", part)
+                if pm is not None:
+                    array_locals.add(pm.group(1))
         for assign_m in re.finditer(
             rf"(?m)^\s*{re.escape(result_var)}%([A-Za-z]\w*)\s*=\s*(.+?)\s*$",
             body,
@@ -42873,14 +43331,41 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             field = assign_m.group(1)
             rhs = assign_m.group(2).strip()
             rhs_bare = re.fullmatch(r"[A-Za-z]\w*", rhs)
+            vector_rhs = False
+            for name in array_locals:
+                for name_m in re.finditer(rf"\b{re.escape(name)}\b", rhs):
+                    tail = rhs[name_m.end():].lstrip()
+                    if tail.startswith("("):
+                        close = tail.find(")")
+                        sub = tail[1:close] if close >= 0 else ""
+                        if close >= 0 and ":" not in sub and "," not in sub:
+                            continue
+                    vector_rhs = True
+                    break
+                if vector_rhs:
+                    break
+            scalar_rhs = (
+                re.search(
+                    r"\([^)]*:|\(:|\[[^\]]*,|r_seq_|_vec\s*\(|pack\s*\(|reshape\s*\(|spread\s*\(|diag\s*\(|r_drop_index",
+                    rhs,
+                    re.IGNORECASE,
+                ) is None
+                and re.search(r"\bdim\s*=", rhs, re.IGNORECASE) is None
+            )
+            if vector_rhs:
+                continue
             if rhs_bare is not None and rhs in real_scalar_locals:
                 demote.setdefault(type_name, {})[field] = "real"
             elif rhs_bare is not None and rhs in int_scalar_locals:
                 demote.setdefault(type_name, {})[field] = "integer"
+            elif scalar_rhs and re.fullmatch(r"[A-Za-z]\w*\s*\(\s*[^,:()]+\s*\)", rhs):
+                demote.setdefault(type_name, {})[field] = "real"
+            elif scalar_rhs and re.search(r"\b(?:tanh|exp|sqrt|log|r_log|atanh)\s*\(", rhs, re.IGNORECASE):
+                demote.setdefault(type_name, {})[field] = "real"
             elif (
                 re.match(r"^real\s*\(", rhs, re.IGNORECASE)
                 and not re.search(
-                    r"\b(?:r_drop_index|r_drop_indices|pack|r_seq_|which|order)\s*\(",
+                    r"\([^)]*:|\b(?:diag|r_drop_index|r_drop_indices|pack|r_seq_|which|order)\s*\(",
                     rhs,
                     re.IGNORECASE,
                 )
@@ -43923,14 +44408,28 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
                 new_block,
             ) is None:
                 continue
-            if re.search(
+            has_alloc_intent = re.search(
                 rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*,\s*intent\(in\)\s*::\s*{re.escape(arg)}\s*\(:\)\s*$",
                 new_block,
-            ) is None:
+            ) is not None
+            has_alloc_local_self_copy = (
+                re.search(
+                    rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::[^\n]*\b{re.escape(arg)}\s*\(:\)",
+                    new_block,
+                ) is not None
+                and re.search(rf"(?m)^\s*{re.escape(arg)}\s*=\s*{re.escape(arg)}\s*$", new_block) is not None
+            )
+            if not (has_alloc_intent or has_alloc_local_self_copy):
                 continue
             new_block = re.sub(
                 rf"(?im)^(\s*real\(kind=dp\),\s*allocatable)\s*,\s*intent\(in\)(\s*::\s*{re.escape(arg)}\s*\(:\)\s*)$",
                 rf"\1\2",
+                new_block,
+                count=1,
+            )
+            new_block = re.sub(
+                rf"(?m)^(\s*{re.escape(arg)}\s*=\s*){re.escape(arg)}\s*$",
+                rf"\1{base}",
                 new_block,
                 count=1,
             )
@@ -44196,7 +44695,7 @@ def ensure_present_dummy_optional(lines: list[str]) -> list[str]:
 def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run command with robust text decoding on Windows."""
     try:
-        return subprocess.run(
+        cp = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
@@ -44204,6 +44703,25 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
             errors="replace",
             cwd=(str(cwd) if cwd is not None else None),
         )
+        compiler_name = Path(cmd[0]).name.lower() if cmd else ""
+        transient_windows_startup_failures = {
+            0xC0000142,  # DLL initialization failed.
+        }
+        if (
+            cp.returncode in transient_windows_startup_failures
+            and not (cp.stdout or cp.stderr)
+            and ("gfortran" in compiler_name or "ifx" in compiler_name)
+        ):
+            time.sleep(0.25)
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=(str(cwd) if cwd is not None else None),
+            )
+        return cp
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", f"{exc}\n")
 
@@ -46400,216 +46918,218 @@ def main() -> int:
             ln_use_fix = re.sub(r"\bsummary_\b", "summary", ln_use_fix)
         use_fix_lines.append(ln_use_fix)
     f90 = "\n".join(use_fix_lines) + ("\n" if f90.endswith("\n") else "")
-    f90 = re.sub(
-        r"real\(kind=dp\)\s*::\s*lambda_dot_cov,\s*lambda_dot_mean,\s*last_t,\s*rf_dot_daily,\s*&\s*\n\s*&\s*risk_dot_aversion,\s*tcost_dot_per_dot_turnover",
-        "integer :: last_t\nreal(kind=dp) :: lambda_dot_cov, lambda_dot_mean, rf_dot_daily, &\n& risk_dot_aversion, tcost_dot_per_dot_turnover",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    if re.search(r"\blast_t\s*=\s*maxval\s*\(\s*which\s*\(", f90, re.IGNORECASE):
+    if args.special_repairs:
+        # Legacy corpus-specific finance/turnover/riskmetrics formatting repairs.
         f90 = re.sub(
-            r"(?m)^(\s*)real\(kind=dp\)\s*::\s*([^\n&]*?)\blast_t\s*,\s*([^\n&]*(?:&\s*\n\s*&[^\n]*)?)$",
-            lambda m: (
-                f"{m.group(1)}integer :: last_t\n"
-                f"{m.group(1)}real(kind=dp) :: "
-                f"{(m.group(2) + m.group(3)).strip().strip(',')}"
-            ),
+            r"real\(kind=dp\)\s*::\s*lambda_dot_cov,\s*lambda_dot_mean,\s*last_t,\s*rf_dot_daily,\s*&\s*\n\s*&\s*risk_dot_aversion,\s*tcost_dot_per_dot_turnover",
+            "integer :: last_t\nreal(kind=dp) :: lambda_dot_cov, lambda_dot_mean, rf_dot_daily, &\n& risk_dot_aversion, tcost_dot_per_dot_turnover",
             f90,
-            count=1,
             flags=re.IGNORECASE,
         )
-    f90 = f90.replace("transpose(r_matrix_col(weight_array(:, j, valid), 1))", "transpose(weight_array(:, j, which(valid)))")
-    f90 = f90.replace("turnover_summary(:,:), wj(:)", "turnover_summary(:,:), wj(:,:)")
-    f90 = f90.replace("turnover_summary(:), wj(:)", "turnover_summary(:,:), wj(:)")
-    f90 = re.sub(r"\bwj\s*\(:\s*\)(?=\s*[,])", "wj(:,:)", f90)
-    f90 = re.sub(
-        r"turnover_summary\s*\(:\s*\),\s*wj\s*\(:\s*&\s*\n\s*&\s*\)",
-        "turnover_summary(:,:), wj(:,:)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(r"\bmethod_names_2\s*=\s*(\[\s*character\(len=\d+\)\s*::\s*&\s*\n\s*&\s*)\"method_names\"", r"method_names = \1method_names", f90)
-    f90 = f90.replace(
-        "real(kind=dp), allocatable :: drawdown(:), sharpe(:,:), wealth(:), x_2(:)",
-        "real(kind=dp), allocatable :: drawdown(:), wealth(:), x_2(:)\nreal(kind=dp) :: sharpe",
-    )
-    f90 = re.sub(r"\bret_dates\s*\(\s*which_first\s*\(\s*rebalance\s*\)\s*\)", "date_to_char(ret_dates(which_first(rebalance)))", f90)
-    f90 = re.sub(
-        r"date_to_char_vec\s*\(\s*ret_dates\s*\(\s*tail\s*\(\s*which\s*\(\s*rebalance\s*\)\s*,\s*1\s*\)\s*\)\s*\)",
-        "date_to_char(ret_dates(which_last(rebalance)))",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(r"\bsum\s*\(\s*([^,\n()]+)\s*,\s*na_rm\s*=\s*\.true\.\s*,\s*dim\s*=\s*1\s*\)", r"sum(\1, dim=1)", f90, flags=re.IGNORECASE)
-    f90 = re.sub(r"\bsize\s*\(\s*([^,\n()]+)\s*,\s*na_rm\s*=\s*\.true\.\s*,\s*1\s*\)", r"size(\1, 1)", f90, flags=re.IGNORECASE)
-    f90 = re.sub(
-        r"(character\(len=)(?:12|13)(\)\s*::\s*&\s*\n\s*&\s*method_names\b)",
-        r"\g<1>16\2",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*ret_stats\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(ret_stats, assets, [character(len=4) :: "mean", "sd", "min", "max"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*perf\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
-        r"call print_table2(perf, method_names, \1, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*final_weights\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(final_weights, assets, method_names, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*turnover_summary\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*turnover_summary\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_real_vector\s*\(\s*turnover_summary\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"turnover_summary\s*=\s*t\s*\(\s*apply\s*\(\s*turnover_valid\s*,\s*2\s*,\s*function\s*\(\s*x\s*\)\s*\n"
-        r"\s*positive\s*=\s*pack\s*\(\s*x\s*,\s*x\s*>\s*0\s*\)\s*\[\s*\(sum\s*\(\s*x\s*\)\s*/\s*size\s*\(\s*x\s*\)\s*\)\s*,\s*merge\s*\(\s*\(sum\s*\(\s*positive\s*\)\s*/\s*&\s*\n"
-        r"\s*&\s*size\s*\(\s*positive\s*\)\s*\)\s*,\s*0\s*,\s*size\s*\(\s*positive\s*\)\s*>\s*0\s*\)\s*,\s*sum\s*\(\s*x\s*\)\s*\]\s*\n"
-        r"\s*write\s*\(\s*\*\s*,\s*\"?\(g0\)\"?\s*\)\s*\)\s*\)",
-        "allocate(turnover_summary(size(turnover_valid, 2), 3))\n"
-        "do j = 1, size(turnover_valid, 2)\n"
-        "   turnover_summary(j, 1) = sum(turnover_valid(:, j)) / real(size(turnover_valid, 1), kind=dp)\n"
-        "   if (count(turnover_valid(:, j) > 0) > 0) then\n"
-        "      turnover_summary(j, 2) = sum(pack(turnover_valid(:, j), turnover_valid(:, j) > 0)) / &\n"
-        "      & real(count(turnover_valid(:, j) > 0), kind=dp)\n"
-        "   else\n"
-        "      turnover_summary(j, 2) = 0.0_dp\n"
-        "   end if\n"
-        "   turnover_summary(j, 3) = sum(turnover_valid(:, j))\n"
-        "end do",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"allocate\(turnover_summary\(size\(turnover_valid,\s*2\),\s*4\)\)\s*\n"
-        r"turnover_summary\(:,\s*1\)\s*=\s*sum\(turnover_valid,\s*&\s*\n"
-        r"\s*&\s*dim=1\)\s*/\s*real\(size\(turnover_valid,\s*1\),\s*kind=dp\)\s*\n"
-        r"turnover_summary\(:,\s*2\)\s*=\s*apply_col_sd\((?:real\(\s*)?turnover_valid(?:\s*,\s*kind=dp\))?\)\s*\n"
-        r"turnover_summary\(:,\s*3\)\s*=\s*minval\(turnover_valid,\s*dim=1\)\s*\n"
-        r"turnover_summary\(:,\s*4\)\s*=\s*maxval\(turnover_valid,\s*dim=1\)",
-        "allocate(turnover_summary(size(turnover_valid, 2), 3))\n"
-        "do j = 1, size(turnover_valid, 2)\n"
-        "   turnover_summary(j, 1) = sum(turnover_valid(:, j)) / real(size(turnover_valid, 1), kind=dp)\n"
-        "   if (count(turnover_valid(:, j) > 0) > 0) then\n"
-        "      turnover_summary(j, 2) = sum(pack(turnover_valid(:, j), turnover_valid(:, j) > 0)) / &\n"
-        "      & real(count(turnover_valid(:, j) > 0), kind=dp)\n"
-        "   else\n"
-        "      turnover_summary(j, 2) = ieee_value(0.0_dp, ieee_quiet_nan)\n"
-        "   end if\n"
-        "   turnover_summary(j, 3) = sum(turnover_valid(:, j))\n"
-        "end do",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*cor\s*\(\s*port_ret_valid\s*\)\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(cor(port_ret_valid), method_names, method_names, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*Sigma_last\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(Sigma_last, assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r'write\(\*,"\(g0\)"\)\s*r_round\s*\(\s*real\s*\(\s*cov2cor\s*\(\s*Sigma_last\s*\)\s*,\s*kind=dp\s*\)\s*,\s*6\s*\)',
-        "call print_table2(cov2cor(Sigma_last), assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma_last\s*\)\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(cov2cor(Sigma_last), assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*Sigma\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(Sigma, assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r'write\(\*,"\(g0\)"\)\s*r_round\s*\(\s*real\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*kind=dp\s*\)\s*,\s*6\s*\)',
-        "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_real_vector\s*\(\s*mu_last\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_named_real_vector(mu_last, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_real_vector\s*\(\s*ann_dot_factor\s*\*\s*mu_last\s*,\s*digits\s*=\s*6\s*\)",
-        "call print_named_real_vector(ann_dot_factor * mu_last, assets, digits=6)",
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summ\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
-        r'call print_table2(summ, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], \1, digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*risk_contrib_mat\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(risk_contrib_mat, assets, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix\s*\(\s*pct_risk_contrib\s*,\s*digits\s*=\s*6\s*\)",
-        'call print_table2(pct_risk_contrib, assets, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], digits=6)',
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summary_table\s*,.*?digits\s*=\s*6\s*\)",
-        'call print_table2(summary_table, [character(len=5) :: "p0.95", "p0.99"], [character(len=19) :: &\n'
-        '& "historical", "normal", "weighted_historical", "riskmetrics_normal", "student_t"], digits=6)',
-        f90,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    f90 = re.sub(
-        r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summary_table_es\s*,.*?digits\s*=\s*6\s*\)",
-        'call print_table2(summary_table_es, [character(len=5) :: "p0.95", "p0.99"], [character(len=19) :: &\n'
-        '& "historical", "normal", "weighted_historical", "riskmetrics_normal", "student_t"], digits=6)',
-        f90,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+        if re.search(r"\blast_t\s*=\s*maxval\s*\(\s*which\s*\(", f90, re.IGNORECASE):
+            f90 = re.sub(
+                r"(?m)^(\s*)real\(kind=dp\)\s*::\s*([^\n&]*?)\blast_t\s*,\s*([^\n&]*(?:&\s*\n\s*&[^\n]*)?)$",
+                lambda m: (
+                    f"{m.group(1)}integer :: last_t\n"
+                    f"{m.group(1)}real(kind=dp) :: "
+                    f"{(m.group(2) + m.group(3)).strip().strip(',')}"
+                ),
+                f90,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        f90 = f90.replace("transpose(r_matrix_col(weight_array(:, j, valid), 1))", "transpose(weight_array(:, j, which(valid)))")
+        f90 = f90.replace("turnover_summary(:,:), wj(:)", "turnover_summary(:,:), wj(:,:)")
+        f90 = f90.replace("turnover_summary(:), wj(:)", "turnover_summary(:,:), wj(:)")
+        f90 = re.sub(r"\bwj\s*\(:\s*\)(?=\s*[,])", "wj(:,:)", f90)
+        f90 = re.sub(
+            r"turnover_summary\s*\(:\s*\),\s*wj\s*\(:\s*&\s*\n\s*&\s*\)",
+            "turnover_summary(:,:), wj(:,:)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(r"\bmethod_names_2\s*=\s*(\[\s*character\(len=\d+\)\s*::\s*&\s*\n\s*&\s*)\"method_names\"", r"method_names = \1method_names", f90)
+        f90 = f90.replace(
+            "real(kind=dp), allocatable :: drawdown(:), sharpe(:,:), wealth(:), x_2(:)",
+            "real(kind=dp), allocatable :: drawdown(:), wealth(:), x_2(:)\nreal(kind=dp) :: sharpe",
+        )
+        f90 = re.sub(r"\bret_dates\s*\(\s*which_first\s*\(\s*rebalance\s*\)\s*\)", "date_to_char(ret_dates(which_first(rebalance)))", f90)
+        f90 = re.sub(
+            r"date_to_char_vec\s*\(\s*ret_dates\s*\(\s*tail\s*\(\s*which\s*\(\s*rebalance\s*\)\s*,\s*1\s*\)\s*\)\s*\)",
+            "date_to_char(ret_dates(which_last(rebalance)))",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(r"\bsum\s*\(\s*([^,\n()]+)\s*,\s*na_rm\s*=\s*\.true\.\s*,\s*dim\s*=\s*1\s*\)", r"sum(\1, dim=1)", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\bsize\s*\(\s*([^,\n()]+)\s*,\s*na_rm\s*=\s*\.true\.\s*,\s*1\s*\)", r"size(\1, 1)", f90, flags=re.IGNORECASE)
+        f90 = re.sub(
+            r"(character\(len=)(?:12|13)(\)\s*::\s*&\s*\n\s*&\s*method_names\b)",
+            r"\g<1>16\2",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*ret_stats\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(ret_stats, assets, [character(len=4) :: "mean", "sd", "min", "max"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix_rstyle_named\s*\(\s*perf\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
+            r"call print_table2(perf, method_names, \1, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*final_weights\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(final_weights, assets, method_names, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*turnover_summary\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix_rstyle_named\s*\(\s*turnover_summary\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_real_vector\s*\(\s*turnover_summary\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(turnover_summary, method_names, [character(len=23) :: &\n& "mean_daily_turnover", "mean_rebalance_turnover", "total_turnover"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"turnover_summary\s*=\s*t\s*\(\s*apply\s*\(\s*turnover_valid\s*,\s*2\s*,\s*function\s*\(\s*x\s*\)\s*\n"
+            r"\s*positive\s*=\s*pack\s*\(\s*x\s*,\s*x\s*>\s*0\s*\)\s*\[\s*\(sum\s*\(\s*x\s*\)\s*/\s*size\s*\(\s*x\s*\)\s*\)\s*,\s*merge\s*\(\s*\(sum\s*\(\s*positive\s*\)\s*/\s*&\s*\n"
+            r"\s*&\s*size\s*\(\s*positive\s*\)\s*\)\s*,\s*0\s*,\s*size\s*\(\s*positive\s*\)\s*>\s*0\s*\)\s*,\s*sum\s*\(\s*x\s*\)\s*\]\s*\n"
+            r"\s*write\s*\(\s*\*\s*,\s*\"?\(g0\)\"?\s*\)\s*\)\s*\)",
+            "allocate(turnover_summary(size(turnover_valid, 2), 3))\n"
+            "do j = 1, size(turnover_valid, 2)\n"
+            "   turnover_summary(j, 1) = sum(turnover_valid(:, j)) / real(size(turnover_valid, 1), kind=dp)\n"
+            "   if (count(turnover_valid(:, j) > 0) > 0) then\n"
+            "      turnover_summary(j, 2) = sum(pack(turnover_valid(:, j), turnover_valid(:, j) > 0)) / &\n"
+            "      & real(count(turnover_valid(:, j) > 0), kind=dp)\n"
+            "   else\n"
+            "      turnover_summary(j, 2) = 0.0_dp\n"
+            "   end if\n"
+            "   turnover_summary(j, 3) = sum(turnover_valid(:, j))\n"
+            "end do",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"allocate\(turnover_summary\(size\(turnover_valid,\s*2\),\s*4\)\)\s*\n"
+            r"turnover_summary\(:,\s*1\)\s*=\s*sum\(turnover_valid,\s*&\s*\n"
+            r"\s*&\s*dim=1\)\s*/\s*real\(size\(turnover_valid,\s*1\),\s*kind=dp\)\s*\n"
+            r"turnover_summary\(:,\s*2\)\s*=\s*apply_col_sd\((?:real\(\s*)?turnover_valid(?:\s*,\s*kind=dp\))?\)\s*\n"
+            r"turnover_summary\(:,\s*3\)\s*=\s*minval\(turnover_valid,\s*dim=1\)\s*\n"
+            r"turnover_summary\(:,\s*4\)\s*=\s*maxval\(turnover_valid,\s*dim=1\)",
+            "allocate(turnover_summary(size(turnover_valid, 2), 3))\n"
+            "do j = 1, size(turnover_valid, 2)\n"
+            "   turnover_summary(j, 1) = sum(turnover_valid(:, j)) / real(size(turnover_valid, 1), kind=dp)\n"
+            "   if (count(turnover_valid(:, j) > 0) > 0) then\n"
+            "      turnover_summary(j, 2) = sum(pack(turnover_valid(:, j), turnover_valid(:, j) > 0)) / &\n"
+            "      & real(count(turnover_valid(:, j) > 0), kind=dp)\n"
+            "   else\n"
+            "      turnover_summary(j, 2) = ieee_value(0.0_dp, ieee_quiet_nan)\n"
+            "   end if\n"
+            "   turnover_summary(j, 3) = sum(turnover_valid(:, j))\n"
+            "end do",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*cor\s*\(\s*port_ret_valid\s*\)\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(cor(port_ret_valid), method_names, method_names, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*Sigma_last\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(Sigma_last, assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r'write\(\*,"\(g0\)"\)\s*r_round\s*\(\s*real\s*\(\s*cov2cor\s*\(\s*Sigma_last\s*\)\s*,\s*kind=dp\s*\)\s*,\s*6\s*\)',
+            "call print_table2(cov2cor(Sigma_last), assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma_last\s*\)\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(cov2cor(Sigma_last), assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*Sigma\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(Sigma, assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r'write\(\*,"\(g0\)"\)\s*r_round\s*\(\s*real\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*kind=dp\s*\)\s*,\s*6\s*\)',
+            "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*cov2cor\s*\(\s*Sigma\s*\)\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_table2(cov2cor(Sigma), assets, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_real_vector\s*\(\s*mu_last\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_named_real_vector(mu_last, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_real_vector\s*\(\s*ann_dot_factor\s*\*\s*mu_last\s*,\s*digits\s*=\s*6\s*\)",
+            "call print_named_real_vector(ann_dot_factor * mu_last, assets, digits=6)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summ\s*,\s*names\s*=\s*(\[[^\n]+(?:\n\s*&[^\n]+)*?\])\s*,\s*digits\s*=\s*6\s*\)",
+            r'call print_table2(summ, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], \1, digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*risk_contrib_mat\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(risk_contrib_mat, assets, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix\s*\(\s*pct_risk_contrib\s*,\s*digits\s*=\s*6\s*\)",
+            'call print_table2(pct_risk_contrib, assets, [character(len=16) :: "equal_weight", "inverse_vol", "global_minvar", "long_only_minvar", "risk_parity"], digits=6)',
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summary_table\s*,.*?digits\s*=\s*6\s*\)",
+            'call print_table2(summary_table, [character(len=5) :: "p0.95", "p0.99"], [character(len=19) :: &\n'
+            '& "historical", "normal", "weighted_historical", "riskmetrics_normal", "student_t"], digits=6)',
+            f90,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        f90 = re.sub(
+            r"\bcall\s+print_matrix_rstyle_named\s*\(\s*summary_table_es\s*,.*?digits\s*=\s*6\s*\)",
+            'call print_table2(summary_table_es, [character(len=5) :: "p0.95", "p0.99"], [character(len=19) :: &\n'
+            '& "historical", "normal", "weighted_historical", "riskmetrics_normal", "student_t"], digits=6)',
+            f90,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
     f90 = re.sub(
         r"\bsize\s*\(\s*([^,\n()]+)\s*,\s*&\s*\n\s*&\s*na_rm\s*=\s*\.true\.\s*,\s*1\s*\)",
         r"size(\1, 1)",
@@ -47172,6 +47692,7 @@ def main() -> int:
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = promote_derived_result_call_locals_text(f90)
+    f90 = lower_function_dataframe_returns_text(f90)
     f90 = lower_rbind_dataframe_appends_text(f90)
     f90 = demote_scalar_dataframe_append_temporaries_text(f90)
     f90 = lower_dataframe_minloc_row_assignments_text(f90)
@@ -47256,22 +47777,29 @@ def main() -> int:
         f90 = hoist_module_used_scalar_parameters_text(f90)
     f90 = repair_character_vector_subset_renames_text(f90)
     f90 = simplify_scalar_spread_matrix_ops_text(f90)
-    f90 = promote_sigma_ret_formals_text(f90)
-    f90 = repair_portfolio_stat_named_indices_text(f90)
-    f90 = repair_portfolio_stats_scalar_locals_text(f90)
-    f90 = repair_portfolio_print_labels_text(f90)
+    if args.special_repairs:
+        # Legacy corpus/example-specific repairs kept out of the default path.
+        f90 = promote_sigma_ret_formals_text(f90)
+        f90 = repair_portfolio_stat_named_indices_text(f90)
+        f90 = repair_portfolio_stats_scalar_locals_text(f90)
+        f90 = repair_portfolio_print_labels_text(f90)
     f90 = promote_forwarded_dummy_ranks_text(f90)
-    f90 = repair_make_pos_def_text(f90)
-    f90 = repair_price_names_decl_text(f90)
-    f90 = repair_trading_days_parameter_text(f90)
+    if args.special_repairs:
+        f90 = repair_make_pos_def_text(f90)
+        f90 = repair_price_names_decl_text(f90)
+        f90 = repair_trading_days_parameter_text(f90)
     f90 = repair_unconditional_null_optim_returns_text(f90)
     f90 = demote_named_element_function_results_text(f90)
-    f90 = repair_trend_results_dataframe_text(f90)
+    if args.special_repairs:
+        f90 = repair_trend_results_dataframe_text(f90)
     f90 = repair_vector_function_result_declarations_text(f90)
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
-    f90 = repair_turnover_obfuscated_dataframe_text(f90)
+    if args.special_repairs:
+        f90 = repair_turnover_obfuscated_dataframe_text(f90)
     f90 = repair_filtered_renamed_argument_decls_text(f90)
+    f90 = demote_locals_from_scalar_derived_components_text(f90)
+    f90 = demote_unindexed_locals_in_scalar_functions_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
