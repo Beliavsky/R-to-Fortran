@@ -1757,9 +1757,22 @@ def collect_named_c_labels(stmts: list[object]) -> dict[str, list[str]]:
     def collect_function_returns(items: list[object]) -> None:
         for st in items:
             if isinstance(st, FuncDef):
+                local_labels: dict[str, list[str]] = {}
+                for inner_assign in st.body:
+                    if isinstance(inner_assign, Assign):
+                        parsed_assign = _parse_named_c_vector(inner_assign.expr.strip())
+                        if parsed_assign is not None:
+                            local_labels[inner_assign.name.lower()] = parsed_assign[0]
                 for inner in reversed(st.body):
                     if isinstance(inner, ExprStmt):
                         labs = expr_labels(inner.expr)
+                        if labs is None:
+                            t_inner = inner.expr.strip()
+                            c_inner = parse_call_text(t_inner)
+                            if c_inner is not None and c_inner[0].lower() == "return" and c_inner[1]:
+                                t_inner = c_inner[1][0].strip()
+                            if re.fullmatch(r"[A-Za-z]\w*", t_inner):
+                                labs = local_labels.get(t_inner.lower())
                         if labs is not None:
                             function_returns[st.name.lower()] = labs
                         break
