@@ -44836,7 +44836,10 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
                     rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::[^\n]*\b{re.escape(arg)}\s*\(:\)",
                     new_block,
                 ) is not None
-                and re.search(rf"(?m)^\s*{re.escape(arg)}\s*=\s*{re.escape(arg)}\s*$", new_block) is not None
+                and (
+                    re.search(rf"(?m)^\s*{re.escape(arg)}\s*=\s*{re.escape(arg)}\s*$", new_block) is not None
+                    or re.search(rf"(?m)^\s*{re.escape(arg)}\s*=\s*pack\s*\(\s*{re.escape(arg)}\b", new_block) is not None
+                )
             )
             if not (has_alloc_intent or has_alloc_local_self_copy):
                 continue
@@ -45005,9 +45008,14 @@ def ensure_pure_dummy_intents(lines: list[str]) -> list[str]:
     i = 0
     while i < len(out):
         header = out[i]
+        header_end = i
+        while header.rstrip().endswith("&") and header_end + 1 < len(out):
+            header_end += 1
+            header += "\n" + out[header_end]
+        header_compact = re.sub(r"&\s*\n\s*&?", " ", header)
         hm = re.match(
             r"^\s*pure\s+(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\s+\w+\s*\(([^)]*)\)",
-            header,
+            header_compact,
             re.IGNORECASE,
         )
         if hm is None:
@@ -45021,7 +45029,7 @@ def ensure_pure_dummy_intents(lines: list[str]) -> list[str]:
         if not dummy_names:
             i += 1
             continue
-        j = i + 1
+        j = header_end + 1
         while j < len(out):
             if re.match(r"^\s*end\s+(?:function|subroutine)\b", out[j], re.IGNORECASE):
                 break
@@ -45043,6 +45051,54 @@ def ensure_pure_dummy_intents(lines: list[str]) -> list[str]:
             suffix = (" " + comment.strip()) if comment.strip() else ""
             out[j] = f"{m.group(1)}{m.group(2)}{m.group(3)}, intent(in) :: {m.group(4).strip()}{suffix}{eol}"
             j += 1
+        i = j + 1
+    return out
+
+
+def remove_pure_from_dummy_mutating_procedures(lines: list[str]) -> list[str]:
+    """Drop pure from procedures that assign to their dummy arguments."""
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        header = out[i]
+        header_end = i
+        while header.rstrip().endswith("&") and header_end + 1 < len(out):
+            header_end += 1
+            header += "\n" + out[header_end]
+        header_compact = re.sub(r"&\s*\n\s*&?", " ", header)
+        hm = re.match(
+            r"^\s*pure\s+(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\s+\w+\s*\(([^)]*)\)",
+            header_compact,
+            re.IGNORECASE,
+        )
+        if hm is None:
+            i += 1
+            continue
+        dummy_names = [
+            a.strip()
+            for a in split_top_level_commas(hm.group(1))
+            if re.fullmatch(r"[A-Za-z]\w*", a.strip())
+        ]
+        if not dummy_names:
+            i += 1
+            continue
+        dummy_alt = "|".join(re.escape(name) for name in sorted(dummy_names, key=len, reverse=True))
+        assign_re = re.compile(
+            rf"^\s*(?:if\s*\(.+?\)\s*)?(?:{dummy_alt})\s*(?:\([^=]*\))?\s*=",
+            re.IGNORECASE,
+        )
+        j = header_end + 1
+        mutates_dummy = False
+        while j < len(out):
+            if re.match(r"^\s*end\s+(?:function|subroutine)\b", out[j], re.IGNORECASE):
+                break
+            code = fscan._split_code_comment(out[j].rstrip("\r\n"))[0]  # type: ignore[attr-defined]
+            if assign_re.match(code):
+                mutates_dummy = True
+                break
+            j += 1
+        if mutates_dummy:
+            out[i] = re.sub(r"^(\s*)pure\s+", r"\1", out[i], count=1, flags=re.IGNORECASE)
         i = j + 1
     return out
 
@@ -47161,6 +47217,7 @@ def main() -> int:
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
     f90_lines = mark_pure_with_xpure(f90_lines)
+    f90_lines = remove_pure_from_dummy_mutating_procedures(f90_lines)
     f90_lines = ensure_pure_dummy_intents(f90_lines)
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     f90_lines = fpost.simplify_do_while_true(f90_lines)
@@ -48037,6 +48094,7 @@ def main() -> int:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
     f90 = _remove_redundant_single_blank_writes(f90)
     f90 = _simplify_single_literal_g0_writes(f90)
+    f90 = "".join(remove_pure_from_dummy_mutating_procedures(f90.splitlines(True)))
     f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
     f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
