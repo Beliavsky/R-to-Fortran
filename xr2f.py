@@ -37288,6 +37288,91 @@ def coerce_named_integer_actuals_from_decls_text(f90: str) -> str:
     return "".join(out)
 
 
+def coerce_positional_integer_actuals_from_decls_text(f90: str) -> str:
+    real_scalars: set[str] = set()
+    for line in f90.splitlines():
+        code = line.split("!", 1)[0]
+        m_real = re.match(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*(?:,\s*[^:]*)?::\s*(.+)$", code, re.IGNORECASE)
+        if m_real is None:
+            continue
+        attrs = code.split("::", 1)[0].lower()
+        if any(x in attrs for x in ("allocatable", "parameter", "pointer")):
+            continue
+        for item in split_top_level_commas(m_real.group(1)):
+            lhs = item.split("=", 1)[0].strip()
+            if "(" not in lhs and re.fullmatch(r"[A-Za-z]\w*", lhs):
+                real_scalars.add(lhs.lower())
+    if not real_scalars:
+        return f90
+
+    fn_int_pos: dict[str, set[int]] = {}
+    fn_re = re.compile(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\(([^)]*)\).*?^\s*end\s+function\b.*?$"
+    )
+    for m_fn in fn_re.finditer(f90):
+        fn_name = m_fn.group(1)
+        formals = [x.strip().lower() for x in split_top_level_commas(m_fn.group(2)) if x.strip()]
+        int_names: set[str] = set()
+        for m_int in re.finditer(r"(?im)^\s*integer\s*(?:,\s*[^:]*)?::\s*(.+)$", m_fn.group(0)):
+            for item in split_top_level_commas(m_int.group(1)):
+                mm = re.match(r"\s*([A-Za-z]\w*)\b", item.split("=", 1)[0].strip())
+                if mm is not None:
+                    int_names.add(mm.group(1).lower())
+        positions = {i for i, nm in enumerate(formals) if nm in int_names}
+        if positions:
+            fn_int_pos[fn_name.lower()] = positions
+    if not fn_int_pos:
+        return f90
+
+    def needs_int(actual: str) -> bool:
+        t = actual.strip()
+        if re.match(r"^int\s*\(", t, re.IGNORECASE) or re.fullmatch(r"[+-]?\d+", t):
+            return False
+        if re.fullmatch(r"[A-Za-z]\w*", t) and t.lower() in real_scalars:
+            return True
+        if re.fullmatch(r"real\s*\(.+\)", t, re.IGNORECASE):
+            return True
+        if re.fullmatch(r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+(?:[eEdD][+-]?\d+)))(?:_dp)?", t):
+            return True
+        return False
+
+    def coerce_call(fn_name: str, inner: str) -> str:
+        positions = fn_int_pos.get(fn_name.lower(), set())
+        out_parts: list[str] = []
+        pos = 0
+        for part in split_top_level_commas(inner):
+            ps = part.strip()
+            if re.match(r"^[A-Za-z]\w*\s*=", ps, re.DOTALL):
+                out_parts.append(ps)
+                continue
+            if pos in positions and needs_int(ps):
+                ps = f"int({ps})"
+            out_parts.append(ps)
+            pos += 1
+        return f"{fn_name}({', '.join(out_parts)})"
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        code, sep, comment = line.partition("!")
+        if re.match(
+            r"^\s*(?:(?:pure|elemental|recursive)\s+)*(?:function|subroutine)\b|"
+            r"^\s*(?:use\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|end\b)",
+            code,
+            re.IGNORECASE,
+        ):
+            out.append(line)
+            continue
+        new_code = code
+        for fn_name in sorted(fn_int_pos, key=len, reverse=True):
+            new_code = _replace_balanced_func_calls(
+                new_code,
+                fn_name,
+                lambda inner, fn_name=fn_name: coerce_call(fn_name, inner),
+            )
+        out.append(new_code + (sep + comment if sep else ""))
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def rewrite_invalid_rank2_double_spread_text(f90: str) -> str:
     return re.sub(
         r"spread\s*\(\s*spread\s*\(\s*reshape\s*\(\s*([A-Za-z]\w*)\s*,\s*\[\s*size\s*\(\s*\1\s*\)\s*\]\s*\)\s*,\s*&?\s*\n?\s*&?\s*dim\s*=\s*1\s*,\s*ncopies\s*=\s*size\s*\(\s*([A-Za-z]\w*)\s*,\s*1\s*\)\s*\)\s*,\s*dim\s*=\s*3\s*,\s*ncopies\s*=\s*size\s*\(\s*\2\s*,\s*3\s*\)\s*\)",
@@ -48606,6 +48691,7 @@ def main() -> int:
     f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
     f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
+    f90 = coerce_positional_integer_actuals_from_decls_text(f90)
     f90 = rewrite_invalid_rank2_double_spread_text(f90)
     f90 = rewrite_rank3_loop_print_slices_text(f90)
     f90 = scalarize_singleton_user_vec_tmp_text(f90)
@@ -48842,6 +48928,7 @@ def main() -> int:
     f90 = promote_vector_slice_locals_text(f90)
     f90 = normalize_one_variable_declarations_text(f90)
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
+    f90 = coerce_positional_integer_actuals_from_decls_text(f90)
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
