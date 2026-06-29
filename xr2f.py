@@ -42159,6 +42159,30 @@ def repair_malformed_logical_return_comparison_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def remove_empty_metadata_if_blocks_text(f90: str) -> str:
+    """Drop empty guards around R name metadata operations.
+
+    Constructs such as `if (is.null(colnames(x))) colnames(x) <- ...` may have
+    the metadata assignment removed earlier, leaving an executable empty
+    Fortran guard like `if (colnames(x) == -1) then`.  Name metadata is not a
+    runtime value in generated Fortran, so the empty guard should disappear.
+    """
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    if_re = re.compile(
+        r"^\s*if\s*\(\s*(?:colnames|rownames|names)\s*\([^)]*\)\s*==\s*-1\s*\)\s*then\s*$",
+        re.IGNORECASE,
+    )
+    while i < len(lines):
+        if if_re.match(lines[i]) and i + 1 < len(lines) and re.match(r"^\s*end\s+if\s*$", lines[i + 1], re.IGNORECASE):
+            i += 2
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def promote_integer_sequence_result_decls_text(f90: str) -> str:
     names = set(re.findall(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*r_seq_int\s*\(", f90))
     if not names:
@@ -49103,6 +49127,7 @@ def main() -> int:
     f90 = repair_integer_vector_function_result_decls_text(f90)
     f90 = coerce_table2_real_args_to_integer_text(f90)
     f90 = repair_malformed_logical_return_comparison_text(f90)
+    f90 = remove_empty_metadata_if_blocks_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = wrap_long_character_constructor_values_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
