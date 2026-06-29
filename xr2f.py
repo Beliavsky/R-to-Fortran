@@ -35852,6 +35852,11 @@ def repair_embedded_mixed_declaration_fragments_text(f90: str) -> str:
         f90,
     )
     f90 = re.sub(
+        r"(?im)^(\s*)real\(kind=dp\)\s*,\s*allocatable\s*::\s*(.+?)\s*,\s*real\s*\(\s*:\s*(?:,\s*:)?\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+        r"\1real(kind=dp), allocatable :: \2\n\1real(kind=dp), allocatable :: \3",
+        f90,
+    )
+    f90 = re.sub(
         r"(?im)^(\s*real\(kind=dp\),\s*allocatable\s*::\s*.*?),\s*real\(kind=dp\)\s*,\s*&\s*\n\s*&\s*([A-Za-z]\w*(?:\s*\([^)\n]*\))?)\s*\n\s*&\s*",
         r"\1, &\n& \2, &\n& ",
         f90,
@@ -41250,6 +41255,48 @@ def promote_real_array_decls_from_assignments_text(f90: str) -> str:
             out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_decl.group(2)}{m_decl.group(3)}")
             continue
         out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_real_matrix_decls_from_matrix_usage_text(f90: str) -> str:
+    """Promote real allocatable locals to rank-2 when matrix construction is explicit."""
+    lines = f90.splitlines()
+    matrix_names: set[str] = set()
+    for ln in lines:
+        m_matrix_assign = re.match(
+            r"^\s*([A-Za-z]\w*)\s*=\s*(?:matrix|cbind|cbind2|rbind)\s*\(",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_matrix_assign is not None:
+            matrix_names.add(m_matrix_assign.group(1).lower())
+    if not matrix_names:
+        return f90
+
+    out: list[str] = []
+    decl_re = re.compile(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m_decl = decl_re.match(ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        changed = False
+        parts: list[str] = []
+        for part in split_top_level_commas(m_decl.group(2)):
+            part_s = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*(\(.*\))?$", part_s)
+            if m_item is not None and m_item.group(1).lower() in matrix_names:
+                dims = (m_item.group(2) or "").replace(" ", "")
+                rank = 0 if not dims else max(1, dims.count(",") + 1, dims.count(":"))
+                if rank < 2:
+                    parts.append(f"{m_item.group(1)}(:,:)")
+                    changed = True
+                    continue
+            parts.append(part_s)
+        if changed:
+            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(parts)}")
+        else:
+            out.append(ln)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -48977,6 +49024,7 @@ def main() -> int:
     f90 = format_convergence_fields_as_integer_text(f90)
     f90 = demote_rank2_reals_from_vector_rhs_text(f90)
     f90 = demote_rank2_reals_from_scalar_rhs_text(f90)
+    f90 = promote_real_matrix_decls_from_matrix_usage_text(f90)
     f90 = rewrite_rank1_print_matrix_calls_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = demote_type_fields_from_rank1_local_assignments_text(f90)
