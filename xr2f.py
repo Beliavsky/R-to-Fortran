@@ -44822,11 +44822,10 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
             if m_arg is None:
                 continue
             base = m_arg.group(1)
-            if re.search(
-                rf"(?im)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*{re.escape(base)}\s*\(:\)\s*$",
-                new_block,
-            ) is None:
+            base_decl_re = rf"(?im)^\s*real\(kind=dp\)(?![^\n:]*\ballocatable\b)[^\n:]*::[^\n]*\b{re.escape(base)}\s*\(:\)"
+            if re.search(base_decl_re, new_block) is None:
                 continue
+            new_block_compact = re.sub(r"&\s*\n\s*&?", " ", new_block)
             has_alloc_intent = re.search(
                 rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*,\s*intent\(in\)\s*::\s*{re.escape(arg)}\s*\(:\)\s*$",
                 new_block,
@@ -44834,7 +44833,7 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
             has_alloc_local_self_copy = (
                 re.search(
                     rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::[^\n]*\b{re.escape(arg)}\s*\(:\)",
-                    new_block,
+                    new_block_compact,
                 ) is not None
                 and (
                     re.search(rf"(?m)^\s*{re.escape(arg)}\s*=\s*{re.escape(arg)}\s*$", new_block) is not None
@@ -44856,8 +44855,8 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
                 count=1,
             )
             new_block = re.sub(
-                rf"(?m)^(\s*{re.escape(arg)}\s*=\s*pack\s*\()\s*{re.escape(arg)}\b",
-                rf"\1{base}",
+                rf"(?m)^(\s*{re.escape(arg)}\s*=\s*pack\s*\()(.*?)\s*$",
+                lambda pm, arg=arg, base=base: pm.group(1) + re.sub(rf"\b{re.escape(arg)}\b", base, pm.group(2)),
                 new_block,
                 count=1,
             )
@@ -44874,7 +44873,7 @@ def repair_filtered_renamed_argument_decls_text(f90: str) -> str:
             for p in parts:
                 m_p = re.fullmatch(r"([A-Za-z]\w*)_2", p)
                 if m_p is not None and re.search(
-                    rf"(?im)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*{re.escape(m_p.group(1))}\s*\(:\)\s*$",
+                    rf"(?im)^\s*real\(kind=dp\)(?![^\n:]*\ballocatable\b)[^\n:]*::[^\n]*\b{re.escape(m_p.group(1))}\s*\(:\)",
                     new_block,
                 ):
                     fixed_parts.append(m_p.group(1))
