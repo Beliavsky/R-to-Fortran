@@ -35510,6 +35510,91 @@ def normalize_one_variable_declarations_text(f90: str) -> str:
     return "".join(normalize_one_variable_declarations(f90.splitlines(True)))
 
 
+def unroll_multi_allocate_statements(lines: list[str]) -> list[str]:
+    """Split safe multi-target allocate statements into one allocate per target."""
+    out: list[str] = []
+    i = 0
+
+    def compact_stmt(start: int) -> tuple[str, int]:
+        stmt = lines[start]
+        end = start
+        while stmt.rstrip().endswith("&") and end + 1 < len(lines):
+            end += 1
+            stmt += "\n" + lines[end]
+        return re.sub(r"&\s*\n\s*&?", " ", stmt), end
+
+    def split_type_spec(inner: str) -> tuple[str, str]:
+        depth = 0
+        in_single = False
+        in_double = False
+        esc = False
+        for idx, ch in enumerate(inner):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                continue
+            if in_single or in_double:
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == ":" and depth == 0 and idx + 1 < len(inner) and inner[idx + 1] == ":":
+                return inner[: idx + 2].strip(), inner[idx + 2 :].strip()
+        return "", inner.strip()
+
+    while i < len(lines):
+        compact, end = compact_stmt(i)
+        code, comment = fscan._split_code_comment(compact.rstrip("\r\n"))  # type: ignore[attr-defined]
+        m = re.match(r"^(\s*)allocate\s*\((.*)\)\s*$", code, re.IGNORECASE)
+        if m is None:
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        indent, inner = m.groups()
+        inner_l = inner.lower()
+        if re.search(r"\b(?:stat|errmsg)\s*=", inner_l):
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        type_spec, rest = split_type_spec(inner)
+        parts = [p.strip() for p in split_top_level_commas(rest) if p.strip()]
+        positional: list[str] = []
+        keywords: list[str] = []
+        for part in parts:
+            if re.match(r"^[A-Za-z]\w*\s*=", part):
+                keywords.append(part)
+            else:
+                positional.append(part)
+        if len(positional) <= 1:
+            out.extend(lines[i : end + 1])
+            i = end + 1
+            continue
+        suffix = (" " + comment.strip()) if comment.strip() else ""
+        eol = "\r\n" if lines[end].endswith("\r\n") else ("\n" if lines[end].endswith("\n") else "")
+        for idx, target in enumerate(positional):
+            pieces: list[str] = []
+            if type_spec:
+                pieces.append(type_spec)
+            pieces.append(target)
+            pieces.extend(keywords)
+            out.append(f"{indent}allocate({', '.join(pieces)}){suffix if idx == 0 else ''}{eol}")
+        i = end + 1
+    return out
+
+
+def unroll_multi_allocate_statements_text(f90: str) -> str:
+    return "".join(unroll_multi_allocate_statements(f90.splitlines(True)))
+
+
 def demote_split_finite_difference_scalars_text(f90: str) -> str:
     """Demote split finite-difference scalar temporaries after decl normalization."""
     names = [
@@ -47388,6 +47473,7 @@ def main() -> int:
     # Reuse shared Fortran cleanup for redundant int(...) casts.
     f90_lines = f90.splitlines()
     f90_lines = normalize_one_variable_declarations(f90_lines)
+    f90_lines = unroll_multi_allocate_statements(f90_lines)
     f90_lines = fscan.remove_redundant_int_casts(f90_lines)
     f90_lines = rewrite_default_array_size_refs(f90_lines)
     f90_lines = rewrite_optional_init_size_checks(f90_lines)
@@ -48317,6 +48403,7 @@ def main() -> int:
     f90 = _remove_redundant_single_blank_writes(f90)
     f90 = _simplify_single_literal_g0_writes(f90)
     f90 = normalize_one_variable_declarations_text(f90)
+    f90 = unroll_multi_allocate_statements_text(f90)
     f90 = "".join(remove_pure_from_dummy_mutating_procedures(f90.splitlines(True)))
     f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
     f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
@@ -48552,6 +48639,7 @@ def main() -> int:
     f90 = remove_scalar_component_singleton_subscripts_text(f90)
     f90 = split_mixed_real_integer_declarations_text(f90)
     f90 = normalize_one_variable_declarations_text(f90)
+    f90 = unroll_multi_allocate_statements_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
