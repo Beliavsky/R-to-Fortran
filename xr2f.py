@@ -42000,6 +42000,144 @@ def promote_logical_comparison_result_decls_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_malformed_logical_return_comparison_text(f90: str) -> str:
+    """Repair function blocks where dummy-renaming corrupts `arg == value` returns.
+
+    A rare interaction between dummy-name repair and logical scalar result promotion can
+    leave a function like `f <- function(n) n == 2 || ...` as:
+
+        function f(n_2) result(f_result)
+        integer, intent(in) :: n
+        real(kind=dp) :: f_result
+        logical :: n_2
+        n_2 = = 2 .or. ...
+
+    The only valid interpretation is `f_result = n == 2 .or. ...`.  Keep this
+    narrowly scoped to function blocks with a malformed `= =` statement.
+    """
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    fn_start_re = re.compile(
+        r"^(\s*(?:pure\s+|elemental\s+|recursive\s+)*)function\s+([A-Za-z]\w*)\s*\(([^)]*)\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)",
+        re.IGNORECASE,
+    )
+    fn_end_re = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    decl_re = re.compile(
+        r"^(\s*)(integer|logical|real\s*\([^)]*\)|complex\s*\([^)]*\)|character\s*\([^)]*\))([^:]*)::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    while i < len(lines):
+        m_start = fn_start_re.match(lines[i])
+        if m_start is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        block: list[str] = [lines[i]]
+        i += 1
+        while i < len(lines):
+            block.append(lines[i])
+            i += 1
+            if fn_end_re.match(block[-1]):
+                break
+
+        header_args = [a.strip() for a in split_top_level_commas(m_start.group(3)) if a.strip()]
+        result_name = m_start.group(4)
+        declared_dummies: list[str] = []
+        for ln in block[1:]:
+            m_decl = decl_re.match(ln)
+            if m_decl is None or "intent(" not in m_decl.group(3).lower():
+                continue
+            for part in split_top_level_commas(m_decl.group(4)):
+                nm = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+                if nm is not None:
+                    declared_dummies.append(nm.group(1))
+        rename_map: dict[str, str] = {}
+        if len(header_args) == 1 and len(declared_dummies) == 1 and header_args[0].lower() != declared_dummies[0].lower():
+            rename_map[header_args[0]] = declared_dummies[0]
+            block[0] = re.sub(
+                r"\(([^)]*)\)",
+                f"({declared_dummies[0]})",
+                block[0],
+                count=1,
+            )
+
+        malformed_names: set[str] = set()
+        needs_logical_result = False
+        fixed: list[str] = []
+        for ln in block:
+            m_bad = re.match(r"^(\s*)([A-Za-z]\w*)\s*=\s*=\s*(.+)$", ln)
+            if m_bad is None:
+                fixed.append(ln)
+                continue
+            bad_name = m_bad.group(2)
+            lhs_name = rename_map.get(bad_name)
+            if lhs_name is None and declared_dummies:
+                lhs_name = declared_dummies[0]
+            if lhs_name is None:
+                fixed.append(ln)
+                continue
+            malformed_names.add(bad_name)
+            needs_logical_result = True
+            fixed.append(f"{m_bad.group(1)}{result_name} = {lhs_name} == {m_bad.group(3).strip()}")
+
+        if malformed_names:
+            pruned: list[str] = []
+            for ln in fixed:
+                m_decl = decl_re.match(ln)
+                if m_decl is None:
+                    pruned.append(ln)
+                    continue
+                parts = split_top_level_commas(m_decl.group(4))
+                kept: list[str] = []
+                removed = False
+                for part in parts:
+                    nm = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+                    if nm is not None and nm.group(1) in malformed_names:
+                        removed = True
+                    else:
+                        kept.append(part.strip())
+                if removed:
+                    if kept:
+                        pruned.append(f"{m_decl.group(1)}{m_decl.group(2)}{m_decl.group(3)}:: {', '.join(kept)}")
+                    continue
+                pruned.append(ln)
+            fixed = pruned
+            for bad_name in sorted(malformed_names, key=len, reverse=True):
+                good_name = rename_map.get(bad_name) or (declared_dummies[0] if declared_dummies else "")
+                if not good_name:
+                    continue
+                fixed = [
+                    re.sub(rf"\b{re.escape(bad_name)}\b", good_name, ln)
+                    for ln in fixed
+                ]
+
+        if needs_logical_result:
+            adjusted: list[str] = []
+            result_decl_pat = re.compile(
+                rf"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(result_name)}\s*$",
+                re.IGNORECASE,
+            )
+            result_zero_pat = re.compile(
+                rf"^(\s*){re.escape(result_name)}\s*=\s*0(?:\.0(?:_dp)?)?\s*$",
+                re.IGNORECASE,
+            )
+            for ln in fixed:
+                m_res = result_decl_pat.match(ln)
+                if m_res is not None:
+                    adjusted.append(f"{m_res.group(1)}logical :: {result_name}")
+                    continue
+                m_zero = result_zero_pat.match(ln)
+                if m_zero is not None:
+                    continue
+                else:
+                    adjusted.append(ln)
+            fixed = adjusted
+
+        out.extend(fixed)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def promote_integer_sequence_result_decls_text(f90: str) -> str:
     names = set(re.findall(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*r_seq_int\s*\(", f90))
     if not names:
@@ -48942,6 +49080,7 @@ def main() -> int:
     f90 = promote_real_array_decls_from_assignments_text(f90)
     f90 = repair_integer_vector_function_result_decls_text(f90)
     f90 = coerce_table2_real_args_to_integer_text(f90)
+    f90 = repair_malformed_logical_return_comparison_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = wrap_long_character_constructor_values_text(f90)
     f90_had_trailing_newline = f90.endswith("\n")
