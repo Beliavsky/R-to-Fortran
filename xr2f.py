@@ -27670,6 +27670,10 @@ def transpile_r_to_fortran(
             fn_return_array_kind[f_ret.name.lower()] = "integer"
         elif ret_name in fn_real_array_names.get(f_ret.name, set()) or ret_name in fn_real_matrix_names.get(f_ret.name, set()):
             fn_return_array_kind[f_ret.name.lower()] = "real"
+        else:
+            ret_sym_info = fn_tail_symbol_info.get(f_ret.name.lower(), {}).get(ret_name.lower())
+            if ret_sym_info is not None and ret_sym_info.rank > 0 and ret_sym_info.kind in {"integer", "logical", "real"}:
+                fn_return_array_kind[f_ret.name.lower()] = "integer" if ret_sym_info.kind in {"integer", "logical"} else "real"
     fn_char_scalars: dict[str, set[str]] = {f.name: infer_function_character_scalars(f) for f in funcs}
     _USER_FUNC_ARG_KIND = {}
     _USER_FUNC_ARG_INDEX = {}
