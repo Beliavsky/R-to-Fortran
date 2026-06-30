@@ -22722,6 +22722,23 @@ def emit_function(
             ints.discard(la)
             real_scalars.discard(la)
             params.pop(la, None)
+
+        def _force_local_int_array(nm_local: str) -> None:
+            int_arrays.add(nm_local)
+            logical_arrays.discard(nm_local)
+            real_arrays.discard(nm_local)
+            ints.discard(nm_local)
+            real_scalars.discard(nm_local)
+            params.pop(nm_local, None)
+
+        def _force_local_logical_array(nm_local: str) -> None:
+            logical_arrays.add(nm_local)
+            int_arrays.discard(nm_local)
+            real_arrays.discard(nm_local)
+            ints.discard(nm_local)
+            real_scalars.discard(nm_local)
+            params.pop(nm_local, None)
+
         changed_c_kind_arrays = True
         while changed_c_kind_arrays:
             changed_c_kind_arrays = False
@@ -22733,20 +22750,10 @@ def emit_function(
                 if c_c_kind is not None and c_c_kind[0].lower() == "c":
                     kind_c_kind = _infer_assignment_kind_hint(rhs_c_kind, {})
                     if kind_c_kind == "integer" and st_c_kind.name not in int_arrays:
-                        int_arrays.add(st_c_kind.name)
-                        logical_arrays.discard(st_c_kind.name)
-                        real_arrays.discard(st_c_kind.name)
-                        ints.discard(st_c_kind.name)
-                        real_scalars.discard(st_c_kind.name)
-                        params.pop(st_c_kind.name, None)
+                        _force_local_int_array(st_c_kind.name)
                         changed_c_kind_arrays = True
                     elif kind_c_kind == "logical" and st_c_kind.name not in logical_arrays:
-                        logical_arrays.add(st_c_kind.name)
-                        int_arrays.discard(st_c_kind.name)
-                        real_arrays.discard(st_c_kind.name)
-                        ints.discard(st_c_kind.name)
-                        real_scalars.discard(st_c_kind.name)
-                        params.pop(st_c_kind.name, None)
+                        _force_local_logical_array(st_c_kind.name)
                         changed_c_kind_arrays = True
                     continue
                 m_c_kind_alias = re.fullmatch(r"[A-Za-z]\w*", rhs_c_kind)
@@ -22754,20 +22761,10 @@ def emit_function(
                     continue
                 src_c_kind = m_c_kind_alias.group(0)
                 if src_c_kind in int_arrays and st_c_kind.name not in int_arrays:
-                    int_arrays.add(st_c_kind.name)
-                    logical_arrays.discard(st_c_kind.name)
-                    real_arrays.discard(st_c_kind.name)
-                    ints.discard(st_c_kind.name)
-                    real_scalars.discard(st_c_kind.name)
-                    params.pop(st_c_kind.name, None)
+                    _force_local_int_array(st_c_kind.name)
                     changed_c_kind_arrays = True
                 elif src_c_kind in logical_arrays and st_c_kind.name not in logical_arrays:
-                    logical_arrays.add(st_c_kind.name)
-                    int_arrays.discard(st_c_kind.name)
-                    real_arrays.discard(st_c_kind.name)
-                    ints.discard(st_c_kind.name)
-                    real_scalars.discard(st_c_kind.name)
-                    params.pop(st_c_kind.name, None)
+                    _force_local_logical_array(st_c_kind.name)
                     changed_c_kind_arrays = True
         for ls in logical_scalars:
             int_arrays.discard(ls)
@@ -23446,20 +23443,16 @@ def emit_function(
                 local_ranks[st_seq_rank.name] = 1
                 c_kind_rank = _infer_assignment_kind_hint(st_seq_rank.expr.strip(), {})
                 if c_kind_rank == "integer":
-                    int_arrays.add(st_seq_rank.name)
-                    real_arrays.discard(st_seq_rank.name)
-                    logical_arrays.discard(st_seq_rank.name)
+                    _force_local_int_array(st_seq_rank.name)
                 elif c_kind_rank == "logical":
-                    logical_arrays.add(st_seq_rank.name)
-                    real_arrays.discard(st_seq_rank.name)
-                    int_arrays.discard(st_seq_rank.name)
+                    _force_local_logical_array(st_seq_rank.name)
                 else:
                     real_arrays.add(st_seq_rank.name)
                     int_arrays.discard(st_seq_rank.name)
                     logical_arrays.discard(st_seq_rank.name)
-                ints.discard(st_seq_rank.name)
-                real_scalars.discard(st_seq_rank.name)
-                params.pop(st_seq_rank.name, None)
+                    ints.discard(st_seq_rank.name)
+                    real_scalars.discard(st_seq_rank.name)
+                    params.pop(st_seq_rank.name, None)
             m_field_rank_fix = re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*([A-Za-z]\w*)\s*$", st_seq_rank.expr.strip())
             if m_field_rank_fix is not None and m_field_rank_fix.group(1).lower() in {"gamma", "xi_sum"}:
                 local_ranks[st_seq_rank.name] = 2
