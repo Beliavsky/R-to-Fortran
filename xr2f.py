@@ -8369,6 +8369,27 @@ def _literal_c_kind(expr: str) -> str | None:
     return None
 
 
+def _simple_vector_constructor_array_kind(expr: str) -> str | None:
+    call = parse_call_text(fscan.strip_redundant_outer_parens_expr(expr.strip()))
+    if call is None:
+        return None
+    nm = call[0].lower()
+    if nm == "c":
+        lit_kind = _literal_c_kind(expr)
+        if lit_kind in {"integer", "logical", "character"}:
+            return f"{lit_kind}-array"
+        return "real-array"
+    if nm in {"integer", "seq", "seq_len", "seq_along"}:
+        return "integer-array"
+    if nm == "logical":
+        return "logical-array"
+    if nm == "character":
+        return "character-array"
+    if nm in {"numeric", "double", "rep", "rnorm", "runif"}:
+        return "real-array"
+    return None
+
+
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
     """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
     expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
@@ -9548,16 +9569,9 @@ def _static_list_field_kind(expr: object, list_vars: dict[str, dict[str, str]] |
         return "integer"
     if _is_real_literal(txt):
         return "real"
-    if re.match(r"^(?:c|seq|seq_len|numeric|integer|logical|character|double|rep|rnorm|runif)\s*\(", txt, re.IGNORECASE):
-        c = parse_call_text(txt)
-        nm = c[0].lower() if c is not None else ""
-        if nm in {"integer", "seq", "seq_len"}:
-            return "integer-array"
-        if nm in {"logical"}:
-            return "logical-array"
-        if nm in {"character"}:
-            return "character-array"
-        return "real-array"
+    ctor_kind = _simple_vector_constructor_array_kind(txt)
+    if ctor_kind is not None:
+        return ctor_kind
     return "unknown"
 
 
