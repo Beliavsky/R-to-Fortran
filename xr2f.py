@@ -11340,9 +11340,10 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"inverse_rle({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "replace":
         _nm_rep, pos_rep, kw_rep = c_usr
-        x_src = pos_rep[0] if pos_rep else kw_rep.get("x", "")
-        list_src = pos_rep[1] if len(pos_rep) >= 2 else kw_rep.get("list", "")
-        values_src = pos_rep[2] if len(pos_rep) >= 3 else kw_rep.get("values", "")
+        replace_call = (_nm_rep, pos_rep, kw_rep)
+        x_src = _first_call_arg(replace_call, "x")
+        list_src = _call_arg(replace_call, 1, "list")
+        values_src = _call_arg(replace_call, 2, "values")
         if not x_src or not list_src or not values_src:
             raise NotImplementedError("replace requires x, list, and values arguments")
         x_f = r_expr_to_fortran(x_src)
