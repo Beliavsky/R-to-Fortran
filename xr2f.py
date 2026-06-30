@@ -11458,15 +11458,17 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"{r_expr_to_fortran(fit_src)}%resid"
     if c_usr is not None and c_usr[0].lower() == "pchisq":
         _nm_pc, pos_pc, kw_pc = c_usr
-        x_src = pos_pc[0] if pos_pc else kw_pc.get("q", "0.0")
-        df_src = kw_pc.get("df", pos_pc[1] if len(pos_pc) >= 2 else "1")
+        pchisq_call = (_nm_pc, pos_pc, kw_pc)
+        x_src = _first_call_arg(pchisq_call, "q") or "0.0"
+        df_src = _call_arg(pchisq_call, 1, "df") or "1"
         return f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), real({r_expr_to_fortran(df_src)}, kind=dp))"
     if c_usr is not None and c_usr[0].lower() == "pnorm":
         _nm_pn, pos_pn, kw_pn = c_usr
         kw_pn_norm = {_sanitize_fortran_kwarg_name(k).lower(): v for k, v in kw_pn.items()}
-        x_src = pos_pn[0] if pos_pn else kw_pn_norm.get("q", "0.0")
-        mean_src = kw_pn_norm.get("mean", pos_pn[1] if len(pos_pn) >= 2 else "0.0")
-        sd_src = kw_pn_norm.get("sd", pos_pn[2] if len(pos_pn) >= 3 else "1.0")
+        pnorm_call = (_nm_pn, pos_pn, kw_pn_norm)
+        x_src = _first_call_arg(pnorm_call, "q") or "0.0"
+        mean_src = _call_arg(pnorm_call, 1, "mean") or "0.0"
+        sd_src = _call_arg(pnorm_call, 2, "sd") or "1.0"
         lower_src = kw_pn_norm.get("lower_tail", "TRUE").strip().lower()
         log_src = kw_pn_norm.get("log_p", "FALSE").strip().lower()
         val = (
