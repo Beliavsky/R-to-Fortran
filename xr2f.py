@@ -8065,7 +8065,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 x_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(x_src, inferred_ranks) if x_src else 2
             if fn_name in {"forwardsolve", "backsolve"}:
-                rhs_src = c_call[1][1].strip() if len(c_call[1]) >= 2 else c_call[2].get("b", c_call[2].get("x", "")).strip()
+                rhs_src = _call_arg(c_call, 1, "b", "x")
                 rhs_rank = _infer_assignment_rank_hint(rhs_src, inferred_ranks) if rhs_src else 1
                 return 2 if rhs_rank >= 2 else 1
             if fn_name in {
@@ -8115,13 +8115,13 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 arg_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 1
             if fn_name == "solve":
-                b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
-                if b_src is None:
+                b_src = _call_arg(c_call, 1, "b")
+                if not b_src:
                     return 2
-                return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks)
+                return _infer_assignment_rank_hint(b_src, inferred_ranks)
             if fn_name in {"qr.solve", "qr_solve", "qr.coef", "qr_coef"}:
-                b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
-                return _infer_assignment_rank_hint(b_src.strip(), inferred_ranks) if b_src is not None else 1
+                b_src = _call_arg(c_call, 1, "b")
+                return _infer_assignment_rank_hint(b_src, inferred_ranks) if b_src else 1
             if fn_name in {"as.integer", "as.numeric", "as.double"}:
                 if c_call[1]:
                     cast_arg = c_call[1][0].strip()
@@ -8427,6 +8427,16 @@ def _simple_constructor_kind(expr: str) -> str | None:
 def _first_call_arg(call: tuple[str, list[str], dict[str, str]], *kw_names: str) -> str:
     if call[1]:
         return call[1][0].strip()
+    for key in kw_names:
+        val = call[2].get(key)
+        if val is not None:
+            return val.strip()
+    return ""
+
+
+def _call_arg(call: tuple[str, list[str], dict[str, str]], pos: int, *kw_names: str) -> str:
+    if len(call[1]) > pos:
+        return call[1][pos].strip()
     for key in kw_names:
         val = call[2].get(key)
         if val is not None:
