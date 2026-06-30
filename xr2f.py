@@ -11597,7 +11597,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"scale({', '.join(args_sc)})"
     if c_usr is not None and c_usr[0].lower() == "sort":
         _nm_sort, pos_sort, kw_sort = c_usr
-        x_src = pos_sort[0] if pos_sort else kw_sort.get("x", "")
+        x_src = _first_call_arg((_nm_sort, pos_sort, kw_sort), "x")
         if not x_src:
             raise NotImplementedError("sort requires x argument")
         dec_src = kw_sort.get("decreasing")
@@ -11606,7 +11606,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"sort({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() in {"sort.list", "sort_list"}:
         _nm_sortl, pos_sortl, kw_sortl = c_usr
-        x_src = pos_sortl[0] if pos_sortl else kw_sortl.get("x", "")
+        x_src = _first_call_arg((_nm_sortl, pos_sortl, kw_sortl), "x")
         if not x_src:
             raise NotImplementedError("sort.list requires x argument")
         dec_src = kw_sortl.get("decreasing")
@@ -11615,8 +11615,9 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"sort_list({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "head":
         _nm_head, pos_head, kw_head = c_usr
-        x_src = pos_head[0] if pos_head else kw_head.get("x", "")
-        n_src = kw_head.get("n", pos_head[1] if len(pos_head) >= 2 else "6")
+        head_call = (_nm_head, pos_head, kw_head)
+        x_src = _first_call_arg(head_call, "x")
+        n_src = _call_arg(head_call, 1, "n") or "6"
         if not x_src:
             raise NotImplementedError("head requires x argument")
         x_f = r_expr_to_fortran(x_src)
