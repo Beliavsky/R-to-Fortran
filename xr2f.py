@@ -23438,8 +23438,7 @@ def emit_function(
                 ) if var_arg else 0
                 if var_arg_rank >= 2:
                     local_ranks[st_seq_rank.name] = 2
-                    real_arrays.add(st_seq_rank.name)
-                    real_scalars.discard(st_seq_rank.name)
+                    _force_local_real_array(st_seq_rank.name)
                 else:
                     local_ranks.pop(st_seq_rank.name, None)
                     real_scalars.add(st_seq_rank.name)
