@@ -22041,24 +22041,42 @@ def emit_function(
     ret_ident_m = re.match(r"^[A-Za-z]\w*$", last_expr_for_ret)
     if list_spec is None and ret_ident_m is not None:
         ret_ident = ret_ident_m.group(0)
+        ret_ident_decl = ret_ident
+        for st_ret_decl_alias in reversed(body_stmts):
+            if isinstance(st_ret_decl_alias, Assign) and st_ret_decl_alias.name == ret_ident:
+                rhs_ret_decl_alias = st_ret_decl_alias.expr.strip()
+                if re.fullmatch(r"[A-Za-z]\w*", rhs_ret_decl_alias):
+                    ret_ident_decl = rhs_ret_decl_alias
+                break
         known_arrays0 = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
         b_ints0, b_real_scalars0, b_int_arrays0, b_real_arrays0, _b_params0 = classify_vars(
             body_stmts, infer_assigned_names(body_stmts), known_arrays=known_arrays0
         )
-        if ret_ident in infer_local_logical_scalars(body_stmts):
+        ret_ident_decl_kind = "unknown"
+        for st_ret_decl_kind in reversed(body_stmts):
+            if isinstance(st_ret_decl_kind, Assign) and st_ret_decl_kind.name == ret_ident_decl:
+                ret_ident_decl_kind = _infer_assignment_kind_hint(st_ret_decl_kind.expr.strip(), {})
+                break
+        if ret_ident_decl in infer_local_logical_scalars(body_stmts):
             rdecl = "logical"
-        elif ret_ident in infer_local_logical_arrays(body_stmts):
-            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident), tail_if_result_rank or 0, 1)
+        elif ret_ident_decl in infer_local_logical_arrays(body_stmts):
+            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident_decl), tail_if_result_rank or 0, 1)
             rdecl = "logical, allocatable"
-        elif ret_ident in b_int_arrays0:
-            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident), tail_if_result_rank or 0)
+        elif ret_ident_decl_kind == "integer" and _infer_local_array_rank(body_stmts, ret_ident_decl) > 0:
+            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident_decl), tail_if_result_rank or 0)
             rdecl = "integer, allocatable"
-        elif ret_ident in b_real_arrays0:
-            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident), tail_if_result_rank or 0)
+        elif ret_ident_decl_kind == "logical" and _infer_local_array_rank(body_stmts, ret_ident_decl) > 0:
+            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident_decl), tail_if_result_rank or 0, 1)
+            rdecl = "logical, allocatable"
+        elif ret_ident_decl in b_int_arrays0:
+            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident_decl), tail_if_result_rank or 0)
+            rdecl = "integer, allocatable"
+        elif ret_ident_decl in b_real_arrays0:
+            ret_rank = max(_infer_local_array_rank(body_stmts, ret_ident_decl), tail_if_result_rank or 0)
             rdecl = "real(kind=dp), allocatable"
-        elif ret_ident in b_ints0:
+        elif ret_ident_decl in b_ints0:
             rdecl = "integer"
-        elif ret_ident in b_real_scalars0:
+        elif ret_ident_decl in b_real_scalars0:
             rdecl = "real(kind=dp)"
     if ret_type_name is not None:
         rdecl = f"type({ret_type_name})"
@@ -22075,8 +22093,10 @@ def emit_function(
         elif ret_rank == 0 and rk == "logical":
             rdecl = "logical"
         elif ret_rank >= 1 and "allocatable" not in rdecl:
-            if fn_return_kind_hint == "int" or rk == "int":
+            if fn_return_kind_hint in {"int", "integer"} or rk == "int":
                 rdecl = "integer, allocatable"
+            elif fn_return_kind_hint == "logical" or rk == "logical":
+                rdecl = "logical, allocatable"
             else:
                 rdecl = "real(kind=dp), allocatable"
     else:
@@ -22697,6 +22717,53 @@ def emit_function(
             ints.discard(la)
             real_scalars.discard(la)
             params.pop(la, None)
+        changed_c_kind_arrays = True
+        while changed_c_kind_arrays:
+            changed_c_kind_arrays = False
+            for st_c_kind in body_use:
+                if not isinstance(st_c_kind, Assign):
+                    continue
+                rhs_c_kind = st_c_kind.expr.strip()
+                c_c_kind = parse_call_text(rhs_c_kind)
+                if c_c_kind is not None and c_c_kind[0].lower() == "c":
+                    kind_c_kind = _infer_assignment_kind_hint(rhs_c_kind, {})
+                    if kind_c_kind == "integer" and st_c_kind.name not in int_arrays:
+                        int_arrays.add(st_c_kind.name)
+                        logical_arrays.discard(st_c_kind.name)
+                        real_arrays.discard(st_c_kind.name)
+                        ints.discard(st_c_kind.name)
+                        real_scalars.discard(st_c_kind.name)
+                        params.pop(st_c_kind.name, None)
+                        changed_c_kind_arrays = True
+                    elif kind_c_kind == "logical" and st_c_kind.name not in logical_arrays:
+                        logical_arrays.add(st_c_kind.name)
+                        int_arrays.discard(st_c_kind.name)
+                        real_arrays.discard(st_c_kind.name)
+                        ints.discard(st_c_kind.name)
+                        real_scalars.discard(st_c_kind.name)
+                        params.pop(st_c_kind.name, None)
+                        changed_c_kind_arrays = True
+                    continue
+                m_c_kind_alias = re.fullmatch(r"[A-Za-z]\w*", rhs_c_kind)
+                if m_c_kind_alias is None:
+                    continue
+                src_c_kind = m_c_kind_alias.group(0)
+                if src_c_kind in int_arrays and st_c_kind.name not in int_arrays:
+                    int_arrays.add(st_c_kind.name)
+                    logical_arrays.discard(st_c_kind.name)
+                    real_arrays.discard(st_c_kind.name)
+                    ints.discard(st_c_kind.name)
+                    real_scalars.discard(st_c_kind.name)
+                    params.pop(st_c_kind.name, None)
+                    changed_c_kind_arrays = True
+                elif src_c_kind in logical_arrays and st_c_kind.name not in logical_arrays:
+                    logical_arrays.add(st_c_kind.name)
+                    int_arrays.discard(st_c_kind.name)
+                    real_arrays.discard(st_c_kind.name)
+                    ints.discard(st_c_kind.name)
+                    real_scalars.discard(st_c_kind.name)
+                    params.pop(st_c_kind.name, None)
+                    changed_c_kind_arrays = True
         for ls in logical_scalars:
             int_arrays.discard(ls)
             real_arrays.discard(ls)
@@ -23066,6 +23133,13 @@ def emit_function(
                     real_scalars.discard(target)
                     params.pop(target, None)
                     return True
+                if cn_expr == "c" and _infer_assignment_kind_hint(expr_txt, {}) in {"integer", "logical"}:
+                    int_arrays.add(target)
+                    ints.discard(target)
+                    real_arrays.discard(target)
+                    real_scalars.discard(target)
+                    params.pop(target, None)
+                    return True
                 if cn_expr in {"c", "numeric", "as.numeric", "pack", "coef", "fitted", "residuals", "colmeans", "rowmeans", "rowsums", "colsums"}:
                     real_arrays.add(target)
                     known_arrays.add(target)
@@ -23365,9 +23439,20 @@ def emit_function(
                 params.pop(st_seq_rank.name, None)
             if re.match(r"^\s*c\s*\(", st_seq_rank.expr.strip(), re.IGNORECASE):
                 local_ranks[st_seq_rank.name] = 1
-                real_arrays.add(st_seq_rank.name)
+                c_kind_rank = _infer_assignment_kind_hint(st_seq_rank.expr.strip(), {})
+                if c_kind_rank == "integer":
+                    int_arrays.add(st_seq_rank.name)
+                    real_arrays.discard(st_seq_rank.name)
+                    logical_arrays.discard(st_seq_rank.name)
+                elif c_kind_rank == "logical":
+                    logical_arrays.add(st_seq_rank.name)
+                    real_arrays.discard(st_seq_rank.name)
+                    int_arrays.discard(st_seq_rank.name)
+                else:
+                    real_arrays.add(st_seq_rank.name)
+                    int_arrays.discard(st_seq_rank.name)
+                    logical_arrays.discard(st_seq_rank.name)
                 ints.discard(st_seq_rank.name)
-                int_arrays.discard(st_seq_rank.name)
                 real_scalars.discard(st_seq_rank.name)
                 params.pop(st_seq_rank.name, None)
             m_field_rank_fix = re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*([A-Za-z]\w*)\s*$", st_seq_rank.expr.strip())
@@ -27431,14 +27516,19 @@ def transpile_r_to_fortran(
                     "seq",
                     "seq_len",
                     "seq_along",
+                    "c",
                 }:
                     ctor_kind_ret = (
                         "integer"
                         if c_ctor_ret[0].lower() in {"integer", "seq_len", "seq_along"}
                         else "logical"
                         if c_ctor_ret[0].lower() == "logical"
+                        else _infer_assignment_kind_hint(st_vec_ret.expr.strip(), {})
+                        if c_ctor_ret[0].lower() == "c"
                         else "real"
                     )
+                    if ctor_kind_ret == "unknown":
+                        ctor_kind_ret = None
                     _set_ret_rank(st_vec_ret.name, 1, ctor_kind_ret)
         changed_ret_ranks = True
         while changed_ret_ranks:
