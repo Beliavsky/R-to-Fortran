@@ -7961,9 +7961,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         return 1
 
     # Constructor vectors/matrices.
-    if expr_l.startswith("c(") or expr_f.startswith("c("):
-        return 1
-    if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|ls)\s*\(", expr_l):
+    simple_ctor_rank = _simple_vector_constructor_rank(expr)
+    if simple_ctor_rank is not None:
+        return simple_ctor_rank
+    if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply)\s*\(", expr_l):
         return 1
 
     m_subset_rank = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr)
@@ -8091,33 +8092,9 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "rbindlist",
             }:
                 return 2
-            if fn_name in {
-                "c",
-                "vector",
-                "backsolve",
-                "rep",
-                "numeric",
-                "double",
-                "integer",
-                "char",
-                "seq",
-                "seq.int",
-                "seq_len",
-                "seq_along",
-                "factorial",
-                "lfactorial",
-                "beta",
-                "lbeta",
-                "choose",
-                "lchoose",
-                "gamma",
-                "lgamma",
-                "psigamma",
-                "digamma",
-                "trigamma",
-                "armaacf",
-            }:
-                return 1
+            simple_ctor_rank = _simple_vector_constructor_rank(expr)
+            if simple_ctor_rank is not None:
+                return simple_ctor_rank
             if fn_name in {"arima.sim", "arima_sim", "predict"}:
                 return 1
             if fn_name in {"acf", "pacf", "ccf"}:
@@ -8387,6 +8364,42 @@ def _simple_vector_constructor_array_kind(expr: str) -> str | None:
         return "character-array"
     if nm in {"numeric", "double", "rep", "rnorm", "runif"}:
         return "real-array"
+    return None
+
+
+def _simple_vector_constructor_rank(expr: str) -> int | None:
+    call = parse_call_text(fscan.strip_redundant_outer_parens_expr(expr.strip()))
+    if call is None:
+        return None
+    if call[0].lower() in {
+        "c",
+        "vector",
+        "rep",
+        "rep_len",
+        "numeric",
+        "double",
+        "integer",
+        "logical",
+        "char",
+        "seq",
+        "seq.int",
+        "seq_len",
+        "seq_along",
+        "ls",
+        "factorial",
+        "lfactorial",
+        "beta",
+        "lbeta",
+        "choose",
+        "lchoose",
+        "gamma",
+        "lgamma",
+        "psigamma",
+        "digamma",
+        "trigamma",
+        "armaacf",
+    }:
+        return 1
     return None
 
 
