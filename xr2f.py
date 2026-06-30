@@ -8024,8 +8024,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 arg_src = _first_call_arg(c_call, "x")
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
             if fn_name == "apply":
-                margin_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("MARGIN", c_call[2].get("margin", "")).strip()
-                fun_src = c_call[1][2] if len(c_call[1]) >= 3 else c_call[2].get("FUN", c_call[2].get("fun", "")).strip()
+                margin_src = _call_arg(c_call, 1, "MARGIN", "margin")
+                fun_src = _call_arg(c_call, 2, "FUN", "fun")
                 if margin_src.strip() in {"2", "2L"} and fun_src.strip().lower() == "cumsum":
                     return 2
                 return 1
