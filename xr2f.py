@@ -11562,16 +11562,13 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"[sd({src_real})]"
     if c_usr is not None and c_usr[0].lower() == "scale":
         _nm_sc, pos_sc, kw_sc = c_usr
-        x_src = pos_sc[0] if pos_sc else kw_sc.get("x", "")
+        scale_call = (_nm_sc, pos_sc, kw_sc)
+        x_src = _first_call_arg(scale_call, "x")
         if not x_src:
             raise NotImplementedError("scale requires x argument")
         x_f = r_expr_to_fortran(x_src)
-        center_src = kw_sc.get("center")
-        scale_src = kw_sc.get("scale")
-        if center_src is None and len(pos_sc) >= 2:
-            center_src = pos_sc[1]
-        if scale_src is None and len(pos_sc) >= 3:
-            scale_src = pos_sc[2]
+        center_src = _call_arg(scale_call, 1, "center") or None
+        scale_src = _call_arg(scale_call, 2, "scale") or None
         args_sc = [f"real({x_f}, kind=dp)"]
         if center_src is not None and scale_src is not None:
             center_txt = center_src.strip()
