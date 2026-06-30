@@ -11534,9 +11534,10 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"{nm_dist.lower()}({', '.join(out_args_dist)})"
     if c_usr is not None and c_usr[0].lower() == "apply":
         _nm_app, pos_app, kw_app = c_usr
-        x_src = pos_app[0] if pos_app else kw_app.get("X", kw_app.get("x", ""))
-        margin_src = pos_app[1] if len(pos_app) >= 2 else kw_app.get("MARGIN", kw_app.get("margin", ""))
-        fun_src = pos_app[2] if len(pos_app) >= 3 else kw_app.get("FUN", kw_app.get("fun", ""))
+        app_call = (_nm_app, pos_app, kw_app)
+        x_src = _first_call_arg(app_call, "X", "x")
+        margin_src = _call_arg(app_call, 1, "MARGIN", "margin")
+        fun_src = _call_arg(app_call, 2, "FUN", "fun")
         fun_name = fun_src.strip().lower()
         margin_txt = margin_src.strip()
         if margin_txt in {"2", "2L"} and fun_name == "cumsum":
