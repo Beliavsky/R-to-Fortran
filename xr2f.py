@@ -11329,15 +11329,22 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"which({name_mask})" if truth_mask else f"which(.not. {name_mask})"
         return f"which({r_expr_to_fortran(mask_src)})"
     if c_usr is not None and c_usr[0].lower() == "rle":
-        x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
+        x_src = _first_call_arg(c_usr, "x")
         if not x_src:
             raise NotImplementedError("rle requires x argument")
         return f"rle({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() in {"inverse.rle", "inverse_rle"}:
-        x_src = c_usr[1][0] if c_usr[1] else c_usr[2].get("x", "")
+        x_src = _first_call_arg(c_usr, "x")
         if not x_src:
             raise NotImplementedError("inverse.rle requires x argument")
         return f"inverse_rle({r_expr_to_fortran(x_src)})"
+    if c_usr is not None and c_usr[0].lower() == "unique":
+        x_src = _first_call_arg(c_usr, "x")
+        if not x_src and not c_usr[1] and len(c_usr[2]) == 1:
+            x_src = next(iter(c_usr[2].values())).strip()
+        if not x_src:
+            raise NotImplementedError("unique requires x argument")
+        return f"unique({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "replace":
         _nm_rep, pos_rep, kw_rep = c_usr
         replace_call = (_nm_rep, pos_rep, kw_rep)
