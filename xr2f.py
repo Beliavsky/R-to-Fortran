@@ -23441,11 +23441,7 @@ def emit_function(
                     _force_local_real_array(st_seq_rank.name)
                 else:
                     local_ranks.pop(st_seq_rank.name, None)
-                    real_scalars.add(st_seq_rank.name)
-                    real_arrays.discard(st_seq_rank.name)
-                ints.discard(st_seq_rank.name)
-                int_arrays.discard(st_seq_rank.name)
-                params.pop(st_seq_rank.name, None)
+                    _force_real_scalar_local(st_seq_rank.name)
             if re.match(r"^\s*c\s*\(", st_seq_rank.expr.strip(), re.IGNORECASE):
                 local_ranks[st_seq_rank.name] = 1
                 c_kind_rank = _infer_assignment_kind_hint(st_seq_rank.expr.strip(), {})
