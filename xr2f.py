@@ -8351,6 +8351,24 @@ def _assigned_scalar_reduction_names(stmts: list[object], rank_names: set[str] |
     return out
 
 
+def _literal_c_kind(expr: str) -> str | None:
+    expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    call = parse_call_text(expr)
+    if call is None or call[0].lower() != "c":
+        return None
+    vals = list(call[1]) + list(call[2].values())
+    if not vals:
+        return None
+    vals = [_strip_named_actual_value(v).strip() for v in vals]
+    if all(v.upper() in {"TRUE", "FALSE", "T", "F"} for v in vals):
+        return "logical"
+    if all(re.fullmatch(r"[+-]?\d+[lL]", v) for v in vals):
+        return "integer"
+    if any(_dequote_string_literal(v) is not None for v in vals):
+        return "character"
+    return None
+
+
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
     """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
     expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
@@ -8379,17 +8397,16 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
     if c_call is not None:
         nm = c_call[0].lower()
         if nm == "c":
-            vals_kind = list(c_call[1]) + list(c_call[2].values())
-            if vals_kind and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_kind):
-                return "logical"
-            if vals_kind and all(re.fullmatch(r"[+-]?\d+[lL]", _strip_named_actual_value(v).strip()) for v in vals_kind):
-                return "integer"
+            lit_kind = _literal_c_kind(expr)
+            if lit_kind is not None:
+                return lit_kind
         if nm in {"re", "im", "mod", "arg", "abs"}:
             return "real"
         vals = list(c_call[1]) + list(c_call[2].values())
         if nm == "c" and vals:
-            if any(_dequote_string_literal(_strip_named_actual_value(v)) is not None for v in vals):
-                return "character"
+            lit_kind = _literal_c_kind(expr)
+            if lit_kind is not None:
+                return lit_kind
         if nm in {"complex", "as.complex"}:
             return "complex"
         if nm in {"solve", "qr.solve", "qr_solve"}:
@@ -22060,7 +22077,7 @@ def emit_function(
         ret_ident_decl_kind = "unknown"
         for st_ret_decl_kind in reversed(body_stmts):
             if isinstance(st_ret_decl_kind, Assign) and st_ret_decl_kind.name == ret_ident_decl:
-                ret_ident_decl_kind = _infer_assignment_kind_hint(st_ret_decl_kind.expr.strip(), {})
+                ret_ident_decl_kind = _literal_c_kind(st_ret_decl_kind.expr.strip()) or _infer_assignment_kind_hint(st_ret_decl_kind.expr.strip(), {})
                 break
         if ret_ident_decl in infer_local_logical_scalars(body_stmts):
             rdecl = "logical"
@@ -22756,7 +22773,7 @@ def emit_function(
                 rhs_c_kind = st_c_kind.expr.strip()
                 c_c_kind = parse_call_text(rhs_c_kind)
                 if c_c_kind is not None and c_c_kind[0].lower() == "c":
-                    kind_c_kind = _infer_assignment_kind_hint(rhs_c_kind, {})
+                    kind_c_kind = _literal_c_kind(rhs_c_kind) or _infer_assignment_kind_hint(rhs_c_kind, {})
                     if kind_c_kind == "integer" and st_c_kind.name not in int_arrays:
                         _force_local_int_array(st_c_kind.name)
                         changed_c_kind_arrays = True
@@ -23143,7 +23160,7 @@ def emit_function(
                     real_scalars.discard(target)
                     params.pop(target, None)
                     return True
-                if cn_expr == "c" and _infer_assignment_kind_hint(expr_txt, {}) in {"integer", "logical"}:
+                if cn_expr == "c" and (_literal_c_kind(expr_txt) or _infer_assignment_kind_hint(expr_txt, {})) in {"integer", "logical"}:
                     int_arrays.add(target)
                     ints.discard(target)
                     real_arrays.discard(target)
@@ -23444,7 +23461,7 @@ def emit_function(
                     _force_real_scalar_local(st_seq_rank.name)
             if re.match(r"^\s*c\s*\(", st_seq_rank.expr.strip(), re.IGNORECASE):
                 local_ranks[st_seq_rank.name] = 1
-                c_kind_rank = _infer_assignment_kind_hint(st_seq_rank.expr.strip(), {})
+                c_kind_rank = _literal_c_kind(st_seq_rank.expr.strip()) or _infer_assignment_kind_hint(st_seq_rank.expr.strip(), {})
                 if c_kind_rank == "integer":
                     _force_local_int_array(st_seq_rank.name)
                 elif c_kind_rank == "logical":
@@ -27519,7 +27536,7 @@ def transpile_r_to_fortran(
                         if c_ctor_ret[0].lower() in {"integer", "seq_len", "seq_along"}
                         else "logical"
                         if c_ctor_ret[0].lower() == "logical"
-                        else _infer_assignment_kind_hint(st_vec_ret.expr.strip(), {})
+                        else (_literal_c_kind(st_vec_ret.expr.strip()) or _infer_assignment_kind_hint(st_vec_ret.expr.strip(), {}))
                         if c_ctor_ret[0].lower() == "c"
                         else "real"
                     )
