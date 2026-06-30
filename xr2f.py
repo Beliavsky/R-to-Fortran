@@ -12510,15 +12510,17 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"{_paren_sweep_operand(x_f)} / {_paren_sweep_operand(rhs)}"
             return f"{r_expr_to_fortran(fn_t)}(real({x_f}, kind=dp), real({rhs}, kind=dp))"
     c_back = parse_call_text(s)
-    if c_back is not None and c_back[0].lower() == "backsolve":
+    if c_back is not None and c_back[0].lower() in {"forwardsolve", "backsolve"}:
         _nb, pos_b, kw_b = c_back
-        if len(pos_b) < 2:
-            raise NotImplementedError("backsolve requires r and x arguments")
-        r_f = r_expr_to_fortran(pos_b[0])
-        x_f = r_expr_to_fortran(pos_b[1])
+        r_src = pos_b[0] if len(pos_b) >= 1 else kw_b.get("r")
+        x_src = pos_b[1] if len(pos_b) >= 2 else kw_b.get("x")
+        if not r_src or not x_src:
+            raise NotImplementedError(f"{c_back[0]} requires r and x arguments")
+        r_f = r_expr_to_fortran(r_src)
+        x_f = r_expr_to_fortran(x_src)
         tr_src = kw_b.get("transpose", ".false.")
         tr_f = r_expr_to_fortran(tr_src)
-        return f"backsolve({r_f}, {x_f}, transpose={tr_f})"
+        return f"{c_back[0].lower()}({r_f}, {x_f}, transpose={tr_f})"
     # Top-level R sequence operator a:b
     s_seq = _split_top_level_colon(s)
     if s_seq is not None and ("[" not in s) and ("]" not in s):
