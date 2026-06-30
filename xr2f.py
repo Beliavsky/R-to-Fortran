@@ -22739,6 +22739,14 @@ def emit_function(
             real_scalars.discard(nm_local)
             params.pop(nm_local, None)
 
+        def _force_local_real_array(nm_local: str) -> None:
+            real_arrays.add(nm_local)
+            int_arrays.discard(nm_local)
+            logical_arrays.discard(nm_local)
+            ints.discard(nm_local)
+            real_scalars.discard(nm_local)
+            params.pop(nm_local, None)
+
         changed_c_kind_arrays = True
         while changed_c_kind_arrays:
             changed_c_kind_arrays = False
@@ -23447,12 +23455,7 @@ def emit_function(
                 elif c_kind_rank == "logical":
                     _force_local_logical_array(st_seq_rank.name)
                 else:
-                    real_arrays.add(st_seq_rank.name)
-                    int_arrays.discard(st_seq_rank.name)
-                    logical_arrays.discard(st_seq_rank.name)
-                    ints.discard(st_seq_rank.name)
-                    real_scalars.discard(st_seq_rank.name)
-                    params.pop(st_seq_rank.name, None)
+                    _force_local_real_array(st_seq_rank.name)
             m_field_rank_fix = re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*([A-Za-z]\w*)\s*$", st_seq_rank.expr.strip())
             if m_field_rank_fix is not None and m_field_rank_fix.group(1).lower() in {"gamma", "xi_sum"}:
                 local_ranks[st_seq_rank.name] = 2
