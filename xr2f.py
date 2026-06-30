@@ -8006,7 +8006,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         if c_call is not None:
             fn_name = c_call[0].lower()
             if fn_name in _SCALAR_DISTRIBUTION_FUNCTIONS:
-                arg_src = c_call[1][0].strip() if c_call[1] else ""
+                arg_src = _first_call_arg(c_call)
                 if not arg_src:
                     for key in ("x", "q", "p", "pv"):
                         if key in c_call[2]:
@@ -8014,14 +8014,14 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                             break
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "diag":
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 arg_rank = _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
                 return 1 if arg_rank >= 2 else 2
             if fn_name == "array":
                 dim_parts = _array_dim_parts(expr)
                 return len(dim_parts) if dim_parts is not None and dim_parts else 3
             if fn_name in {"t", "transpose"}:
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 1
             if fn_name == "apply":
                 margin_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("MARGIN", c_call[2].get("margin", "")).strip()
@@ -8034,10 +8034,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "apply_col_sd":
                 return 1
             if fn_name == "var":
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 0
             if fn_name in {"as.numeric", "as.double"}:
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 if arg_src:
                     if re.match(r"^solve\s*\(", arg_src, re.IGNORECASE):
                         return 1
@@ -8057,12 +8057,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 "floor", "log", "log10", "log2", "round", "sign", "sin",
                 "sinh", "sqrt", "tan", "tanh", "trunc",
             }:
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "scale":
                 return 2
             if fn_name == "sweep":
-                x_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                x_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(x_src, inferred_ranks) if x_src else 2
             if fn_name in {"forwardsolve", "backsolve"}:
                 rhs_src = c_call[1][1].strip() if len(c_call[1]) >= 2 else c_call[2].get("b", c_call[2].get("x", "")).strip()
@@ -8106,13 +8106,13 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name in {"anyduplicated", "anyDuplicated".lower(), "setequal"}:
                 return 0
             if fn_name in {"cov", "cor"}:
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return 2 if arg_src and _infer_assignment_rank_hint(arg_src, inferred_ranks) >= 2 else 0
             if fn_name == "scale":
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 0
             if fn_name == "diff":
-                arg_src = c_call[1][0].strip() if c_call[1] else c_call[2].get("x", "").strip()
+                arg_src = _first_call_arg(c_call, "x")
                 return _infer_assignment_rank_hint(arg_src, inferred_ranks) if arg_src else 1
             if fn_name == "solve":
                 b_src = c_call[1][1] if len(c_call[1]) >= 2 else c_call[2].get("b")
@@ -8422,6 +8422,16 @@ def _simple_constructor_kind(expr: str) -> str | None:
     if nm in {"character", "as.character"}:
         return "character"
     return None
+
+
+def _first_call_arg(call: tuple[str, list[str], dict[str, str]], *kw_names: str) -> str:
+    if call[1]:
+        return call[1][0].strip()
+    for key in kw_names:
+        val = call[2].get(key)
+        if val is not None:
+            return val.strip()
+    return ""
 
 
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
