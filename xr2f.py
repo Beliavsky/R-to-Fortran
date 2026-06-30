@@ -245,6 +245,12 @@ class FuncDef:
     leading_comments: tuple[str, ...] = ()
 
 
+@dataclass
+class SymbolInfo:
+    rank: int = 0
+    kind: str | None = None
+
+
 def _fortran_comment_payload(text: str) -> str | None:
     if not _FORTRAN_COMMENTS:
         return None
@@ -27374,28 +27380,66 @@ def transpile_r_to_fortran(
     fn_real_matrix_names: dict[str, set[str]] = {f.name: infer_function_real_matrix_names(f) for f in funcs}
     _USER_FUNC_RETURN_RANK = {}
     _USER_FUNC_RETURN_KIND = {}
+    fn_tail_symbol_info: dict[str, dict[str, SymbolInfo]] = {}
     def _function_tail_rank(fn_rank_tail: FuncDef) -> int | None:
-        inferred_ret_ranks: dict[str, int] = {}
+        symbols_ret: dict[str, SymbolInfo] = {}
+
+        def _set_ret_rank(name_ret: str, rank_ret: int, kind_ret: str | None = None) -> bool:
+            if rank_ret <= 0:
+                return False
+            key_ret = name_ret.lower()
+            info_ret = symbols_ret.setdefault(key_ret, SymbolInfo())
+            changed_ret = False
+            if rank_ret > info_ret.rank:
+                info_ret.rank = rank_ret
+                changed_ret = True
+            if kind_ret is not None and info_ret.kind != kind_ret:
+                info_ret.kind = kind_ret
+                changed_ret = True
+            return changed_ret
+
+        def _ret_rank(name_ret: str) -> int:
+            info_ret = symbols_ret.get(name_ret.lower())
+            return info_ret.rank if info_ret is not None else 0
+
+        def _ret_rank_hints() -> dict[str, int]:
+            return {name_ret: info_ret.rank for name_ret, info_ret in symbols_ret.items() if info_ret.rank > 0}
+
         for a_tail in fn_rank_tail.args:
             rk_arg_tail = max(
                 infer_arg_rank(fn_rank_tail, a_tail),
                 _USER_FUNC_ARG_RANK.get(fn_rank_tail.name.lower(), {}).get(a_tail.lower(), 0),
             )
             if rk_arg_tail > 0:
-                inferred_ret_ranks[a_tail.lower()] = rk_arg_tail
+                _set_ret_rank(a_tail, rk_arg_tail)
         for nm_ret in fn_real_matrix_names.get(fn_rank_tail.name, set()):
-            inferred_ret_ranks[nm_ret.lower()] = 2
+            _set_ret_rank(nm_ret, 2, "real")
         for nm_ret in fn_real_array_names.get(fn_rank_tail.name, set()):
-            inferred_ret_ranks.setdefault(nm_ret.lower(), 1)
+            _set_ret_rank(nm_ret, 1, "real")
         for nm_ret in fn_int_array_names.get(fn_rank_tail.name, set()):
-            inferred_ret_ranks.setdefault(nm_ret.lower(), 1)
+            _set_ret_rank(nm_ret, 1, "integer")
         for st_vec_ret in fn_rank_tail.body:
-            if isinstance(st_vec_ret, Assign) and re.match(
-                r"^\s*(?:numeric|double|integer|logical|rep|rep_len|seq|seq_len|seq_along)\s*\(",
-                st_vec_ret.expr.strip(),
-                re.IGNORECASE,
-            ):
-                inferred_ret_ranks.setdefault(st_vec_ret.name.lower(), 1)
+            if isinstance(st_vec_ret, Assign):
+                c_ctor_ret = parse_call_text(st_vec_ret.expr.strip())
+                if c_ctor_ret is not None and c_ctor_ret[0].lower() in {
+                    "numeric",
+                    "double",
+                    "integer",
+                    "logical",
+                    "rep",
+                    "rep_len",
+                    "seq",
+                    "seq_len",
+                    "seq_along",
+                }:
+                    ctor_kind_ret = (
+                        "integer"
+                        if c_ctor_ret[0].lower() in {"integer", "seq_len", "seq_along"}
+                        else "logical"
+                        if c_ctor_ret[0].lower() == "logical"
+                        else "real"
+                    )
+                    _set_ret_rank(st_vec_ret.name, 1, ctor_kind_ret)
         changed_ret_ranks = True
         while changed_ret_ranks:
             changed_ret_ranks = False
@@ -27406,12 +27450,25 @@ def transpile_r_to_fortran(
                 expr_ret_rank = st_vec_ret.expr.strip()
                 alias_ret_rank = re.fullmatch(r"[A-Za-z]\w*", expr_ret_rank)
                 if alias_ret_rank is not None:
-                    rr_alias_ret = inferred_ret_ranks.get(alias_ret_rank.group(0).lower(), 0)
+                    alias_ret_name = alias_ret_rank.group(0)
+                    rr_alias_ret = _ret_rank(alias_ret_name)
+                    alias_info_ret = symbols_ret.get(alias_ret_name.lower())
+                    alias_kind_ret = alias_info_ret.kind if alias_info_ret is not None else None
                 else:
-                    rr_alias_ret = _infer_assignment_rank_hint(expr_ret_rank, inferred_ret_ranks)
-                if rr_alias_ret > inferred_ret_ranks.get(lhs_ret_rank, 0):
-                    inferred_ret_ranks[lhs_ret_rank] = rr_alias_ret
+                    rr_alias_ret = _infer_assignment_rank_hint(expr_ret_rank, _ret_rank_hints())
+                    alias_kind_ret = _infer_assignment_kind_hint(
+                        expr_ret_rank,
+                        {
+                            name_ret: info_ret.kind
+                            for name_ret, info_ret in symbols_ret.items()
+                            if info_ret.kind is not None
+                        },
+                    )
+                    if alias_kind_ret == "unknown":
+                        alias_kind_ret = None
+                if rr_alias_ret > _ret_rank(lhs_ret_rank) and _set_ret_rank(lhs_ret_rank, rr_alias_ret, alias_kind_ret):
                     changed_ret_ranks = True
+        fn_tail_symbol_info[fn_rank_tail.name.lower()] = symbols_ret
 
         def stmt_rank(st_rank_tail: object) -> int | None:
             if isinstance(st_rank_tail, ExprStmt):
@@ -27467,12 +27524,12 @@ def transpile_r_to_fortran(
                         nm.lower() for nm in fn_int_array_names.get(fn_rank_tail.name, set())
                     }:
                         rr_tail = 0
-                    elif tail_name_l in inferred_ret_ranks:
-                        rr_tail = inferred_ret_ranks[tail_name_l]
+                    elif _ret_rank(tail_name_l) > 0:
+                        rr_tail = _ret_rank(tail_name_l)
                     else:
                         rr_tail = _infer_local_array_rank(fn_rank_tail.body, m_tail.group(1))
                 else:
-                    rr_tail = _infer_assignment_rank_hint(expr_rank_tail, inferred_ret_ranks)
+                    rr_tail = _infer_assignment_rank_hint(expr_rank_tail, _ret_rank_hints())
                 if re.match(r"^-?\s*(?:sum|mean|median|sd|var|prod|min|max|Reduce|which\.max|which\.min)\s*\(", expr_rank_tail, re.IGNORECASE):
                     rr_tail = 0
                 reduced_expr_tail = expr_rank_tail
@@ -27482,7 +27539,7 @@ def transpile_r_to_fortran(
                         red_name_tail,
                         lambda _inner: "0",
                     )
-                if reduced_expr_tail != expr_rank_tail and _infer_assignment_rank_hint(reduced_expr_tail, inferred_ret_ranks) == 0:
+                if reduced_expr_tail != expr_rank_tail and _infer_assignment_rank_hint(reduced_expr_tail, _ret_rank_hints()) == 0:
                     rr_tail = 0
                 return rr_tail
             if isinstance(st_rank_tail, IfStmt):
@@ -27799,6 +27856,18 @@ def transpile_r_to_fortran(
             rr = max(1, _USER_FUNC_ARG_RANK.get(f_rank_ret.name.lower(), {}).get(f_rank_ret.args[0].lower(), 0))
         if rr is not None:
             _USER_FUNC_RETURN_RANK[f_rank_ret.name.lower()] = rr
+        if f_rank_ret.name.lower() not in _USER_FUNC_RETURN_KIND and f_rank_ret.body and isinstance(f_rank_ret.body[-1], ExprStmt):
+            ret_kind_sym_expr = f_rank_ret.body[-1].expr.strip()
+            ret_kind_sym_arg = _return_call_arg(ret_kind_sym_expr)
+            if ret_kind_sym_arg is not None:
+                ret_kind_sym_expr = ret_kind_sym_arg.strip()
+            m_ret_kind_sym = re.fullmatch(r"[A-Za-z]\w*", ret_kind_sym_expr)
+            if m_ret_kind_sym is not None:
+                ret_sym_info = fn_tail_symbol_info.get(f_rank_ret.name.lower(), {}).get(m_ret_kind_sym.group(0).lower())
+                if ret_sym_info is not None and ret_sym_info.kind in {"real", "integer", "logical"}:
+                    _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = (
+                        "int" if ret_sym_info.kind == "integer" and _USER_FUNC_RETURN_RANK.get(f_rank_ret.name.lower(), 0) <= 0 else ret_sym_info.kind
+                    )
     for f in funcs:
         kinds: list[str] = []
         fn_ints = fn_int_names.get(f.name, set())
