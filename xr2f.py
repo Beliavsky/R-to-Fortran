@@ -8403,6 +8403,27 @@ def _simple_vector_constructor_rank(expr: str) -> int | None:
     return None
 
 
+def _simple_constructor_kind(expr: str) -> str | None:
+    expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
+    if _dequote_string_literal(expr) is not None:
+        return "character"
+    if expr.upper() in {"TRUE", "FALSE", "T", "F"}:
+        return "logical"
+    call = parse_call_text(expr)
+    if call is None:
+        return None
+    nm = call[0].lower()
+    if nm in {"integer", "as.integer", "int"}:
+        return "integer"
+    if nm == "logical":
+        return "logical"
+    if nm in {"numeric", "double", "as.numeric", "as.double", "real"}:
+        return "real"
+    if nm in {"character", "as.character"}:
+        return "character"
+    return None
+
+
 def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> str:
     """Heuristic kind hint for reuse renaming; currently distinguishes complex."""
     expr = fscan.strip_redundant_outer_parens_expr(expr.strip())
@@ -8427,6 +8448,9 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
         return "integer"
     if _contains_r_complex_literal(expr):
         return "complex"
+    simple_kind = _simple_constructor_kind(expr)
+    if simple_kind is not None:
+        return simple_kind
     c_call = parse_call_text(expr)
     if c_call is not None:
         nm = c_call[0].lower()
