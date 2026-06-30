@@ -19049,6 +19049,7 @@ def emit_stmts(
                                 need_r_mod.add("print_real_vector")
                             need_r_mod.add("inverse_rle")
                             continue
+                        c_user_logical_vec_print = parse_call_text(one_f_simple)
                         if (
                             re.fullmatch(r"[A-Za-z]\w*", one_f_simple)
                             and (
@@ -19069,6 +19070,10 @@ def emit_stmts(
                             )
                         ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple|is_na|ieee_is_finite)\s*\(", one_f_simple, re.IGNORECASE) or re.match(r"^spread\s*\(\s*\.(?:true|false)\.", one_f_simple, re.IGNORECASE) or (
                             one_f_simple.lower().startswith("(.not. ieee_is_finite(")
+                        ) or (
+                            c_user_logical_vec_print is not None
+                            and _USER_FUNC_RETURN_RANK.get(c_user_logical_vec_print[0].lower(), 0) > 0
+                            and _USER_FUNC_RETURN_KIND.get(c_user_logical_vec_print[0].lower()) == "logical"
                         ):
                             _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                             continue
@@ -49566,6 +49571,19 @@ def main() -> int:
     f90 = demote_locals_from_scalar_derived_components_text(f90)
     f90 = demote_unindexed_locals_in_scalar_functions_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
+    logical_vector_result_fns: set[str] = set()
+    for m_log_vec_fn in re.finditer(
+        r"(?ims)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*logical\s*,\s*allocatable\s*::\s*\2\s*\(:\s*\)",
+        f90,
+    ):
+        logical_vector_result_fns.add(m_log_vec_fn.group(1))
+    for fn_log_vec_fortran in logical_vector_result_fns:
+        f90 = re.sub(
+            rf"(?m)^(\s*)call\s+print_real_vector\s*\(\s*real\s*\(\s*({re.escape(fn_log_vec_fortran)}\s*\([^()\n]*\))\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*$",
+            r'\1write(*,"(*(g0,1x))") \2',
+            f90,
+            flags=re.IGNORECASE,
+        )
     if "call print_matrix_rstyle_named(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix_rstyle_named"})
     if "call print_real_vector(" in f90:
