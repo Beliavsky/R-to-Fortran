@@ -12413,6 +12413,11 @@ def r_expr_to_fortran(expr: str) -> str:
         if b_src is None:
             return f"solve_real({a_f}, diag(size({a_f}, 1)))"
         return f"solve_real({a_f}, {r_expr_to_fortran(b_src)})"
+    c_chol = parse_call_text(s)
+    if c_chol is not None and c_chol[0].lower() == "chol":
+        x_src = _first_call_arg(c_chol, "x")
+        if x_src:
+            return f"chol({r_expr_to_fortran(x_src)})"
     c_tail = parse_call_text(s)
     if c_tail is not None and c_tail[0].lower() == "tail":
         _nt, pos_tl, kw_tl = c_tail
@@ -12566,7 +12571,7 @@ def r_expr_to_fortran(expr: str) -> str:
     c_back = parse_call_text(s)
     if c_back is not None and c_back[0].lower() in {"forwardsolve", "backsolve"}:
         _nb, pos_b, kw_b = c_back
-        r_src = pos_b[0] if len(pos_b) >= 1 else kw_b.get("r")
+        r_src = pos_b[0] if len(pos_b) >= 1 else kw_b.get("r", kw_b.get("l"))
         x_src = pos_b[1] if len(pos_b) >= 2 else kw_b.get("x")
         if not r_src or not x_src:
             raise NotImplementedError(f"{c_back[0]} requires r and x arguments")
