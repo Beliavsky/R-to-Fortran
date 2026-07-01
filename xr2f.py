@@ -11406,9 +11406,18 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"cor(cbind({cols_cor_df[0]}, {cols_cor_df[1]}, {cols_cor_df[2]}))"
     if c_usr is not None and c_usr[0].lower() == "t_test":
         _nm_tt, pos_tt, kw_tt = c_usr
-        pos_out_tt = [r_expr_to_fortran(a) for a in pos_tt]
+        tt_call = (_nm_tt, pos_tt, kw_tt)
+        x_src_tt = _first_call_arg(tt_call, "x")
+        y_src_tt = _call_arg(tt_call, 1, "y")
+        pos_out_tt = []
+        if x_src_tt:
+            pos_out_tt.append(r_expr_to_fortran(x_src_tt))
+        if y_src_tt:
+            pos_out_tt.append(r_expr_to_fortran(y_src_tt))
         kw_out_tt: list[str] = []
         for k, v in kw_tt.items():
+            if _sanitize_fortran_kwarg_name(k).lower() in {"x", "y"}:
+                continue
             vf_tt = r_expr_to_fortran(v)
             if _sanitize_fortran_kwarg_name(k).lower() == "mu" and _is_int_literal(vf_tt.strip()):
                 vf_tt = f"{int(vf_tt.strip())}.0_dp"
@@ -11436,8 +11445,19 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"fisher_test({', '.join(pos_out_ft + kw_out_ft)})"
     if c_usr is not None and c_usr[0].lower() in {"wilcox.test", "wilcox_test"}:
         _nm_wx, pos_wx, kw_wx = c_usr
-        pos_out_wx = [r_expr_to_fortran(a) for a in pos_wx]
-        kw_out_wx = [f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}" for k, v in kw_wx.items()]
+        wx_call = (_nm_wx, pos_wx, kw_wx)
+        x_src_wx = _first_call_arg(wx_call, "x")
+        y_src_wx = _call_arg(wx_call, 1, "y")
+        pos_out_wx = []
+        if x_src_wx:
+            pos_out_wx.append(r_expr_to_fortran(x_src_wx))
+        if y_src_wx:
+            pos_out_wx.append(r_expr_to_fortran(y_src_wx))
+        kw_out_wx = [
+            f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}"
+            for k, v in kw_wx.items()
+            if _sanitize_fortran_kwarg_name(k).lower() not in {"x", "y"}
+        ]
         return f"wilcox_test({', '.join(pos_out_wx + kw_out_wx)})"
     if c_usr is not None and c_usr[0].lower() in {"kruskal.test", "kruskal_test"}:
         _nm_kw, pos_kw, kw_kw = c_usr
