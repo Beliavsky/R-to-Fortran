@@ -11444,13 +11444,13 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"kruskal_test({', '.join(pos_out_kw + kw_out_kw)})"
     if c_usr is not None and c_usr[0].lower() == "lm_cooks_distance":
         _nm_cd, pos_cd, kw_cd = c_usr
-        fit_src = pos_cd[0] if pos_cd else kw_cd.get("object", "")
+        fit_src = _first_call_arg((_nm_cd, pos_cd, kw_cd), "object")
         if not fit_src:
             raise NotImplementedError("cooks.distance requires a fitted model")
         return f"lm_cooks_distance({r_expr_to_fortran(fit_src)})"
     if c_usr is not None and c_usr[0].lower() == "resid":
         _nm_res, pos_res, kw_res = c_usr
-        fit_src = pos_res[0] if pos_res else kw_res.get("object", "")
+        fit_src = _first_call_arg((_nm_res, pos_res, kw_res), "object")
         typ = (_dequote_string_literal(kw_res.get("type", "").strip()) or "").lower()
         if fit_src and typ == "pearson":
             return f"glm_pearson_resid({r_expr_to_fortran(fit_src)})"
