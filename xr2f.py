@@ -10975,9 +10975,11 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
     c_cor0 = parse_call_text(s)
     if c_cor0 is not None and c_cor0[0].lower() in {"cor", "cov"}:
-        vals_cor = list(c_cor0[1])
-        if c_cor0[0].lower() == "cor" and len(vals_cor) == 1 and not c_cor0[2]:
-            df_src = vals_cor[0].strip()
+        cor_call = (c_cor0[0], c_cor0[1], c_cor0[2])
+        x_src_cor = _first_call_arg(cor_call, "x")
+        y_src_cor = _call_arg(cor_call, 1, "y")
+        if c_cor0[0].lower() == "cor" and x_src_cor and not y_src_cor:
+            df_src = x_src_cor.strip()
             if re.fullmatch(r"[A-Za-z]\w*", df_src):
                 fields_cor_df = _EXPANDED_DATA_FRAME_FIELDS.get(df_src) or _EXPANDED_DATA_FRAME_FIELDS.get(df_src.lower())
                 if fields_cor_df:
@@ -10989,6 +10991,10 @@ def r_expr_to_fortran(expr: str) -> str:
                         return f"cor(cbind2({cols_cor_df[0]}, {cols_cor_df[1]}))"
                     if len(cols_cor_df) == 3:
                         return f"cor(cbind({cols_cor_df[0]}, {cols_cor_df[1]}, {cols_cor_df[2]}))"
+        vals_cor = [x_src_cor]
+        if y_src_cor:
+            vals_cor.append(y_src_cor)
+        vals_cor = [v for v in vals_cor if v]
         if vals_cor:
             return f"{c_cor0[0].lower()}({', '.join(r_expr_to_fortran(v) for v in vals_cor[:2])})"
     c_rbinom0 = parse_call_text(s)
@@ -11648,9 +11654,17 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"lm_confint({', '.join(pos_out_ci + kw_out_ci)})"
     if c_usr is not None and c_usr[0].lower() == "quantile":
         _nm_q, pos_q, kw_q = c_usr
-        args_q = [r_expr_to_fortran(a) for a in pos_q]
+        quant_call = (_nm_q, pos_q, kw_q)
+        x_src_q = _first_call_arg(quant_call, "x")
+        args_q = [r_expr_to_fortran(x_src_q)] if x_src_q else []
+        probs_src_q = _call_arg(quant_call, 1, "probs")
+        if probs_src_q:
+            args_q.append(f"probs={r_expr_to_fortran(probs_src_q)}")
         for k, v in kw_q.items():
-            args_q.append(f"{_sanitize_fortran_kwarg_name(k)}={r_expr_to_fortran(v)}")
+            kf_q = _sanitize_fortran_kwarg_name(k)
+            if kf_q.lower() in {"x", "probs"}:
+                continue
+            args_q.append(f"{kf_q}={r_expr_to_fortran(v)}")
         return f"quantile({', '.join(args_q)})"
     if c_usr is not None:
         nm_u, pos_u, kw_u = c_usr
