@@ -13615,7 +13615,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"{fname}({r_expr_to_fortran(x_src)})"
     s = _replace_balanced_func_calls(s, "all", lambda inner: _logical_reduction_to_fortran("all", inner))
     s = _replace_balanced_func_calls(s, "any", lambda inner: _logical_reduction_to_fortran("any", inner))
-    s = _replace_balanced_func_calls(s, "as.matrix", lambda inner: inner.strip())
+    def _as_matrix_inner_repl(inner: str) -> str:
+        c_as_matrix = parse_call_text("as.matrix(" + inner + ")")
+        if c_as_matrix is None:
+            return inner.strip()
+        x_src = _first_call_arg(c_as_matrix, "x")
+        return x_src.strip() if x_src else inner.strip()
+
+    s = _replace_balanced_func_calls(s, "as.matrix", _as_matrix_inner_repl)
     def _as_vector_to_fortran(inner: str) -> str:
         src_v = inner.strip()
         x_f = r_expr_to_fortran(src_v)
