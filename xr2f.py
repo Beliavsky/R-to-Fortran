@@ -17221,10 +17221,11 @@ def emit_stmts(
             c_outer = parse_call_text(rhs)
             if c_outer is not None and c_outer[0].lower() == "outer":
                 _nm_o, pos_o, kw_o = c_outer
-                if len(pos_o) < 2:
+                outer_call = (_nm_o, pos_o, kw_o)
+                x_src = _first_call_arg(outer_call, "X", "x")
+                y_src = _call_arg(outer_call, 1, "Y", "y")
+                if not x_src or not y_src:
                     raise NotImplementedError("outer requires x and y arguments")
-                x_src = pos_o[0].strip()
-                y_src = pos_o[1].strip()
                 fun_src = kw_o.get("FUN", pos_o[2] if len(pos_o) >= 3 else "")
                 c_vec_fun = parse_call_text(fun_src.strip())
                 if c_vec_fun is not None and c_vec_fun[0].lower() == "vectorize":
@@ -34685,10 +34686,21 @@ def rewrite_leftover_sweep_calls_text(f90: str) -> str:
         parts = split_top_level_commas(inner)
         if len(parts) < 3:
             return f"sweep({inner})"
-        x_f = parts[0].strip()
-        margin = parts[1].strip()
-        stats_f = parts[2].strip()
-        fun = parts[3].strip().strip("\"'") if len(parts) >= 4 else "+"
+        pos_parts: list[str] = []
+        kw_parts: dict[str, str] = {}
+        for part in parts:
+            asn = split_top_level_assignment(part.strip())
+            if asn is None:
+                pos_parts.append(part.strip())
+            else:
+                kw_parts[_sanitize_fortran_kwarg_name(asn[0].strip()).lower()] = asn[1].strip()
+        sweep_call = ("sweep", pos_parts, kw_parts)
+        x_f = _first_call_arg(sweep_call, "x")
+        margin = _call_arg(sweep_call, 1, "margin")
+        stats_f = _call_arg(sweep_call, 2, "stats")
+        fun = (_call_arg(sweep_call, 3, "fun") or "+").strip().strip("\"'")
+        if not x_f or not margin or not stats_f:
+            return f"sweep({inner})"
         if margin in {"2", "2L"}:
             rhs = f"spread({stats_f}, dim=1, ncopies=size({base_size_expr(x_f)},1))"
         elif margin in {"1", "1L"}:
