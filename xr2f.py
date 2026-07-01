@@ -10366,7 +10366,7 @@ def r_expr_to_fortran(expr: str) -> str:
     c_resid_early = parse_call_text(s)
     if c_resid_early is not None and c_resid_early[0].lower() == "resid":
         _nm_res_e, pos_res_e, kw_res_e = c_resid_early
-        fit_src_e = pos_res_e[0] if pos_res_e else kw_res_e.get("object", "")
+        fit_src_e = _first_call_arg((_nm_res_e, pos_res_e, kw_res_e), "object")
         typ_e = (_dequote_string_literal(kw_res_e.get("type", "").strip()) or "").lower()
         if fit_src_e and typ_e == "pearson":
             return f"glm_pearson_resid({r_expr_to_fortran(fit_src_e)})"
@@ -11482,15 +11482,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return val
     if c_usr is not None and c_usr[0].lower() in {"ppois", "qpois"}:
         nm_pois, pos_pois, kw_pois = c_usr
+        pois_call = (nm_pois, pos_pois, kw_pois)
         out_args: list[str] = []
-        if pos_pois:
-            out_args.append(f"real({r_expr_to_fortran(pos_pois[0])}, kind=dp)")
-            if len(pos_pois) >= 2:
-                out_args.append(f"real({r_expr_to_fortran(pos_pois[1])}, kind=dp)")
-        elif "q" in kw_pois:
-            out_args.append(f"q=real({r_expr_to_fortran(kw_pois['q'])}, kind=dp)")
-        elif "p" in kw_pois:
-            out_args.append(f"p=real({r_expr_to_fortran(kw_pois['p'])}, kind=dp)")
+        first_pois = _first_call_arg(pois_call, "q", "p")
+        if first_pois:
+            out_args.append(f"real({r_expr_to_fortran(first_pois)}, kind=dp)")
+        lambda_pois = _call_arg(pois_call, 1, "lambda")
+        if len(pos_pois) >= 2 and lambda_pois:
+            out_args.append(f"real({r_expr_to_fortran(lambda_pois)}, kind=dp)")
         for k_pois, v_pois in kw_pois.items():
             kf_pois = _sanitize_fortran_kwarg_name(k_pois)
             if kf_pois in {"q", "p"} and not pos_pois:
@@ -11527,6 +11526,16 @@ def r_expr_to_fortran(expr: str) -> str:
         }
         out_args_dist: list[str] = []
         int_pos_dist = pos_int_by_fun.get(nm_dist.lower(), set())
+        first_kw_dist = None
+        first_kw_name = None
+        if not pos_dist:
+            for cand_kw_dist in ("x", "q", "p"):
+                if cand_kw_dist in kw_dist:
+                    first_kw_name = cand_kw_dist
+                    first_kw_dist = kw_dist[cand_kw_dist]
+                    break
+        if first_kw_dist is not None:
+            out_args_dist.append(f"real({r_expr_to_fortran(first_kw_dist)}, kind=dp)")
         for i_dist, a_dist in enumerate(pos_dist):
             af_dist = r_expr_to_fortran(a_dist)
             if i_dist == 0 or i_dist not in int_pos_dist:
@@ -11534,6 +11543,8 @@ def r_expr_to_fortran(expr: str) -> str:
             out_args_dist.append(af_dist)
         for k_dist, v_dist in kw_dist.items():
             kf_dist = _sanitize_fortran_kwarg_name(k_dist).lower()
+            if first_kw_name is not None and kf_dist == first_kw_name:
+                continue
             kf_dist = rename_kw.get(kf_dist, kf_dist)
             vf_dist = r_expr_to_fortran(v_dist)
             if kf_dist in real_kw:
