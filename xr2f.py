@@ -11435,7 +11435,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"wilcox_test({', '.join(pos_out_wx + kw_out_wx)})"
     if c_usr is not None and c_usr[0].lower() in {"kruskal.test", "kruskal_test"}:
         _nm_kw, pos_kw, kw_kw = c_usr
-        arg_kw = pos_kw[0].strip() if pos_kw else kw_kw.get("formula", "").strip()
+        arg_kw = _first_call_arg((_nm_kw, pos_kw, kw_kw), "formula")
         mm_kw = _split_top_level_token(arg_kw, "~", from_right=True)
         if mm_kw is not None:
             return f"kruskal_test({r_expr_to_fortran(mm_kw[0].strip())}, {r_expr_to_fortran(mm_kw[1].strip())})"
