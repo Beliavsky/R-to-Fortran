@@ -12793,8 +12793,10 @@ def r_expr_to_fortran(expr: str) -> str:
             ni_src = pos_i[0] if pos_i else kw_i.get("n", "1")
             ni_f = _int_bound_expr(r_expr_to_fortran(ni_src))
             if ni_f == "1":
-                mean_f = r_expr_to_fortran(kw_i.get("mean", "0.0"))
-                sd_f = r_expr_to_fortran(kw_i.get("sd", "1.0"))
+                mean_src = pos_i[1] if len(pos_i) >= 2 else kw_i.get("mean", "0.0")
+                sd_src = pos_i[2] if len(pos_i) >= 3 else kw_i.get("sd", "1.0")
+                mean_f = r_expr_to_fortran(mean_src)
+                sd_f = r_expr_to_fortran(sd_src)
                 if mean_f == "0.0_dp" and sd_f == "1.0_dp":
                     return f"rnorm_vec({n_f})"
                 return f"({mean_f}) + ({sd_f}) * rnorm_vec({n_f})"
@@ -12827,8 +12829,10 @@ def r_expr_to_fortran(expr: str) -> str:
             n0_f = _int_bound_expr(r_expr_to_fortran(n0_src))
             if n0_f != "1":
                 return "rnorm(" + inner + ")"
-            mean0_f = r_expr_to_fortran(k0.get("mean", "0.0"))
-            sd0_f = r_expr_to_fortran(k0.get("sd", "1.0"))
+            mean0_src = p0[1] if len(p0) >= 2 else k0.get("mean", "0.0")
+            sd0_src = p0[2] if len(p0) >= 3 else k0.get("sd", "1.0")
+            mean0_f = r_expr_to_fortran(mean0_src)
+            sd0_f = r_expr_to_fortran(sd0_src)
             if mean0_f == "0.0_dp" and sd0_f == "1.0_dp":
                 return f"rnorm_vec({n_f})"
             return f"(({mean0_f}) + ({sd0_f}) * rnorm_vec({n_f}))"
@@ -12858,8 +12862,10 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"runif_vec({n_f})"
             return f"({a_f}) + (({b_f}) - ({a_f})) * runif_vec({n_f})"
         if fn == "rnorm":
-            mean_f = r_expr_to_fortran(kw_g.get("mean", "0.0"))
-            sd_f = r_expr_to_fortran(kw_g.get("sd", "1.0"))
+            mean_src = pos_g[1] if len(pos_g) >= 2 else kw_g.get("mean", "0.0")
+            sd_src = pos_g[2] if len(pos_g) >= 3 else kw_g.get("sd", "1.0")
+            mean_f = r_expr_to_fortran(mean_src)
+            sd_f = r_expr_to_fortran(sd_src)
             rn_base = "rnorm1()" if n_f.strip() in {"1", "1_int64"} else f"rnorm_vec({n_f})"
             if mean_f == "0.0_dp" and sd_f == "1.0_dp":
                 return rn_base
@@ -14656,8 +14662,10 @@ def r_expr_to_fortran(expr: str) -> str:
         _nn, posn, kwn = ci
         n_src = posn[0] if posn else kwn.get("n", "1")
         n_f = _int_bound_expr(r_expr_to_fortran(n_src))
-        mean_f = r_expr_to_fortran(kwn.get("mean", "0.0"))
-        sd_f = r_expr_to_fortran(kwn.get("sd", "1.0"))
+        mean_src = posn[1] if len(posn) >= 2 else kwn.get("mean", "0.0")
+        sd_src = posn[2] if len(posn) >= 3 else kwn.get("sd", "1.0")
+        mean_f = r_expr_to_fortran(mean_src)
+        sd_f = r_expr_to_fortran(sd_src)
         if _HAS_R_MOD:
             if n_f == "1":
                 if mean_f == "0.0_dp" and sd_f == "1.0_dp":
@@ -17776,8 +17784,10 @@ def emit_stmts(
                     _nn, pos_i, kw_i = c_rn_i
                     n_src = pos_i[0] if pos_i else kw_i.get("n", "")
                     n_f = _int_bound_expr(r_expr_to_fortran(n_src))
-                    mean_f = r_expr_to_fortran(kw_i.get("mean", "0.0"))
-                    sd_f = r_expr_to_fortran(kw_i.get("sd", "1.0"))
+                    mean_src = pos_i[1] if len(pos_i) >= 2 else kw_i.get("mean", "0.0")
+                    sd_src = pos_i[2] if len(pos_i) >= 3 else kw_i.get("sd", "1.0")
+                    mean_f = r_expr_to_fortran(mean_src)
+                    sd_f = r_expr_to_fortran(sd_src)
                     rn_scalar = n_f.strip() in {"1", "1_int64"}
                     rn_count = len(re.findall(r"\brnorm\s*\(", rhs, re.IGNORECASE))
                     if rhs.strip() == rn_call and has_r_mod:
@@ -18267,7 +18277,7 @@ def emit_stmts(
                     o.w("end block")
                     continue
                 # fallback simple rnorm(n)
-                m_rn = re.match(r"^rnorm\s*\(\s*([^)]+)\s*\)\s*$", rhs)
+                m_rn = re.match(r"^rnorm\s*\(\s*([^,()]+)\s*\)\s*$", rhs)
                 if m_rn:
                     n = r_expr_to_fortran(m_rn.group(1))
                     if has_r_mod:
@@ -18282,8 +18292,10 @@ def emit_stmts(
                     _nrn, pos_rn, kw_rn = c_rn
                     n_src = pos_rn[0] if pos_rn else kw_rn.get("n", "")
                     n_f = _int_bound_expr(r_expr_to_fortran(n_src))
-                    mean_f = r_expr_to_fortran(kw_rn.get("mean", "0.0"))
-                    sd_f = r_expr_to_fortran(kw_rn.get("sd", "1.0"))
+                    mean_src = pos_rn[1] if len(pos_rn) >= 2 else kw_rn.get("mean", "0.0")
+                    sd_src = pos_rn[2] if len(pos_rn) >= 3 else kw_rn.get("sd", "1.0")
+                    mean_f = r_expr_to_fortran(mean_src)
+                    sd_f = r_expr_to_fortran(sd_src)
                     if has_r_mod:
                         o.w(f"{st.name} = ({mean_f}) + ({sd_f}) * rnorm_vec({n_f})")
                         need_r_mod.add("rnorm_vec")
