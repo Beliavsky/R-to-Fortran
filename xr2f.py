@@ -32834,19 +32834,49 @@ def transpile_r_to_fortran(
                 return f"real(kind=dp), allocatable :: {k}(:,:)"
             f_obj_field = funcs_by_name.get(fn_name)
             if f_obj_field is not None:
-                for st_field in f_obj_field.body:
-                    if isinstance(st_field, Assign) and st_field.name == txt:
-                        if _static_character_vector_values(st_field.expr.strip()) is not None:
-                            return f"character(len=:), allocatable :: {k}(:)"
-                        if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
-                            return f"integer, allocatable :: {k}(:)"
-                        if _literal_c_kind(st_field.expr.strip()) == "logical":
-                            return f"logical, allocatable :: {k}(:)"
-                        c_field_rhs = parse_call_text(st_field.expr.strip())
-                        if c_field_rhs is not None and c_field_rhs[0].lower() in {"optim", "constroptim"}:
-                            return f"type(optim_result_t) :: {k}"
-                        if c_field_rhs is not None and c_field_rhs[0] in list_specs:
-                            return f"type({_type_name_for_path(c_field_rhs[0], ())}) :: {k}"
+                def _find_func_alias_assign(ss_alias: list[object]) -> Assign | None:
+                    for st_alias in ss_alias:
+                        if isinstance(st_alias, Assign) and st_alias.name == txt:
+                            return st_alias
+                        if isinstance(st_alias, IfStmt):
+                            found_alias = _find_func_alias_assign(st_alias.then_body) or _find_func_alias_assign(st_alias.else_body)
+                            if found_alias is not None:
+                                return found_alias
+                        elif isinstance(st_alias, ForStmt):
+                            found_alias = _find_func_alias_assign(st_alias.body)
+                            if found_alias is not None:
+                                return found_alias
+                        elif isinstance(st_alias, WhileStmt):
+                            found_alias = _find_func_alias_assign(st_alias.body)
+                            if found_alias is not None:
+                                return found_alias
+                        elif isinstance(st_alias, RepeatStmt):
+                            found_alias = _find_func_alias_assign(st_alias.body)
+                            if found_alias is not None:
+                                return found_alias
+                        elif isinstance(st_alias, SwitchStmt):
+                            for _label_alias, body_alias in st_alias.cases:
+                                found_alias = _find_func_alias_assign(body_alias)
+                                if found_alias is not None:
+                                    return found_alias
+                            found_alias = _find_func_alias_assign(st_alias.default_body)
+                            if found_alias is not None:
+                                return found_alias
+                    return None
+
+                st_field = _find_func_alias_assign(f_obj_field.body)
+                if st_field is not None:
+                    if _static_character_vector_values(st_field.expr.strip()) is not None:
+                        return f"character(len=:), allocatable :: {k}(:)"
+                    if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
+                        return f"integer, allocatable :: {k}(:)"
+                    if _literal_c_kind(st_field.expr.strip()) == "logical":
+                        return f"logical, allocatable :: {k}(:)"
+                    c_field_rhs = parse_call_text(st_field.expr.strip())
+                    if c_field_rhs is not None and c_field_rhs[0].lower() in {"optim", "constroptim"}:
+                        return f"type(optim_result_t) :: {k}"
+                    if c_field_rhs is not None and c_field_rhs[0] in list_specs:
+                        return f"type({_type_name_for_path(c_field_rhs[0], ())}) :: {k}"
             if fn_name in main_list_specs:
                 def _find_main_alias_assign(ss_alias: list[object]) -> Assign | None:
                     for st_alias in ss_alias:
