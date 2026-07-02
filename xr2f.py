@@ -11397,6 +11397,19 @@ def r_expr_to_fortran(expr: str) -> str:
         elif _is_int_literal(values_src.strip()) and x_src.strip().lower() in _KNOWN_VECTOR_NAMES:
             values_f = f"real({values_f}, kind=dp)"
         return f"replace({', '.join([x_f, list_f, values_f] + extra_replace_args)})"
+    if c_usr is not None and c_usr[0].lower() == "diff":
+        _nm_diff, pos_diff, kw_diff = c_usr
+        diff_call = (_nm_diff, pos_diff, kw_diff)
+        x_src = _first_call_arg(diff_call, "x")
+        if not x_src:
+            raise NotImplementedError("diff requires x argument")
+        lag_src = _call_arg(diff_call, 1, "lag")
+        differences_src = _call_arg(diff_call, 2, "differences")
+        if lag_src and _int_bound_expr(r_expr_to_fortran(lag_src)) not in {"1", "1_int64"}:
+            raise NotImplementedError("diff currently supports lag = 1")
+        if differences_src and _int_bound_expr(r_expr_to_fortran(differences_src)) not in {"1", "1_int64"}:
+            raise NotImplementedError("diff currently supports differences = 1")
+        return f"diff({r_expr_to_fortran(x_src)})"
     if c_usr is not None and c_usr[0].lower() == "cor" and len(c_usr[1]) == 1 and not c_usr[2]:
         df_src = c_usr[1][0].strip()
         if re.fullmatch(r"[A-Za-z]\w*", df_src):
