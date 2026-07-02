@@ -24619,6 +24619,59 @@ def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
     return int_arrays
 
 
+def infer_function_logical_array_names(fn: FuncDef) -> set[str]:
+    """Infer local names that are likely logical arrays within one function scope."""
+    body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
+    logical_arrays = infer_local_logical_arrays(body_no_ret)
+
+    def _seed_static_logical_arrays(ss_seed: list[object]) -> None:
+        for st_seed in ss_seed:
+            if isinstance(st_seed, Assign):
+                if _literal_c_kind(st_seed.expr.strip()) == "logical":
+                    logical_arrays.add(st_seed.name)
+            elif isinstance(st_seed, IfStmt):
+                _seed_static_logical_arrays(st_seed.then_body)
+                _seed_static_logical_arrays(st_seed.else_body)
+            elif isinstance(st_seed, ForStmt):
+                _seed_static_logical_arrays(st_seed.body)
+            elif isinstance(st_seed, WhileStmt):
+                _seed_static_logical_arrays(st_seed.body)
+            elif isinstance(st_seed, RepeatStmt):
+                _seed_static_logical_arrays(st_seed.body)
+            elif isinstance(st_seed, SwitchStmt):
+                for case_seed in st_seed.cases:
+                    _seed_static_logical_arrays(case_seed.body)
+
+    _seed_static_logical_arrays(body_no_ret)
+    changed = True
+    while changed:
+        changed = False
+
+        def _propagate_aliases(ss_alias: list[object]) -> None:
+            nonlocal changed
+            for st_alias in ss_alias:
+                if isinstance(st_alias, Assign):
+                    rhs_alias = st_alias.expr.strip()
+                    if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in logical_arrays and st_alias.name not in logical_arrays:
+                        logical_arrays.add(st_alias.name)
+                        changed = True
+                elif isinstance(st_alias, IfStmt):
+                    _propagate_aliases(st_alias.then_body)
+                    _propagate_aliases(st_alias.else_body)
+                elif isinstance(st_alias, ForStmt):
+                    _propagate_aliases(st_alias.body)
+                elif isinstance(st_alias, WhileStmt):
+                    _propagate_aliases(st_alias.body)
+                elif isinstance(st_alias, RepeatStmt):
+                    _propagate_aliases(st_alias.body)
+                elif isinstance(st_alias, SwitchStmt):
+                    for case_alias in st_alias.cases:
+                        _propagate_aliases(case_alias.body)
+
+        _propagate_aliases(body_no_ret)
+    return logical_arrays
+
+
 def infer_function_real_array_names(fn: FuncDef) -> set[str]:
     """Infer local names that are likely real arrays within one function scope."""
     real_arrays: set[str] = set()
@@ -27976,6 +28029,7 @@ def transpile_r_to_fortran(
     fn_int_array_names: dict[str, set[str]] = {f.name: infer_function_integer_array_names(f) for f in funcs}
     fn_real_array_names: dict[str, set[str]] = {f.name: infer_function_real_array_names(f) for f in funcs}
     fn_real_matrix_names: dict[str, set[str]] = {f.name: infer_function_real_matrix_names(f) for f in funcs}
+    fn_logical_array_names: dict[str, set[str]] = {f.name: infer_function_logical_array_names(f) for f in funcs}
     _USER_FUNC_RETURN_RANK = {}
     _USER_FUNC_RETURN_KIND = {}
     fn_tail_symbol_info: dict[str, dict[str, SymbolInfo]] = {}
@@ -29060,7 +29114,17 @@ def transpile_r_to_fortran(
         real_matrices.discard(nm)
         logical_arrays.discard(nm)
         params.pop(nm, None)
-    logical_arrays.discard("ok")
+    ok_is_logical_vector_assignment = False
+    for txt_ok_vec in _stmt_texts_for_rank_scan(main_stmts):
+        m_ok_vec = re.match(r"^\s*ok\s*(?:<-|=)\s*(.+)$", txt_ok_vec, re.IGNORECASE)
+        if m_ok_vec is None:
+            continue
+        rhs_ok_vec = m_ok_vec.group(1).strip()
+        if _literal_c_kind(rhs_ok_vec) == "logical" or re.match(r"^(?:logical|rep|rep_len)\s*\(", rhs_ok_vec, re.IGNORECASE):
+            ok_is_logical_vector_assignment = True
+            break
+    if not ok_is_logical_vector_assignment:
+        logical_arrays.discard("ok")
     int_arrays.discard("ok")
     real_arrays.discard("ok")
     params.pop("ok", None)
@@ -32879,6 +32943,7 @@ def transpile_r_to_fortran(
         fn_int_arrays = fn_int_array_names.get(fn_name, set())
         fn_real_arrays = fn_real_array_names.get(fn_name, set())
         fn_real_mats = fn_real_matrix_names.get(fn_name, set())
+        fn_logical_arrays = fn_logical_array_names.get(fn_name, set())
         fn_char_arrays = infer_function_character_array_names(funcs_by_name[fn_name]) if fn_name in funcs_by_name else set()
         fn_lms = fn_lm_names.get(fn_name, set())
         txt_l = txt.lower()
@@ -32927,6 +32992,8 @@ def transpile_r_to_fortran(
                     return f"character(len=:), allocatable :: {k}(:)"
                 if rhs_alias.lower() in {x.lower() for x in fn_int_arrays}:
                     return f"integer, allocatable :: {k}(:)"
+                if rhs_alias.lower() in {x.lower() for x in fn_logical_arrays}:
+                    return f"logical, allocatable :: {k}(:)"
             return None
 
         if k_l in {"p_2", "p_2_2"}:
