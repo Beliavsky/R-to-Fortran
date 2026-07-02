@@ -32804,6 +32804,7 @@ def transpile_r_to_fortran(
         fn_int_arrays = fn_int_array_names.get(fn_name, set())
         fn_real_arrays = fn_real_array_names.get(fn_name, set())
         fn_real_mats = fn_real_matrix_names.get(fn_name, set())
+        fn_char_arrays = infer_function_character_array_names(funcs_by_name[fn_name]) if fn_name in funcs_by_name else set()
         fn_lms = fn_lm_names.get(fn_name, set())
         txt_l = txt.lower()
         k_l = k.lower()
@@ -32835,6 +32836,12 @@ def transpile_r_to_fortran(
             if f_obj_field is not None:
                 for st_field in f_obj_field.body:
                     if isinstance(st_field, Assign) and st_field.name == txt:
+                        if _static_character_vector_values(st_field.expr.strip()) is not None:
+                            return f"character(len=:), allocatable :: {k}(:)"
+                        if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
+                            return f"integer, allocatable :: {k}(:)"
+                        if _literal_c_kind(st_field.expr.strip()) == "logical":
+                            return f"logical, allocatable :: {k}(:)"
                         c_field_rhs = parse_call_text(st_field.expr.strip())
                         if c_field_rhs is not None and c_field_rhs[0].lower() in {"optim", "constroptim"}:
                             return f"type(optim_result_t) :: {k}"
@@ -32844,7 +32851,9 @@ def transpile_r_to_fortran(
                 return f"type(lm_fit_t) :: {k}"
             if txt in fn_ints:
                 return f"integer :: {k}"
-            if txt in fn_int_arrays:
+            if txt.lower() in {x.lower() for x in fn_char_arrays}:
+                return f"character(len=:), allocatable :: {k}(:)"
+            if txt in fn_int_arrays or txt.lower() in {x.lower() for x in fn_int_arrays}:
                 return f"integer, allocatable :: {k}(:)"
             rk_simple = _local_rank_for_type_field(fn_name, txt)
             if rk_simple >= 3:
