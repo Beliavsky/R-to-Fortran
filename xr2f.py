@@ -14241,6 +14241,10 @@ def r_expr_to_fortran(expr: str) -> str:
                 v = m_kw.group(2).strip().lower()
                 na_rm = v in {"true", ".true.", "t", "1"}
                 continue
+            m_named_val = re.match(r"^[A-Za-z.]\w*\s*=(?!=)\s*(.+)$", t)
+            if m_named_val is not None:
+                x_parts.append(m_named_val.group(1).strip())
+                continue
             if t:
                 x_parts.append(t)
         return x_parts, na_rm
@@ -14390,16 +14394,18 @@ def r_expr_to_fortran(expr: str) -> str:
         ),
     )
     def _rowsums_to_fortran(inner: str) -> str:
-        t = inner.strip()
+        c_rs = parse_call_text("rowSums(" + inner.strip() + ")")
+        t = (_first_call_arg(c_rs, "x") if c_rs is not None else None) or inner.strip()
         m = re.match(r"^exp\s*\(\s*([A-Za-z]\w*)\s*-\s*([A-Za-z]\w*)\s*\)\s*$", t)
         if m:
             a_f = r_expr_to_fortran(m.group(1))
             b_f = r_expr_to_fortran(m.group(2))
             return f"sum(exp({a_f} - spread({b_f}, dim=2, ncopies=size({a_f},2))), dim=2)"
-        return f"sum({inner}, dim=2)"
+        return f"sum({r_expr_to_fortran(t)}, dim=2)"
 
     def _colsums_to_fortran(inner: str) -> str:
-        t = inner.strip()
+        c_cs = parse_call_text("colSums(" + inner.strip() + ")")
+        t = (_first_call_arg(c_cs, "x") if c_cs is not None else None) or inner.strip()
         m_df_na = re.match(r"^(?:is\.na|is_na)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", t, re.IGNORECASE)
         if m_df_na is not None:
             df_nm = m_df_na.group(1)
@@ -14415,18 +14421,22 @@ def r_expr_to_fortran(expr: str) -> str:
             a_f = r_expr_to_fortran(m.group(1))
             b_f = r_expr_to_fortran(m.group(2))
             return f"sum(exp({a_f} - spread({b_f}, dim=1, ncopies=size({a_f},1))), dim=1)"
-        return f"sum({inner}, dim=1)"
+        return f"sum({r_expr_to_fortran(t)}, dim=1)"
 
     def _rowmeans_to_fortran(inner: str) -> str:
-        x_f = r_expr_to_fortran(inner.strip())
+        c_rm = parse_call_text("rowMeans(" + inner.strip() + ")")
+        x_src = (_first_call_arg(c_rm, "x") if c_rm is not None else None) or inner.strip()
+        x_f = r_expr_to_fortran(x_src)
         return f"(sum({x_f}, dim=2)/real(size({x_f}, 2), kind=dp))"
 
     def _colmeans_to_fortran(inner: str) -> str:
-        masked = _logical_mask_subset_fortran(inner.strip())
+        c_cm = parse_call_text("colMeans(" + inner.strip() + ")")
+        x_src = (_first_call_arg(c_cm, "x") if c_cm is not None else None) or inner.strip()
+        masked = _logical_mask_subset_fortran(x_src)
         if masked is not None:
             x_f, n_f = masked
             return f"(sum({x_f}, dim=1)/real({n_f}, kind=dp))"
-        x_f = r_expr_to_fortran(inner.strip())
+        x_f = r_expr_to_fortran(x_src)
         return f"(sum({x_f}, dim=1)/real(size({x_f}, 1), kind=dp))"
 
     s = _replace_balanced_func_calls(s, "rowSums", _rowsums_to_fortran)
