@@ -32808,6 +32808,47 @@ def transpile_r_to_fortran(
         fn_lms = fn_lm_names.get(fn_name, set())
         txt_l = txt.lower()
         k_l = k.lower()
+
+        def _find_alias_assign(ss_alias: list[object], name_alias: str) -> Assign | None:
+            for st_alias in ss_alias:
+                if isinstance(st_alias, Assign) and st_alias.name == name_alias:
+                    return st_alias
+                if isinstance(st_alias, IfStmt):
+                    found_alias = _find_alias_assign(st_alias.then_body, name_alias) or _find_alias_assign(st_alias.else_body, name_alias)
+                    if found_alias is not None:
+                        return found_alias
+                elif isinstance(st_alias, ForStmt):
+                    found_alias = _find_alias_assign(st_alias.body, name_alias)
+                    if found_alias is not None:
+                        return found_alias
+                elif isinstance(st_alias, WhileStmt):
+                    found_alias = _find_alias_assign(st_alias.body, name_alias)
+                    if found_alias is not None:
+                        return found_alias
+                elif isinstance(st_alias, RepeatStmt):
+                    found_alias = _find_alias_assign(st_alias.body, name_alias)
+                    if found_alias is not None:
+                        return found_alias
+                elif isinstance(st_alias, SwitchStmt):
+                    for _label_alias, body_alias in st_alias.cases:
+                        found_alias = _find_alias_assign(body_alias, name_alias)
+                        if found_alias is not None:
+                            return found_alias
+                    found_alias = _find_alias_assign(st_alias.default_body, name_alias)
+                    if found_alias is not None:
+                        return found_alias
+            return None
+
+        def _field_decl_from_alias_rhs(rhs_alias: str) -> str | None:
+            rhs_alias = rhs_alias.strip()
+            if _static_character_vector_values(rhs_alias) is not None:
+                return f"character(len=:), allocatable :: {k}(:)"
+            if _strict_int_vector_literal_from_c(rhs_alias) is not None:
+                return f"integer, allocatable :: {k}(:)"
+            if _literal_c_kind(rhs_alias) == "logical":
+                return f"logical, allocatable :: {k}(:)"
+            return None
+
         if k_l in {"p_2", "p_2_2"}:
             return f"real(kind=dp), allocatable :: {k}(:,:)"
         if k_l in {"prob_init_2", "mu_2", "sd_2", "stationary_prob"}:
@@ -32834,89 +32875,22 @@ def transpile_r_to_fortran(
                 return f"real(kind=dp), allocatable :: {k}(:,:)"
             f_obj_field = funcs_by_name.get(fn_name)
             if f_obj_field is not None:
-                def _find_func_alias_assign(ss_alias: list[object]) -> Assign | None:
-                    for st_alias in ss_alias:
-                        if isinstance(st_alias, Assign) and st_alias.name == txt:
-                            return st_alias
-                        if isinstance(st_alias, IfStmt):
-                            found_alias = _find_func_alias_assign(st_alias.then_body) or _find_func_alias_assign(st_alias.else_body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, ForStmt):
-                            found_alias = _find_func_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, WhileStmt):
-                            found_alias = _find_func_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, RepeatStmt):
-                            found_alias = _find_func_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, SwitchStmt):
-                            for _label_alias, body_alias in st_alias.cases:
-                                found_alias = _find_func_alias_assign(body_alias)
-                                if found_alias is not None:
-                                    return found_alias
-                            found_alias = _find_func_alias_assign(st_alias.default_body)
-                            if found_alias is not None:
-                                return found_alias
-                    return None
-
-                st_field = _find_func_alias_assign(f_obj_field.body)
+                st_field = _find_alias_assign(f_obj_field.body, txt)
                 if st_field is not None:
-                    if _static_character_vector_values(st_field.expr.strip()) is not None:
-                        return f"character(len=:), allocatable :: {k}(:)"
-                    if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
-                        return f"integer, allocatable :: {k}(:)"
-                    if _literal_c_kind(st_field.expr.strip()) == "logical":
-                        return f"logical, allocatable :: {k}(:)"
+                    alias_decl = _field_decl_from_alias_rhs(st_field.expr)
+                    if alias_decl is not None:
+                        return alias_decl
                     c_field_rhs = parse_call_text(st_field.expr.strip())
                     if c_field_rhs is not None and c_field_rhs[0].lower() in {"optim", "constroptim"}:
                         return f"type(optim_result_t) :: {k}"
                     if c_field_rhs is not None and c_field_rhs[0] in list_specs:
                         return f"type({_type_name_for_path(c_field_rhs[0], ())}) :: {k}"
             if fn_name in main_list_specs:
-                def _find_main_alias_assign(ss_alias: list[object]) -> Assign | None:
-                    for st_alias in ss_alias:
-                        if isinstance(st_alias, Assign) and st_alias.name == txt:
-                            return st_alias
-                        if isinstance(st_alias, IfStmt):
-                            found_alias = _find_main_alias_assign(st_alias.then_body) or _find_main_alias_assign(st_alias.else_body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, ForStmt):
-                            found_alias = _find_main_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, WhileStmt):
-                            found_alias = _find_main_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, RepeatStmt):
-                            found_alias = _find_main_alias_assign(st_alias.body)
-                            if found_alias is not None:
-                                return found_alias
-                        elif isinstance(st_alias, SwitchStmt):
-                            for _label_alias, body_alias in st_alias.cases:
-                                found_alias = _find_main_alias_assign(body_alias)
-                                if found_alias is not None:
-                                    return found_alias
-                            found_alias = _find_main_alias_assign(st_alias.default_body)
-                            if found_alias is not None:
-                                return found_alias
-                    return None
-
-                st_field = _find_main_alias_assign(main_stmts)
+                st_field = _find_alias_assign(main_stmts, txt)
                 if st_field is not None:
-                    if isinstance(st_field, Assign) and st_field.name == txt:
-                        if _static_character_vector_values(st_field.expr.strip()) is not None:
-                            return f"character(len=:), allocatable :: {k}(:)"
-                        if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
-                            return f"integer, allocatable :: {k}(:)"
-                        if _literal_c_kind(st_field.expr.strip()) == "logical":
-                            return f"logical, allocatable :: {k}(:)"
+                    alias_decl = _field_decl_from_alias_rhs(st_field.expr)
+                    if alias_decl is not None:
+                        return alias_decl
             if txt in fn_lms:
                 return f"type(lm_fit_t) :: {k}"
             if txt in fn_ints:
