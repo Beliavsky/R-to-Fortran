@@ -13265,10 +13265,11 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"r_seq_int({_int_bound_expr(a_f)}, {_int_bound_expr(b_f)})"
         return f"real(r_seq_int({_int_bound_expr(a_f)}, {_int_bound_expr(b_f)}), kind=dp)"
     if c_seq is not None and c_seq[0].lower() == "seq_along":
-        _nm_s, pos_s, _kw_s = c_seq
-        if not pos_s:
+        _nm_s, pos_s, kw_s = c_seq
+        t_src = pos_s[0] if pos_s else kw_s.get("along.with", kw_s.get("along_with"))
+        if t_src is None:
             return "r_seq_len(0)"
-        t = pos_s[0].strip()
+        t = t_src.strip()
         m_num = re.match(r"^numeric\s*\((.+)\)$", t, re.IGNORECASE)
         if m_num:
             n_f = _int_bound_expr(r_expr_to_fortran(m_num.group(1).strip()))
@@ -13305,8 +13306,8 @@ def r_expr_to_fortran(expr: str) -> str:
                     n_f = f"size({ft})"
         return f"r_seq_len({_int_bound_expr(n_f)})"
     if c_seq is not None and c_seq[0].lower() == "seq_len":
-        _nm_s, pos_s, _kw_s = c_seq
-        n_src = pos_s[0] if pos_s else "0"
+        _nm_s, pos_s, kw_s = c_seq
+        n_src = pos_s[0] if pos_s else kw_s.get("length.out", kw_s.get("length_out", "0"))
         return f"r_seq_len({_int_bound_expr(r_expr_to_fortran(n_src))})"
     # paste(..., sep="...") / paste0(...) -> "a" // sep // "b" // ...
     c_paste = parse_call_text(s)
