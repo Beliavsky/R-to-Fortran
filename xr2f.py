@@ -10364,7 +10364,7 @@ def r_expr_to_fortran(expr: str) -> str:
         idx = terms.index(coef_nm) + 2 if coef_nm in terms else 1
         return f"{r_expr_to_fortran(fit_nm)}%coef({idx})"
     c_resid_early = parse_call_text(s)
-    if c_resid_early is not None and c_resid_early[0].lower() == "resid":
+    if c_resid_early is not None and c_resid_early[0].lower() in {"resid", "residuals"}:
         _nm_res_e, pos_res_e, kw_res_e = c_resid_early
         fit_src_e = _first_call_arg((_nm_res_e, pos_res_e, kw_res_e), "object")
         typ_e = (_dequote_string_literal(kw_res_e.get("type", "").strip()) or "").lower()
@@ -10372,6 +10372,12 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"glm_pearson_resid({r_expr_to_fortran(fit_src_e)})"
         if fit_src_e:
             return f"{r_expr_to_fortran(fit_src_e)}%resid"
+    c_fitted_early = parse_call_text(s)
+    if c_fitted_early is not None and c_fitted_early[0].lower() == "fitted":
+        _nm_fit_e, pos_fit_e, kw_fit_e = c_fitted_early
+        fit_src_e = _first_call_arg((_nm_fit_e, pos_fit_e, kw_fit_e), "object")
+        if fit_src_e:
+            return f"{r_expr_to_fortran(fit_src_e)}%fitted"
     s = re.sub(r"\bt\.test\s*\(", "t_test(", s, flags=re.IGNORECASE)
     s = re.sub(r"\bcooks\.distance\s*\(", "lm_cooks_distance(", s, flags=re.IGNORECASE)
 
@@ -11474,7 +11480,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if not fit_src:
             raise NotImplementedError("cooks.distance requires a fitted model")
         return f"lm_cooks_distance({r_expr_to_fortran(fit_src)})"
-    if c_usr is not None and c_usr[0].lower() == "resid":
+    if c_usr is not None and c_usr[0].lower() in {"resid", "residuals"}:
         _nm_res, pos_res, kw_res = c_usr
         fit_src = _first_call_arg((_nm_res, pos_res, kw_res), "object")
         typ = (_dequote_string_literal(kw_res.get("type", "").strip()) or "").lower()
@@ -11482,6 +11488,11 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"glm_pearson_resid({r_expr_to_fortran(fit_src)})"
         if fit_src:
             return f"{r_expr_to_fortran(fit_src)}%resid"
+    if c_usr is not None and c_usr[0].lower() == "fitted":
+        _nm_fit, pos_fit, kw_fit = c_usr
+        fit_src = _first_call_arg((_nm_fit, pos_fit, kw_fit), "object")
+        if fit_src:
+            return f"{r_expr_to_fortran(fit_src)}%fitted"
     if c_usr is not None and c_usr[0].lower() == "pchisq":
         _nm_pc, pos_pc, kw_pc = c_usr
         pchisq_call = (_nm_pc, pos_pc, kw_pc)
@@ -12471,6 +12482,8 @@ def r_expr_to_fortran(expr: str) -> str:
         fit_src = pos_pr0[0].strip() if pos_pr0 else kw_pr0.get("object", "").strip()
         typ = (_dequote_string_literal(kw_pr0.get("type", "").strip()) or "").lower()
         newdata_src = kw_pr0.get("newdata", "").strip()
+        if fit_src and not typ and not newdata_src and re.fullmatch(r"[A-Za-z]\w*", fit_src):
+            return f"{r_expr_to_fortran(fit_src)}%fitted"
         if fit_src and typ == "response" and not newdata_src:
             fit_f = r_expr_to_fortran(fit_src)
             return f"glm_predict_response({fit_f}, {fit_f}%xpred)"
@@ -19521,6 +19534,11 @@ def emit_stmts(
                             continue
                     if m_sum:
                         sum_arg = m_sum.group(1).strip()
+                        c_sum_call = parse_call_text(one)
+                        if c_sum_call is not None:
+                            sum_arg_kw = _first_call_arg(c_sum_call, "object", "x")
+                            if sum_arg_kw:
+                                sum_arg = sum_arg_kw
                         c_sum_lm = parse_call_text(sum_arg)
                         if c_sum_lm is not None and c_sum_lm[0].lower() == "lm":
                             _nm_slm, pos_slm, kw_slm = c_sum_lm
