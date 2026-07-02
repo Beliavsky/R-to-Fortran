@@ -219,6 +219,14 @@ class IfStmt:
 
 
 @dataclass
+class SwitchStmt:
+    selector: str
+    cases: list[tuple[str, list[object]]]
+    default_body: list[object]
+    selector_kind: str = "character"
+
+
+@dataclass
 class CallStmt:
     name: str
     args: list[str]
@@ -3334,6 +3342,104 @@ def parse_block(
     return stmts, i
 
 
+def _combine_switch_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not re.match(r"^\s*switch\s*\(", line, re.IGNORECASE):
+            out.append(line)
+            i += 1
+            continue
+        parts = [line]
+        depth = line.count("(") - line.count(")")
+        i += 1
+        while i < len(lines) and depth > 0:
+            parts.append(lines[i])
+            depth += lines[i].count("(") - lines[i].count(")")
+            i += 1
+        out.append(" ".join(p.strip() for p in parts if p.strip()))
+    return out
+
+
+def _split_switch_body_lines(body_src: str) -> list[str]:
+    txt = body_src.strip()
+    if not txt:
+        return []
+    txt = re.sub(r"\s+(?=[A-Za-z]\w*(?:\[[^\]]+\])?\s*(?:<-|=)\s*)", "\n", txt)
+    return [ln.strip() for ln in txt.splitlines() if ln.strip()]
+
+
+def _parse_switch_case_block(case_src: str) -> tuple[str, list[object]] | None:
+    m_case = re.match(r'^\s*("(?:""|[^"])*")\s*=\s*\{(.*)\}\s*$', case_src, re.DOTALL)
+    if m_case is None:
+        return None
+    label_src = m_case.group(1).strip()
+    body_src = m_case.group(2).strip()
+    body_lines = _split_switch_body_lines(body_src)
+    body, idx = parse_block(body_lines, 0)
+    if idx != len(body_lines):
+        raise NotImplementedError("could not parse switch case body")
+    return label_src, body
+
+
+def _parse_switch_positional_block(case_src: str) -> list[object] | None:
+    t_case = case_src.strip()
+    if not (t_case.startswith("{") and t_case.endswith("}")):
+        return None
+    body_lines = _split_switch_body_lines(t_case[1:-1].strip())
+    body, idx = parse_block(body_lines, 0)
+    if idx != len(body_lines):
+        raise NotImplementedError("could not parse switch positional body")
+    return body
+
+
+def _lower_switch_expr_stmt(st: ExprStmt) -> object:
+    c_switch = parse_call_text(st.expr.strip())
+    if c_switch is None or c_switch[0].lower() != "switch" or not c_switch[1]:
+        return st
+    selector_src = c_switch[1][0].strip()
+    cases: list[tuple[str, list[object]]] = []
+    default_body: list[object] = []
+    for case_src in c_switch[1][1:]:
+        parsed = _parse_switch_case_block(case_src)
+        if parsed is not None:
+            cases.append(parsed)
+            continue
+    if cases:
+        return SwitchStmt(selector=selector_src, cases=cases, default_body=default_body, selector_kind="character")
+    for idx_case, case_src in enumerate(c_switch[1][1:], start=1):
+        body = _parse_switch_positional_block(case_src)
+        if body is None:
+            return st
+        cases.append((str(idx_case), body))
+    if not cases:
+        return st
+    return SwitchStmt(selector=selector_src, cases=cases, default_body=default_body, selector_kind="integer")
+
+
+def lower_switch_statements(stmts: list[object]) -> list[object]:
+    out: list[object] = []
+    for st in stmts:
+        if isinstance(st, ExprStmt):
+            out.append(_lower_switch_expr_stmt(st))
+        elif isinstance(st, FuncDef):
+            out.append(FuncDef(st.name, st.args, st.defaults, lower_switch_statements(st.body)))
+        elif isinstance(st, IfStmt):
+            out.append(IfStmt(st.cond, lower_switch_statements(st.then_body), lower_switch_statements(st.else_body)))
+        elif isinstance(st, SwitchStmt):
+            out.append(SwitchStmt(st.selector, [(label, lower_switch_statements(body)) for label, body in st.cases], lower_switch_statements(st.default_body), st.selector_kind))
+        elif isinstance(st, ForStmt):
+            out.append(ForStmt(st.var, st.iter_expr, lower_switch_statements(st.body)))
+        elif isinstance(st, WhileStmt):
+            out.append(WhileStmt(st.cond, lower_switch_statements(st.body)))
+        elif isinstance(st, RepeatStmt):
+            out.append(RepeatStmt(lower_switch_statements(st.body)))
+        else:
+            out.append(st)
+    return out
+
+
 def infer_assigned_names(stmts: list[object], out: dict[str, int] | None = None) -> dict[str, int]:
     if out is None:
         out = {}
@@ -3350,6 +3456,10 @@ def infer_assigned_names(stmts: list[object], out: dict[str, int] | None = None)
         elif isinstance(st, IfStmt):
             infer_assigned_names(st.then_body, out)
             infer_assigned_names(st.else_body, out)
+        elif isinstance(st, SwitchStmt):
+            for _label, body in st.cases:
+                infer_assigned_names(body, out)
+            infer_assigned_names(st.default_body, out)
         elif isinstance(st, FuncDef):
             # separate scope
             continue
@@ -4782,6 +4892,10 @@ def classify_vars(
             elif isinstance(st, IfStmt):
                 seed_sequence_assignments(st.then_body)
                 seed_sequence_assignments(st.else_body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    seed_sequence_assignments(body)
+                seed_sequence_assignments(st.default_body)
             elif isinstance(st, (ForStmt, WhileStmt, RepeatStmt)):
                 seed_sequence_assignments(st.body)
 
@@ -4842,6 +4956,11 @@ def classify_vars(
                 mark_array_uses(st.cond)
                 walk(st.then_body)
                 walk(st.else_body)
+            elif isinstance(st, SwitchStmt):
+                mark_array_uses(st.selector)
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
             elif isinstance(st, Assign):
                 rhs = st.expr.strip()
                 rhs_l = rhs.lower()
@@ -7072,6 +7191,7 @@ def obfuscate_r_source(src: str, seed: int | None = None) -> str:
     _SANITIZED_R_NAME_BY_RAW = {}
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for obfuscation")
@@ -8299,6 +8419,10 @@ def _assigned_scalar_reduction_names(stmts: list[object], rank_names: set[str] |
             elif isinstance(st, IfStmt):
                 walk(st.then_body)
                 walk(st.else_body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
             elif isinstance(st, ForStmt):
                 walk(st.body)
             elif isinstance(st, WhileStmt):
@@ -20272,6 +20396,24 @@ def emit_stmts(
                 emit_stmts(o, st.else_body, need_rnorm, params, alloc_seen, helper_ctx)
                 o.pop()
             o.w("end if")
+        elif isinstance(st, SwitchStmt):
+            selector_f = r_expr_to_fortran(st.selector)
+            if st.selector_kind == "integer":
+                o.w(f"select case ({_int_bound_expr(selector_f)})")
+            else:
+                o.w(f"select case (trim({selector_f}))")
+            for label_src, body in st.cases:
+                label_f = _int_bound_expr(r_expr_to_fortran(label_src)) if st.selector_kind == "integer" else r_expr_to_fortran(label_src)
+                o.w(f"case ({label_f})")
+                o.push()
+                emit_stmts(o, body, need_rnorm, params, alloc_seen, helper_ctx)
+                o.pop()
+            if st.default_body:
+                o.w("case default")
+                o.push()
+                emit_stmts(o, st.default_body, need_rnorm, params, alloc_seen, helper_ctx)
+                o.pop()
+            o.w("end select")
         elif isinstance(st, ExprStmt):
             if re.match(r"^\s*(?:colnames|rownames|dimnames|names|storage\.mode)\s*\(", st.expr, re.IGNORECASE):
                 continue
@@ -26982,9 +27124,11 @@ def _annotation_kind_maps_for_function(fn: FuncDef) -> dict[str, str]:
 def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False) -> str:
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for R annotation")
+    stmts = lower_switch_statements(stmts)
     stmts = _lower_dim_assignments(stmts)
     stmts = attach_function_adjacent_comments(stmts)
     stmts = _rename_duplicate_function_defs(stmts)
@@ -27334,12 +27478,14 @@ def transpile_r_to_fortran(
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
     validate_unsupported_environment_assignment(stmts)
     if obfuscate:
         stmts = obfuscate_user_defined_names(stmts)
+    stmts = lower_switch_statements(stmts)
     _KNOWN_CHAR_VECTOR_NAMES.update(_collect_character0_assignments(stmts))
     _STATIC_LS_NAMES = []
     _STATIC_LS_STR_LINES = []
@@ -32982,6 +33128,7 @@ def _r_unparse_functions(funcs: list[FuncDef]) -> str:
 def _parse_r_functions_for_partial(src: str) -> list[FuncDef]:
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for partial translation")
@@ -33282,6 +33429,7 @@ def build_partial_main_source(
 
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for partial-main translation")
