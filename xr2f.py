@@ -14047,10 +14047,13 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "lower.tri", lambda inner: _tri_to_fortran(inner, "lower_tri"))
     s = _replace_balanced_func_calls(s, "upper.tri", lambda inner: _tri_to_fortran(inner, "upper_tri"))
     def _strsplit_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            x_src = parts[0].strip()
-            split_src = parts[1].strip()
+        c_ss = parse_call_text("strsplit(" + inner + ")")
+        if c_ss is not None:
+            _nm_ss, pos_ss, kw_ss = c_ss
+            x_src = _first_call_arg(c_ss, "x")
+            split_src = pos_ss[1].strip() if len(pos_ss) >= 2 else kw_ss.get("split")
+            if x_src is None or split_src is None:
+                return f"strsplit({inner})"
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"strsplit_fixed({r_expr_to_fortran(x_src)}(1), {r_expr_to_fortran(split_src)})"
             return f"strsplit_fixed({r_expr_to_fortran(x_src)}, {r_expr_to_fortran(split_src)})"
@@ -14060,10 +14063,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return f'char_join({r_expr_to_fortran(inner.strip())}, ", ")'
     s = _replace_balanced_func_calls(s, "toString", _tostring_to_fortran)
     def _grepl_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            pat_f = r_expr_to_fortran(parts[0].strip())
-            x_src = parts[1].strip()
+        c_gr = parse_call_text("grepl(" + inner + ")")
+        if c_gr is not None:
+            _nm_gr, pos_gr, kw_gr = c_gr
+            pat_src = pos_gr[0].strip() if pos_gr else kw_gr.get("pattern")
+            x_src = pos_gr[1].strip() if len(pos_gr) >= 2 else kw_gr.get("x")
+            if pat_src is None or x_src is None:
+                return f"grepl({inner})"
+            pat_f = r_expr_to_fortran(pat_src)
             x_f = r_expr_to_fortran(x_src)
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"[(index({x_f}(i_gr), {pat_f}) > 0, i_gr=1,size({x_f}))]"
@@ -14071,10 +14078,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"grepl({inner})"
     s = _replace_balanced_func_calls(s, "grepl", _grepl_to_fortran)
     def _grep_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            pat_f = r_expr_to_fortran(parts[0].strip())
-            x_src = parts[1].strip()
+        c_gp = parse_call_text("grep(" + inner + ")")
+        if c_gp is not None:
+            _nm_gp, pos_gp, kw_gp = c_gp
+            pat_src = pos_gp[0].strip() if pos_gp else kw_gp.get("pattern")
+            x_src = pos_gp[1].strip() if len(pos_gp) >= 2 else kw_gp.get("x")
+            if pat_src is None or x_src is None:
+                return f"grep({inner})"
+            pat_f = r_expr_to_fortran(pat_src)
             x_f = r_expr_to_fortran(x_src)
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"pack([(i_gr, i_gr=1,size({x_f}))], [(index({x_f}(i_gr), {pat_f}) > 0, i_gr=1,size({x_f}))])"
@@ -14087,23 +14098,32 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"regexpr({inner})"
     s = _replace_balanced_func_calls(s, "regexpr", _regexpr_to_fortran)
     def _startswith_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            x_src = parts[0].strip()
+        c_sw = parse_call_text("startsWith(" + inner + ")")
+        if c_sw is not None:
+            _nm_sw, pos_sw, kw_sw = c_sw
+            x_src = pos_sw[0].strip() if pos_sw else kw_sw.get("x")
+            pat_src = pos_sw[1].strip() if len(pos_sw) >= 2 else kw_sw.get("prefix")
+            if x_src is None or pat_src is None:
+                return f"startsWith({inner})"
             x_f = r_expr_to_fortran(x_src)
-            pat_f = r_expr_to_fortran(parts[1].strip())
+            pat_f = r_expr_to_fortran(pat_src)
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"[(index({x_f}(i_sw), {pat_f}) == 1, i_sw=1,size({x_f}))]"
-            return f"(index({r_expr_to_fortran(parts[0].strip())}, {r_expr_to_fortran(parts[1].strip())}) == 1)"
+            return f"(index({x_f}, {pat_f}) == 1)"
         return f"startsWith({inner})"
     s = _replace_balanced_func_calls(s, "startsWith", _startswith_to_fortran)
     def _endswith_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            x_src = parts[0].strip()
+        c_ew = parse_call_text("endsWith(" + inner + ")")
+        if c_ew is not None:
+            _nm_ew, pos_ew, kw_ew = c_ew
+            x_src = pos_ew[0].strip() if pos_ew else kw_ew.get("x")
+            pat_src = pos_ew[1].strip() if len(pos_ew) >= 2 else kw_ew.get("suffix")
+            if x_src is None or pat_src is None:
+                return f"endsWith({inner})"
             x_f = r_expr_to_fortran(x_src)
-            pat_f = r_expr_to_fortran(parts[1].strip())
-            pat_len = f"nchar({pat_f})"
+            pat_f = r_expr_to_fortran(pat_src)
+            pat_lit = _dequote_string_literal(pat_src.strip())
+            pat_len = str(len(pat_lit)) if pat_lit is not None else f"nchar({pat_f})"
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"[(nchar({x_f}(i_ew)) >= {pat_len} .and. {x_f}(i_ew)(nchar({x_f}(i_ew)) - {pat_len} + 1:nchar({x_f}(i_ew))) == {pat_f}, i_ew=1,size({x_f}))]"
             return f"(nchar({x_f}) >= {pat_len} .and. {x_f}(nchar({x_f}) - {pat_len} + 1:nchar({x_f})) == {pat_f})"
@@ -14131,11 +14151,17 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"gsub({inner})"
     s = _replace_balanced_func_calls(s, "gsub", _gsub_to_fortran)
     def _substr_to_fortran(inner: str) -> str:
-        parts = split_top_level_commas(inner)
-        if len(parts) >= 2:
-            x = r_expr_to_fortran(parts[0].strip())
-            a = _int_bound_expr(r_expr_to_fortran(parts[1].strip()))
-            b = _int_bound_expr(r_expr_to_fortran(parts[2].strip())) if len(parts) >= 3 else f"nchar({x})"
+        c_substr = parse_call_text("substr(" + inner + ")")
+        if c_substr is not None:
+            _nm_substr, pos_substr, kw_substr = c_substr
+            x_src = pos_substr[0].strip() if pos_substr else kw_substr.get("x", kw_substr.get("text"))
+            a_src = pos_substr[1].strip() if len(pos_substr) >= 2 else kw_substr.get("start", kw_substr.get("first"))
+            b_src = pos_substr[2].strip() if len(pos_substr) >= 3 else kw_substr.get("stop", kw_substr.get("last"))
+            if x_src is None or a_src is None:
+                return f"substr({inner})"
+            x = r_expr_to_fortran(x_src)
+            a = _int_bound_expr(r_expr_to_fortran(a_src))
+            b = _int_bound_expr(r_expr_to_fortran(b_src)) if b_src is not None else f"nchar({x})"
             return f"{x}({a}:{b})"
         return f"substr({inner})"
     s = _replace_balanced_func_calls(s, "substr", _substr_to_fortran)
