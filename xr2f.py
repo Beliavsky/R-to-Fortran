@@ -17307,6 +17307,8 @@ def emit_stmts(
                                 vv_txt = str(vv).strip()
                                 if field_kk == "order":
                                     rhs_f = _int_vector_literal_from_c(vv_txt) or r_expr_to_fortran(vv_txt)
+                                elif _strict_int_vector_literal_from_c(vv_txt) is not None:
+                                    rhs_f = _strict_int_vector_literal_from_c(vv_txt) or r_expr_to_fortran(vv_txt)
                                 else:
                                     rhs_f = '""' if field_kk == "out" and vv_txt.upper() == "NULL" else r_expr_to_fortran(vv_txt)
                                 _wstmt(f"{prefix}%{field_kk} = {rhs_f}", st.comment)
@@ -32826,6 +32828,12 @@ def transpile_r_to_fortran(
             cn, pos_cn, kw_cn = c_txt
             cn_l = cn.lower()
             if cn_l == "c":
+                if _static_character_vector_values(txt) is not None:
+                    return f"character(len=:), allocatable :: {k}(:)"
+                if _strict_int_vector_literal_from_c(txt) is not None:
+                    return f"integer, allocatable :: {k}(:)"
+                if _literal_c_kind(txt) == "logical":
+                    return f"logical, allocatable :: {k}(:)"
                 return f"real(kind=dp), allocatable :: {k}(:)"
             if cn_l in {"r_matmul", "crossprod", "tcrossprod", "t", "matrix", "array", "cbind", "cbind2"}:
                 return f"real(kind=dp), allocatable :: {k}(:,:)"
@@ -32846,6 +32854,8 @@ def transpile_r_to_fortran(
                 return f"integer, allocatable :: {k}(:)"
         if "%*%" in txt or re.match(r"^(?:cbind|cbind2|matrix|array)\s*\(", txt, re.IGNORECASE):
             return f"real(kind=dp), allocatable :: {k}(:,:)"
+        if _static_character_vector_values(txt) is not None:
+            return f"character(len=:), allocatable :: {k}(:)"
         if txt.startswith("c(") or txt.startswith("[") or txt_l.startswith(("runif(", "rnorm(")):
             return f"real(kind=dp), allocatable :: {k}(:)"
         return None
@@ -32934,6 +32944,9 @@ def transpile_r_to_fortran(
                     elif parse_call_text(txt) is not None:
                         c_txt = parse_call_text(txt)
                         _cn, pos_cn, kw_cn = c_txt if c_txt is not None else ("", [], {})
+                        if _cn.lower() == "c" and _static_character_vector_values(txt) is not None:
+                            o.w(f"character(len=:), allocatable :: {k}(:)")
+                            continue
                         if _cn.lower() == "c":
                             o.w(f"real(kind=dp), allocatable :: {k}(:)")
                             continue
