@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import fortran_post as fpost
 import fortran_scan as fscan
@@ -24571,52 +24572,47 @@ def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
         )
         int_arrays.update(b_int_arrays)
 
-        def _seed_static_integer_arrays(ss_seed: list[object]) -> None:
-            for st_seed in ss_seed:
-                if isinstance(st_seed, Assign):
-                    if _is_static_integer_vector_expr(st_seed.expr):
-                        int_arrays.add(st_seed.name)
-                elif isinstance(st_seed, IfStmt):
-                    _seed_static_integer_arrays(st_seed.then_body)
-                    _seed_static_integer_arrays(st_seed.else_body)
-                elif isinstance(st_seed, ForStmt):
-                    _seed_static_integer_arrays(st_seed.body)
-                elif isinstance(st_seed, WhileStmt):
-                    _seed_static_integer_arrays(st_seed.body)
-                elif isinstance(st_seed, RepeatStmt):
-                    _seed_static_integer_arrays(st_seed.body)
-                elif isinstance(st_seed, SwitchStmt):
-                    for case_seed in st_seed.cases:
-                        _seed_static_integer_arrays(case_seed.body)
+        def seed_static_integer(st_seed: Assign) -> None:
+            if _is_static_integer_vector_expr(st_seed.expr):
+                int_arrays.add(st_seed.name)
 
-        _seed_static_integer_arrays(body_no_ret)
-        changed = True
-        while changed:
-            changed = False
-
-            def _propagate_aliases(ss_alias: list[object]) -> None:
-                nonlocal changed
-                for st_alias in ss_alias:
-                    if isinstance(st_alias, Assign):
-                        rhs_alias = st_alias.expr.strip()
-                        if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in int_arrays and st_alias.name not in int_arrays:
-                            int_arrays.add(st_alias.name)
-                            changed = True
-                    elif isinstance(st_alias, IfStmt):
-                        _propagate_aliases(st_alias.then_body)
-                        _propagate_aliases(st_alias.else_body)
-                    elif isinstance(st_alias, ForStmt):
-                        _propagate_aliases(st_alias.body)
-                    elif isinstance(st_alias, WhileStmt):
-                        _propagate_aliases(st_alias.body)
-                    elif isinstance(st_alias, RepeatStmt):
-                        _propagate_aliases(st_alias.body)
-                    elif isinstance(st_alias, SwitchStmt):
-                        for case_alias in st_alias.cases:
-                            _propagate_aliases(case_alias.body)
-
-            _propagate_aliases(body_no_ret)
+        _walk_assignments_recursive(body_no_ret, seed_static_integer)
+        _propagate_simple_alias_names(body_no_ret, int_arrays)
     return int_arrays
+
+
+def _walk_assignments_recursive(stmts: list[object], visit: Callable[[Assign], None]) -> None:
+    for st in stmts:
+        if isinstance(st, Assign):
+            visit(st)
+        elif isinstance(st, IfStmt):
+            _walk_assignments_recursive(st.then_body, visit)
+            _walk_assignments_recursive(st.else_body, visit)
+        elif isinstance(st, ForStmt):
+            _walk_assignments_recursive(st.body, visit)
+        elif isinstance(st, WhileStmt):
+            _walk_assignments_recursive(st.body, visit)
+        elif isinstance(st, RepeatStmt):
+            _walk_assignments_recursive(st.body, visit)
+        elif isinstance(st, SwitchStmt):
+            for case in st.cases:
+                _walk_assignments_recursive(case.body, visit)
+            _walk_assignments_recursive(st.default_body, visit)
+
+
+def _propagate_simple_alias_names(stmts: list[object], names: set[str]) -> None:
+    changed = True
+    while changed:
+        changed = False
+
+        def visit(st: Assign) -> None:
+            nonlocal changed
+            rhs_alias = st.expr.strip()
+            if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in names and st.name not in names:
+                names.add(st.name)
+                changed = True
+
+        _walk_assignments_recursive(stmts, visit)
 
 
 def infer_function_logical_array_names(fn: FuncDef) -> set[str]:
@@ -24624,51 +24620,12 @@ def infer_function_logical_array_names(fn: FuncDef) -> set[str]:
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     logical_arrays = infer_local_logical_arrays(body_no_ret)
 
-    def _seed_static_logical_arrays(ss_seed: list[object]) -> None:
-        for st_seed in ss_seed:
-            if isinstance(st_seed, Assign):
-                if _literal_c_kind(st_seed.expr.strip()) == "logical":
-                    logical_arrays.add(st_seed.name)
-            elif isinstance(st_seed, IfStmt):
-                _seed_static_logical_arrays(st_seed.then_body)
-                _seed_static_logical_arrays(st_seed.else_body)
-            elif isinstance(st_seed, ForStmt):
-                _seed_static_logical_arrays(st_seed.body)
-            elif isinstance(st_seed, WhileStmt):
-                _seed_static_logical_arrays(st_seed.body)
-            elif isinstance(st_seed, RepeatStmt):
-                _seed_static_logical_arrays(st_seed.body)
-            elif isinstance(st_seed, SwitchStmt):
-                for case_seed in st_seed.cases:
-                    _seed_static_logical_arrays(case_seed.body)
+    def seed_static_logical(st_seed: Assign) -> None:
+        if _literal_c_kind(st_seed.expr.strip()) == "logical":
+            logical_arrays.add(st_seed.name)
 
-    _seed_static_logical_arrays(body_no_ret)
-    changed = True
-    while changed:
-        changed = False
-
-        def _propagate_aliases(ss_alias: list[object]) -> None:
-            nonlocal changed
-            for st_alias in ss_alias:
-                if isinstance(st_alias, Assign):
-                    rhs_alias = st_alias.expr.strip()
-                    if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in logical_arrays and st_alias.name not in logical_arrays:
-                        logical_arrays.add(st_alias.name)
-                        changed = True
-                elif isinstance(st_alias, IfStmt):
-                    _propagate_aliases(st_alias.then_body)
-                    _propagate_aliases(st_alias.else_body)
-                elif isinstance(st_alias, ForStmt):
-                    _propagate_aliases(st_alias.body)
-                elif isinstance(st_alias, WhileStmt):
-                    _propagate_aliases(st_alias.body)
-                elif isinstance(st_alias, RepeatStmt):
-                    _propagate_aliases(st_alias.body)
-                elif isinstance(st_alias, SwitchStmt):
-                    for case_alias in st_alias.cases:
-                        _propagate_aliases(case_alias.body)
-
-        _propagate_aliases(body_no_ret)
+    _walk_assignments_recursive(body_no_ret, seed_static_logical)
+    _propagate_simple_alias_names(body_no_ret, logical_arrays)
     return logical_arrays
 
 
