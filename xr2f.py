@@ -7720,6 +7720,18 @@ def _static_character_vector_values(expr: str) -> list[str] | None:
     return vals
 
 
+def _is_static_integer_vector_expr(expr: str) -> bool:
+    expr_s = expr.strip()
+    cinfo = parse_call_text(expr_s)
+    if cinfo is not None and cinfo[0].lower() == "c":
+        args = list(cinfo[1]) + list(cinfo[2].values())
+        return bool(args) and all(_is_int_literal(arg.strip()) for arg in args)
+    parts = _split_top_level_colon(expr_s)
+    if parts is not None:
+        return all(_is_int_literal(part.strip()) for part in parts)
+    return False
+
+
 def _static_get_target(arg: str, scalar_names: dict[str, str]) -> str | None:
     arg_s = arg.strip()
     lit = _dequote_string_literal(arg_s)
@@ -23110,6 +23122,9 @@ def emit_function(
         params.pop(rname, None)
         char_scalars_loc = set(fn_char_scalars) - set(fn.args)
         char_arrays_loc = set(fn_char_arrays) - set(fn.args)
+        char_scalars_loc.difference_update(char_arrays_loc)
+        char_array_lowers_loc = {name.lower() for name in char_arrays_loc}
+        char_scalars_loc = {name for name in char_scalars_loc if name.lower() not in char_array_lowers_loc}
         logical_arrays: set[str] = set()
         array_name_pool = set(known_arrays) | set(int_arrays) | set(real_arrays)
         def _collect_logical_array_targets(ss_la: list[object]) -> None:
@@ -24245,6 +24260,9 @@ def emit_function(
             o.w("logical :: " + ", ".join(sorted(logical_scalars)))
         if real_scalars:
             o.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
+        char_scalars_loc.difference_update(char_arrays_loc)
+        char_array_lowers_loc = {name.lower() for name in char_arrays_loc}
+        char_scalars_loc = {name for name in char_scalars_loc if name.lower() not in char_array_lowers_loc}
         if char_scalars_loc:
             o.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars_loc)))
         if char_arrays_loc:
@@ -24552,6 +24570,52 @@ def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
             body_no_ret, infer_assigned_names(body_no_ret), known_arrays=known_arrays
         )
         int_arrays.update(b_int_arrays)
+
+        def _seed_static_integer_arrays(ss_seed: list[object]) -> None:
+            for st_seed in ss_seed:
+                if isinstance(st_seed, Assign):
+                    if _is_static_integer_vector_expr(st_seed.expr):
+                        int_arrays.add(st_seed.name)
+                elif isinstance(st_seed, IfStmt):
+                    _seed_static_integer_arrays(st_seed.then_body)
+                    _seed_static_integer_arrays(st_seed.else_body)
+                elif isinstance(st_seed, ForStmt):
+                    _seed_static_integer_arrays(st_seed.body)
+                elif isinstance(st_seed, WhileStmt):
+                    _seed_static_integer_arrays(st_seed.body)
+                elif isinstance(st_seed, RepeatStmt):
+                    _seed_static_integer_arrays(st_seed.body)
+                elif isinstance(st_seed, SwitchStmt):
+                    for case_seed in st_seed.cases:
+                        _seed_static_integer_arrays(case_seed.body)
+
+        _seed_static_integer_arrays(body_no_ret)
+        changed = True
+        while changed:
+            changed = False
+
+            def _propagate_aliases(ss_alias: list[object]) -> None:
+                nonlocal changed
+                for st_alias in ss_alias:
+                    if isinstance(st_alias, Assign):
+                        rhs_alias = st_alias.expr.strip()
+                        if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in int_arrays and st_alias.name not in int_arrays:
+                            int_arrays.add(st_alias.name)
+                            changed = True
+                    elif isinstance(st_alias, IfStmt):
+                        _propagate_aliases(st_alias.then_body)
+                        _propagate_aliases(st_alias.else_body)
+                    elif isinstance(st_alias, ForStmt):
+                        _propagate_aliases(st_alias.body)
+                    elif isinstance(st_alias, WhileStmt):
+                        _propagate_aliases(st_alias.body)
+                    elif isinstance(st_alias, RepeatStmt):
+                        _propagate_aliases(st_alias.body)
+                    elif isinstance(st_alias, SwitchStmt):
+                        for case_alias in st_alias.cases:
+                            _propagate_aliases(case_alias.body)
+
+            _propagate_aliases(body_no_ret)
     return int_arrays
 
 
@@ -25244,6 +25308,8 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
         for st in ss:
             if isinstance(st, Assign):
                 rhs = st.expr.strip()
+                if _static_character_vector_values(rhs) is not None:
+                    out.add(st.name)
                 if rhs.lower().startswith("commandargs("):
                     out.add(st.name)
                 if rhs.lower().startswith("strsplit("):
@@ -25267,6 +25333,15 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
 
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     _scan(body_no_ret)
+    changed = True
+    while changed:
+        changed = False
+        for st_alias in body_no_ret:
+            if isinstance(st_alias, Assign):
+                rhs_alias = st_alias.expr.strip()
+                if re.fullmatch(r"[A-Za-z]\w*", rhs_alias) and rhs_alias in out and st_alias.name not in out:
+                    out.add(st_alias.name)
+                    changed = True
     return out
 
 
@@ -32847,6 +32922,11 @@ def transpile_r_to_fortran(
                 return f"integer, allocatable :: {k}(:)"
             if _literal_c_kind(rhs_alias) == "logical":
                 return f"logical, allocatable :: {k}(:)"
+            if re.fullmatch(r"[A-Za-z]\w*", rhs_alias):
+                if rhs_alias.lower() in {x.lower() for x in fn_char_arrays}:
+                    return f"character(len=:), allocatable :: {k}(:)"
+                if rhs_alias.lower() in {x.lower() for x in fn_int_arrays}:
+                    return f"integer, allocatable :: {k}(:)"
             return None
 
         if k_l in {"p_2", "p_2_2"}:
@@ -40020,10 +40100,18 @@ def rewrite_sum_logical_arrays(lines: list[str]) -> list[str]:
 
 def promote_character_constructor_assignments(lines: list[str]) -> list[str]:
     targets: set[str] = set()
+    declared_char_arrays: set[str] = set()
     for ln in lines:
+        m_char_decl = re.match(r"^\s*character\(len=:\)\s*,\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m_char_decl is not None:
+            for part in split_top_level_commas(m_char_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", part)
+                if m_item is not None:
+                    declared_char_arrays.add(m_item.group(1).lower())
         m = re.match(r"^\s*(?:if\s*\(.+\)\s*)?([A-Za-z]\w*)\s*=\s*\[\s*character\s*\(", ln, re.IGNORECASE)
         if m is not None:
             targets.add(m.group(1))
+    targets = {target for target in targets if target.lower() not in declared_char_arrays}
     if not targets:
         return lines
     out: list[str] = []
@@ -44068,6 +44156,18 @@ def repair_price_names_decl_text(f90: str) -> str:
             f90,
         )
     ]
+    for line in f90.splitlines():
+        m_line_decl = re.match(r"^\s*character\(len=:\)\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_line_decl is None:
+            continue
+        for item in split_top_level_commas(m_line_decl.group(1)):
+            m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", item)
+            if m_item is not None:
+                declared.add(m_item.group(1).lower())
+                continue
+            m_scalar_item = re.match(r"\s*([A-Za-z]\w*)\s*$", item)
+            if m_scalar_item is not None:
+                scalar_declared.add(m_scalar_item.group(1).lower())
     for m_decl in char_decl_pat.finditer(f90):
         if first_char_decl is None:
             first_char_decl = m_decl
@@ -44115,6 +44215,42 @@ def repair_price_names_decl_text(f90: str) -> str:
         return f90
     insert = "\n" + first_char_decl.group(1) + ", ".join(f"{name}(:)" for name in missing)
     return f90[:first_char_decl.end()] + insert + f90[first_char_decl.end():]
+
+
+def dedupe_character_array_declarations_text(f90: str) -> str:
+    """Remove duplicate character-vector declarations within one Fortran scope."""
+    out: list[str] = []
+    seen: set[str] = set()
+    scope_reset_pat = re.compile(
+        r"^\s*(?:pure\s+|elemental\s+|recursive\s+)*(?:program|function|subroutine)\b|"
+        r"^\s*type\s*(?:,\s*[^:]*)?::\s*[A-Za-z]\w*\s*$|"
+        r"^\s*contains\s*$|"
+        r"^\s*end\s*(?:program|function|subroutine|type)\b",
+        re.IGNORECASE,
+    )
+    decl_pat = re.compile(r"^(\s*character\(len=:\)\s*,\s*allocatable\s*::\s*)(.+)$", re.IGNORECASE)
+    for ln in f90.splitlines():
+        if scope_reset_pat.match(ln):
+            seen.clear()
+        m_decl = decl_pat.match(ln)
+        if m_decl is None:
+            out.append(ln)
+            continue
+        kept: list[str] = []
+        for item in split_top_level_commas(m_decl.group(2)):
+            item_s = item.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*\(:\)\s*$", item_s)
+            if m_item is None:
+                kept.append(item_s)
+                continue
+            key = m_item.group(1).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(item_s)
+        if kept:
+            out.append(m_decl.group(1) + ", ".join(kept))
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def repair_trading_days_parameter_text(f90: str) -> str:
@@ -50181,6 +50317,7 @@ def main() -> int:
         f90 = repair_make_pos_def_text(f90)
         f90 = repair_price_names_decl_text(f90)
         f90 = repair_trading_days_parameter_text(f90)
+    f90 = dedupe_character_array_declarations_text(f90)
     f90 = repair_unconditional_null_optim_returns_text(f90)
     f90 = demote_named_element_function_results_text(f90)
     if args.special_repairs:
