@@ -1966,6 +1966,10 @@ def _collect_character0_assignments(stmts: list[object]) -> set[str]:
                 walk(st.body)
             elif isinstance(st, RepeatStmt):
                 walk(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
 
     walk(stmts)
     return out
@@ -3418,11 +3422,29 @@ def _lower_switch_expr_stmt(st: ExprStmt) -> object:
     return SwitchStmt(selector=selector_src, cases=cases, default_body=default_body, selector_kind="integer")
 
 
+def _lower_switch_assign_stmt(st: Assign) -> object:
+    c_switch = parse_call_text(st.expr.strip())
+    if c_switch is None or c_switch[0].lower() != "switch" or not c_switch[1]:
+        return st
+    selector_src = c_switch[1][0].strip()
+    cases: list[tuple[str, list[object]]] = []
+    for idx_case, case_src in enumerate(c_switch[1][1:], start=1):
+        case_expr = case_src.strip()
+        if _parse_switch_case_block(case_expr) is not None or _parse_switch_positional_block(case_expr) is not None:
+            return st
+        cases.append((str(idx_case), [Assign(st.name, case_expr, st.comment if idx_case == 1 else "")]))
+    if not cases:
+        return st
+    return SwitchStmt(selector=selector_src, cases=cases, default_body=[], selector_kind="integer")
+
+
 def lower_switch_statements(stmts: list[object]) -> list[object]:
     out: list[object] = []
     for st in stmts:
         if isinstance(st, ExprStmt):
             out.append(_lower_switch_expr_stmt(st))
+        elif isinstance(st, Assign):
+            out.append(_lower_switch_assign_stmt(st))
         elif isinstance(st, FuncDef):
             out.append(FuncDef(st.name, st.args, st.defaults, lower_switch_statements(st.body)))
         elif isinstance(st, IfStmt):
@@ -21215,6 +21237,10 @@ def infer_local_logical_scalars(stmts: list[object]) -> set[str]:
                 walk(st.body)
             elif isinstance(st, RepeatStmt):
                 walk(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
 
     walk(stmts)
     return out
@@ -21240,6 +21266,10 @@ def infer_local_logical_arrays(stmts: list[object]) -> set[str]:
                 walk(st.body)
             elif isinstance(st, RepeatStmt):
                 walk(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
 
     walk(stmts)
     return out
@@ -24837,6 +24867,10 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                 walk(st.body)
             elif isinstance(st, RepeatStmt):
                 walk(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
 
     walk(stmts)
     return out
