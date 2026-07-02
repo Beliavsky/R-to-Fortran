@@ -18534,6 +18534,18 @@ def emit_stmts(
                         _wcomment(f"print({one}) omitted: bench::mark output is not translated")
                         continue
                     one_probe_f = r_expr_to_fortran(one)
+                    if has_r_mod:
+                        m_list_char_field_print0 = re.match(r"^([A-Za-z]\w*)(?:\$|%)([A-Za-z]\w*)$", one.strip())
+                        if m_list_char_field_print0 is not None:
+                            obj_print0 = m_list_char_field_print0.group(1)
+                            field_print0 = m_list_char_field_print0.group(2)
+                            fields_print_meta0 = list_locals.get(obj_print0)
+                            if fields_print_meta0 is not None:
+                                field_expr_print0 = fields_print_meta0.get(field_print0)
+                                if field_expr_print0 is not None and _static_character_vector_values(str(field_expr_print0)) is not None:
+                                    _wstmt(f"call print_char_vector({one_probe_f})", st.comment)
+                                    need_r_mod.add("print_char_vector")
+                                    continue
                     if re.match(r"^\s*mark\s*\(", one_probe_f, re.IGNORECASE):
                         _wcomment(f"print({one}) omitted: bench::mark output is not translated")
                         continue
@@ -19465,6 +19477,17 @@ def emit_stmts(
                                 _wstmt(f'write(*,"(*(1x,i0))") {one_f}', st.comment)
                             continue
                         if has_r_mod:
+                            m_list_char_field_print = re.match(r"^([A-Za-z]\w*)(?:\$|%)([A-Za-z]\w*)$", one.strip())
+                            if m_list_char_field_print is not None:
+                                obj_print = m_list_char_field_print.group(1)
+                                field_print = m_list_char_field_print.group(2)
+                                fields_print_meta = list_locals.get(obj_print)
+                                if fields_print_meta is not None:
+                                    field_expr_print = fields_print_meta.get(field_print)
+                                    if field_expr_print is not None and _static_character_vector_values(str(field_expr_print)) is not None:
+                                        _wstmt(f"call print_char_vector({one_f})", st.comment)
+                                        need_r_mod.add("print_char_vector")
+                                        continue
                             m_char_subset_print = re.match(r"^([A-Za-z]\w*)\s*\[.+\]$", one.strip())
                             if (
                                 m_char_subset_print is not None
@@ -29516,22 +29539,55 @@ def transpile_r_to_fortran(
                 _collect_main_vector_list_names(st_vl.body)
             elif isinstance(st_vl, RepeatStmt):
                 _collect_main_vector_list_names(st_vl.body)
+            elif isinstance(st_vl, SwitchStmt):
+                for _label, body in st_vl.cases:
+                    _collect_main_vector_list_names(body)
+                _collect_main_vector_list_names(st_vl.default_body)
 
     _collect_main_vector_list_names(main_stmts)
+
+    def _register_main_list_fields(name: str, fields: dict[str, object]) -> None:
+        tnm = _type_name_for_path(name, ())
+        list_vars[name] = tnm
+        merged = dict(main_list_var_fields.get(name, {}))
+        for field_name, field_expr in fields.items():
+            merged.setdefault(field_name, field_expr)
+        main_list_specs[name] = ListReturnSpec(
+            fn_name=name,
+            root_fields=merged,
+            nested_types=_collect_nested_types(name, merged),
+        )
+        main_list_var_fields[name] = merged
+
+    def _collect_main_list_constructors(ss_ml: list[object]) -> None:
+        for st_ml in ss_ml:
+            if isinstance(st_ml, Assign):
+                fields_ml = _parse_list_constructor(st_ml.expr.strip())
+                if fields_ml is not None:
+                    _register_main_list_fields(st_ml.name, fields_ml)
+            elif isinstance(st_ml, IfStmt):
+                _collect_main_list_constructors(st_ml.then_body)
+                _collect_main_list_constructors(st_ml.else_body)
+            elif isinstance(st_ml, ForStmt):
+                _collect_main_list_constructors(st_ml.body)
+            elif isinstance(st_ml, WhileStmt):
+                _collect_main_list_constructors(st_ml.body)
+            elif isinstance(st_ml, RepeatStmt):
+                _collect_main_list_constructors(st_ml.body)
+            elif isinstance(st_ml, SwitchStmt):
+                for _label, body in st_ml.cases:
+                    _collect_main_list_constructors(body)
+                _collect_main_list_constructors(st_ml.default_body)
+
+    _collect_main_list_constructors(main_stmts)
+
     for st in main_stmts:
         if isinstance(st, Assign):
             if re.match(r"^vector\s*\(\s*['\"]list['\"]", st.expr.strip(), re.IGNORECASE):
                 main_vector_list_names.add(st.name)
             fields_main = _parse_list_constructor(st.expr.strip())
             if fields_main is not None:
-                tnm = _type_name_for_path(st.name, ())
-                list_vars[st.name] = tnm
-                main_list_specs[st.name] = ListReturnSpec(
-                    fn_name=st.name,
-                    root_fields=fields_main,
-                    nested_types=_collect_nested_types(st.name, fields_main),
-                )
-                main_list_var_fields[st.name] = fields_main
+                _register_main_list_fields(st.name, fields_main)
                 continue
             c_fit_main = parse_call_text(st.expr.strip())
             c_fit_primary_src = _trycatch_primary_expr(st.expr.strip())
@@ -29715,6 +29771,10 @@ def transpile_r_to_fortran(
                 _walk_collect_extra_list_fields(st.body)
             elif isinstance(st, RepeatStmt):
                 _walk_collect_extra_list_fields(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    _walk_collect_extra_list_fields(body)
+                _walk_collect_extra_list_fields(st.default_body)
             elif isinstance(st, ExprStmt):
                 mm = re.match(
                     r"^([A-Za-z]\w*(?:\$[A-Za-z]\w+)+)\s*(?:<-|=)\s*(.+)$",
