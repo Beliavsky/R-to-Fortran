@@ -32847,6 +32847,15 @@ def transpile_r_to_fortran(
                             return f"type(optim_result_t) :: {k}"
                         if c_field_rhs is not None and c_field_rhs[0] in list_specs:
                             return f"type({_type_name_for_path(c_field_rhs[0], ())}) :: {k}"
+            if fn_name in main_list_specs:
+                for st_field in main_stmts:
+                    if isinstance(st_field, Assign) and st_field.name == txt:
+                        if _static_character_vector_values(st_field.expr.strip()) is not None:
+                            return f"character(len=:), allocatable :: {k}(:)"
+                        if _strict_int_vector_literal_from_c(st_field.expr.strip()) is not None:
+                            return f"integer, allocatable :: {k}(:)"
+                        if _literal_c_kind(st_field.expr.strip()) == "logical":
+                            return f"logical, allocatable :: {k}(:)"
             if txt in fn_lms:
                 return f"type(lm_fit_t) :: {k}"
             if txt in fn_ints:
