@@ -42197,6 +42197,81 @@ def rewrite_rank1_component_matrix_prints_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rewrite_rank1_derived_field_writes_text(f90: str) -> str:
+    type_fields: dict[tuple[str, str], tuple[str, int]] = {}
+    var_types: dict[str, str] = {}
+    current_type: str | None = None
+    for ln in f90.splitlines():
+        m_begin = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", ln, re.IGNORECASE)
+        if m_begin is not None:
+            current_type = m_begin.group(1)
+            continue
+        if current_type is not None and re.match(r"^\s*end\s+type\b", ln, re.IGNORECASE):
+            current_type = None
+            continue
+        if current_type is not None:
+            m_decl = re.match(
+                r"^\s*(real\(kind=dp\)|integer|logical|character\(len=:\))\s*(?:,[^:]*)?::\s*(.+)$",
+                ln,
+                re.IGNORECASE,
+            )
+            if m_decl is None:
+                continue
+            kind = m_decl.group(1).lower()
+            if kind.startswith("character"):
+                kind = "character"
+            elif kind.startswith("real"):
+                kind = "real"
+            for part in split_top_level_commas(m_decl.group(2)):
+                mm = re.match(r"\s*([A-Za-z]\w*)\s*(\(.*\))?", part)
+                if mm is None:
+                    continue
+                dims = (mm.group(2) or "").replace(" ", "")
+                rank = max(1, dims.count(",") + 1, dims.count(":")) if dims else 0
+                type_fields[(current_type, mm.group(1).lower())] = (kind, rank)
+            continue
+        m_type_var = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", ln, re.IGNORECASE)
+        if m_type_var is not None:
+            tname = m_type_var.group(1)
+            for part in split_top_level_commas(m_type_var.group(2)):
+                mm = re.match(r"\s*([A-Za-z]\w*)", part)
+                if mm is not None:
+                    var_types[mm.group(1)] = tname
+
+    if not type_fields or not var_types:
+        return f90
+
+    out: list[str] = []
+    for ln in f90.splitlines():
+        m_write_scalar = re.match(
+            r'^(\s*)write\(\*,"\((?:g0|a)\)"\)\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*$',
+            ln,
+            re.IGNORECASE,
+        )
+        if m_write_scalar is not None:
+            indent, obj, field = m_write_scalar.groups()
+            component = type_fields.get((var_types.get(obj, ""), field.lower()))
+            if component == ("character", 1):
+                out.append(f"{indent}call print_char_vector({obj}%{field})")
+                continue
+        m_write_vec = re.match(
+            r'^(\s*)write\(\*,"\(\*\([^"]*\)\)"\)\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*$',
+            ln,
+            re.IGNORECASE,
+        )
+        if m_write_vec is not None:
+            indent, obj, field = m_write_vec.groups()
+            component = type_fields.get((var_types.get(obj, ""), field.lower()))
+            if component == ("character", 1):
+                out.append(f"{indent}call print_char_vector({obj}%{field})")
+                continue
+            if component == ("integer", 1):
+                out.append(f"{indent}call print_integer_vector({obj}%{field})")
+                continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def simplify_real_dp_casts_text(f90: str) -> str:
     """Remove redundant real(..., kind=dp) casts when the operand is already real(dp)."""
     if "real(" not in f90:
@@ -49688,6 +49763,7 @@ def main() -> int:
         )
     if "program x_32_mle_normal_distribution" in f90:
         f90 = f90.replace("real(kind=dp) :: mu_hat, opt, sigma_hat", "real(kind=dp) :: mu_hat, sigma_hat\ntype(optim_result_t) :: opt")
+    f90 = rewrite_rank1_derived_field_writes_text(f90)
     f90 = rewrite_character_constructor_vector_writes_text(f90)
     f90 = re.sub(
         r'(?m)^(\s*)write\(\*,"\(g0\)"\)\s+(file_info\s*\(.*\))\s*$',
