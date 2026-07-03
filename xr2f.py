@@ -25342,6 +25342,7 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
             out.add(st.name)
 
     _walk_assignments_recursive(stmts, visit)
+    _propagate_simple_alias_names(stmts, out)
     return out
 
 
