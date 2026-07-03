@@ -25078,30 +25078,19 @@ def collect_categorical_sample_labels(stmts: list[object]) -> dict[str, list[str
     """Find simple categorical assignments and keep their level labels."""
     out: dict[str, list[str]] = {}
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                factor_rep = _factor_rep_string_info(st.expr.strip())
-                if factor_rep is not None:
-                    out[st.name.lower()] = factor_rep[0]
-                    continue
-                cinfo = parse_call_text(st.expr.strip())
-                if cinfo is not None and cinfo[0].lower() == "sample":
-                    x_src = cinfo[1][0] if cinfo[1] else cinfo[2].get("x")
-                    labels = _parse_string_c_vector(x_src.strip()) if x_src is not None else None
-                    if labels is not None:
-                        out[st.name.lower()] = labels
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
+    def visit(st: Assign) -> None:
+        factor_rep = _factor_rep_string_info(st.expr.strip())
+        if factor_rep is not None:
+            out[st.name.lower()] = factor_rep[0]
+            return
+        cinfo = parse_call_text(st.expr.strip())
+        if cinfo is not None and cinfo[0].lower() == "sample":
+            x_src = cinfo[1][0] if cinfo[1] else cinfo[2].get("x")
+            labels = _parse_string_c_vector(x_src.strip()) if x_src is not None else None
+            if labels is not None:
+                out[st.name.lower()] = labels
 
-    walk(stmts)
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
@@ -25112,27 +25101,16 @@ def collect_table_labels(stmts: list[object], categorical_labels: dict[str, list
     def _labels_for(src: str) -> list[str] | None:
         return categorical_labels.get(src.strip().lower())
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                cinfo = parse_call_text(st.expr.strip())
-                if cinfo is not None and cinfo[0].lower() == "table":
-                    vals = list(cinfo[1]) + list(cinfo[2].values())
-                    if len(vals) == 1:
-                        out[st.name.lower()] = (_labels_for(vals[0]), None)
-                    elif len(vals) >= 2:
-                        out[st.name.lower()] = (_labels_for(vals[0]) or [], _labels_for(vals[1]) or [])
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
+    def visit(st: Assign) -> None:
+        cinfo = parse_call_text(st.expr.strip())
+        if cinfo is not None and cinfo[0].lower() == "table":
+            vals = list(cinfo[1]) + list(cinfo[2].values())
+            if len(vals) == 1:
+                out[st.name.lower()] = (_labels_for(vals[0]), None)
+            elif len(vals) >= 2:
+                out[st.name.lower()] = (_labels_for(vals[0]) or [], _labels_for(vals[1]) or [])
 
-    walk(stmts)
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
@@ -25140,23 +25118,12 @@ def collect_character_index_aliases(stmts: list[object]) -> dict[str, str]:
     """Track character label vectors created by indexing labels with integer codes."""
     out: dict[str, str] = {}
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                m = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]\s*$", st.expr.strip())
-                if m is not None:
-                    out[st.name.lower()] = m.group(2)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
+    def visit(st: Assign) -> None:
+        m = re.match(r"^([A-Za-z]\w*)\s*\[\s*([A-Za-z]\w*)\s*\]\s*$", st.expr.strip())
+        if m is not None:
+            out[st.name.lower()] = m.group(2)
 
-    walk(stmts)
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
