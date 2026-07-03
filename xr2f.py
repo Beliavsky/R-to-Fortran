@@ -7480,7 +7480,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:rle|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:rle|sapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -17461,6 +17461,44 @@ def emit_stmts(
                     _wstmt(f"{st.name} = r_seq_int({a_f}, {b_f})", st.comment)
                     need_r_mod.add("r_seq_int")
                 continue
+            sapply_lam = _parse_sapply_shorthand_lambda(rhs)
+            if sapply_lam is not None:
+                x_src, arg_nm, body_src = sapply_lam
+                idx_nm = f"xr2f_sapply_i_{st.name}"
+                x_f = r_expr_to_fortran(x_src)
+                elem_f = f"real({x_f}({idx_nm}), kind=dp)"
+                body_sub = re.sub(rf"\b{re.escape(arg_nm)}\b", elem_f, body_src)
+                _wstmt("block", st.comment)
+                o.push()
+                o.w(f"integer :: {idx_nm}")
+                o.w(f"allocate({st.name}(size({x_f})))")
+                o.w(f"do {idx_nm} = 1, size({x_f})")
+                o.push()
+                body_f = r_expr_to_fortran(body_sub)
+                for fn_name in sorted(_USER_FUNC_ARG_KIND, key=len, reverse=True):
+                    kinds_fn = _USER_FUNC_ARG_KIND.get(fn_name.lower(), [])
+                    if "integer" not in kinds_fn:
+                        continue
+
+                    def _coerce_integer_actuals(inner: str, kinds_fn: list[str] = kinds_fn, fn_name: str = fn_name) -> str:
+                        parts = split_top_level_commas(inner)
+                        out_parts: list[str] = []
+                        for pos_i, part in enumerate(parts):
+                            part_s = part.strip()
+                            if pos_i < len(kinds_fn) and kinds_fn[pos_i] == "integer":
+                                c_arg = parse_call_text(part_s)
+                                if c_arg is not None and _USER_FUNC_RETURN_KIND.get(c_arg[0].lower()) == "real":
+                                    part_s = f"int({part_s})"
+                            out_parts.append(part_s)
+                        return f"{fn_name}({', '.join(out_parts)})"
+
+                    body_f = _replace_balanced_func_calls(body_f, fn_name, _coerce_integer_actuals)
+                _wstmt(f"{st.name}({idx_nm}) = {body_f}", None)
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             c_lm = parse_call_text(rhs)
             c_outer = parse_call_text(rhs)
             if c_outer is not None and c_outer[0].lower() == "outer":
@@ -20146,6 +20184,43 @@ def emit_stmts(
                             if arg_cat.lower() in date_scalar_vars_ctx:
                                 out_items.append(f"date_format({r_expr_to_fortran(arg_cat)}, {r_expr_to_fortran(fmt_cat)})")
                                 need_r_mod.add("date_format")
+                                continue
+                        if c_cat_item is not None and c_cat_item[0].lower() == "paste":
+                            sep_cat = c_cat_item[2].get("sep", '" "').strip()
+                            collapse_cat = c_cat_item[2].get("collapse")
+                            if collapse_cat is None and _dequote_string_literal(sep_cat) == " ":
+                                for p_cat in c_cat_item[1]:
+                                    p_cat_s = p_cat.strip()
+                                    lit_p_cat = _dequote_string_literal(p_cat_s)
+                                    if lit_p_cat is not None and re.fullmatch(r"(?:\\n|\n)+", lit_p_cat):
+                                        newline_count = len(re.findall(r"\\n|\n", lit_p_cat))
+                                        for _i_newline in range(newline_count):
+                                            if out_items:
+                                                _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
+                                                out_items = []
+                                            else:
+                                                _wstmt("write(*,*)", "")
+                                            just_flushed_cat_line = True
+                                        continue
+                                    if lit_p_cat is not None and ("\\n" in lit_p_cat or "\n" in lit_p_cat):
+                                        parts_p_cat = re.split(r"(?:\\n|\n)", lit_p_cat)
+                                        for ip_p_cat, part_p_cat in enumerate(parts_p_cat):
+                                            lit2_p_cat = part_p_cat.replace("\\t", " ")
+                                            if lit2_p_cat:
+                                                out_items.append(_fortran_str_literal(lit2_p_cat))
+                                                just_flushed_cat_line = False
+                                            if ip_p_cat < len(parts_p_cat) - 1:
+                                                if out_items:
+                                                    _wstmt('write(*,"(*(g0,:,1x))") ' + ", ".join(out_items), st.comment)
+                                                    out_items = []
+                                                else:
+                                                    _wstmt("write(*,*)", "")
+                                                just_flushed_cat_line = True
+                                        continue
+                                    out_items.append(r_expr_to_fortran(p_cat_s))
+                                    just_flushed_cat_line = False
+                                if not just_flushed_cat_line:
+                                    out_items.append(_fortran_str_literal(""))
                                 continue
                         item_f = _display_expr_to_fortran(a)
                         if re.fullmatch(r"[A-Za-z]\w*", item_f.strip()) and item_f.strip() in char_scalar_vars:
@@ -25349,6 +25424,18 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
     return out
 
 
+def _parse_sapply_shorthand_lambda(expr: str) -> tuple[str, str, str] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "sapply" or len(cinfo[1]) < 2:
+        return None
+    x_src = cinfo[1][0].strip()
+    lam_src = cinfo[1][1].strip()
+    m_lam = re.match(r"^\\\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", lam_src, re.DOTALL)
+    if m_lam is None:
+        return None
+    return x_src, m_lam.group(1), m_lam.group(2).strip()
+
+
 def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set[str]:
     """Find rank-1 logical mask variables assigned from vector predicates."""
     out: set[str] = set()
@@ -25379,6 +25466,14 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
                 and _USER_FUNC_RETURN_RANK.get(c_user_log[0].lower(), 0) >= 1
             ):
                 is_logical_vec = True
+            if not is_logical_vec:
+                sapply_lam = _parse_sapply_shorthand_lambda(rhs)
+                if sapply_lam is not None:
+                    _x_src, _arg_nm, body_src = sapply_lam
+                    is_logical_vec = _expr_kind_simple(body_src) == "logical" or any(
+                        _split_top_level_token(body_src, op, from_right=True) is not None
+                        for op in ["==", "!=", ">=", "<=", ">", "<", "&&", "||", "&", "|"]
+                    )
         if (not is_logical_vec) and any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
             names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
             rhs_f = r_expr_to_fortran(rhs)
