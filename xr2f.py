@@ -147,6 +147,7 @@ _CALL_COERCION_WARNINGS: set[tuple[str, str, str]] = set()
 _SUPPRESS_WARNINGS = False
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
+_COMMAND_ARGS_FILE_ARG: str | None = None
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
 DEFAULT_COMPILER = "gfortran -O3 -march=native -Wfatal-errors"
 IFX_COMPILER = "ifx /O2 /heap-arrays" if sys.platform.startswith("win") else "ifx -O2"
@@ -6756,10 +6757,11 @@ def _replace_idents(expr: str, mapping: dict[str, str]) -> str:
         "as.character",
     }
     for old in sorted(mapping.keys(), key=len, reverse=True):
+        ident_pat = rf"(?<![A-Za-z0-9_.]){re.escape(old)}(?![A-Za-z0-9_.])"
         if old.lower() in builtin_calls:
-            pat = rf"\b{re.escape(old)}\b(?!\s*\()"
+            pat = ident_pat + r"(?!\s*\()"
         else:
-            pat = rf"\b{re.escape(old)}\b"
+            pat = ident_pat
         out = re.sub(pat, mapping[old], out)
     return out
 
@@ -7409,6 +7411,14 @@ def _replace_name_in_stmt(st: object, name: str, repl: str) -> object:
     if simple_f_re.fullmatch(r) or simple_r_re.fullmatch(r):
         return _rename_stmt_obj(st, {name: r})
     return _rename_stmt_obj(st, {name: f"({r})"})
+
+
+def _r_condition_to_fortran(expr: str) -> str:
+    cond = r_expr_to_fortran(expr)
+    m_size = re.fullmatch(r"\s*size\s*\((.+)\)\s*", cond, re.IGNORECASE)
+    if m_size is not None:
+        return f"size({m_size.group(1).strip()}) > 0"
+    return cond
 
 
 def _is_print_only_loop_over_value(ss: list[object], var: str, *, exact_var_only: bool = False) -> bool:
@@ -8503,6 +8513,20 @@ def _literal_c_kind(expr: str) -> str | None:
     if any(_dequote_string_literal(v) is not None for v in vals):
         return "character"
     return None
+
+
+def _command_args_replacement(inner: str) -> str:
+    trailing_only = False
+    c = parse_call_text(f"commandArgs({inner})")
+    if c is not None:
+        args, kwargs = c[1], c[2]
+        value = kwargs.get("trailingOnly", kwargs.get("trailing.only", ""))
+        if not value and args:
+            value = args[0]
+        trailing_only = value.strip().upper() in {"TRUE", "T", ".TRUE."}
+    if trailing_only or not _COMMAND_ARGS_FILE_ARG:
+        return f"r_command_args({'.true.' if trailing_only else '.false.'})"
+    return f"r_command_args(.false., {_fortran_str_literal('--file=' + _COMMAND_ARGS_FILE_ARG)})"
 
 
 def _simple_vector_constructor_array_kind(expr: str) -> str | None:
@@ -10041,7 +10065,7 @@ def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src:
 
 
 def r_expr_to_fortran(expr: str) -> str:
-    global _R_SD_CALL_NAME
+    global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
     s = fscan.strip_redundant_outer_parens_expr(s)
     try_primary = _trycatch_primary_expr(s)
@@ -10244,6 +10268,8 @@ def r_expr_to_fortran(expr: str) -> str:
             idx_inner = _int_bound_expr(r_expr_to_fortran(inner_src.strip()))
             return f"{base_dbl}(:, :, {idx_inner}, {idx_outer})"
         idx_dbl = _int_bound_expr(r_expr_to_fortran(idx_dbl_src))
+        if base_dbl.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+            return f"{base_dbl}({idx_dbl})"
         if base_dbl.lower() in _KNOWN_RANK3_NAMES:
             return f"{base_dbl}(:, :, {idx_dbl})"
         if base_dbl.lower() in _KNOWN_MATRIX_NAMES:
@@ -14200,7 +14226,7 @@ def r_expr_to_fortran(expr: str) -> str:
         lambda inner: f"all(ieee_is_finite({r_expr_to_fortran(inner.strip())}), dim=2)",
     )
     s = _replace_balanced_func_calls(s, "typeof", lambda inner: f"r_typeof({r_expr_to_fortran(inner)})")
-    s = _replace_balanced_func_calls(s, "commandArgs", lambda inner: "r_command_args()")
+    s = _replace_balanced_func_calls(s, "commandArgs", _command_args_replacement)
     def _tri_to_fortran(inner: str, fn_name: str) -> str:
         parts = split_top_level_commas(inner)
         x_src = parts[0].strip() if parts else ""
@@ -14253,6 +14279,12 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"grep({inner})"
             pat_f = r_expr_to_fortran(pat_src)
             x_f = r_expr_to_fortran(x_src)
+            value_src = kw_gp.get("value", "").strip()
+            if value_src.upper() in {"TRUE", "T", ".TRUE."} and (
+                (re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES)
+                or re.match(r"^(?:commandArgs|r_command_args)\s*\(", x_src, re.IGNORECASE)
+            ):
+                return f"grep_value_char({pat_f}, {x_f})"
             if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                 return f"pack([(i_gr, i_gr=1,size({x_f}))], [(index({x_f}(i_gr), {pat_f}) > 0, i_gr=1,size({x_f}))])"
         return f"grep({inner})"
@@ -17251,6 +17283,19 @@ def emit_stmts(
             if _emit_assign_user_vector_call_scalar(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_assign_array_expr_scalar_subset(st.name, st.expr.strip(), st.comment):
+                continue
+            c_grep_char_assign = parse_call_text(st.expr.strip())
+            if (
+                c_grep_char_assign is not None
+                and c_grep_char_assign[0].lower() == "grep"
+                and c_grep_char_assign[2].get("value", "").strip().upper() in {"TRUE", "T", ".TRUE."}
+            ):
+                _wstmt(f"{st.name} = {r_expr_to_fortran(st.expr.strip())}", st.comment)
+                continue
+            if re.match(r"^\s*grep\s*\(", st.expr.strip(), re.IGNORECASE) and re.search(
+                r"\bvalue\s*=\s*(?:TRUE|T|\.true\.)\b", st.expr.strip(), re.IGNORECASE
+            ):
+                _wstmt(f"{st.name} = {r_expr_to_fortran(st.expr.strip())}", st.comment)
                 continue
             c_scale_track = parse_call_text(st.expr.strip())
             if c_scale_track is not None and c_scale_track[0].lower() == "scale":
@@ -20517,11 +20562,11 @@ def emit_stmts(
                     rhs_t = r_expr_to_fortran(a_then.expr)
                     rhs_e = r_expr_to_fortran(a_else.expr)
                     if _is_simple_value_for_merge(rhs_t) and _is_simple_value_for_merge(rhs_e):
-                        cond_f = r_expr_to_fortran(st.cond)
+                        cond_f = _r_condition_to_fortran(st.cond)
                         o.w(f"{a_then.name} = merge({rhs_t}, {rhs_e}, {cond_f})")
                         continue
 
-            o.w(f"if ({r_expr_to_fortran(st.cond)}) then")
+            o.w(f"if ({_r_condition_to_fortran(st.cond)}) then")
             o.push()
             emit_stmts(o, st.then_body, need_rnorm, params, alloc_seen, helper_ctx)
             o.pop()
@@ -22355,7 +22400,7 @@ def emit_function(
     purity_texts = _collect_stmt_expr_texts(body_stmts) + ([last.expr] if isinstance(last, ExprStmt) else [])
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
-    if any(re.search(r"\b(?:dir\.exists|dir_exists|dir|list\.files|list_files|file\.info|file_info|scan|scan_real|tempfile|file\.path|file_path)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
+    if any(re.search(r"\b(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.exists|dir_exists|dir|list\.files|list_files|file\.info|file_info|scan|scan_real|tempfile|file\.path|file_path)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
     if any(re.search(r"\b(?:lm\.fit|qr|qr\.coef|qr\.resid|qr_coef|qr_resid)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
@@ -25363,6 +25408,14 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
                     out.add(st.name)
                 if rhs.lower().startswith("list.files(") or rhs.lower().startswith("list_files(") or rhs.lower().startswith("dir("):
                     out.add(st.name)
+                c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0].lower() == "grep":
+                    value_src = c_rhs[2].get("value", "").strip()
+                    x_src = c_rhs[1][1].strip() if len(c_rhs[1]) >= 2 else c_rhs[2].get("x", "").strip()
+                    if value_src.upper() in {"TRUE", "T"} and (
+                        x_src.lower() in out or x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES or x_src.lower().startswith("commandargs(")
+                    ):
+                        out.add(st.name)
                 if re.match(r"^(?:format|date_format_vec)\s*\(", rhs, re.IGNORECASE):
                     out.add(st.name)
                 m_idx = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
@@ -27571,6 +27624,7 @@ def transpile_r_to_fortran(
     recycle_stop: bool = False,
     fortran_comments: bool = True,
     obfuscate: bool = False,
+    source_path: str | None = None,
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
@@ -27580,10 +27634,11 @@ def transpile_r_to_fortran(
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
-    global _R_SD_CALL_NAME
+    global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     global _CALL_COERCION_WARNINGS
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
+    _COMMAND_ARGS_FILE_ARG = source_path
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
     _DOTTED_VAR_RENAMES = {}
@@ -31509,7 +31564,7 @@ def transpile_r_to_fortran(
         any("r_character(" in ln for ln in pbody.lines)
         or any("r_character(" in ln for ln in mprocs.lines)
     ))
-    emit_local_command_args = (
+    emit_local_command_args = (not has_r_mod_emit) and (
         any("r_command_args(" in ln for ln in pbody.lines)
         or any("r_command_args(" in ln for ln in mprocs.lines)
     )
@@ -31530,22 +31585,35 @@ def transpile_r_to_fortran(
         or any("solve_real(" in ln for ln in mprocs.lines)
     ) and (not has_r_mod_main)
     if emit_local_command_args:
-        mprocs.w("function r_command_args() result(out)")
+        mprocs.w("function r_command_args(trailing_only, file_arg) result(out)")
+        mprocs.w("logical, intent(in) :: trailing_only")
+        mprocs.w("character(len=*), intent(in), optional :: file_arg")
         mprocs.w("character(len=:), allocatable :: out(:)")
-        mprocs.w("integer :: i, n, stat")
+        mprocs.w("integer :: i, n, stat, arg_len, out_len, prefix")
         mprocs.w("character(len=4096) :: buf")
         mprocs.w("n = command_argument_count()")
-        mprocs.w("allocate(character(len=4096) :: out(n))")
+        mprocs.w("prefix = 0")
+        mprocs.w("if (.not. trailing_only .and. present(file_arg)) prefix = 1")
+        mprocs.w("out_len = 1")
+        mprocs.w("if (prefix == 1) out_len = max(out_len, len(file_arg))")
+        mprocs.w("do i = 1, n")
+        mprocs.push()
+        mprocs.w("call get_command_argument(i, length=arg_len, status=stat)")
+        mprocs.w("if (stat == 0) out_len = max(out_len, arg_len)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("allocate(character(len=out_len) :: out(n + prefix))")
+        mprocs.w("if (prefix == 1) out(1) = file_arg")
         mprocs.w("do i = 1, n")
         mprocs.push()
         mprocs.w("call get_command_argument(i, buf, status=stat)")
         mprocs.w("if (stat == 0) then")
         mprocs.push()
-        mprocs.w("out(i) = trim(buf)")
+        mprocs.w("out(i + prefix) = trim(buf)")
         mprocs.pop()
         mprocs.w("else")
         mprocs.push()
-        mprocs.w('out(i) = ""')
+        mprocs.w('out(i + prefix) = ""')
         mprocs.pop()
         mprocs.w("end if")
         mprocs.pop()
@@ -32348,6 +32416,7 @@ def transpile_r_to_fortran(
         "dir_create",
         "list_files",
         "scan_real",
+        "grep_value_char",
         "strsplit_fixed",
         "toupper",
         "tolower",
@@ -32409,6 +32478,7 @@ def transpile_r_to_fortran(
         "print_rle",
         "r_typeof",
         "r_character",
+        "r_command_args",
         "rank_average",
         "rank_first",
         "det_real",
@@ -42698,6 +42768,12 @@ def repair_character_vector_subset_renames_text(f90: str) -> str:
         )
     for base in sorted(char_vecs, key=len, reverse=True):
         out = re.sub(
+            rf"\b{re.escape(base)}\s*\(\s*:\s*,\s*([^)]+?)\s*\)",
+            rf"{base}(\1)",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(
             rf"\bcall\s+print_real_vector\s*\(\s*real\s*\(\s*{re.escape(base)}\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
             f"call print_char_vector({base})",
             out,
@@ -49241,6 +49317,7 @@ def main() -> int:
                 recycle_stop=args.recycle_stop,
                 fortran_comments=(not args.no_fortran_comments),
                 obfuscate=(args.obfuscate and not source_already_obfuscated),
+                source_path=str(out_path.resolve()),
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
