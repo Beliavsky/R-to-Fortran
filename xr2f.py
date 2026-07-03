@@ -24981,107 +24981,96 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
 def infer_main_character_arrays(stmts: list[object]) -> set[str]:
     """Find vector vars assigned from c("...")-style character constructors."""
     out: set[str] = set()
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs = st.expr.strip()
-                low = rhs.lower()
-                if low.startswith("commandargs("):
-                    out.add(st.name)
-                    continue
-                if low.startswith("character("):
-                    out.add(st.name)
-                    continue
-                if low.startswith("strsplit("):
-                    out.add(st.name)
-                    continue
-                if low.startswith("list.files(") or low.startswith("list_files(") or low.startswith("dir("):
-                    out.add(st.name)
-                    continue
-                c_rhs = parse_call_text(rhs)
-                if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
-                    out.add(st.name)
-                    continue
-                if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
-                    arg = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
-                    if _is_date_vector_source(arg):
-                        out.add(st.name)
-                        continue
-                if c_rhs is not None and c_rhs[0].lower() in {"read_csv_header_names", "lag_names", "ar_coef_names"}:
-                    out.add(st.name)
-                    continue
-                if c_rhs is not None and c_rhs[0].lower() in {"rownames", "colnames", "names"}:
-                    out.add(st.name)
-                    continue
-                if c_rhs is not None and c_rhs[0].lower() == "ifelse":
-                    args_ifelse_chr = c_rhs[1]
-                    yes_chr = c_rhs[2].get("yes", args_ifelse_chr[1] if len(args_ifelse_chr) >= 2 else "")
-                    no_chr = c_rhs[2].get("no", args_ifelse_chr[2] if len(args_ifelse_chr) >= 3 else "")
-                    if _expr_returns_character(yes_chr.strip()) or _expr_returns_character(no_chr.strip()):
-                        out.add(st.name)
-                        continue
-                if c_rhs is not None and c_rhs[0].lower() == "setdiff" and c_rhs[1]:
-                    src = c_rhs[1][0].strip()
-                    src_call = parse_call_text(src)
-                    if (
-                        src.lower() in {x.lower() for x in out}
-                        or src.lower() in _KNOWN_CHAR_VECTOR_NAMES
-                        or (src_call is not None and src_call[0].lower() in {"names", "read_csv_header_names"})
-                    ):
-                        out.add(st.name)
-                    continue
-                if c_rhs is not None and c_rhs[0].lower() == "unique":
-                    src = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
-                    if src.lower() in {x.lower() for x in out} or src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
-                        out.add(st.name)
-                    continue
-                m_char_subset = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
-                if m_char_subset is not None and m_char_subset.group(1).lower() in {x.lower() for x in out}:
-                    idx_txt = rhs[rhs.find("[") + 1 : rhs.rfind("]")].strip()
-                    vectorish_subset = (
-                        ":" in idx_txt
-                        or "," in idx_txt
-                        or any(op in idx_txt for op in ["==", "!=", ">=", "<=", ">", "<"])
-                        or ".and." in idx_txt.lower()
-                        or ".or." in idx_txt.lower()
-                        or idx_txt.lower().startswith(("seq", "which", "c("))
-                    )
-                    if not vectorish_subset:
-                        continue
-                    out.add(st.name)
-                    continue
-                if not low.startswith("c("):
-                    continue
-                cinfo = c_rhs
-                if cinfo is None:
-                    continue
-                _nm, pos, _kw = cinfo
-                if not pos:
-                    continue
-                all_chr = True
-                for a in pos:
-                    aa = a.strip()
-                    if _dequote_string_literal(aa) is not None:
-                        continue
-                    if aa.upper() == "NA_CHARACTER_":
-                        continue
-                    if _expr_returns_character(aa):
-                        continue
-                    all_chr = False
-                    break
-                if all_chr:
-                    out.add(st.name)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
 
-    walk(stmts)
+    def visit(st: Assign) -> None:
+        rhs = st.expr.strip()
+        low = rhs.lower()
+        if low.startswith("commandargs("):
+            out.add(st.name)
+            return
+        if low.startswith("character("):
+            out.add(st.name)
+            return
+        if low.startswith("strsplit("):
+            out.add(st.name)
+            return
+        if low.startswith("list.files(") or low.startswith("list_files(") or low.startswith("dir("):
+            out.add(st.name)
+            return
+        c_rhs = parse_call_text(rhs)
+        if c_rhs is not None and c_rhs[0].lower() in {"arma_coef_names"}:
+            out.add(st.name)
+            return
+        if c_rhs is not None and c_rhs[0].lower() in {"as.character", "format"}:
+            arg = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+            if _is_date_vector_source(arg):
+                out.add(st.name)
+                return
+        if c_rhs is not None and c_rhs[0].lower() in {"read_csv_header_names", "lag_names", "ar_coef_names"}:
+            out.add(st.name)
+            return
+        if c_rhs is not None and c_rhs[0].lower() in {"rownames", "colnames", "names"}:
+            out.add(st.name)
+            return
+        if c_rhs is not None and c_rhs[0].lower() == "ifelse":
+            args_ifelse_chr = c_rhs[1]
+            yes_chr = c_rhs[2].get("yes", args_ifelse_chr[1] if len(args_ifelse_chr) >= 2 else "")
+            no_chr = c_rhs[2].get("no", args_ifelse_chr[2] if len(args_ifelse_chr) >= 3 else "")
+            if _expr_returns_character(yes_chr.strip()) or _expr_returns_character(no_chr.strip()):
+                out.add(st.name)
+                return
+        if c_rhs is not None and c_rhs[0].lower() == "setdiff" and c_rhs[1]:
+            src = c_rhs[1][0].strip()
+            src_call = parse_call_text(src)
+            if (
+                src.lower() in {x.lower() for x in out}
+                or src.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                or (src_call is not None and src_call[0].lower() in {"names", "read_csv_header_names"})
+            ):
+                out.add(st.name)
+            return
+        if c_rhs is not None and c_rhs[0].lower() == "unique":
+            src = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+            if src.lower() in {x.lower() for x in out} or src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                out.add(st.name)
+            return
+        m_char_subset = re.match(r"^([A-Za-z]\w*)\s*\[[^\]]+\]\s*$", rhs)
+        if m_char_subset is not None and m_char_subset.group(1).lower() in {x.lower() for x in out}:
+            idx_txt = rhs[rhs.find("[") + 1 : rhs.rfind("]")].strip()
+            vectorish_subset = (
+                ":" in idx_txt
+                or "," in idx_txt
+                or any(op in idx_txt for op in ["==", "!=", ">=", "<=", ">", "<"])
+                or ".and." in idx_txt.lower()
+                or ".or." in idx_txt.lower()
+                or idx_txt.lower().startswith(("seq", "which", "c("))
+            )
+            if vectorish_subset:
+                out.add(st.name)
+            return
+        if not low.startswith("c("):
+            return
+        cinfo = c_rhs
+        if cinfo is None:
+            return
+        _nm, pos, _kw = cinfo
+        if not pos:
+            return
+        all_chr = True
+        for a in pos:
+            aa = a.strip()
+            if _dequote_string_literal(aa) is not None:
+                continue
+            if aa.upper() == "NA_CHARACTER_":
+                continue
+            if _expr_returns_character(aa):
+                continue
+            all_chr = False
+            break
+        if all_chr:
+            out.add(st.name)
+
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
