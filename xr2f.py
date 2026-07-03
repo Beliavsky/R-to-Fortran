@@ -26131,87 +26131,75 @@ def collect_rownames_sources(stmts: list[object]) -> dict[str, str]:
     def key_for_target(txt: str) -> str:
         return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs = st.expr.strip()
-                m_alias = re.fullmatch(r"[A-Za-z]\w*", rhs)
-                if m_alias is not None:
-                    src = sources.get(m_alias.group(0).lower())
+    def visit(st: object) -> None:
+        if isinstance(st, Assign):
+            rhs = st.expr.strip()
+            m_alias = re.fullmatch(r"[A-Za-z]\w*", rhs)
+            if m_alias is not None:
+                src = sources.get(m_alias.group(0).lower())
+                if isinstance(src, str):
+                    sources[key_for_target(st.name)] = src
+            c_rhs = parse_call_text(rhs)
+            if c_rhs is not None and c_rhs[0].lower() in {"cor", "cov", "cov2cor"} and c_rhs[1]:
+                src_nm = c_rhs[1][0].strip()
+                col_sources = collect_colname_sources(stmts)
+                src = col_sources.get(src_nm.lower())
+                sources[key_for_target(st.name)] = src if isinstance(src, str) else f"colnames({src_nm})"
+            if c_rhs is not None and c_rhs[0].lower() in {"cbind", "cbind2"}:
+                first_arg = c_rhs[1][0].strip() if c_rhs[1] else next(iter(c_rhs[2].values()), "").strip()
+                m_first = re.fullmatch(r"[A-Za-z]\w*", first_arg)
+                if m_first is not None:
+                    sources[key_for_target(st.name)] = f"names({m_first.group(0)})"
+            if c_rhs is not None and c_rhs[0].lower() == "t" and c_rhs[1]:
+                c_inner = parse_call_text(c_rhs[1][0].strip())
+                if (
+                    c_inner is not None
+                    and c_inner[0].lower() == "apply"
+                    and len(c_inner[1]) >= 2
+                    and c_inner[1][1].strip() == "2"
+                ):
+                    src_nm = c_inner[1][0].strip()
+                    sources[key_for_target(st.name)] = f"colnames({src_nm})"
+            m_apply_open = re.match(
+                r"^t\s*\(\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*2L?\s*,\s*function\s*\([^)]*\)\s*(?:\{\s*)?$",
+                rhs,
+                re.IGNORECASE,
+            )
+            if m_apply_open is not None:
+                sources[key_for_target(st.name)] = f"colnames({m_apply_open.group(1)})"
+            has_top_arith = any(
+                _split_top_level_token(rhs, tok, from_right=True) is not None
+                for tok in ("+", "-", "*", "/")
+            )
+            if key_for_target(st.name) not in sources and has_top_arith:
+                candidates = [
+                    m.group(1).lower()
+                    for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", rhs)
+                ]
+                for cand in reversed(candidates):
+                    src = sources.get(cand)
                     if isinstance(src, str):
                         sources[key_for_target(st.name)] = src
-                c_rhs = parse_call_text(rhs)
-                if c_rhs is not None and c_rhs[0].lower() in {"cor", "cov", "cov2cor"} and c_rhs[1]:
-                    src_nm = c_rhs[1][0].strip()
-                    col_sources = collect_colname_sources(stmts)
-                    src = col_sources.get(src_nm.lower())
-                    sources[key_for_target(st.name)] = src if isinstance(src, str) else f"colnames({src_nm})"
-                if c_rhs is not None and c_rhs[0].lower() in {"cbind", "cbind2"}:
-                    first_arg = c_rhs[1][0].strip() if c_rhs[1] else next(iter(c_rhs[2].values()), "").strip()
-                    m_first = re.fullmatch(r"[A-Za-z]\w*", first_arg)
-                    if m_first is not None:
-                        sources[key_for_target(st.name)] = f"names({m_first.group(0)})"
-                if c_rhs is not None and c_rhs[0].lower() == "t" and c_rhs[1]:
-                    c_inner = parse_call_text(c_rhs[1][0].strip())
-                    if (
-                        c_inner is not None
-                        and c_inner[0].lower() == "apply"
-                        and len(c_inner[1]) >= 2
-                        and c_inner[1][1].strip() == "2"
-                    ):
-                        src_nm = c_inner[1][0].strip()
-                        sources[key_for_target(st.name)] = f"colnames({src_nm})"
-                m_apply_open = re.match(
-                    r"^t\s*\(\s*apply\s*\(\s*([A-Za-z]\w*)\s*,\s*2L?\s*,\s*function\s*\([^)]*\)\s*(?:\{\s*)?$",
-                    rhs,
-                    re.IGNORECASE,
-                )
-                if m_apply_open is not None:
-                    sources[key_for_target(st.name)] = f"colnames({m_apply_open.group(1)})"
-                has_top_arith = any(
-                    _split_top_level_token(rhs, tok, from_right=True) is not None
-                    for tok in ("+", "-", "*", "/")
-                )
-                if key_for_target(st.name) not in sources and has_top_arith:
-                    candidates = [
-                        m.group(1).lower()
-                        for m in re.finditer(r"(?:^|[^A-Za-z0-9_])([A-Za-z]\w*)\b", rhs)
-                    ]
-                    for cand in reversed(candidates):
-                        src = sources.get(cand)
-                        if isinstance(src, str):
-                            sources[key_for_target(st.name)] = src
-                            break
-            if isinstance(st, ExprStmt):
-                m = re.match(
-                    rf"^\s*rownames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
-                    st.expr.strip(),
-                    re.IGNORECASE,
-                )
-                if m is not None:
-                    sources[key_for_target(m.group(1))] = m.group(2).strip()
-                m_dim = re.match(
-                    rf"^\s*dimnames\s*\(\s*{target_pat}\s*\)\s*<-\s*list\s*\((.*)\)\s*$",
-                    st.expr.strip(),
-                    re.IGNORECASE,
-                )
-                if m_dim is not None:
-                    parts = split_top_level_commas(m_dim.group(2))
-                    if parts:
-                        sources[key_for_target(m_dim.group(1))] = parts[0].strip()
-            elif isinstance(st, FuncDef):
-                walk(st.body)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
+                        break
+        if isinstance(st, ExprStmt):
+            m = re.match(
+                rf"^\s*rownames\s*\(\s*{target_pat}\s*\)\s*<-\s*(.+)$",
+                st.expr.strip(),
+                re.IGNORECASE,
+            )
+            if m is not None:
+                sources[key_for_target(m.group(1))] = m.group(2).strip()
+            m_dim = re.match(
+                rf"^\s*dimnames\s*\(\s*{target_pat}\s*\)\s*<-\s*list\s*\((.*)\)\s*$",
+                st.expr.strip(),
+                re.IGNORECASE,
+            )
+            if m_dim is not None:
+                parts = split_top_level_commas(m_dim.group(2))
+                if parts:
+                    sources[key_for_target(m_dim.group(1))] = parts[0].strip()
 
-    walk(stmts)
+    _walk_statements_recursive(stmts, visit)
     return sources
 
 
