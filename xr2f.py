@@ -21260,56 +21260,28 @@ def _ls_str_function_summary(f: FuncDef) -> str:
 def infer_local_logical_scalars(stmts: list[object]) -> set[str]:
     out: set[str] = set()
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs = st.expr.strip()
-                if _expr_kind_simple(rhs) == "logical":
-                    out.add(st.name)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
-            elif isinstance(st, SwitchStmt):
-                for _label, body in st.cases:
-                    walk(body)
-                walk(st.default_body)
+    def visit(st: object) -> None:
+        if isinstance(st, Assign):
+            rhs = st.expr.strip()
+            if _expr_kind_simple(rhs) == "logical":
+                out.add(st.name)
 
-    walk(stmts)
+    _walk_statements_recursive(stmts, visit)
     return out
 
 
 def infer_local_logical_arrays(stmts: list[object]) -> set[str]:
     out: set[str] = set()
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs = st.expr.strip()
-                if re.match(r"^(?:rep|rep_len)\s*\(\s*(?:FALSE|TRUE)\b", rhs, re.IGNORECASE) or re.match(
-                    r"^logical\s*\(", rhs, re.IGNORECASE
-                ):
-                    out.add(st.name)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
-            elif isinstance(st, SwitchStmt):
-                for _label, body in st.cases:
-                    walk(body)
-                walk(st.default_body)
+    def visit(st: object) -> None:
+        if isinstance(st, Assign):
+            rhs = st.expr.strip()
+            if re.match(r"^(?:rep|rep_len)\s*\(\s*(?:FALSE|TRUE)\b", rhs, re.IGNORECASE) or re.match(
+                r"^logical\s*\(", rhs, re.IGNORECASE
+            ):
+                out.add(st.name)
 
-    walk(stmts)
+    _walk_statements_recursive(stmts, visit)
     return out
 
 
