@@ -24603,6 +24603,29 @@ def _walk_assignments_recursive(stmts: list[object], visit: Callable[[Assign], N
             _walk_assignments_recursive(st.default_body, visit)
 
 
+def _walk_statements_recursive(stmts: list[object], visit: Callable[[object], None]) -> None:
+    for st in stmts:
+        visit(st)
+        if isinstance(st, FuncDef):
+            _walk_statements_recursive(st.body, visit)
+        elif isinstance(st, IfStmt):
+            _walk_statements_recursive(st.then_body, visit)
+            _walk_statements_recursive(st.else_body, visit)
+        elif isinstance(st, ForStmt):
+            _walk_statements_recursive(st.body, visit)
+        elif isinstance(st, WhileStmt):
+            _walk_statements_recursive(st.body, visit)
+        elif isinstance(st, RepeatStmt):
+            _walk_statements_recursive(st.body, visit)
+        elif isinstance(st, SwitchStmt):
+            for case in st.cases:
+                if isinstance(case, tuple):
+                    _walk_statements_recursive(case[1], visit)
+                else:
+                    _walk_statements_recursive(case.body, visit)
+            _walk_statements_recursive(st.default_body, visit)
+
+
 def _propagate_simple_alias_names(stmts: list[object], names: set[str]) -> None:
     changed = True
     while changed:
@@ -26401,29 +26424,18 @@ def collect_names_sources(stmts: list[object]) -> dict[str, str]:
     def key_for_target(txt: str) -> str:
         return re.sub(r"\s+", "", txt.strip().replace("$", "%")).lower()
 
-    def walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, ExprStmt):
-                m = re.match(
-                    rf"^\s*names\s*\(\s*{target_pat}\s*\)\s*(?:<-|=)\s*(.+)$",
-                    st.expr.strip(),
-                    re.IGNORECASE,
-                )
-                if m is not None:
-                    sources[key_for_target(m.group(1))] = m.group(2).strip()
-            elif isinstance(st, FuncDef):
-                walk(st.body)
-            elif isinstance(st, IfStmt):
-                walk(st.then_body)
-                walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                walk(st.body)
-            elif isinstance(st, WhileStmt):
-                walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                walk(st.body)
+    def visit(st: object) -> None:
+        if not isinstance(st, ExprStmt):
+            return
+        m = re.match(
+            rf"^\s*names\s*\(\s*{target_pat}\s*\)\s*(?:<-|=)\s*(.+)$",
+            st.expr.strip(),
+            re.IGNORECASE,
+        )
+        if m is not None:
+            sources[key_for_target(m.group(1))] = m.group(2).strip()
 
-    walk(stmts)
+    _walk_statements_recursive(stmts, visit)
     return sources
 
 
