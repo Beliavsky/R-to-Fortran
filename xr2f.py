@@ -7726,7 +7726,7 @@ def _is_static_integer_vector_expr(expr: str) -> bool:
     cinfo = parse_call_text(expr_s)
     if cinfo is not None and cinfo[0].lower() == "c":
         args = list(cinfo[1]) + list(cinfo[2].values())
-        return bool(args) and all(_is_int_literal(arg.strip()) for arg in args)
+        return bool(args) and all(re.match(r"^[+-]?\d+[lL](?:_[A-Za-z]\w*)?$", arg.strip()) is not None for arg in args)
     parts = _split_top_level_colon(expr_s)
     if parts is not None:
         return all(_is_int_literal(part.strip()) for part in parts)
@@ -24981,6 +24981,13 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
 def infer_main_character_arrays(stmts: list[object]) -> set[str]:
     """Find vector vars assigned from c("...")-style character constructors."""
     out: set[str] = set()
+    static_int_vectors: set[str] = set()
+
+    def seed_static_int(st_seed: Assign) -> None:
+        if _is_static_integer_vector_expr(st_seed.expr):
+            static_int_vectors.add(st_seed.name.lower())
+
+    _walk_assignments_recursive(stmts, seed_static_int)
 
     def visit(st: Assign) -> None:
         rhs = st.expr.strip()
@@ -25044,6 +25051,7 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
                 or ".and." in idx_txt.lower()
                 or ".or." in idx_txt.lower()
                 or idx_txt.lower().startswith(("seq", "which", "c("))
+                or idx_txt.lower() in static_int_vectors
             )
             if vectorish_subset:
                 out.add(st.name)
@@ -28714,6 +28722,15 @@ def transpile_r_to_fortran(
             real_scalars.discard(comp_nm)
             ints.add(comp_nm)
             params.pop(comp_nm, None)
+    def seed_main_static_integer_array(st_seed_int: Assign) -> None:
+        if _is_static_integer_vector_expr(st_seed_int.expr):
+            int_arrays.add(st_seed_int.name)
+            ints.discard(st_seed_int.name)
+            real_scalars.discard(st_seed_int.name)
+            real_arrays.discard(st_seed_int.name)
+            params.pop(st_seed_int.name, None)
+
+    _walk_assignments_recursive(main_stmts, seed_main_static_integer_array)
     array_params = infer_main_array_params(main_stmts, assign_counts)
     pi_trig_args = _collect_pi_trig_array_args(main_stmts)
     array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
@@ -28722,6 +28739,8 @@ def transpile_r_to_fortran(
         real_scalars.discard(nm_real_param)
     char_scalars = infer_main_character_scalars(main_stmts)
     char_arrays = infer_main_character_arrays(main_stmts)
+    char_array_lowers = {nm.lower() for nm in char_arrays}
+    char_scalars = {nm for nm in char_scalars if nm.lower() not in char_array_lowers}
     for nm_date in _KNOWN_DATE_NAMES:
         ints.add(nm_date)
         real_scalars.discard(nm_date)
@@ -29035,6 +29054,12 @@ def transpile_r_to_fortran(
             real_scalars.discard(nm_order)
             ints.discard(nm_order)
             params.pop(nm_order, None)
+    for nm_char_arr in set(char_arrays):
+        ints.discard(nm_char_arr)
+        real_scalars.discard(nm_char_arr)
+        int_arrays.discard(nm_char_arr)
+        real_arrays.discard(nm_char_arr)
+        params.pop(nm_char_arr, None)
     _KNOWN_INT_NAMES = {n.lower() for n in ints}
     _KNOWN_INT_VECTOR_NAMES = {n.lower() for n in int_arrays}
     _KNOWN_VECTOR_NAMES = {n.lower() for n in (set(int_arrays) | set(real_arrays) | set(array_params.keys()))}
