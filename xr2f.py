@@ -25317,14 +25317,13 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
 def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
     """Find scalar vars assigned from scalar logical expressions in main statements."""
     out: set[str] = set()
-    for st in stmts:
-        if not isinstance(st, Assign):
-            continue
+
+    def visit(st: Assign) -> None:
         rhs = st.expr.strip()
         rhs_u = rhs.upper()
         if rhs_u in {"TRUE", "FALSE"}:
             out.add(st.name)
-            continue
+            return
         c_rhs = parse_call_text(rhs)
         if c_rhs is not None and c_rhs[0].lower() in {
             "file.exists",
@@ -25341,6 +25340,8 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
             "any",
         }:
             out.add(st.name)
+
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
