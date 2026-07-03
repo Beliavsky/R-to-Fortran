@@ -24596,7 +24596,10 @@ def _walk_assignments_recursive(stmts: list[object], visit: Callable[[Assign], N
             _walk_assignments_recursive(st.body, visit)
         elif isinstance(st, SwitchStmt):
             for case in st.cases:
-                _walk_assignments_recursive(case.body, visit)
+                if isinstance(case, tuple):
+                    _walk_assignments_recursive(case[1], visit)
+                else:
+                    _walk_assignments_recursive(case.body, visit)
             _walk_assignments_recursive(st.default_body, visit)
 
 
@@ -25389,53 +25392,42 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
     """Find rank-1 logical mask variables assigned from vector predicates."""
     out: set[str] = set()
 
-    def _walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs = st.expr.strip()
-                rhs_l = rhs.lower()
-                is_logical_vec = False
-                if re.match(r"^logical\s*\(", rhs_l):
-                    is_logical_vec = True
-                elif re.match(r"^rep\s*\(\s*(?:TRUE|FALSE|T|F)\b", rhs, re.IGNORECASE):
-                    is_logical_vec = True
-                elif rhs_l.startswith("c("):
-                    c_log = parse_call_text(rhs)
-                    vals_log = (c_log[1] + list(c_log[2].values())) if c_log is not None and c_log[0].lower() == "c" else []
-                    is_logical_vec = bool(vals_log) and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_log)
-                elif re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
-                    is_logical_vec = True
-                elif _split_top_level_token(rhs, "%in%", from_right=True) is not None:
-                    is_logical_vec = True
-                elif re.match(r"^(?:is\.element|is_element|r_in|duplicated|complete\.cases|complete_cases)\s*\(", rhs_l):
-                    is_logical_vec = True
-                else:
-                    c_user_log = parse_call_text(rhs)
-                    if (
-                        c_user_log is not None
-                        and _USER_FUNC_RETURN_KIND.get(c_user_log[0].lower()) == "logical"
-                        and _USER_FUNC_RETURN_RANK.get(c_user_log[0].lower(), 0) >= 1
-                    ):
-                        is_logical_vec = True
-                if (not is_logical_vec) and any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
-                    names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
-                    rhs_f = r_expr_to_fortran(rhs)
-                    is_logical_vec = bool(names & array_names) or bool(
-                        re.search(r"\b(?:runif_vec|rnorm_vec|numeric|r_rep_real|r_rep_int)\s*\(", rhs_f)
-                    )
-                if is_logical_vec:
-                    out.add(st.name)
-            elif isinstance(st, IfStmt):
-                _walk(st.then_body)
-                _walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                _walk(st.body)
-            elif isinstance(st, WhileStmt):
-                _walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                _walk(st.body)
+    def visit(st: Assign) -> None:
+        rhs = st.expr.strip()
+        rhs_l = rhs.lower()
+        is_logical_vec = False
+        if re.match(r"^logical\s*\(", rhs_l):
+            is_logical_vec = True
+        elif re.match(r"^rep\s*\(\s*(?:TRUE|FALSE|T|F)\b", rhs, re.IGNORECASE):
+            is_logical_vec = True
+        elif rhs_l.startswith("c("):
+            c_log = parse_call_text(rhs)
+            vals_log = (c_log[1] + list(c_log[2].values())) if c_log is not None and c_log[0].lower() == "c" else []
+            is_logical_vec = bool(vals_log) and all(v.strip().upper() in {"TRUE", "FALSE", "T", "F"} for v in vals_log)
+        elif re.match(r"^is\.na\s*\(", rhs_l) or re.match(r"^is_na\s*\(", rhs_l):
+            is_logical_vec = True
+        elif _split_top_level_token(rhs, "%in%", from_right=True) is not None:
+            is_logical_vec = True
+        elif re.match(r"^(?:is\.element|is_element|r_in|duplicated|complete\.cases|complete_cases)\s*\(", rhs_l):
+            is_logical_vec = True
+        else:
+            c_user_log = parse_call_text(rhs)
+            if (
+                c_user_log is not None
+                and _USER_FUNC_RETURN_KIND.get(c_user_log[0].lower()) == "logical"
+                and _USER_FUNC_RETURN_RANK.get(c_user_log[0].lower(), 0) >= 1
+            ):
+                is_logical_vec = True
+        if (not is_logical_vec) and any(_split_top_level_token(rhs, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
+            names = {n for n in re.findall(r"\b[A-Za-z]\w*\b", rhs)}
+            rhs_f = r_expr_to_fortran(rhs)
+            is_logical_vec = bool(names & array_names) or bool(
+                re.search(r"\b(?:runif_vec|rnorm_vec|numeric|r_rep_real|r_rep_int)\s*\(", rhs_f)
+            )
+        if is_logical_vec:
+            out.add(st.name)
 
-    _walk(stmts)
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
@@ -25443,23 +25435,12 @@ def infer_main_logical_matrices(stmts: list[object]) -> set[str]:
     """Find rank-2 logical mask variables."""
     out: set[str] = set()
 
-    def _walk(ss: list[object]) -> None:
-        for st in ss:
-            if isinstance(st, Assign):
-                rhs_l = st.expr.strip().lower()
-                if re.match(r"^(?:lower\.tri|upper\.tri)\s*\(", rhs_l):
-                    out.add(st.name)
-            elif isinstance(st, IfStmt):
-                _walk(st.then_body)
-                _walk(st.else_body)
-            elif isinstance(st, ForStmt):
-                _walk(st.body)
-            elif isinstance(st, WhileStmt):
-                _walk(st.body)
-            elif isinstance(st, RepeatStmt):
-                _walk(st.body)
+    def visit(st: Assign) -> None:
+        rhs_l = st.expr.strip().lower()
+        if re.match(r"^(?:lower\.tri|upper\.tri)\s*\(", rhs_l):
+            out.add(st.name)
 
-    _walk(stmts)
+    _walk_assignments_recursive(stmts, visit)
     return out
 
 
