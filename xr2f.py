@@ -5449,6 +5449,13 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^Position\s*\(", rhs, re.IGNORECASE):
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                    ints.add(st.name)
                 elif re.match(r"^Find\s*\(", rhs, re.IGNORECASE):
                     c_find_rank = parse_call_text(rhs)
                     x_find_src = c_find_rank[1][1].strip() if c_find_rank is not None and len(c_find_rank[1]) >= 2 else (c_find_rank[2].get("x", "").strip() if c_find_rank is not None else "")
@@ -7612,7 +7619,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -8430,6 +8437,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "tapply":
                 return 1
             if fn_name == "find":
+                return 0
+            if fn_name == "position":
                 return 0
             if fn_name == "apply_col_cumsum":
                 return 2
@@ -16214,6 +16223,19 @@ def emit_stmts(
             raise NotImplementedError("Find requires predicate and vector arguments")
         return pred_src.strip(), x_src.strip(), kw_find.get("nomatch")
 
+    def _parse_position_call(expr: str) -> tuple[str, str, str | None, bool] | None:
+        c_pos = parse_call_text(fscan.strip_redundant_outer_parens_expr(expr.strip()))
+        if c_pos is None or c_pos[0] != "Position":
+            return None
+        _nm_pos, pos_pos, kw_pos = c_pos
+        pred_src = pos_pos[0] if pos_pos else kw_pos.get("f")
+        x_src = pos_pos[1] if len(pos_pos) >= 2 else kw_pos.get("x")
+        if pred_src is None or x_src is None:
+            raise NotImplementedError("Position requires predicate and vector arguments")
+        right_src = kw_pos.get("right", pos_pos[2] if len(pos_pos) >= 3 else "FALSE").strip().upper()
+        right = right_src in {"TRUE", "T", ".TRUE.", "1"}
+        return pred_src.strip(), x_src.strip(), kw_pos.get("nomatch"), right
+
     def _find_vector_kind(x_src: str) -> str:
         x_name = x_src.strip()
         if x_name in char_vector_vars_ctx or x_name.lower() in _KNOWN_CHAR_VECTOR_NAMES:
@@ -16346,6 +16368,89 @@ def emit_stmts(
         o.w(f"if ({pred_f}) then")
         o.push()
         _wstmt(f"{target} = {elem_f}", "")
+        o.w("exit")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end do")
+        o.pop()
+        o.w("end block")
+        return True
+
+    def _position_nomatch_value(nomatch_src: str | None) -> str:
+        if nomatch_src is None:
+            return "0"
+        nomatch_l = nomatch_src.strip().lower()
+        if nomatch_l in {"na", "na_integer_", "null"}:
+            return "0"
+        return _int_bound_expr(r_expr_to_fortran(nomatch_src))
+
+    def _emit_position_print(expr: str, comment: str) -> bool:
+        parsed = _parse_position_call(expr)
+        if parsed is None:
+            return False
+        pred_src, x_src, nomatch_src, right = parsed
+        x_f = r_expr_to_fortran(x_src)
+        find_print_counter["n"] += 1
+        suffix = find_print_counter["n"]
+        i_nm = f"i_pos_{suffix}"
+        found_nm = f"found_pos_{suffix}"
+        elem_f = f"{x_f}({i_nm})"
+        pred_f = _find_predicate_for_element(pred_src, elem_f)
+        loop_stmt = f"do {i_nm} = size({x_f}), 1, -1" if right else f"do {i_nm} = 1, size({x_f})"
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {i_nm}")
+        o.w(f"logical :: {found_nm}")
+        o.w(f"{found_nm} = .false.")
+        o.w(loop_stmt)
+        o.push()
+        o.w(f"if ({pred_f}) then")
+        o.push()
+        o.w(f"{found_nm} = .true.")
+        o.w("exit")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end do")
+        o.w(f"if ({found_nm}) then")
+        o.push()
+        _wstmt(f'write(*,"(i0)") {i_nm}', comment)
+        o.pop()
+        o.w("else")
+        o.push()
+        nomatch_l = (nomatch_src or "NA").strip().lower()
+        if nomatch_l in {"na", "na_integer_", "null"}:
+            _wstmt('write(*,"(a)") "NA"', "")
+        else:
+            _wstmt(f'write(*,"(i0)") {_int_bound_expr(r_expr_to_fortran(nomatch_src or "0"))}', "")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end block")
+        return True
+
+    def _emit_position_assign(target: str, expr: str, comment: str) -> bool:
+        parsed = _parse_position_call(expr)
+        if parsed is None:
+            return False
+        pred_src, x_src, nomatch_src, right = parsed
+        x_f = r_expr_to_fortran(x_src)
+        find_print_counter["n"] += 1
+        suffix = find_print_counter["n"]
+        i_nm = f"i_pos_{suffix}"
+        elem_f = f"{x_f}({i_nm})"
+        pred_f = _find_predicate_for_element(pred_src, elem_f)
+        loop_stmt = f"do {i_nm} = size({x_f}), 1, -1" if right else f"do {i_nm} = 1, size({x_f})"
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {i_nm}")
+        _wstmt(f"{target} = {_position_nomatch_value(nomatch_src)}", comment)
+        o.w(loop_stmt)
+        o.push()
+        o.w(f"if ({pred_f}) then")
+        o.push()
+        _wstmt(f"{target} = {i_nm}", "")
         o.w("exit")
         o.pop()
         o.w("end if")
@@ -17768,6 +17873,8 @@ def emit_stmts(
             if _emit_assign_quantile_scalar(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_assign_qnorm_scalar(st.name, st.expr.strip(), st.comment):
+                continue
+            if _emit_position_assign(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_find_assign(st.name, st.expr.strip(), st.comment):
                 continue
@@ -19228,6 +19335,8 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if _emit_position_print(one, st.comment):
+                        continue
                     if _emit_find_print(one, st.comment):
                         continue
                     if print_digits_src is not None and has_r_mod:
