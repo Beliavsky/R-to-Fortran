@@ -44,6 +44,7 @@ _USER_FUNC_RETURN_RANK: dict[str, int] = {}
 _USER_FUNC_RETURN_KIND: dict[str, str] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _FUNC_DEFS_BY_NAME: dict[str, object] = {}
+_VECTORIZED_ALIASES: dict[str, str] = {}
 _VOID_FUNCTION_LIKE: set[str] = set()
 _SUBROUTINE_FUNCTIONS: set[str] = set()
 _INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
@@ -7346,6 +7347,7 @@ def obfuscate_r_source(src: str, seed: int | None = None) -> str:
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
     lines = _combine_switch_lines(lines)
+    _VECTORIZED_ALIASES = {}
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source for obfuscation")
@@ -7619,7 +7621,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|Position|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -7984,6 +7986,70 @@ def lower_static_get_calls(stmts: list[object]) -> list[object]:
         return out
 
     return lower_list(stmts, scalar_names, char_vectors)
+
+
+def lower_simple_vectorize_aliases(stmts: list[object]) -> list[object]:
+    """Record and remove simple vf <- Vectorize(f) aliases.
+
+    This intentionally handles only the first support tier: no vectorize.args
+    and a statically named underlying function.
+    """
+
+    def _vectorize_target(expr: str) -> str | None:
+        cinfo = parse_call_text(expr.strip())
+        if cinfo is None or cinfo[0].lower() != "vectorize":
+            return None
+        if any(k.lower() == "vectorize.args" for k in cinfo[2]):
+            return None
+        fn_src = cinfo[1][0].strip() if cinfo[1] else cinfo[2].get("FUN", "").strip()
+        if not re.fullmatch(r"[A-Za-z]\w*", fn_src):
+            return None
+        return fn_src
+
+    def lower_list(ss: list[object], aliases: dict[str, str]) -> list[object]:
+        out: list[object] = []
+        env = dict(aliases)
+        for st in ss:
+            if isinstance(st, Assign):
+                rhs = st.expr
+                target = _vectorize_target(rhs)
+                if target is not None:
+                    env = dict(env)
+                    env[st.name] = target
+                    _VECTORIZED_ALIASES[st.name.lower()] = target
+                    continue
+                if st.name in env:
+                    env = dict(env)
+                    env.pop(st.name, None)
+                    _VECTORIZED_ALIASES.pop(st.name.lower(), None)
+                out.append(st)
+            elif isinstance(st, PrintStmt):
+                out.append(st)
+            elif isinstance(st, CallStmt):
+                out.append(st)
+            elif isinstance(st, ExprStmt):
+                out.append(st)
+            elif isinstance(st, IfStmt):
+                out.append(
+                    IfStmt(
+                        st.cond,
+                        lower_list(st.then_body, dict(env)),
+                        lower_list(st.else_body, dict(env)),
+                    )
+                )
+            elif isinstance(st, ForStmt):
+                out.append(ForStmt(st.var, st.iter_expr, lower_list(st.body, dict(env))))
+            elif isinstance(st, WhileStmt):
+                out.append(WhileStmt(st.cond, lower_list(st.body, dict(env))))
+            elif isinstance(st, RepeatStmt):
+                out.append(RepeatStmt(lower_list(st.body, dict(env))))
+            elif isinstance(st, FuncDef):
+                out.append(FuncDef(st.name, st.args, st.defaults, lower_list(st.body, dict(env)), st.leading_comments))
+            else:
+                out.append(st)
+        return out
+
+    return lower_list(stmts, {})
 
 
 def lower_static_new_env_calls(stmts: list[object]) -> list[object]:
@@ -16488,6 +16554,98 @@ def emit_stmts(
         o.w("end block")
         return True
 
+    def _vectorized_alias_call(expr: str) -> tuple[str, list[str], dict[str, str]] | None:
+        cinfo = parse_call_text(expr.strip())
+        if cinfo is None:
+            return None
+        target = _VECTORIZED_ALIASES.get(cinfo[0].lower())
+        if target is None:
+            return None
+        return target, list(cinfo[1]), dict(cinfo[2])
+
+    def _expr_rank_for_vectorize_actual(actual_src: str) -> int:
+        actual = actual_src.strip()
+        actual_l = actual.lower()
+        if actual in int_vector_vars or actual in real_vector_vars or actual in logical_vector_vars:
+            return 1
+        if actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_INT_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES:
+            return 1
+        if re.match(r"^\s*c\s*\(", actual, re.IGNORECASE) or _split_top_level_colon(actual) is not None:
+            return 1
+        return _infer_assignment_rank_hint(actual, {nm: 1 for nm in _KNOWN_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES | _KNOWN_INT_VECTOR_NAMES})
+
+    def _emit_vectorized_alias_call(expr: str, comment: str, target: str | None = None) -> bool:
+        parsed = _vectorized_alias_call(expr)
+        if parsed is None:
+            return False
+        fn_name, pos_args, kw_args = parsed
+        fn_l = fn_name.lower()
+        idx_map = _USER_FUNC_ARG_INDEX.get(fn_l, {})
+        inv_idx = {v: k for k, v in idx_map.items()}
+        kinds = _USER_FUNC_ARG_KIND.get(fn_l, [])
+        args_src = list(pos_args)
+        for key, value in kw_args.items():
+            args_src.append(value)
+        if not args_src:
+            return False
+        arg_ranks = [_expr_rank_for_vectorize_actual(a) for a in args_src]
+        if not any(r >= 1 for r in arg_ranks):
+            return False
+        find_print_counter["n"] += 1
+        suffix = find_print_counter["n"]
+        idx_nm = f"i_vec_{suffix}"
+        n_nm = f"n_vec_{suffix}"
+        tmp_nm = target or f"xr2f_vectorize_tmp_{suffix}"
+        size_terms = [
+            f"size({r_expr_to_fortran(src)})"
+            for src, rank in zip(args_src, arg_ranks)
+            if rank >= 1
+        ]
+        n_expr = size_terms[0] if len(size_terms) == 1 else f"min({', '.join(size_terms)})"
+        ret_kind = _USER_FUNC_RETURN_KIND.get(fn_l, "real")
+        is_logical = ret_kind == "logical"
+
+        actuals: list[str] = []
+        for i_arg, (src, rank) in enumerate(zip(args_src, arg_ranks)):
+            src_f = r_expr_to_fortran(src)
+            formal = inv_idx.get(i_arg, "")
+            wanted = kinds[i_arg] if i_arg < len(kinds) else "real"
+            if rank >= 1:
+                val = f"{src_f}({idx_nm})"
+                if wanted == "real" and (src.strip() in int_vector_vars or src.strip().lower() in _KNOWN_INT_VECTOR_NAMES):
+                    val = f"real({val}, kind=dp)"
+            else:
+                val = src_f
+                if wanted == "real" and (_is_int_literal(src_f) or src.strip() in int_scalar_vars or src.strip().lower() in _KNOWN_INT_NAMES):
+                    val = f"real({val}, kind=dp)"
+            actuals.append(f"{formal}={val}" if formal and i_arg >= len(pos_args) else val)
+        call_expr = f"{fn_name}({', '.join(actuals)})"
+
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {idx_nm}, {n_nm}")
+        if target is None:
+            if is_logical:
+                o.w(f"logical, allocatable :: {tmp_nm}(:)")
+            else:
+                o.w(f"real(kind=dp), allocatable :: {tmp_nm}(:)")
+        o.w(f"{n_nm} = {n_expr}")
+        o.w(f"allocate({tmp_nm}({n_nm}))")
+        o.w(f"do {idx_nm} = 1, {n_nm}")
+        o.push()
+        _wstmt(f"{tmp_nm}({idx_nm}) = {call_expr}", "")
+        o.pop()
+        o.w("end do")
+        if target is None:
+            if is_logical:
+                _wstmt(f'write(*,"(*(g0,1x))") {tmp_nm}', comment)
+            else:
+                _wstmt(f"call print_real_vector({tmp_nm})", comment)
+                need_r_mod.add("print_real_vector")
+        o.pop()
+        o.w("end block")
+        return True
+
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -17901,6 +18059,8 @@ def emit_stmts(
             if _emit_assign_quantile_scalar(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_assign_qnorm_scalar(st.name, st.expr.strip(), st.comment):
+                continue
+            if _emit_vectorized_alias_call(st.expr.strip(), st.comment, target=st.name):
                 continue
             if _emit_position_assign(st.name, st.expr.strip(), st.comment):
                 continue
@@ -19363,6 +19523,8 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if _emit_vectorized_alias_call(one, st.comment):
+                        continue
                     if _emit_position_print(one, st.comment):
                         continue
                     if _emit_find_print(one, st.comment):
@@ -28593,7 +28755,7 @@ def transpile_r_to_fortran(
     obfuscate: bool = False,
     source_path: str | None = None,
 ) -> str:
-    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -28678,6 +28840,7 @@ def transpile_r_to_fortran(
     stmts = rename_case_conflicting_names(stmts)
     stmts = lower_static_get_calls(stmts)
     stmts = lower_static_new_env_calls(stmts)
+    stmts = lower_simple_vectorize_aliases(stmts)
     stmts = specialize_singleton_character_for_loops(stmts)
     validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
