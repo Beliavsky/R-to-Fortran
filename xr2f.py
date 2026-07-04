@@ -5448,7 +5448,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -7599,7 +7599,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:rle|sapply|mapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -7966,6 +7966,114 @@ def lower_static_get_calls(stmts: list[object]) -> list[object]:
     return lower_list(stmts, scalar_names, char_vectors)
 
 
+def lower_static_new_env_calls(stmts: list[object]) -> list[object]:
+    """Lower simple new.env/eapply usage with statically named numeric fields."""
+    envs: set[str] = set()
+    fields: dict[str, list[str]] = {}
+
+    def remember_field(base: str, fld: str) -> None:
+        if base not in envs:
+            return
+        cur = fields.setdefault(base, [])
+        if fld not in cur:
+            cur.append(fld)
+
+    def scan(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, Assign):
+                c = parse_call_text(st.expr.strip())
+                if c is not None and c[0].lower() == "new.env":
+                    envs.add(st.name)
+                    fields.setdefault(st.name, [])
+            elif isinstance(st, ExprStmt):
+                asn = split_top_level_assignment(st.expr.strip())
+                if asn is not None:
+                    m = re.match(r"^([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)$", asn[0].strip())
+                    if m is not None:
+                        remember_field(m.group(1), m.group(2))
+            elif isinstance(st, IfStmt):
+                scan(st.then_body)
+                scan(st.else_body)
+            elif isinstance(st, (ForStmt, WhileStmt, RepeatStmt)):
+                scan(st.body)
+
+    scan(stmts)
+    if not envs:
+        return stmts
+
+    def env_var(base: str, fld: str) -> str:
+        return _sanitize_r_var_name(f"{base}_{fld}")
+
+    def rewrite_expr(expr: str) -> str:
+        out = expr
+
+        def eapply_repl(inner: str) -> str:
+            c = parse_call_text("eapply(" + inner + ")")
+            if c is None:
+                return "eapply(" + inner + ")"
+            pos, kw = c[1], c[2]
+            env_src = (pos[0] if pos else kw.get("env", kw.get("ENV", ""))).strip()
+            fun_src = (pos[1] if len(pos) >= 2 else kw.get("FUN", kw.get("fun", ""))).strip()
+            if env_src not in envs or not fun_src or not fields.get(env_src):
+                return "eapply(" + inner + ")"
+            vals: list[str] = []
+            m_anon = re.match(r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", fun_src, re.IGNORECASE | re.DOTALL)
+            if m_anon is not None:
+                arg_nm = m_anon.group(1)
+                body = m_anon.group(2).strip()
+                for fld in fields[env_src]:
+                    vals.append(re.sub(rf"\b{re.escape(arg_nm)}\b", env_var(env_src, fld), body))
+            elif re.fullmatch(r"[A-Za-z]\w*", fun_src):
+                vals = [f"{fun_src}({env_var(env_src, fld)})" for fld in fields[env_src]]
+            else:
+                return "eapply(" + inner + ")"
+            return "c(" + ", ".join(vals) + ")"
+
+        out = _replace_balanced_func_calls(out, "eapply", eapply_repl)
+        for base in sorted(envs, key=len, reverse=True):
+            for fld in sorted(fields.get(base, []), key=len, reverse=True):
+                out = re.sub(rf"\b{re.escape(base)}\s*\$\s*{re.escape(fld)}\b", env_var(base, fld), out)
+        return out
+
+    def rewrite_stmt(st: object) -> list[object]:
+        if isinstance(st, Assign):
+            c = parse_call_text(st.expr.strip())
+            if st.name in envs and c is not None and c[0].lower() == "new.env":
+                return []
+            return [Assign(st.name, rewrite_expr(st.expr), st.comment)]
+        if isinstance(st, ExprStmt):
+            asn = split_top_level_assignment(st.expr.strip())
+            if asn is not None:
+                lhs, rhs = asn[0].strip(), asn[1].strip()
+                m = re.match(r"^([A-Za-z]\w*)\s*\$\s*([A-Za-z]\w*)$", lhs)
+                if m is not None and m.group(1) in envs:
+                    return [Assign(env_var(m.group(1), m.group(2)), rewrite_expr(rhs), st.comment)]
+            return [ExprStmt(rewrite_expr(st.expr), st.comment)]
+        if isinstance(st, PrintStmt):
+            return [PrintStmt([rewrite_expr(a) for a in st.args], st.comment)]
+        if isinstance(st, CallStmt):
+            return [CallStmt(st.name, [rewrite_expr(a) for a in st.args], st.comment)]
+        if isinstance(st, IfStmt):
+            return [
+                IfStmt(
+                    rewrite_expr(st.cond),
+                    [x for b in st.then_body for x in rewrite_stmt(b)],
+                    [x for b in st.else_body for x in rewrite_stmt(b)],
+                )
+            ]
+        if isinstance(st, ForStmt):
+            return [ForStmt(st.var, rewrite_expr(st.iter_expr), [x for b in st.body for x in rewrite_stmt(b)])]
+        if isinstance(st, WhileStmt):
+            return [WhileStmt(rewrite_expr(st.cond), [x for b in st.body for x in rewrite_stmt(b)])]
+        if isinstance(st, RepeatStmt):
+            return [RepeatStmt([x for b in st.body for x in rewrite_stmt(b)])]
+        if isinstance(st, FuncDef):
+            return [FuncDef(st.name, st.args, st.defaults, [x for b in st.body for x in rewrite_stmt(b)], st.leading_comments)]
+        return [st]
+
+    return [x for st in stmts for x in rewrite_stmt(st)]
+
+
 def specialize_singleton_character_for_loops(stmts: list[object]) -> list[object]:
     """Replace loop variables over one-element character vectors with literals."""
     char_vectors: dict[str, list[str]] = {}
@@ -8305,6 +8413,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                     return 2
                 return 1
             if fn_name == "mapply":
+                return 1
+            if fn_name == "tapply":
                 return 1
             if fn_name == "apply_col_cumsum":
                 return 2
@@ -17766,6 +17876,101 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
+            tapply_call = _parse_tapply_call(rhs)
+            if tapply_call is not None:
+                x_src, idx_src, fun_kind, anon_arg, anon_body = tapply_call
+                idx_nm = f"xr2f_tapply_i_{st.name}"
+                grp_nm = f"xr2f_tapply_j_{st.name}"
+                n_nm = f"xr2f_tapply_n_{st.name}"
+                val_nm = f"xr2f_tapply_x_{st.name}"
+                idx_vec_nm = f"xr2f_tapply_idx_{st.name}"
+                label_nm = f"xr2f_tapply_label_{st.name}"
+                sum_nm = f"xr2f_tapply_sum_{st.name}"
+                cnt_nm = f"xr2f_tapply_count_{st.name}"
+                found_nm = f"xr2f_tapply_found_{st.name}"
+                x_f = r_expr_to_fortran(x_src)
+                idx_f = r_expr_to_fortran(idx_src)
+                idx_src_l = idx_src.strip().lower()
+                group_is_char = (
+                    idx_src.strip() in char_vector_vars_ctx
+                    or idx_src_l in _KNOWN_CHAR_VECTOR_NAMES
+                    or idx_f.strip().lower() in _KNOWN_CHAR_VECTOR_NAMES
+                )
+
+                def _tapply_result_expr() -> str:
+                    mean_expr = f"({sum_nm}({grp_nm}) / real({cnt_nm}({grp_nm}), kind=dp))"
+                    sum_expr = f"{sum_nm}({grp_nm})"
+                    count_expr = f"{cnt_nm}({grp_nm})"
+                    if fun_kind == "mean":
+                        return mean_expr
+                    if fun_kind == "sum":
+                        return sum_expr
+                    body = anon_body or "0.0"
+                    arg = anon_arg or "x"
+                    body = re.sub(rf"\bmean\s*\(\s*{re.escape(arg)}\s*\)", mean_expr, body, flags=re.IGNORECASE)
+                    body = re.sub(rf"\bsum\s*\(\s*{re.escape(arg)}\s*\)", sum_expr, body, flags=re.IGNORECASE)
+                    body = re.sub(rf"\blength\s*\(\s*{re.escape(arg)}\s*\)", count_expr, body, flags=re.IGNORECASE)
+                    body = re.sub(rf"\bsize\s*\(\s*{re.escape(arg)}\s*\)", count_expr, body, flags=re.IGNORECASE)
+                    return r_expr_to_fortran(body)
+
+                _wstmt("block", st.comment)
+                o.push()
+                o.w(f"integer :: {idx_nm}, {grp_nm}, {n_nm}")
+                o.w(f"logical :: {found_nm}")
+                o.w(f"real(kind=dp), allocatable :: {val_nm}(:), {sum_nm}(:)")
+                o.w(f"integer, allocatable :: {cnt_nm}(:)")
+                if group_is_char:
+                    o.w(f"character(len=:), allocatable :: {idx_vec_nm}(:), {label_nm}(:)")
+                else:
+                    o.w(f"integer, allocatable :: {idx_vec_nm}(:), {label_nm}(:)")
+                o.w(f"{val_nm} = real({x_f}, kind=dp)")
+                if group_is_char:
+                    o.w(f"{idx_vec_nm} = {idx_f}")
+                    o.w(f"allocate(character(len=len({idx_vec_nm})) :: {label_nm}(size({idx_vec_nm})))")
+                else:
+                    o.w(f"{idx_vec_nm} = int({idx_f})")
+                    o.w(f"allocate({label_nm}(size({idx_vec_nm})))")
+                o.w(f"allocate({sum_nm}(size({idx_vec_nm})), {cnt_nm}(size({idx_vec_nm})))")
+                o.w(f"{sum_nm} = 0.0_dp")
+                o.w(f"{cnt_nm} = 0")
+                o.w(f"{n_nm} = 0")
+                o.w(f"do {idx_nm} = 1, min(size({val_nm}), size({idx_vec_nm}))")
+                o.push()
+                o.w(f"{found_nm} = .false.")
+                o.w(f"do {grp_nm} = 1, {n_nm}")
+                o.push()
+                if group_is_char:
+                    o.w(f"if (trim({idx_vec_nm}({idx_nm})) == trim({label_nm}({grp_nm}))) then")
+                else:
+                    o.w(f"if ({idx_vec_nm}({idx_nm}) == {label_nm}({grp_nm})) then")
+                o.push()
+                o.w(f"{sum_nm}({grp_nm}) = {sum_nm}({grp_nm}) + {val_nm}({idx_nm})")
+                o.w(f"{cnt_nm}({grp_nm}) = {cnt_nm}({grp_nm}) + 1")
+                o.w(f"{found_nm} = .true.")
+                o.w("exit")
+                o.pop()
+                o.w("end if")
+                o.pop()
+                o.w("end do")
+                o.w(f"if (.not. {found_nm}) then")
+                o.push()
+                o.w(f"{n_nm} = {n_nm} + 1")
+                o.w(f"{label_nm}({n_nm}) = {idx_vec_nm}({idx_nm})")
+                o.w(f"{sum_nm}({n_nm}) = {val_nm}({idx_nm})")
+                o.w(f"{cnt_nm}({n_nm}) = 1")
+                o.pop()
+                o.w("end if")
+                o.pop()
+                o.w("end do")
+                o.w(f"allocate({st.name}({n_nm}))")
+                o.w(f"do {grp_nm} = 1, {n_nm}")
+                o.push()
+                o.w(f"{st.name}({grp_nm}) = {_tapply_result_expr()}")
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             sapply_lam = _parse_sapply_shorthand_lambda(rhs)
             if sapply_lam is not None:
                 x_src, arg_nm, body_src = sapply_lam
@@ -25904,6 +26109,29 @@ def _parse_mapply_call(expr: str) -> tuple[str, list[str], list[str] | None, str
     return fun_src, arg_srcs, anon_args, anon_body
 
 
+def _parse_tapply_call(expr: str) -> tuple[str, str, str, str | None, str | None] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "tapply":
+        return None
+    pos, kw = cinfo[1], cinfo[2]
+    x_src = (pos[0] if len(pos) >= 1 else kw.get("X", kw.get("x", ""))).strip()
+    idx_src = (pos[1] if len(pos) >= 2 else kw.get("INDEX", kw.get("index", ""))).strip()
+    fun_src = (pos[2] if len(pos) >= 3 else kw.get("FUN", kw.get("fun", ""))).strip()
+    if not x_src or not idx_src or not fun_src:
+        return None
+    m_anon = re.match(
+        r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
+        fun_src,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_anon is not None:
+        return x_src, idx_src, "function", m_anon.group(1), m_anon.group(2).strip()
+    fun_l = fun_src.lower()
+    if fun_l in {"mean", "sum"}:
+        return x_src, idx_src, fun_l, None, None
+    return None
+
+
 def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set[str]:
     """Find rank-1 logical mask variables assigned from vector predicates."""
     out: set[str] = set()
@@ -28127,6 +28355,7 @@ def transpile_r_to_fortran(
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
     stmts = lower_static_get_calls(stmts)
+    stmts = lower_static_new_env_calls(stmts)
     stmts = specialize_singleton_character_for_loops(stmts)
     validate_static_list_field_updates(stmts)
     for old, new, line_no in loop_shadow_warnings:
