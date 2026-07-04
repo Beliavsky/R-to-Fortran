@@ -13,7 +13,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, constr_optim_bfgs, constr_optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -24,7 +24,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
-   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, r_matrix_row_filter, r_matrix_col_filter, &
+   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, r_matrix_rows, r_matrix_row_filter, r_matrix_col_filter, &
    & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_matrix_index, r_head, rev_int, rev_real, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
@@ -34,7 +34,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, cut, outer, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
-   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
@@ -51,6 +51,7 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec
+public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -83,6 +84,11 @@ type :: lm_fit_t
    real(kind=dp) :: sigma, r_squared, adj_r_squared
    integer :: df = 0
 end type lm_fit_t
+
+type :: r_dataframe_t
+   character(len=:), allocatable :: names(:)
+   real(kind=dp), allocatable :: real_cols(:,:)
+end type r_dataframe_t
 
 type :: glm_fit_t
 ! Container for fitted glm fit model state.
@@ -427,6 +433,10 @@ interface rbind
    module procedure rbind_mat
    module procedure rbind_vec_mat
    module procedure rbind_mat_vec
+   module procedure rbind_int_vec
+   module procedure rbind_int_mat
+   module procedure rbind_int_vec_mat
+   module procedure rbind_int_mat_vec
 end interface rbind
 
 interface t_test
@@ -915,6 +925,11 @@ interface r_matrix_row
    module procedure r_matrix_row_real
    module procedure r_matrix_row_int
 end interface r_matrix_row
+
+interface r_matrix_rows
+   module procedure r_matrix_rows_real
+   module procedure r_matrix_rows_int
+end interface r_matrix_rows
 
 interface r_matrix_row_filter
    module procedure r_matrix_row_filter_real
@@ -1532,6 +1547,114 @@ out%par = simplex(:,best)
 out%value = fvals(best)
 out%convergence = merge(0, 1, converged)
 end function optim_nelder_mead
+
+function constr_optim_bfgs(fn, theta, ui, ci, maxit, reltol, ndeps) result(out)
+! Approximate R constrOptim() with a logarithmic barrier and BFGS inner solves.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: theta(:), ui(:,:), ci(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out, inner
+integer :: outer, max_outer, inner_maxit
+real(kind=dp) :: mu, tol, step_eps
+real(kind=dp), allocatable :: p(:), slack(:)
+max_outer = 8
+inner_maxit = 100
+if (present(maxit)) inner_maxit = max(10, maxit / max_outer)
+tol = 1.0e-8_dp
+if (present(reltol)) tol = reltol
+step_eps = 1.0e-3_dp
+if (present(ndeps)) step_eps = ndeps
+p = theta
+slack = matmul(ui, p) - ci
+if (any(slack <= 0.0_dp)) then
+   out%par = p
+   out%value = huge(1.0_dp)
+   out%convergence = 1
+   return
+end if
+mu = 1.0_dp
+out%par = p
+out%value = fn(p)
+out%convergence = 1
+do outer = 1, max_outer
+   inner = optim_bfgs(barrier_obj, p, maxit=inner_maxit, reltol=tol, ndeps=step_eps)
+   p = inner%par
+   slack = matmul(ui, p) - ci
+   if (any(slack <= 0.0_dp)) exit
+   out%par = p
+   out%value = fn(p)
+   out%convergence = inner%convergence
+   if (mu < tol) exit
+   mu = 0.2_dp * mu
+end do
+contains
+pure function barrier_obj(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+real(kind=dp), allocatable :: s(:)
+s = matmul(ui, x) - ci
+if (any(s <= 0.0_dp)) then
+   value = huge(1.0_dp) / 100.0_dp + sum(min(0.0_dp, s)**2) * 1.0e20_dp
+else
+   value = fn(x) - mu * sum(log(s))
+end if
+end function barrier_obj
+end function constr_optim_bfgs
+
+function constr_optim_nelder_mead(fn, theta, ui, ci, maxit, reltol, ndeps) result(out)
+! Approximate R constrOptim() with a logarithmic barrier and Nelder-Mead inner solves.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: theta(:), ui(:,:), ci(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps
+type(optim_result_t) :: out, inner
+integer :: outer, max_outer, inner_maxit
+real(kind=dp) :: mu, tol, step_eps
+real(kind=dp), allocatable :: p(:), slack(:)
+max_outer = 8
+inner_maxit = 100
+if (present(maxit)) inner_maxit = max(10, maxit / max_outer)
+tol = 1.0e-8_dp
+if (present(reltol)) tol = reltol
+step_eps = 1.0e-3_dp
+if (present(ndeps)) step_eps = ndeps
+p = theta
+slack = matmul(ui, p) - ci
+if (any(slack <= 0.0_dp)) then
+   out%par = p
+   out%value = huge(1.0_dp)
+   out%convergence = 1
+   return
+end if
+mu = 1.0_dp
+out%par = p
+out%value = fn(p)
+out%convergence = 1
+do outer = 1, max_outer
+   inner = optim_nelder_mead(barrier_obj, p, maxit=inner_maxit, reltol=tol, ndeps=step_eps)
+   p = inner%par
+   slack = matmul(ui, p) - ci
+   if (any(slack <= 0.0_dp)) exit
+   out%par = p
+   out%value = fn(p)
+   out%convergence = inner%convergence
+   if (mu < tol) exit
+   mu = 0.2_dp * mu
+end do
+contains
+pure function barrier_obj(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+real(kind=dp), allocatable :: s(:)
+s = matmul(ui, x) - ci
+if (any(s <= 0.0_dp)) then
+   value = huge(1.0_dp) / 100.0_dp + sum(min(0.0_dp, s)**2) * 1.0e20_dp
+else
+   value = fn(x) - mu * sum(log(s))
+end if
+end function barrier_obj
+end function constr_optim_nelder_mead
 
 subroutine optim_fd_gradient(fn, p, step_eps, g)
 procedure(optim_vec_objective) :: fn
@@ -2277,6 +2400,38 @@ else
    out = 0
 end if
 end function r_matrix_row_int
+
+pure function r_matrix_rows_real(x, idx) result(out)
+! Return matrix rows selected by integer indices.
+real(kind=dp), intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: idx(:) ! one-based row indices
+real(kind=dp), allocatable :: out(:,:)
+integer :: i
+allocate(out(size(idx), size(x, 2)))
+do i = 1, size(idx)
+   if (idx(i) >= 1 .and. idx(i) <= size(x, 1)) then
+      out(i, :) = x(idx(i), :)
+   else
+      out(i, :) = 0.0_dp
+   end if
+end do
+end function r_matrix_rows_real
+
+pure function r_matrix_rows_int(x, idx) result(out)
+! Return integer matrix rows selected by integer indices.
+integer, intent(in) :: x(:,:) ! source matrix
+integer, intent(in) :: idx(:) ! one-based row indices
+integer, allocatable :: out(:,:)
+integer :: i
+allocate(out(size(idx), size(x, 2)))
+do i = 1, size(idx)
+   if (idx(i) >= 1 .and. idx(i) <= size(x, 1)) then
+      out(i, :) = x(idx(i), :)
+   else
+      out(i, :) = 0
+   end if
+end do
+end function r_matrix_rows_int
 
 pure function r_matrix_row_filter_real(x, mask) result(out)
 ! Return matrix rows selected by a recycled logical mask.
@@ -3931,7 +4086,7 @@ integer(kind=int64) :: k
 real(kind=dp) :: r, tol
 character(len=32) :: fmt
 if (present(digits)) then
-   write(fmt, '("(*(f0.",i0,",1x))")') max(0, digits)
+   write(fmt, '("(8(f0.",i0,",1x,:))")') max(0, digits)
    write(*,fmt) x
    return
 end if
@@ -3959,25 +4114,16 @@ if (use_int_like) then
    end do
 end if
 if (all_int) then
-   do i = 1, size(x)
-      k = nint(x(i), kind=int64)
-      write(*,"(i0)", advance="no") k
-      if (i < size(x)) write(*,"(a)", advance="no") " "
-   end do
-   write(*,*)
+   write(*,"(20(i0,1x,:))") (nint(x(i), kind=int64), i = 1, size(x))
 else
-   write(*,"(*(g0,1x))") x
+   write(*,"(8(g0,1x,:))") x
 end if
 end subroutine print_real_vector
 
 subroutine print_integer_vector(x)
-! Print one integer vector with R-like spacing.
+! Print one integer vector with R-like line wrapping.
 integer, intent(in) :: x(:) ! values to print
-integer :: i
-do i = 1, size(x)
-   write(*,"(i0)", advance="no") x(i)
-   if (i < size(x)) write(*,"(a)", advance="no") " "
-end do
+write (*,"(20(g0,1x,:))") x
 write(*,*)
 end subroutine print_integer_vector
 
@@ -8575,6 +8721,48 @@ case default
 end select
 end function trimws
 
+pure function grep_value_char(pattern, x) result(out)
+! Return character entries containing a fixed substring.
+character(len=*), intent(in) :: pattern
+character(len=*), intent(in) :: x(:)
+character(len=:), allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i
+allocate(keep(size(x)))
+do i = 1, size(x)
+   keep(i) = index(x(i), pattern) > 0
+end do
+out = pack(x, keep)
+end function grep_value_char
+
+function r_command_args(trailing_only, file_arg) result(out)
+! Return command arguments, optionally prepending a generated --file= entry.
+logical, intent(in) :: trailing_only
+character(len=*), intent(in), optional :: file_arg
+character(len=:), allocatable :: out(:)
+integer :: i, n, stat, arg_len, out_len, prefix
+character(len=4096) :: buf
+n = command_argument_count()
+prefix = 0
+if (.not. trailing_only .and. present(file_arg)) prefix = 1
+out_len = 1
+if (prefix == 1) out_len = max(out_len, len(file_arg))
+do i = 1, n
+   call get_command_argument(i, length=arg_len, status=stat)
+   if (stat == 0) out_len = max(out_len, arg_len)
+end do
+allocate(character(len=out_len) :: out(n + prefix))
+if (prefix == 1) out(1) = file_arg
+do i = 1, n
+   call get_command_argument(i, buf, status=stat)
+   if (stat == 0) then
+      out(i + prefix) = trim(buf)
+   else
+      out(i + prefix) = ""
+   end if
+end do
+end function r_command_args
+
 pure function replace_first_fixed(s, old, new) result(out)
 ! Return a copy with selected first fixed entries replaced.
 character(len=*), intent(in) :: s ! source string
@@ -9709,6 +9897,60 @@ if (ncol == 0) return
 if (nrow > 0) out(1:nrow, 1:ncol) = a(:, 1:ncol)
 out(nrow + 1, 1:ncol) = b(1:ncol)
 end function rbind_mat_vec
+
+pure function rbind_int_vec(a, b) result(out)
+! Bind two integer vectors as rows of a 2D array.
+integer, intent(in) :: a(:)
+integer, intent(in) :: b(:)
+integer, allocatable :: out(:,:)
+integer :: n
+n = min(size(a), size(b))
+allocate(out(2, n))
+if (n > 0) out = transpose(reshape([a(1:n), b(1:n)], [n, 2]))
+end function rbind_int_vec
+
+pure function rbind_int_mat(a, b) result(out)
+! Bind two integer matrices by concatenating rows.
+integer, intent(in) :: a(:,:)
+integer, intent(in) :: b(:,:)
+integer, allocatable :: out(:,:)
+integer :: n1, n2, ncol
+n1 = size(a, 1)
+n2 = size(b, 1)
+ncol = min(size(a, 2), size(b, 2))
+allocate(out(n1 + n2, ncol))
+if (ncol == 0 .or. (n1 == 0 .and. n2 == 0)) return
+if (n1 > 0) out(1:n1, 1:ncol) = a(:, 1:ncol)
+if (n2 > 0) out(n1 + 1:n1 + n2, 1:ncol) = b(:, 1:ncol)
+end function rbind_int_mat
+
+pure function rbind_int_vec_mat(a, b) result(out)
+! Bind an integer vector as a row and an integer matrix below it.
+integer, intent(in) :: a(:)
+integer, intent(in) :: b(:,:)
+integer, allocatable :: out(:,:)
+integer :: ncol, nrow
+ncol = min(size(a), size(b, 2))
+nrow = size(b, 1)
+allocate(out(nrow + 1, ncol))
+if (ncol == 0) return
+out(1, 1:ncol) = a(1:ncol)
+if (nrow > 0) out(2:, 1:ncol) = b(:, 1:ncol)
+end function rbind_int_vec_mat
+
+pure function rbind_int_mat_vec(a, b) result(out)
+! Bind an integer matrix above an integer vector row.
+integer, intent(in) :: a(:,:)
+integer, intent(in) :: b(:)
+integer, allocatable :: out(:,:)
+integer :: ncol, nrow
+ncol = min(size(a, 2), size(b))
+nrow = size(a, 1)
+allocate(out(nrow + 1, ncol))
+if (ncol == 0) return
+if (nrow > 0) out(1:nrow, 1:ncol) = a(:, 1:ncol)
+out(nrow + 1, 1:ncol) = b(1:ncol)
+end function rbind_int_mat_vec
 
 pure function matrix_real(x, nrow, ncol) result(out)
 ! Build matrix with R-like recycling in column-major order.
@@ -14839,5 +15081,67 @@ real(kind=dp), allocatable :: tmp(:)
 tmp = qsignrank_vec([p], n=n)
 out = tmp(1)
 end function qsignrank_scalar
+
+pure function data_frame_real(names, cols) result(df)
+character(len=*), intent(in) :: names(:)
+real(kind=dp), intent(in) :: cols(:,:)
+type(r_dataframe_t) :: df
+integer :: j, name_len
+name_len = 1
+do j = 1, size(names)
+   name_len = max(name_len, len_trim(names(j)))
+end do
+allocate(character(len=name_len) :: df%names(size(names)))
+df%names = names
+df%real_cols = cols
+end function data_frame_real
+
+function dataframe_real_col(df, name) result(col)
+type(r_dataframe_t), intent(in) :: df
+character(len=*), intent(in) :: name
+real(kind=dp), allocatable :: col(:)
+integer :: j
+do j = 1, size(df%names)
+   if (trim(df%names(j)) == trim(name)) then
+      col = df%real_cols(:, j)
+      return
+   end if
+end do
+error stop "dataframe column not found"
+end function dataframe_real_col
+
+subroutine print_dataframe(df, n)
+type(r_dataframe_t), intent(in) :: df
+integer, intent(in), optional :: n
+integer :: i, j, nshow
+if (.not. allocated(df%real_cols)) then
+   write(*,"(a)") "data frame with 0 columns"
+   return
+end if
+nshow = size(df%real_cols, 1)
+if (present(n)) nshow = min(nshow, max(0, n))
+write(*,"(a)", advance="no") "      "
+do j = 1, size(df%real_cols, 2)
+   write(*,"(1x,a12)", advance="no") trim(df%names(j))
+end do
+write(*,*)
+do i = 1, nshow
+   write(*,"(i6)", advance="no") i
+   do j = 1, size(df%real_cols, 2)
+      write(*,"(1x,g12.6)", advance="no") df%real_cols(i, j)
+   end do
+   write(*,*)
+end do
+end subroutine print_dataframe
+
+subroutine print_dataframe_head(df, n)
+type(r_dataframe_t), intent(in) :: df
+integer, intent(in), optional :: n
+if (present(n)) then
+   call print_dataframe(df, n)
+else
+   call print_dataframe(df, 6)
+end if
+end subroutine print_dataframe_head
 
 end module r_mod
