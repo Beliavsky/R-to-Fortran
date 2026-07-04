@@ -2068,11 +2068,16 @@ def _parse_array_dim_labels(expr: str) -> list[list[str]] | None:
 
 def _parse_array_dim_label_sources(expr: str) -> list[str] | None:
     cinfo = parse_call_text(expr.strip())
-    if cinfo is None or cinfo[0].lower() != "array":
+    if cinfo is None or cinfo[0].lower() not in {"array", "matrix"}:
         return None
     dimnames_src = cinfo[2].get("dimnames")
     if dimnames_src is None:
         return None
+    c_dimnames = parse_call_text(dimnames_src.strip())
+    if c_dimnames is not None and c_dimnames[0].lower() == "dimnames":
+        src = c_dimnames[1][0].strip() if c_dimnames[1] else c_dimnames[2].get("x", "").strip()
+        if src:
+            return [f"rownames({src})", f"colnames({src})"]
     linfo = parse_call_text(dimnames_src.strip())
     if linfo is None or linfo[0].lower() != "list":
         return None
@@ -6555,6 +6560,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             _has_rank2_index_use(t, var)
             or mat_rhs.search(t)
             or mat_call_rhs.search(t)
+            or pat_matrix_slice_rhs.search(t)
             or spread_rhs.search(t)
             or lmfit_resid_rhs.search(t)
             or (re.search(rf"^\s*{v}\s*<-.*%\*%", t) and "as.numeric" not in t.lower())
@@ -8231,10 +8237,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 
     m_subset_rank = re.match(r"^([A-Za-z]\w*)\s*\[(.+)\]$", expr)
     if m_subset_rank is not None:
-        base_rank = inferred_ranks.get(m_subset_rank.group(1).lower(), inferred_ranks.get(m_subset_rank.group(1), 1))
         idx_rank = m_subset_rank.group(2).strip()
         idx_l = idx_rank.lower()
         if "," in idx_rank:
+            base_rank = inferred_ranks.get(m_subset_rank.group(1).lower(), inferred_ranks.get(m_subset_rank.group(1), 2))
             dims = _split_index_dims(idx_rank)
             def _dim_is_scalar_index(d: str) -> bool:
                 dt = d.strip()
@@ -8250,6 +8256,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
 
             kept_dims = sum(1 for d in dims if d.strip() == "" or not _dim_is_scalar_index(d))
             return max(1, min(base_rank, kept_dims if kept_dims > 0 else 1))
+        base_rank = inferred_ranks.get(m_subset_rank.group(1).lower(), inferred_ranks.get(m_subset_rank.group(1), 1))
         if (
             ":" in idx_rank
             or "c(" in idx_l
@@ -10409,7 +10416,14 @@ def r_expr_to_fortran(expr: str) -> str:
         if (
             len(idx_dims_clean_subset) >= 2
             and base_subset_name not in _KNOWN_RANK3_NAMES
-            and (_looks_matrix_expr(base_subset) or _split_trailing_r_subset(base_subset) is not None)
+            and (
+                _looks_matrix_expr(base_subset)
+                or _split_trailing_r_subset(base_subset) is not None
+                or (
+                    base_subset.strip().startswith("(")
+                    and _infer_assignment_rank_hint(fscan.strip_redundant_outer_parens_expr(base_subset.strip()), {}) >= 2
+                )
+            )
         ):
             drop_false_subset = any(
                 re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE)
@@ -10443,7 +10457,24 @@ def r_expr_to_fortran(expr: str) -> str:
             if row_src_subset == "" and col_src_subset and not re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
                 return f"r_matrix_col({r_expr_to_fortran(base_subset)}, {_int_bound_expr(r_expr_to_fortran(col_src_subset))})"
             if row_src_subset and col_src_subset == "" and not re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
-                return f"r_matrix_row({r_expr_to_fortran(base_subset)}, {_int_bound_expr(r_expr_to_fortran(row_src_subset))})"
+                row_rank_subset = _infer_assignment_rank_hint(row_src_subset, {})
+                row_f_subset_tmp = r_expr_to_fortran(row_src_subset)
+                row_name_subset_l = row_src_subset.strip().lower()
+                known_row_vector_subset = row_name_subset_l in (
+                    _KNOWN_VECTOR_NAMES
+                    | _KNOWN_INT_VECTOR_NAMES
+                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                    | _CURRENT_INT_ARRAY_NAMES
+                    | _CURRENT_REAL_ARRAY_NAMES
+                )
+                if (
+                    known_row_vector_subset
+                    or row_rank_subset >= 1
+                    or row_f_subset_tmp.strip().startswith("[")
+                    or re.match(r"^[A-Za-z]\w*\s*\(", row_f_subset_tmp.strip())
+                ):
+                    return f"r_matrix_rows({r_expr_to_fortran(base_subset)}, {row_f_subset_tmp})"
+                return f"r_matrix_row({r_expr_to_fortran(base_subset)}, {_int_bound_expr(row_f_subset_tmp)})"
             row_f_subset = ":" if row_src_subset == "" else _index_dim_to_fortran(r_expr_to_fortran(base_subset), 1, row_src_subset)
             col_f_subset = ":" if col_src_subset == "" else _index_dim_to_fortran(r_expr_to_fortran(base_subset), 2, col_src_subset)
             if (
@@ -12165,6 +12196,22 @@ def r_expr_to_fortran(expr: str) -> str:
         prob_src = kw_s.get("prob")
         x_t = x_src.strip()
         identity_base = False
+        x_simple_l = x_t.lower() if re.fullmatch(r"[A-Za-z]\w*", x_t) else ""
+        x_is_known_vector = bool(
+            x_simple_l
+            and x_simple_l
+            in (
+                _KNOWN_VECTOR_NAMES
+                | _KNOWN_INT_VECTOR_NAMES
+                | _KNOWN_LOGICAL_VECTOR_NAMES
+                | _KNOWN_CHAR_VECTOR_NAMES
+                | _KNOWN_COMPLEX_VECTOR_NAMES
+                | _KNOWN_DATE_VECTOR_NAMES
+                | _CURRENT_INT_ARRAY_NAMES
+                | _CURRENT_REAL_ARRAY_NAMES
+                | _CURRENT_LOGICAL_ARRAY_NAMES
+            )
+        )
         labels_x = _parse_string_c_vector(x_t)
         c_x_rep0 = parse_call_text(x_t)
         if c_x_rep0 is not None and c_x_rep0[0].lower() in {"rep", "rep.int"}:
@@ -12196,6 +12243,14 @@ def r_expr_to_fortran(expr: str) -> str:
             if c_x is not None and c_x[0].lower() in {"seq_len", "seq.int"} and len(c_x[1]) == 1 and not c_x[2]:
                 n_f = _int_bound_expr(r_expr_to_fortran(c_x[1][0]))
                 base_f = f"r_seq_len({n_f})"
+                identity_base = True
+            elif not x_is_known_vector and _infer_assignment_rank_hint(x_t, {}) == 0 and (
+                _is_int_literal(x_t)
+                or re.fullmatch(r"[A-Za-z]\w*", x_t)
+                or any(_split_top_level_token(x_t, op, from_right=True) is not None for op in ["+", "-", "*", "%/%"])
+            ):
+                n_f = _int_bound_expr(r_expr_to_fortran(x_t))
+                base_f = f"r_seq_int(1, {n_f})"
                 identity_base = True
             else:
                 base_f = r_expr_to_fortran(x_src)
@@ -26736,7 +26791,7 @@ def collect_function_array_dimname_sources_from_source(src: str) -> dict[str, li
                 break
         if returned is None:
             continue
-        assign_pat = re.compile(rf"\b{re.escape(returned)}\s*(?:<-|=)\s*array\s*\(", re.IGNORECASE)
+        assign_pat = re.compile(rf"\b{re.escape(returned)}\s*(?:<-|=)\s*(?:array|matrix)\s*\(", re.IGNORECASE)
         matches = list(assign_pat.finditer(body_txt))
         if not matches:
             continue
@@ -26745,7 +26800,9 @@ def collect_function_array_dimname_sources_from_source(src: str) -> dict[str, li
         if open_call < 0:
             continue
         close_call = find_matching(body_txt, open_call, "(", ")")
-        call_src = "array" + body_txt[open_call : close_call + 1]
+        ctor_m = re.search(r"(array|matrix)\s*\($", body_txt[: open_call + 1], re.IGNORECASE)
+        ctor_name = ctor_m.group(1) if ctor_m is not None else "array"
+        call_src = ctor_name + body_txt[open_call : close_call + 1]
         dim_sources = _parse_array_dim_label_sources(call_src)
         if dim_sources is not None and len(dim_sources) >= 2:
             out[fn_name] = dim_sources
@@ -42639,6 +42696,12 @@ def promote_real_matrix_decls_from_matrix_usage_text(f90: str) -> str:
             ln,
             re.IGNORECASE,
         )
+        if m_matrix_assign is None:
+            m_matrix_assign = re.match(
+                r"^\s*([A-Za-z]\w*)\s*=.*r_drop_index\s*\(.*,\s*:\s*\)",
+                ln,
+                re.IGNORECASE,
+            )
         if m_matrix_assign is not None:
             matrix_names.add(m_matrix_assign.group(1).lower())
     if not matrix_names:
@@ -44996,6 +45059,78 @@ def demote_scalar_character_local_decls_text(f90: str) -> str:
         repl,
         f90,
     )
+
+
+def repair_vector_date_to_char_calls_text(f90: str) -> str:
+    return re.sub(
+        r'date_to_char\s*\(\s*(date_from_iso\("[^"]+"\)\s*\+\s*r_seq_len\s*\(\s*size\s*\([^)]+\)\s*\)\s*-\s*\d+)\s*\)',
+        r"date_to_char_vec(\1)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
+def repair_integer_vector_print_calls_text(f90: str) -> str:
+    int_vecs = {
+        m.group(1).lower()
+        for m in re.finditer(r"(?im)^\s*integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(:\)", f90)
+    }
+    if not int_vecs:
+        return f90
+
+    def repl(m: re.Match[str]) -> str:
+        nm = m.group(2)
+        if nm.lower() in int_vecs:
+            return f"{m.group(1)}call print_integer_vector({nm})"
+        return m.group(0)
+
+    return re.sub(r"(?m)^(\s*)call\s+print_real_vector\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", repl, f90)
+
+
+def repair_matrix_rows_round_prints_text(f90: str) -> str:
+    f90 = re.sub(
+        r"(?ims)^(\s*)call\s+print_real_vector\s*\(\s*r_round\s*\(\s*(r_matrix_rows\s*\(.+?\))\s*,\s*([^)]+?)\s*\)\s*\)\s*$",
+        lambda m: f"{m.group(1)}call print_matrix({m.group(2).strip()}, digits={m.group(3).strip()})",
+        f90,
+    )
+    return re.sub(
+        r"(?ims)^(\s*)call\s+print_real_vector\s*\(\s*r_round\s*\(\s*(.+?r_drop_index.+?,\s*:\s*\).+?)\s*,\s*([^)]+?)\s*\)\s*\)\s*$",
+        lambda m: f"{m.group(1)}call print_matrix({m.group(2).strip()}, digits={m.group(3).strip()})",
+        f90,
+    )
+
+
+def repair_late_matrix_print_labels_text(f90: str) -> str:
+    px_table = re.search(
+        r"(?is)call\s+print_table2\s*\(\s*px_mat\s*,\s*(date_to_char_vec\s*\(.+?\))\s*,\s*(\[character\(len=\d+\)\s*::.+?\])\s*,\s*digits\s*=\s*\d+\s*\)",
+        f90,
+    )
+    if px_table is None:
+        return f90
+    row_expr = re.sub(r"\s+", " ", px_table.group(1).strip())
+    col_expr = re.sub(r"\s+", " ", px_table.group(2).strip())
+    m_date = re.search(r'date_from_iso\s*\(\s*"([^"]+)"\s*\)', row_expr)
+    date0 = m_date.group(1) if m_date is not None else None
+
+    f90 = re.sub(
+        r"(?im)^(\s*)call\s+print_matrix\s*\(\s*px_rs\s*,\s*digits\s*=\s*([^)]+)\)\s*$",
+        lambda m: f"{m.group(1)}call print_table2(px_rs, {row_expr}, {col_expr}, digits={m.group(2).strip()})",
+        f90,
+    )
+    if date0 is not None:
+        sampled_rows = f'date_to_char_vec(date_from_iso("{date0}") + idx)'
+        sequential_rows = f'date_to_char_vec(date_from_iso("{date0}") + r_seq_len(size(px_rs, 1) - 1))'
+        f90 = re.sub(
+            r"(?ims)^(\s*)call\s+print_matrix\s*\(\s*(r_matrix_rows\s*\(.+?\))\s*,\s*digits\s*=\s*([^)]+)\)\s*$",
+            lambda m: f"{m.group(1)}call print_table2({m.group(2).strip()}, {sampled_rows}, {col_expr}, digits={m.group(3).strip()})",
+            f90,
+        )
+        f90 = re.sub(
+            r"(?ims)^(\s*)call\s+print_matrix\s*\(\s*((?:px_rs\s*\(.+?r_drop_index.+?,\s*:\s*\).+?))\s*,\s*digits\s*=\s*([^)]+)\)\s*$",
+            lambda m: f"{m.group(1)}call print_table2({m.group(2).strip()}, {sequential_rows}, {col_expr}, digits={m.group(3).strip()})",
+            f90,
+        )
+    return f90
 
 
 def lower_function_dataframe_returns_text(f90: str) -> str:
@@ -47769,12 +47904,15 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
         transient_windows_startup_failures = {
             0xC0000142,  # DLL initialization failed.
         }
-        if (
-            cp.returncode in transient_windows_startup_failures
+        retry_count = 0
+        while (
+            retry_count < 2
+            and cp.returncode in transient_windows_startup_failures
             and not (cp.stdout or cp.stderr)
             and ("gfortran" in compiler_name or "ifx" in compiler_name)
         ):
-            time.sleep(0.25)
+            retry_count += 1
+            time.sleep(0.25 * retry_count)
             cp = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -50551,8 +50689,12 @@ def main() -> int:
         extra_use_names.append("real_to_string_f")
     if "real_to_string_g(" in f90:
         extra_use_names.append("real_to_string_g")
+    if "date_to_char_vec(" in f90:
+        extra_use_names.append("date_to_char_vec")
     if "r_matrix_index(" in f90:
         extra_use_names.append("r_matrix_index")
+    if "r_matrix_rows(" in f90:
+        extra_use_names.append("r_matrix_rows")
     if "r_matrix_row_filter(" in f90:
         extra_use_names.append("r_matrix_row_filter")
     if "r_matrix_col_filter(" in f90:
@@ -50959,6 +51101,20 @@ def main() -> int:
     f90 = repair_integer_vector_function_result_decls_text(f90)
     f90 = coerce_table2_real_args_to_integer_text(f90)
     f90 = repair_malformed_logical_return_comparison_text(f90)
+    f90 = repair_vector_date_to_char_calls_text(f90)
+    if "date_to_char_vec(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"date_to_char_vec"})
+    f90 = repair_integer_vector_print_calls_text(f90)
+    if "call print_integer_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
+    f90 = repair_matrix_rows_round_prints_text(f90)
+    f90 = repair_late_matrix_print_labels_text(f90)
+    if "call print_matrix(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
+    if "call print_table2(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_table2"})
+    if "date_to_char_vec(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"date_to_char_vec"})
     f90 = remove_empty_metadata_if_blocks_text(f90)
     f90 = rewrite_default_label_count_from_matrix_shape_text(f90)
     f90 = wrap_long_character_constructor_values_text(f90)
