@@ -5261,7 +5261,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE) or re.match(r"^as\.(?:numeric|double)\s*\(\s*(?:arima\.sim|arima_sim)\s*\(", rhs_l, re.IGNORECASE):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|ave|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE) or re.match(r"^as\.(?:numeric|double)\s*\(\s*(?:arima\.sim|arima_sim)\s*\(", rhs_l, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -5469,7 +5469,7 @@ def classify_vars(
                         real_scalars.add(st.name)
                     else:
                         real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|ave|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -7621,7 +7621,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -8499,6 +8499,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                     return 2
                 return 1
             if fn_name == "mapply":
+                return 1
+            if fn_name == "ave":
                 return 1
             if fn_name == "tapply":
                 return 1
@@ -10422,6 +10424,25 @@ def r_expr_to_fortran(expr: str) -> str:
     c_sys0 = parse_call_text(s)
     if c_sys0 is not None:
         sys_nm0 = c_sys0[0].lower()
+        if sys_nm0 == "ave":
+            pos_ave, kw_ave = c_sys0[1], c_sys0[2]
+            x_src = pos_ave[0].strip() if pos_ave else kw_ave.get("x", "").strip()
+            if not x_src:
+                raise NotImplementedError("ave requires an x argument")
+            group_srcs = [a.strip() for a in pos_ave[1:] if a.strip()]
+            group_kw_src = kw_ave.get("group", kw_ave.get("g", "")).strip()
+            if group_kw_src:
+                group_srcs.append(group_kw_src)
+            if not group_srcs:
+                raise NotImplementedError("ave currently requires at least one grouping vector")
+            fun_src = kw_ave.get("FUN", kw_ave.get("fun", "mean")).strip()
+            fun_txt = (_dequote_string_literal(fun_src) or fun_src).strip()
+            if not re.fullmatch(r"(?:mean|sum|length|min|max)", fun_txt, re.IGNORECASE):
+                raise NotImplementedError("ave currently supports FUN = mean, sum, length, min, or max")
+            group_f = r_expr_to_fortran(group_srcs[0])
+            for extra_group_src in group_srcs[1:]:
+                group_f = f"ave_group_key({group_f}, {r_expr_to_fortran(extra_group_src)})"
+            return f"ave(real({r_expr_to_fortran(x_src)}, kind=dp), {group_f}, {_fortran_str_literal(fun_txt.lower())})"
         if sys_nm0 == "sprintf":
             sp_scalar0 = _sprintf_scalar_expr_to_fortran(s)
             if sp_scalar0 is not None:
@@ -16330,6 +16351,84 @@ def emit_stmts(
             return "int"
         return "real"
 
+    def _emit_outer_print(expr: str, comment: str) -> bool:
+        raw = fscan.strip_redundant_outer_parens_expr(expr.strip())
+        abs_wrap = False
+        c_abs = parse_call_text(raw)
+        if c_abs is not None and c_abs[0].lower() == "abs":
+            inner_abs = c_abs[1][0].strip() if c_abs[1] else c_abs[2].get("x", "").strip()
+            if inner_abs:
+                raw = fscan.strip_redundant_outer_parens_expr(inner_abs)
+                abs_wrap = True
+        c_outer_print = parse_call_text(raw)
+        if c_outer_print is None or c_outer_print[0].lower() != "outer":
+            return False
+        _nm_o, pos_o, kw_o = c_outer_print
+        outer_call = (_nm_o, pos_o, kw_o)
+        x_src = _first_call_arg(outer_call, "X", "x")
+        y_src = _call_arg(outer_call, 1, "Y", "y")
+        if not x_src or not y_src:
+            raise NotImplementedError("outer requires x and y arguments")
+        fun_src = kw_o.get("FUN", pos_o[2] if len(pos_o) >= 3 else "")
+        c_vec_fun = parse_call_text(fun_src.strip())
+        if c_vec_fun is not None and c_vec_fun[0].lower() == "vectorize":
+            if c_vec_fun[1]:
+                fun_src = c_vec_fun[1][0].strip()
+            elif "FUN" in c_vec_fun[2]:
+                fun_src = c_vec_fun[2]["FUN"].strip()
+        m_fun = re.match(
+            r"^function\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
+            fun_src.strip(),
+            re.IGNORECASE | re.S,
+        )
+        if m_fun:
+            vi = m_fun.group(1)
+            vj = m_fun.group(2)
+            fexpr_r = m_fun.group(3).strip()
+            fexpr_r = re.sub(rf"\b{re.escape(vi)}\b", "ox(i_out)", fexpr_r)
+            fexpr_r = re.sub(rf"\b{re.escape(vj)}\b", "oy(j_out)", fexpr_r)
+        else:
+            op = fun_src.strip().strip("\"'")
+            if op not in {"+", "-", "*", "/", "^"}:
+                raise NotImplementedError("outer print currently supports FUN=function(i,j) <expr> or arithmetic operators")
+            fexpr_r = f"ox(i_out) {op} oy(j_out)"
+        fexpr_f = r_expr_to_fortran(fexpr_r)
+
+        def _real_vec_expr(src: str) -> str:
+            seq = _split_top_level_colon(src.strip())
+            if seq is not None:
+                a0, b0 = seq
+                return f"real(r_seq_int({_int_bound_expr(r_expr_to_fortran(a0))}, {_int_bound_expr(r_expr_to_fortran(b0))}), kind=dp)"
+            return f"real({r_expr_to_fortran(src)}, kind=dp)"
+
+        x_vec = _real_vec_expr(x_src)
+        y_vec = _real_vec_expr(y_src)
+        o.w("block")
+        o.push()
+        o.w("real(kind=dp), allocatable :: ox(:), oy(:), outer_print_tmp(:,:)")
+        o.w("integer :: i_out, j_out")
+        o.w(f"ox = {x_vec}")
+        o.w(f"oy = {y_vec}")
+        o.w("allocate(outer_print_tmp(size(ox), size(oy)))")
+        o.w("do i_out = 1, size(outer_print_tmp, 1)")
+        o.push()
+        o.w("do j_out = 1, size(outer_print_tmp, 2)")
+        o.push()
+        o.w(f"outer_print_tmp(i_out, j_out) = {fexpr_f}")
+        o.pop()
+        o.w("end do")
+        o.pop()
+        o.w("end do")
+        if abs_wrap:
+            o.w("outer_print_tmp = abs(outer_print_tmp)")
+        _wstmt("call print_matrix(outer_print_tmp)", comment)
+        o.pop()
+        o.w("end block")
+        need_r_mod.add("print_matrix_rstyle")
+        if "r_seq_int(" in x_vec or "r_seq_int(" in y_vec:
+            need_r_mod.add("r_seq_int")
+        return True
+
     def _find_predicate_for_element(pred_src: str, elem_f: str) -> str:
         pred = pred_src.strip()
         c_negate = parse_call_text(pred)
@@ -16716,6 +16815,8 @@ def emit_stmts(
             arg_rank_print = c_rank_print[1][0].strip() if c_rank_print[1] else c_rank_print[2].get("x", "").strip()
             if arg_rank_print:
                 return _expr_rank_for_print(arg_rank_print)
+        if c_rank_print is not None and c_rank_print[0].lower() == "ave":
+            return 1
         m_field_print = re.match(r"^[A-Za-z]\w*\s*\$\s*([A-Za-z]\w*)\b", t)
         if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:lengths|values)\b", t):
             if re.search(r"\[[^\]]+\]\s*$", t):
@@ -17061,6 +17162,7 @@ def emit_stmts(
                 "r_div",
                 "runif_vec",
                 "rnorm_vec",
+                "ave",
                 "numeric",
                 "quantile",
                 "tail",
@@ -19524,6 +19626,8 @@ def emit_stmts(
                 if len(st.args) == 1:
                     one = st.args[0].strip()
                     if _emit_vectorized_alias_call(one, st.comment):
+                        continue
+                    if _emit_outer_print(one, st.comment):
                         continue
                     if _emit_position_print(one, st.comment):
                         continue
@@ -51487,6 +51591,10 @@ def main() -> int:
         extra_use_names.append("scan_real")
     if "ecdf_eval(" in f90:
         extra_use_names.append("ecdf_eval")
+    if "ave(" in f90:
+        extra_use_names.append("ave")
+    if "ave_group_key(" in f90:
+        extra_use_names.append("ave_group_key")
     if "ks_test(" in f90 or "print_ks_test(" in f90:
         extra_use_names.extend(["ks_test", "ks_test_result_t", "print_ks_test"])
     if "lm_fit_general(" in f90 or "lm_predict_general(" in f90 or "type(lm_fit_t)" in f90:
