@@ -36,6 +36,7 @@ import fortran_scan as fscan
 _HAS_R_MOD = False
 _FORTRAN_COMMENTS = True
 EMIT_PRIVATE_MODULE_PUBLICS = True
+COALESCE_FINAL_DECLARATIONS = True
 _RAW_FORTRAN_TAG = "xr2f_raw_fortran"
 _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
@@ -37999,6 +38000,107 @@ def normalize_one_variable_declarations_text(f90: str) -> str:
     return "".join(normalize_one_variable_declarations(f90.splitlines(True)))
 
 
+def coalesce_final_declarations_text(f90: str, max_len: int = 132) -> str:
+    """Merge adjacent like declarations late, keeping function results separate."""
+    if not COALESCE_FINAL_DECLARATIONS:
+        return f90
+
+    lines = f90.splitlines(True)
+    out: list[str] = []
+    pending: list[tuple[str, str, str, str]] = []
+    current_results: set[str] = set()
+    in_derived_type = False
+    decl_re = re.compile(
+        r"^(\s*)([^:][^:]*)\s*::\s*(.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    def eol_of(line: str) -> str:
+        return "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+
+    def entity_name(entity: str) -> str:
+        m_name = re.match(r"\s*([A-Za-z]\w*)", entity)
+        return m_name.group(1).lower() if m_name is not None else ""
+
+    def emit_pending() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        if len(pending) == 1:
+            indent, spec, entity, eol = pending[0]
+            out.append(f"{indent}{spec} :: {entity}{eol}")
+            pending = []
+            return
+        indent, spec, _entity0, eol = pending[0]
+        names = [entity for _indent, _spec, entity, _eol in pending]
+        eol = pending[-1][3] or eol
+        merged = f"{indent}{spec} :: {', '.join(names)}"
+        if len(merged) <= max_len:
+            out.append(f"{merged}{eol}")
+        else:
+            first = f"{indent}{spec} :: {names[0]}, &"
+            if len(first) <= max_len:
+                out.append(f"{first}{eol}")
+                start_idx = 1
+            else:
+                out.append(f"{indent}{spec} :: &{eol}")
+                start_idx = 0
+            for idx in range(start_idx, len(names)):
+                tail = "" if idx == len(names) - 1 else ", &"
+                out.append(f"{indent}   & {names[idx]}{tail}{eol}")
+        pending = []
+
+    for line in lines:
+        code0 = line.rstrip("\r\n")
+        code, comment = fscan._split_code_comment(code0)
+        code = code.rstrip()
+
+        m_func = re.match(
+            r"^\s*(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function\b.*\bresult\s*\(\s*([A-Za-z]\w*)\s*\)",
+            code,
+            re.IGNORECASE,
+        )
+        if m_func is not None:
+            emit_pending()
+            current_results = {m_func.group(1).lower()}
+            out.append(line)
+            continue
+        if re.match(r"^\s*end\s+function\b", code, re.IGNORECASE):
+            emit_pending()
+            current_results = set()
+            out.append(line)
+            continue
+        if re.match(r"^\s*type\s*::\s*[A-Za-z]\w*\b", code, re.IGNORECASE):
+            emit_pending()
+            in_derived_type = True
+            out.append(line)
+            continue
+        if in_derived_type and re.match(r"^\s*end\s+type\b", code, re.IGNORECASE):
+            emit_pending()
+            in_derived_type = False
+            out.append(line)
+            continue
+
+        m_decl = None if comment.strip() else decl_re.match(code)
+        if m_decl is None:
+            emit_pending()
+            out.append(line)
+            continue
+        indent, spec, entity = m_decl.groups()
+        spec = spec.strip()
+        entity = entity.strip()
+        if ("=" in entity and "parameter" not in spec.lower()) or entity_name(entity) in current_results:
+            emit_pending()
+            out.append(line)
+            continue
+        key = (indent, spec.lower())
+        if pending and (pending[0][0], pending[0][1].lower()) != key:
+            emit_pending()
+        pending.append((indent, spec, entity, eol_of(line)))
+    emit_pending()
+    return "".join(out)
+
+
 def unroll_multi_allocate_statements(lines: list[str]) -> list[str]:
     """Split safe multi-target allocate statements into one allocate per target."""
     out: list[str] = []
@@ -52568,6 +52670,7 @@ def main() -> int:
     f90_lines = final_wrapped_lines
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = coalesce_final_declarations_text(f90, max_len=132)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
