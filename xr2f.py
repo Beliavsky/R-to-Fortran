@@ -11217,9 +11217,18 @@ def r_expr_to_fortran(expr: str) -> str:
         if pred_src is None or x_src is None:
             raise NotImplementedError("Filter requires predicate and vector arguments")
         pred = pred_src.strip()
+        x_f = r_expr_to_fortran(x_src)
+        m_anon_pred = re.match(
+            r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", pred, flags=re.S
+        )
+        if m_anon_pred:
+            arg_name = m_anon_pred.group(1)
+            body_src = m_anon_pred.group(2).strip()
+            body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({x_src.strip()})", body_src)
+            mask_f = r_expr_to_fortran(body_src)
+            return f"pack({x_f}, {mask_f})"
         if not re.match(r"^[A-Za-z]\w*$", pred):
             raise NotImplementedError("Filter currently requires a named predicate function")
-        x_f = r_expr_to_fortran(x_src)
         return f"pack({x_f}, {pred}({x_f}))"
     if c_filter is not None and c_filter[0] == "filter":
         _nm_filter, pos_filter, kw_filter = c_filter
