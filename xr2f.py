@@ -23541,6 +23541,11 @@ def emit_function(
     if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
     for txt_pure in purity_texts:
+        if re.search(r"\b(?:rowSums|colSums)\s*\(", txt_pure, re.IGNORECASE) and re.search(
+            r"[\+\-\*/]", txt_pure
+        ):
+            can_be_pure = False
+            break
         try:
             lowered_pure = r_expr_to_fortran(txt_pure)
         except Exception:
@@ -43200,6 +43205,15 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
             tname = local_type_vars.get(obj)
             if tname is None:
                 continue
+            m_subset_rhs = re.match(r"^\s*([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", rhs_expr)
+            if m_subset_rhs is not None:
+                base_rhs = m_subset_rhs.group(1)
+                base_decl = local_decls.get(base_rhs)
+                if base_decl is not None:
+                    current_rank = type_field_ranks.get((tname, field.lower()), 0)
+                    if base_decl[0] != current_rank:
+                        replacements[(tname, field.lower())] = base_decl[1].format(field=field)
+                    continue
             rhs_low = rhs_expr.lower()
             rhs_rank: int | None = None
             if re.search(r"\b(?:sum|product|minval|maxval)\s*\(.*\bdim\s*=", rhs_low) is not None:
