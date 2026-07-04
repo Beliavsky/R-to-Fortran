@@ -4990,6 +4990,7 @@ def classify_vars(
     real_arrays: set[str] = set()
     params: dict[str, str] = {}
     known_arrays = set(known_arrays or set())
+    find_char_arrays = {x.lower() for x in infer_main_character_arrays(stmts)}
 
     def seed_sequence_assignments(ss: list[object]) -> None:
         for st in ss:
@@ -5448,6 +5449,18 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif re.match(r"^Find\s*\(", rhs, re.IGNORECASE):
+                    c_find_rank = parse_call_text(rhs)
+                    x_find_src = c_find_rank[1][1].strip() if c_find_rank is not None and len(c_find_rank[1]) >= 2 else (c_find_rank[2].get("x", "").strip() if c_find_rank is not None else "")
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                    ints.discard(st.name)
+                    if x_find_src.lower() not in find_char_arrays and x_find_src.lower() not in _KNOWN_CHAR_VECTOR_NAMES:
+                        real_scalars.add(st.name)
+                    else:
+                        real_scalars.discard(st.name)
                 elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -7599,7 +7612,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|rle|sapply|mapply|tapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -8416,6 +8429,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name == "tapply":
                 return 1
+            if fn_name == "find":
+                return 0
             if fn_name == "apply_col_cumsum":
                 return 2
             if fn_name == "apply_col_sd":
@@ -16188,6 +16203,158 @@ def emit_stmts(
             return None
         return fit_nm, _int_bound_expr(r_expr_to_fortran(n_head))
 
+    def _parse_find_call(expr: str) -> tuple[str, str, str | None] | None:
+        c_find = parse_call_text(fscan.strip_redundant_outer_parens_expr(expr.strip()))
+        if c_find is None or c_find[0] != "Find":
+            return None
+        _nm_find, pos_find, kw_find = c_find
+        pred_src = pos_find[0] if pos_find else kw_find.get("f")
+        x_src = pos_find[1] if len(pos_find) >= 2 else kw_find.get("x")
+        if pred_src is None or x_src is None:
+            raise NotImplementedError("Find requires predicate and vector arguments")
+        return pred_src.strip(), x_src.strip(), kw_find.get("nomatch")
+
+    def _find_vector_kind(x_src: str) -> str:
+        x_name = x_src.strip()
+        if x_name in char_vector_vars_ctx or x_name.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+            return "char"
+        if x_name in int_vector_vars or x_name.lower() in _KNOWN_INT_VECTOR_NAMES:
+            return "int"
+        return "real"
+
+    def _find_predicate_for_element(pred_src: str, elem_f: str) -> str:
+        pred = pred_src.strip()
+        m_anon = re.match(
+            r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
+            pred,
+            flags=re.S,
+        )
+        if m_anon is not None:
+            arg_name = m_anon.group(1)
+            body_src = m_anon.group(2).strip()
+            body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({elem_f})", body_src)
+            return r_expr_to_fortran(body_src)
+        if not re.match(r"^[A-Za-z]\w*$", pred):
+            raise NotImplementedError("Find currently requires a named or one-argument anonymous predicate")
+        actual_f = elem_f
+        kinds = _USER_FUNC_ARG_KIND.get(pred.lower())
+        if not kinds:
+            f_pred = _FUNC_DEFS_BY_NAME.get(pred.lower())
+            if f_pred is not None and f_pred.args:
+                first_arg = f_pred.args[0]
+                if first_arg in infer_function_integer_names(f_pred):
+                    kinds = ["int"]
+        if kinds:
+            wanted = kinds[0]
+            if wanted in {"int", "integer"}:
+                actual_f = f"int({elem_f})"
+            elif wanted == "real":
+                actual_f = f"real({elem_f}, kind=dp)"
+        return f"{pred}({actual_f})"
+
+    find_print_counter = {"n": 0}
+
+    def _emit_find_print(expr: str, comment: str) -> bool:
+        parsed = _parse_find_call(expr)
+        if parsed is None:
+            return False
+        pred_src, x_src, nomatch_src = parsed
+        x_f = r_expr_to_fortran(x_src)
+        kind = _find_vector_kind(x_src)
+        find_print_counter["n"] += 1
+        suffix = find_print_counter["n"]
+        i_nm = f"i_find_{suffix}"
+        found_nm = f"found_find_{suffix}"
+        elem_f = f"{x_f}({i_nm})"
+        pred_f = _find_predicate_for_element(pred_src, elem_f)
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {i_nm}")
+        o.w(f"logical :: {found_nm}")
+        o.w(f"{found_nm} = .false.")
+        o.w(f"do {i_nm} = 1, size({x_f})")
+        o.push()
+        o.w(f"if ({pred_f}) then")
+        o.push()
+        o.w(f"{found_nm} = .true.")
+        o.w("exit")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end do")
+        o.w(f"if ({found_nm}) then")
+        o.push()
+        if kind == "char":
+            _wstmt(f'write(*,"(a)") {elem_f}', comment)
+        elif kind == "int":
+            _wstmt(f'write(*,"(i0)") {elem_f}', comment)
+        else:
+            _wstmt(f"call print_real_scalar({elem_f})", comment)
+            need_r_mod.add("print_real_scalar")
+        o.pop()
+        o.w("else")
+        o.push()
+        nomatch_l = (nomatch_src or "NULL").strip().lower()
+        if nomatch_l in {"null", "na", "na_real_", "na_integer_", "na_character_"}:
+            label = "NULL" if nomatch_l == "null" else "NA"
+            _wstmt(f'write(*,"(a)") "{label}"', "")
+        elif kind == "char":
+            _wstmt(f'write(*,"(a)") {r_expr_to_fortran(nomatch_src or "\"\"")}', "")
+        elif kind == "int":
+            _wstmt(f'write(*,"(i0)") {_int_bound_expr(r_expr_to_fortran(nomatch_src or "0"))}', "")
+        else:
+            _wstmt(f"call print_real_scalar({r_expr_to_fortran(nomatch_src or '0.0')})", "")
+            need_r_mod.add("print_real_scalar")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end block")
+        return True
+
+    def _find_nomatch_value(nomatch_src: str | None, kind: str) -> str:
+        nomatch_l = (nomatch_src or "").strip().lower()
+        if kind == "char":
+            if nomatch_src is None or nomatch_l in {"null", "na", "na_character_"}:
+                return '""'
+            return r_expr_to_fortran(nomatch_src)
+        if kind == "int":
+            if nomatch_src is None or nomatch_l in {"null", "na", "na_integer_"}:
+                return "0"
+            return _int_bound_expr(r_expr_to_fortran(nomatch_src))
+        if nomatch_src is None or nomatch_l in {"null", "na", "na_real_", "na_integer_"}:
+            return "ieee_value(0.0_dp, ieee_quiet_nan)"
+        return r_expr_to_fortran(nomatch_src)
+
+    def _emit_find_assign(target: str, expr: str, comment: str) -> bool:
+        parsed = _parse_find_call(expr)
+        if parsed is None:
+            return False
+        pred_src, x_src, nomatch_src = parsed
+        x_f = r_expr_to_fortran(x_src)
+        kind = _find_vector_kind(x_src)
+        find_print_counter["n"] += 1
+        suffix = find_print_counter["n"]
+        i_nm = f"i_find_{suffix}"
+        elem_f = f"{x_f}({i_nm})"
+        pred_f = _find_predicate_for_element(pred_src, elem_f)
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {i_nm}")
+        _wstmt(f"{target} = {_find_nomatch_value(nomatch_src, kind)}", comment)
+        o.w(f"do {i_nm} = 1, size({x_f})")
+        o.push()
+        o.w(f"if ({pred_f}) then")
+        o.push()
+        _wstmt(f"{target} = {elem_f}", "")
+        o.w("exit")
+        o.pop()
+        o.w("end if")
+        o.pop()
+        o.w("end do")
+        o.pop()
+        o.w("end block")
+        return True
+
     def _expr_rank_for_print(expr_txt: str) -> int | None:
         t = expr_txt.strip()
         if t.startswith("[") and t.endswith("]"):
@@ -17601,6 +17768,8 @@ def emit_stmts(
             if _emit_assign_quantile_scalar(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_assign_qnorm_scalar(st.name, st.expr.strip(), st.comment):
+                continue
+            if _emit_find_assign(st.name, st.expr.strip(), st.comment):
                 continue
             if _emit_assign_user_vector_call_scalar(st.name, st.expr.strip(), st.comment):
                 continue
@@ -19059,6 +19228,8 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    if _emit_find_print(one, st.comment):
+                        continue
                     if print_digits_src is not None and has_r_mod:
                         digits_raw_f = _int_bound_expr(r_expr_to_fortran(print_digits_src))
                         if re.fullmatch(r"[+-]?\d+[lL]?", print_digits_src.strip()):
@@ -25585,6 +25756,11 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                     out.add(st.name)
                     continue
                 c_rhs = parse_call_text(rhs)
+                if c_rhs is not None and c_rhs[0] == "Find":
+                    x_src = c_rhs[1][1].strip() if len(c_rhs[1]) >= 2 else c_rhs[2].get("x", "").strip()
+                    if x_src.lower() in {x.lower() for x in char_arrays_seen} or x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
+                        out.add(st.name)
+                        continue
                 if c_rhs is not None and c_rhs[0].lower() in {"date", "sys.timezone", "sys_timezone", "class", "getwd", "tempfile", "file.path", "file_path"}:
                     out.add(st.name)
                     continue
