@@ -37558,11 +37558,16 @@ def demote_type_fields_from_rank1_local_assignments_text(f90: str) -> str:
                 obj_types[m_obj.group(1)] = tname
 
     demote: set[tuple[str, str]] = set()
-    for m_assign in re.finditer(r"\b([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\b", normalized):
+    for m_assign in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$", normalized):
         obj, field, rhs = m_assign.groups()
         tname = obj_types.get(obj)
         if tname is not None and rhs in rank1_locals:
             demote.add((tname, field.lower()))
+    for m_assign in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*(.+?)\s*$", normalized):
+        obj, field, rhs = m_assign.groups()
+        tname = obj_types.get(obj)
+        if tname is not None and _looks_matrix_expr(rhs):
+            demote.discard((tname, field.lower()))
     if not demote:
         return f90
 
@@ -43168,6 +43173,7 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
 
     replacements: dict[tuple[str, str], str] = {}
     type_field_ranks: dict[tuple[str, str], int] = {}
+    type_field_bases: dict[tuple[str, str], str] = {}
     local_type_vars: dict[str, str] = {}
     local_decls: dict[str, tuple[int, str]] = {}
     in_proc = False
@@ -43176,6 +43182,30 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
         re.IGNORECASE,
     )
     type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", re.IGNORECASE)
+
+    def field_decl_for_rank(base: str, field: str, rank: int) -> str | None:
+        base_l = base.lower()
+        if base_l.startswith("real"):
+            if rank >= 3:
+                return f"real(kind=dp), allocatable :: {field}(:,:,:)"
+            if rank == 2:
+                return f"real(kind=dp), allocatable :: {field}(:,:)"
+            if rank == 1:
+                return f"real(kind=dp), allocatable :: {field}(:)"
+            return f"real(kind=dp) :: {field}"
+        if base_l == "integer":
+            if rank >= 2:
+                return f"integer, allocatable :: {field}(:,:)"
+            if rank == 1:
+                return f"integer, allocatable :: {field}(:)"
+            return f"integer :: {field}"
+        if base_l == "logical":
+            if rank >= 2:
+                return f"logical, allocatable :: {field}(:,:)"
+            if rank == 1:
+                return f"logical, allocatable :: {field}(:)"
+            return f"logical :: {field}"
+        return None
 
     current_type: str | None = None
     for ln in lines:
@@ -43195,7 +43225,9 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
         for part in split_top_level_commas(rest):
             mm = re.match(r"\s*([A-Za-z]\w*)\s*(\(.*\))?", part)
             if mm is not None:
-                type_field_ranks[(current_type, mm.group(1).lower())] = decl_rank_from_dims(mm.group(2) or "")
+                key = (current_type, mm.group(1).lower())
+                type_field_ranks[key] = decl_rank_from_dims(mm.group(2) or "")
+                type_field_bases[key] = _base
 
     for ln in lines:
         if re.match(r"^\s*(?:program|(?:pure\s+|recursive\s+|elemental\s+|module\s+)*function|subroutine)\b", ln, re.IGNORECASE):
@@ -43274,7 +43306,9 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
                         continue
             rhs_low = rhs_expr.lower()
             rhs_rank: int | None = None
-            if re.search(r"\b(?:sum|product|minval|maxval)\s*\(.*\bdim\s*=", rhs_low) is not None:
+            if _looks_matrix_expr(rhs_expr):
+                rhs_rank = 2
+            elif re.search(r"\b(?:sum|product|minval|maxval)\s*\(.*\bdim\s*=", rhs_low) is not None:
                 rhs_rank = 1
             elif re.search(r"\bapply_col_sd\s*\(", rhs_low) is not None:
                 rhs_rank = 1
@@ -43285,12 +43319,10 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
             if rhs_rank is not None:
                 current_rank = type_field_ranks.get((tname, field.lower()), 0)
                 if rhs_rank != current_rank:
-                    if rhs_rank == 0:
-                        replacements[(tname, field.lower())] = f"real(kind=dp) :: {field}"
-                    elif rhs_rank == 1:
-                        replacements[(tname, field.lower())] = f"real(kind=dp), allocatable :: {field}(:)"
-                    elif rhs_rank == 2:
-                        replacements[(tname, field.lower())] = f"real(kind=dp), allocatable :: {field}(:,:)"
+                    key = (tname, field.lower())
+                    repl = field_decl_for_rank(type_field_bases.get(key, "real(kind=dp)"), field, rhs_rank)
+                    if repl is not None:
+                        replacements[key] = repl
 
     if not replacements:
         return f90
@@ -46326,6 +46358,117 @@ def repair_known_scalar_result_fields_text(f90: str) -> str:
                     out.extend(scalar_lines)
                     continue
         out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_result_fields_from_array_sections_text(f90: str) -> str:
+    """Set derived-result field ranks from assignments like res%x = a(:, idx)."""
+
+    logical = re.sub(r"&\s*\n\s*&?", " ", f90)
+    obj_types: dict[str, str] = {}
+    rank1_names: set[str] = set()
+    scalar_names: set[str] = set()
+    for m_decl in re.finditer(
+        r"(?m)^\s*(?:real\s*\([^)]*\)|integer|logical)\s*(?:,\s*allocatable)?\s*::\s*(.+)$",
+        logical,
+        re.IGNORECASE,
+    ):
+        for part in split_top_level_commas(m_decl.group(1)):
+            part_s = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*(\(.*\))?", part_s)
+            if m_item is None:
+                continue
+            dims = (m_item.group(2) or "").replace(" ", "")
+            if dims:
+                rank1_names.add(m_item.group(1))
+            else:
+                scalar_names.add(m_item.group(1))
+    for m_type in re.finditer(
+        r"(?m)^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$",
+        logical,
+        re.IGNORECASE,
+    ):
+        tname = m_type.group(1)
+        for part in split_top_level_commas(m_type.group(2)):
+            m_obj = re.match(r"\s*([A-Za-z]\w*)\b", part)
+            if m_obj is not None:
+                obj_types[m_obj.group(1)] = tname
+
+    repairs: dict[tuple[str, str], int] = {}
+    for m_assign in re.finditer(r"(?m)^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*(.+?)\s*$", logical):
+        obj, field, rhs = m_assign.groups()
+        tname = obj_types.get(obj)
+        if tname is not None and _looks_matrix_expr(rhs):
+            repairs[(tname, field.lower())] = max(repairs.get((tname, field.lower()), 0), 2)
+    for m_assign in re.finditer(
+        r"(?m)^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(([^()]*)\)\s*$",
+        logical,
+    ):
+        obj, field, callee, dims_src = m_assign.groups()
+        tname = obj_types.get(obj)
+        if tname is None:
+            continue
+        if _looks_matrix_expr(f"{callee}({dims_src})"):
+            continue
+        dims = [d.strip() for d in _split_index_dims(dims_src) if d.strip()]
+        rank = 0
+        for d in dims:
+            if ":" in d:
+                rank += 1
+                continue
+            if re.fullmatch(r"[A-Za-z]\w*", d) and d in rank1_names and d not in scalar_names:
+                rank += 1
+                continue
+            if d.startswith("[") or re.match(r"^(?:r_seq_|pack|which|order|int\s*\(\s*\[)", d, re.IGNORECASE):
+                rank += 1
+        if rank > 0:
+            repairs[(tname, field.lower())] = max(repairs.get((tname, field.lower()), 0), rank)
+    if not repairs:
+        return f90
+
+    out: list[str] = []
+    current_type: str | None = None
+    for line in f90.splitlines():
+        m_begin = re.match(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", line, re.IGNORECASE)
+        if m_begin is not None:
+            current_type = m_begin.group(1)
+        if current_type is not None and "::" in line:
+            m_decl = re.match(
+                r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*(?:,\s*allocatable)?\s*::\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if m_decl is not None:
+                kept: list[str] = []
+                repls: list[str] = []
+                for part in split_top_level_commas(m_decl.group(2)):
+                    part_s = part.strip()
+                    m_item = re.fullmatch(r"([A-Za-z]\w*)\s*(?:\(.*\))?", part_s)
+                    rank = repairs.get((current_type, m_item.group(1).lower())) if m_item is not None else None
+                    current_rank = 0
+                    if m_item is not None:
+                        dims_m = re.search(r"\((.*)\)", part_s)
+                        dims_txt = (dims_m.group(1) if dims_m is not None else "").replace(" ", "")
+                        if dims_txt:
+                            current_rank = max(1, dims_txt.count(",") + 1, dims_txt.count(":"))
+                    if rank is None or rank <= current_rank:
+                        kept.append(part_s)
+                    elif rank == 1:
+                        repls.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_item.group(1)}(:)")
+                    elif rank == 2:
+                        repls.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_item.group(1)}(:,:)")
+                    else:
+                        repls.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_item.group(1)}(:,:,:)")
+                if repls:
+                    if kept:
+                        out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: " + ", ".join(kept))
+                    out.extend(repls)
+                    if re.match(r"^\s*end\s+type\b", line, re.IGNORECASE):
+                        current_type = None
+                    continue
+        out.append(line)
+        if current_type is not None and re.match(r"^\s*end\s+type\b", line, re.IGNORECASE):
+            current_type = None
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -52405,9 +52548,11 @@ def main() -> int:
     f90 = promote_integer_index_result_decls_text(f90)
     f90 = restore_missing_vector_formal_declarations_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
+    f90 = repair_result_fields_from_array_sections_text(f90)
     f90 = repair_known_scalar_result_fields_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
+    f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
     f90_lines = fpost.apply_xindent_defaults(f90.splitlines(), max_len=1_000_000)
     final_wrapped_lines: list[str] = []
@@ -52422,6 +52567,7 @@ def main() -> int:
             final_wrapped_lines.extend(fscan.wrap_long_fortran_lines([ln], max_len=132))
     f90_lines = final_wrapped_lines
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
+    f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
