@@ -13841,6 +13841,14 @@ def r_expr_to_fortran(expr: str) -> str:
         return x_src.strip() if x_src else inner.strip()
 
     s = _replace_balanced_func_calls(s, "as.matrix", _as_matrix_inner_repl)
+    def _as_data_frame_inner_repl(inner: str) -> str:
+        c_as_df = parse_call_text("as.data.frame(" + inner + ")")
+        if c_as_df is None:
+            return inner.strip()
+        x_src = _first_call_arg(c_as_df, "x")
+        return r_expr_to_fortran(x_src.strip()) if x_src else inner.strip()
+
+    s = _replace_balanced_func_calls(s, "as.data.frame", _as_data_frame_inner_repl)
     def _as_vector_to_fortran(inner: str) -> str:
         src_v = inner.strip()
         x_f = r_expr_to_fortran(src_v)
@@ -22400,7 +22408,7 @@ def emit_function(
     purity_texts = _collect_stmt_expr_texts(body_stmts) + ([last.expr] if isinstance(last, ExprStmt) else [])
     if any(re.search(r"\blm\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
-    if any(re.search(r"\b(?:file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.exists|dir_exists|dir|list\.files|list_files|file\.info|file_info|scan|scan_real|tempfile|file\.path|file_path)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
+    if any(re.search(r"\b(?:read\.csv|read_csv_real_matrix|read\.table|read_table_real_matrix|file\.exists|file_exists|file\.create|file_create|file\.remove|file_remove|dir\.exists|dir_exists|dir|list\.files|list_files|file\.info|file_info|scan|scan_real|tempfile|file\.path|file_path)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
     if any(re.search(r"\b(?:lm\.fit|qr|qr\.coef|qr\.resid|qr_coef|qr_resid)\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
@@ -23791,6 +23799,11 @@ def emit_function(
                     _force_local_vector_component_aliases(st_alias.body)
 
         _force_local_vector_component_aliases(body_use)
+        local_read_table_matrices: set[str] = set()
+        for st_read_mat in body_use:
+            if isinstance(st_read_mat, Assign) and st_read_mat.expr.strip().lower().startswith(("read.csv(", "read.table(")):
+                local_read_table_matrices.add(st_read_mat.name)
+                _force_local_real_array(st_read_mat.name)
         for metric_scalar in {"loglik", "loglik_old", "aic", "bic", "npar", "ridge", "sigma2"} & assigned_locals:
             ints.discard(metric_scalar)
             int_arrays.discard(metric_scalar)
@@ -23816,6 +23829,8 @@ def emit_function(
                 local_ranks[a] = rk_a
         for x in sorted(int_arrays | real_arrays):
             local_ranks[x] = _infer_local_array_rank(body_use, x)
+        for x in local_read_table_matrices:
+            local_ranks[x] = 2
         for x in function_return_vector_locals:
             local_ranks[x] = 1
         for x in function_return_rank3_locals:
@@ -24791,6 +24806,13 @@ def infer_function_real_matrix_names(fn: FuncDef) -> set[str]:
         for nm in b_real_arrays:
             if _infer_local_array_rank(body_no_ret, nm) >= 2:
                 mats.add(nm)
+
+        def seed_matrix_assignment(st_seed: Assign) -> None:
+            rhs = st_seed.expr.strip()
+            if rhs.lower().startswith(("read.csv(", "read.table(", "as.matrix(")):
+                mats.add(st_seed.name)
+
+        _walk_assignments_recursive(body_no_ret, seed_matrix_assignment)
     return mats
 
 
@@ -42251,19 +42273,68 @@ def rewrite_read_csv_matrix_arg_ranks_text(f90: str) -> str:
 
 
 def repair_real_matrix_reader_target_decls_text(f90: str) -> str:
-    names: set[str] = set()
-    for m in re.finditer(r"\bcall\s+(?:read_csv_real_matrix|read_table_real_matrix)\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*(?:,|\))", f90, re.IGNORECASE):
-        names.add(m.group(1).lower())
-    if not names:
+    if not re.search(r"\bcall\s+(?:read_csv_real_matrix|read_table_real_matrix)\s*\(", f90, re.IGNORECASE):
         return f90
 
-    out: list[str] = []
-    for ln in f90.splitlines():
-        m_decl = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(([^)]*)\)\s*$", ln, re.IGNORECASE)
-        if m_decl is not None and m_decl.group(2).lower() in names:
-            out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {m_decl.group(2)}(:,:)")
+    lines = f90.splitlines()
+    out = list(lines)
+    i = 0
+    offset = 0
+    proc_start_re = re.compile(r"^\s*(?:program|(?:pure\s+|elemental\s+|recursive\s+)*function|subroutine)\b", re.IGNORECASE)
+    proc_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
+    decl_re = re.compile(
+        r"^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\)|character\s*(?:\([^)]*\))?|type\s*\([^)]*\))[^:]*::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    while i < len(lines):
+        if proc_start_re.match(lines[i]) is None:
+            i += 1
             continue
-        out.append(ln)
+        end_i = next((j for j in range(i + 1, len(lines)) if proc_end_re.match(lines[j])), -1)
+        if end_i < 0:
+            i += 1
+            continue
+        block_lines = lines[i:end_i + 1]
+        block = "\n".join(block_lines)
+        targets = {
+            m.group(1)
+            for m in re.finditer(
+                r"\bcall\s+(?:read_csv_real_matrix|read_table_real_matrix)\s*\(\s*[^,]+,\s*([A-Za-z]\w*)\s*(?:,|\))",
+                block,
+                re.IGNORECASE,
+            )
+        }
+        if not targets:
+            i = end_i + 1
+            continue
+        target_l = {nm.lower() for nm in targets}
+        declared: set[str] = set()
+        first_exec = end_i
+        for j in range(i + 1, end_i):
+            ln = lines[j]
+            m_decl = decl_re.match(ln)
+            if m_decl is not None:
+                for item in split_top_level_commas(m_decl.group(1)):
+                    m_item = re.match(r"\s*([A-Za-z]\w*)", item)
+                    if m_item is not None:
+                        declared.add(m_item.group(1).lower())
+                m_bad = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*([A-Za-z]\w*)\s*\(([^)]*)\)\s*$", ln, re.IGNORECASE)
+                if m_bad is not None and m_bad.group(2).lower() in target_l:
+                    out[j + offset] = f"{m_bad.group(1)}real(kind=dp), allocatable :: {m_bad.group(2)}(:,:)"
+                continue
+            if ln.lstrip().startswith("&"):
+                continue
+            if re.match(r"^\s*(?:use\b|implicit\s+none\b|public\b|private\b|contains\b|interface\b|end\s+interface\b|module\s+procedure\b|!)", ln, re.IGNORECASE):
+                continue
+            if ln.strip() == "":
+                continue
+            first_exec = j
+            break
+        missing = [nm for nm in sorted(targets) if nm.lower() not in declared]
+        if missing:
+            out.insert(first_exec + offset, "real(kind=dp), allocatable :: " + ", ".join(f"{nm}(:,:)" for nm in missing))
+            offset += 1
+        i = end_i + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
