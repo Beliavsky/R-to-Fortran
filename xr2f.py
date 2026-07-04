@@ -3025,6 +3025,12 @@ def _r_statement_continues(txt: str) -> bool:
     t = txt.rstrip()
     if not t:
         return False
+    asn = split_top_level_assignment(t)
+    if asn is not None:
+        rhs = asn[1].strip()
+        ih = _parse_if_head(rhs)
+        if ih is not None and not ih[1].strip():
+            return True
     return re.search(r"(?:<-|=|,|%\*%|%%|%/%|\|>|[+\-*/^]|&&|\|\||&|\|)\s*$", t) is not None
 
 
