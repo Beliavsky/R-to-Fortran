@@ -16408,12 +16408,26 @@ def emit_stmts(
             fexpr_r = m_fun.group(3).strip()
             fexpr_r = re.sub(rf"\b{re.escape(vi)}\b", "ox(i_out)", fexpr_r)
             fexpr_r = re.sub(rf"\b{re.escape(vj)}\b", "oy(j_out)", fexpr_r)
+            fexpr_f = r_expr_to_fortran(fexpr_r)
         else:
             op = fun_src.strip().strip("\"'")
-            if op not in {"+", "-", "*", "/", "^"}:
+            if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", op) and (
+                op.lower() in _FUNC_DEFS_BY_NAME or op.lower() in _USER_FUNC_ARG_KIND
+            ):
+                fn_name = _sanitize_r_var_name(op)
+                kinds = _USER_FUNC_ARG_KIND.get(op.lower(), [])
+                arg1 = "ox(i_out)"
+                arg2 = "oy(j_out)"
+                if len(kinds) >= 1 and kinds[0] in {"int", "integer"}:
+                    arg1 = f"int({arg1})"
+                if len(kinds) >= 2 and kinds[1] in {"int", "integer"}:
+                    arg2 = f"int({arg2})"
+                fexpr_f = f"{fn_name}({arg1}, {arg2})"
+            elif op in {"+", "-", "*", "/", "^"}:
+                fexpr_r = f"ox(i_out) {op} oy(j_out)"
+                fexpr_f = r_expr_to_fortran(fexpr_r)
+            else:
                 raise NotImplementedError("outer print currently supports FUN=function(i,j) <expr> or arithmetic operators")
-            fexpr_r = f"ox(i_out) {op} oy(j_out)"
-        fexpr_f = r_expr_to_fortran(fexpr_r)
 
         def _real_vec_expr(src: str) -> str:
             seq = _split_top_level_colon(src.strip())
@@ -18630,20 +18644,37 @@ def emit_stmts(
                     vi = m_fun.group(1)
                     vj = m_fun.group(2)
                     fexpr_r = m_fun.group(3).strip()
-                else:
-                    op = fun_src.strip().strip("\"'")
-                    if op not in {"+", "-", "*", "/", "^"}:
-                        raise NotImplementedError("outer currently supports FUN=function(i,j) <expr>")
-                    vi = "i_out"
-                    vj = "j_out"
-                    fexpr_r = f"ox(i_out) {op} oy(j_out)"
-                fexpr_chk = re.sub(rf"\b{re.escape(vi)}\b", "1", fexpr_r)
-                fexpr_chk = re.sub(rf"\b{re.escape(vj)}\b", "1", fexpr_chk)
-                int_outer = _is_integer_arith_expr(fexpr_chk)
-                if m_fun:
+                    fexpr_chk = re.sub(rf"\b{re.escape(vi)}\b", "1", fexpr_r)
+                    fexpr_chk = re.sub(rf"\b{re.escape(vj)}\b", "1", fexpr_chk)
+                    int_outer = _is_integer_arith_expr(fexpr_chk)
                     fexpr_r = re.sub(rf"\b{re.escape(vi)}\b", "ox(i_out)", fexpr_r)
                     fexpr_r = re.sub(rf"\b{re.escape(vj)}\b", "oy(j_out)", fexpr_r)
-                fexpr_f = r_expr_to_fortran(fexpr_r)
+                    fexpr_f = r_expr_to_fortran(fexpr_r)
+                else:
+                    op = fun_src.strip().strip("\"'")
+                    if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", op) and (
+                        op.lower() in _FUNC_DEFS_BY_NAME or op.lower() in _USER_FUNC_ARG_KIND
+                    ):
+                        fn_name = _sanitize_r_var_name(op)
+                        kinds = _USER_FUNC_ARG_KIND.get(op.lower(), [])
+                        arg1 = "ox(i_out)"
+                        arg2 = "oy(j_out)"
+                        if len(kinds) >= 1 and kinds[0] in {"int", "integer"}:
+                            arg1 = f"int({arg1})"
+                        if len(kinds) >= 2 and kinds[1] in {"int", "integer"}:
+                            arg2 = f"int({arg2})"
+                        fexpr_f = f"{fn_name}({arg1}, {arg2})"
+                        int_outer = False
+                    elif op in {"+", "-", "*", "/", "^"}:
+                        vi = "i_out"
+                        vj = "j_out"
+                        fexpr_r = f"ox(i_out) {op} oy(j_out)"
+                        fexpr_chk = re.sub(rf"\b{re.escape(vi)}\b", "1", fexpr_r)
+                        fexpr_chk = re.sub(rf"\b{re.escape(vj)}\b", "1", fexpr_chk)
+                        int_outer = _is_integer_arith_expr(fexpr_chk)
+                        fexpr_f = r_expr_to_fortran(fexpr_r)
+                    else:
+                        raise NotImplementedError("outer currently supports FUN=function(i,j) <expr>")
 
                 def _vec_expr(src: str) -> str:
                     seq = _split_top_level_colon(src.strip())
