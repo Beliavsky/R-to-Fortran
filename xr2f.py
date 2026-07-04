@@ -11242,18 +11242,38 @@ def r_expr_to_fortran(expr: str) -> str:
             raise NotImplementedError("Filter requires predicate and vector arguments")
         pred = pred_src.strip()
         x_f = r_expr_to_fortran(x_src)
-        m_anon_pred = re.match(
-            r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", pred, flags=re.S
-        )
-        if m_anon_pred:
-            arg_name = m_anon_pred.group(1)
-            body_src = m_anon_pred.group(2).strip()
-            body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({x_src.strip()})", body_src)
-            mask_f = r_expr_to_fortran(body_src)
-            return f"pack({x_f}, {mask_f})"
-        if not re.match(r"^[A-Za-z]\w*$", pred):
-            raise NotImplementedError("Filter currently requires a named predicate function")
-        return f"pack({x_f}, {pred}({x_f}))"
+
+        def _filter_mask_for_pred(pred_text: str, value_src: str, value_f: str) -> str:
+            pred_inner = pred_text.strip()
+            c_neg = parse_call_text(pred_inner)
+            if c_neg is not None and c_neg[0] == "Negate":
+                inner_pred = c_neg[1][0].strip() if c_neg[1] else c_neg[2].get("f", "").strip()
+                if not inner_pred:
+                    raise NotImplementedError("Negate requires a predicate argument")
+                return f".not. ({_filter_mask_for_pred(inner_pred, value_src, value_f)})"
+            m_anon = re.match(
+                r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", pred_inner, flags=re.S
+            )
+            if m_anon:
+                arg_name = m_anon.group(1)
+                body_src = m_anon.group(2).strip()
+                body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({value_src.strip()})", body_src)
+                return r_expr_to_fortran(body_src)
+            if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", pred_inner):
+                raise NotImplementedError("Filter currently requires a named or one-argument anonymous predicate")
+            actual_f = value_f
+            kinds = _USER_FUNC_ARG_KIND.get(pred_inner.lower())
+            if kinds:
+                wanted = kinds[0]
+                if wanted in {"int", "integer"}:
+                    actual_f = f"int({value_f})"
+                elif wanted == "real":
+                    actual_f = f"real({value_f}, kind=dp)"
+            if "." in pred_inner:
+                return r_expr_to_fortran(f"{pred_inner}({actual_f})")
+            return f"{pred_inner}({actual_f})"
+
+        return f"pack({x_f}, {_filter_mask_for_pred(pred, x_src, x_f)})"
     if c_filter is not None and c_filter[0] == "filter":
         _nm_filter, pos_filter, kw_filter = c_filter
         x_src = pos_filter[0] if pos_filter else kw_filter.get("x", "")
@@ -16246,6 +16266,12 @@ def emit_stmts(
 
     def _find_predicate_for_element(pred_src: str, elem_f: str) -> str:
         pred = pred_src.strip()
+        c_negate = parse_call_text(pred)
+        if c_negate is not None and c_negate[0] == "Negate":
+            inner_pred = c_negate[1][0].strip() if c_negate[1] else c_negate[2].get("f", "").strip()
+            if not inner_pred:
+                raise NotImplementedError("Negate requires a predicate argument")
+            return f".not. ({_find_predicate_for_element(inner_pred, elem_f)})"
         m_anon = re.match(
             r"^function\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
             pred,
@@ -16256,7 +16282,7 @@ def emit_stmts(
             body_src = m_anon.group(2).strip()
             body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({elem_f})", body_src)
             return r_expr_to_fortran(body_src)
-        if not re.match(r"^[A-Za-z]\w*$", pred):
+        if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", pred):
             raise NotImplementedError("Find currently requires a named or one-argument anonymous predicate")
         actual_f = elem_f
         kinds = _USER_FUNC_ARG_KIND.get(pred.lower())
@@ -16272,6 +16298,8 @@ def emit_stmts(
                 actual_f = f"int({elem_f})"
             elif wanted == "real":
                 actual_f = f"real({elem_f}, kind=dp)"
+        if "." in pred:
+            return r_expr_to_fortran(f"{pred}({actual_f})")
         return f"{pred}({actual_f})"
 
     find_print_counter = {"n": 0}
