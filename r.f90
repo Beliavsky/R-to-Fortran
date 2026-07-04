@@ -31,7 +31,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & print_real_vector, print_integer_vector, print_char_vector, &
    & print_named_real_vector, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
-   & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, match, r_in, unique, duplicated, anyDuplicated, &
+   & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, cut, outer, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
    & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
@@ -89,6 +89,17 @@ type :: r_dataframe_t
    character(len=:), allocatable :: names(:)
    real(kind=dp), allocatable :: real_cols(:,:)
 end type r_dataframe_t
+
+type :: aggregate_result_t
+   character(len=:), allocatable :: group_name, value_name
+   character(len=:), allocatable :: labels(:)
+   real(kind=dp), allocatable :: values(:)
+end type aggregate_result_t
+
+type :: by_matrix_result_t
+   character(len=:), allocatable :: labels(:)
+   real(kind=dp), allocatable :: values(:,:)
+end type by_matrix_result_t
 
 type :: glm_fit_t
 ! Container for fitted glm fit model state.
@@ -874,6 +885,30 @@ interface prop_table
    module procedure prop_table_int_vec
    module procedure prop_table_int_mat
 end interface prop_table
+
+interface ave
+   module procedure ave_real_char
+   module procedure ave_real_int
+end interface ave
+
+interface ave_group_key
+   module procedure ave_group_key_char_char
+   module procedure ave_group_key_char_int
+   module procedure ave_group_key_int_char
+   module procedure ave_group_key_int_int
+end interface ave_group_key
+
+interface aggregate
+   module procedure aggregate_real_char
+   module procedure aggregate_real_int
+end interface aggregate
+
+interface r_by
+   module procedure by_real_vec_char
+   module procedure by_real_vec_int
+   module procedure by_real_mat_char
+   module procedure by_real_mat_int
+end interface r_by
 
 interface print_table2
    module procedure print_table2_int
@@ -3278,6 +3313,391 @@ else
    out = ieee_value(0.0_dp, ieee_quiet_nan)
 end if
 end function prop_table_int_mat
+
+pure function ave_real_char(x, g, fun) result(out)
+! Apply a simple group aggregate and return one value per input observation.
+real(kind=dp), intent(in) :: x(:)
+character(len=*), intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+real(kind=dp), allocatable :: out(:)
+integer :: i, j, n, cnt
+real(kind=dp) :: total, vmin, vmax
+n = min(size(x), size(g))
+allocate(out(size(x)))
+out = ieee_value(0.0_dp, ieee_quiet_nan)
+do i = 1, n
+   total = 0.0_dp
+   vmin = huge(0.0_dp)
+   vmax = -huge(0.0_dp)
+   cnt = 0
+   do j = 1, n
+      if (trim(g(j)) == trim(g(i))) then
+         total = total + x(j)
+         vmin = min(vmin, x(j))
+         vmax = max(vmax, x(j))
+         cnt = cnt + 1
+      end if
+   end do
+   select case (trim(fun))
+   case ("mean")
+      if (cnt > 0) out(i) = total / real(cnt, kind=dp)
+   case ("sum")
+      out(i) = total
+   case ("length")
+      out(i) = real(cnt, kind=dp)
+   case ("min")
+      if (cnt > 0) out(i) = vmin
+   case ("max")
+      if (cnt > 0) out(i) = vmax
+   case default
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   end select
+end do
+end function ave_real_char
+
+pure function ave_real_int(x, g, fun) result(out)
+! Apply a simple group aggregate and return one value per input observation.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+real(kind=dp), allocatable :: out(:)
+integer :: i, j, n, cnt
+real(kind=dp) :: total, vmin, vmax
+n = min(size(x), size(g))
+allocate(out(size(x)))
+out = ieee_value(0.0_dp, ieee_quiet_nan)
+do i = 1, n
+   total = 0.0_dp
+   vmin = huge(0.0_dp)
+   vmax = -huge(0.0_dp)
+   cnt = 0
+   do j = 1, n
+      if (g(j) == g(i)) then
+         total = total + x(j)
+         vmin = min(vmin, x(j))
+         vmax = max(vmax, x(j))
+         cnt = cnt + 1
+      end if
+   end do
+   select case (trim(fun))
+   case ("mean")
+      if (cnt > 0) out(i) = total / real(cnt, kind=dp)
+   case ("sum")
+      out(i) = total
+   case ("length")
+      out(i) = real(cnt, kind=dp)
+   case ("min")
+      if (cnt > 0) out(i) = vmin
+   case ("max")
+      if (cnt > 0) out(i) = vmax
+   case default
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   end select
+end do
+end function ave_real_int
+
+pure function ave_group_key_char_char(a, b) result(out)
+! Combine two grouping vectors into one character key vector.
+character(len=*), intent(in) :: a(:), b(:)
+character(len=:), allocatable :: out(:)
+integer :: i, n, key_len
+n = min(size(a), size(b))
+key_len = len(a) + len(b) + 1
+allocate(character(len=max(1, key_len)) :: out(n))
+do i = 1, n
+   out(i) = trim(a(i)) // achar(31) // trim(b(i))
+end do
+end function ave_group_key_char_char
+
+pure function ave_group_key_char_int(a, b) result(out)
+! Combine character and integer grouping vectors into one character key vector.
+character(len=*), intent(in) :: a(:)
+integer, intent(in) :: b(:)
+character(len=:), allocatable :: out(:)
+integer :: i, n, key_len
+n = min(size(a), size(b))
+key_len = len(a) + 32
+allocate(character(len=max(1, key_len)) :: out(n))
+do i = 1, n
+   out(i) = trim(a(i)) // achar(31) // trim(int_to_string(b(i)))
+end do
+end function ave_group_key_char_int
+
+pure function ave_group_key_int_char(a, b) result(out)
+! Combine integer and character grouping vectors into one character key vector.
+integer, intent(in) :: a(:)
+character(len=*), intent(in) :: b(:)
+character(len=:), allocatable :: out(:)
+integer :: i, n, key_len
+n = min(size(a), size(b))
+key_len = len(b) + 32
+allocate(character(len=max(1, key_len)) :: out(n))
+do i = 1, n
+   out(i) = trim(int_to_string(a(i))) // achar(31) // trim(b(i))
+end do
+end function ave_group_key_int_char
+
+pure function ave_group_key_int_int(a, b) result(out)
+! Combine two integer grouping vectors into one character key vector.
+integer, intent(in) :: a(:), b(:)
+character(len=:), allocatable :: out(:)
+integer :: i, n
+n = min(size(a), size(b))
+allocate(character(len=65) :: out(n))
+do i = 1, n
+   out(i) = trim(int_to_string(a(i))) // achar(31) // trim(int_to_string(b(i)))
+end do
+end function ave_group_key_int_int
+
+pure function aggregate_real_char(x, g, group_name, value_name, fun) result(out)
+! Aggregate a numeric vector by one character grouping vector.
+real(kind=dp), intent(in) :: x(:)
+character(len=*), intent(in) :: g(:)
+character(len=*), intent(in) :: group_name, value_name, fun
+type(aggregate_result_t) :: out
+integer :: i, j, n, ngrp, cnt
+logical :: seen
+real(kind=dp) :: total, vmin, vmax
+n = min(size(x), size(g))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, i - 1
+      if (trim(g(j)) == trim(g(i))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (.not. seen) ngrp = ngrp + 1
+end do
+out%group_name = trim(group_name)
+out%value_name = trim(value_name)
+allocate(character(len=max(1, len(g))) :: out%labels(ngrp))
+allocate(out%values(ngrp))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, ngrp
+      if (trim(out%labels(j)) == trim(g(i))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (seen) cycle
+   ngrp = ngrp + 1
+   out%labels(ngrp) = trim(g(i))
+   total = 0.0_dp
+   vmin = huge(0.0_dp)
+   vmax = -huge(0.0_dp)
+   cnt = 0
+   do j = 1, n
+      if (trim(g(j)) == trim(g(i))) then
+         total = total + x(j)
+         vmin = min(vmin, x(j))
+         vmax = max(vmax, x(j))
+         cnt = cnt + 1
+      end if
+   end do
+   select case (trim(fun))
+   case ("mean")
+      if (cnt > 0) out%values(ngrp) = total / real(cnt, kind=dp)
+   case ("sum")
+      out%values(ngrp) = total
+   case ("length")
+      out%values(ngrp) = real(cnt, kind=dp)
+   case ("min")
+      out%values(ngrp) = vmin
+   case ("max")
+      out%values(ngrp) = vmax
+   case default
+      out%values(ngrp) = ieee_value(0.0_dp, ieee_quiet_nan)
+   end select
+end do
+end function aggregate_real_char
+
+pure function aggregate_real_int(x, g, group_name, value_name, fun) result(out)
+! Aggregate a numeric vector by one integer grouping vector.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: g(:)
+character(len=*), intent(in) :: group_name, value_name, fun
+type(aggregate_result_t) :: out
+integer :: i, j, n, ngrp, cnt
+logical :: seen
+real(kind=dp) :: total, vmin, vmax
+n = min(size(x), size(g))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, i - 1
+      if (g(j) == g(i)) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (.not. seen) ngrp = ngrp + 1
+end do
+out%group_name = trim(group_name)
+out%value_name = trim(value_name)
+allocate(character(len=32) :: out%labels(ngrp))
+allocate(out%values(ngrp))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, ngrp
+      if (trim(out%labels(j)) == trim(int_to_string(g(i)))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (seen) cycle
+   ngrp = ngrp + 1
+   out%labels(ngrp) = trim(int_to_string(g(i)))
+   total = 0.0_dp
+   vmin = huge(0.0_dp)
+   vmax = -huge(0.0_dp)
+   cnt = 0
+   do j = 1, n
+      if (g(j) == g(i)) then
+         total = total + x(j)
+         vmin = min(vmin, x(j))
+         vmax = max(vmax, x(j))
+         cnt = cnt + 1
+      end if
+   end do
+   select case (trim(fun))
+   case ("mean")
+      if (cnt > 0) out%values(ngrp) = total / real(cnt, kind=dp)
+   case ("sum")
+      out%values(ngrp) = total
+   case ("length")
+      out%values(ngrp) = real(cnt, kind=dp)
+   case ("min")
+      out%values(ngrp) = vmin
+   case ("max")
+      out%values(ngrp) = vmax
+   case default
+      out%values(ngrp) = ieee_value(0.0_dp, ieee_quiet_nan)
+   end select
+end do
+end function aggregate_real_int
+
+pure function by_real_vec_char(x, g, fun) result(out)
+! Apply a scalar aggregate to a vector by one character grouping vector.
+real(kind=dp), intent(in) :: x(:)
+character(len=*), intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+real(kind=dp), allocatable :: out(:)
+type(aggregate_result_t) :: tmp
+tmp = aggregate_real_char(x, g, "", "", fun)
+out = tmp%values
+end function by_real_vec_char
+
+pure function by_real_vec_int(x, g, fun) result(out)
+! Apply a scalar aggregate to a vector by one integer grouping vector.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+real(kind=dp), allocatable :: out(:)
+type(aggregate_result_t) :: tmp
+tmp = aggregate_real_int(x, g, "", "", fun)
+out = tmp%values
+end function by_real_vec_int
+
+pure function by_real_mat_char(x, g, fun) result(out)
+! Apply colMeans/colSums to row groups of a matrix.
+real(kind=dp), intent(in) :: x(:,:)
+character(len=*), intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+type(by_matrix_result_t) :: out
+integer :: i, j, k, n, ngrp, cnt
+logical :: seen
+n = min(size(x, 1), size(g))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, i - 1
+      if (trim(g(j)) == trim(g(i))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (.not. seen) ngrp = ngrp + 1
+end do
+allocate(character(len=max(1, len(g))) :: out%labels(ngrp))
+allocate(out%values(ngrp, size(x, 2)))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, ngrp
+      if (trim(out%labels(j)) == trim(g(i))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (seen) cycle
+   ngrp = ngrp + 1
+   out%labels(ngrp) = trim(g(i))
+   out%values(ngrp, :) = 0.0_dp
+   cnt = 0
+   do j = 1, n
+      if (trim(g(j)) == trim(g(i))) then
+         cnt = cnt + 1
+         do k = 1, size(x, 2)
+            out%values(ngrp, k) = out%values(ngrp, k) + x(j, k)
+         end do
+      end if
+   end do
+   if (trim(fun) == "colmeans" .and. cnt > 0) out%values(ngrp, :) = out%values(ngrp, :) / real(cnt, kind=dp)
+end do
+end function by_real_mat_char
+
+pure function by_real_mat_int(x, g, fun) result(out)
+! Apply colMeans/colSums to row groups of a matrix.
+real(kind=dp), intent(in) :: x(:,:)
+integer, intent(in) :: g(:)
+character(len=*), intent(in) :: fun
+type(by_matrix_result_t) :: out
+integer :: i, j, k, n, ngrp, cnt
+logical :: seen
+n = min(size(x, 1), size(g))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, i - 1
+      if (g(j) == g(i)) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (.not. seen) ngrp = ngrp + 1
+end do
+allocate(character(len=32) :: out%labels(ngrp))
+allocate(out%values(ngrp, size(x, 2)))
+ngrp = 0
+do i = 1, n
+   seen = .false.
+   do j = 1, ngrp
+      if (trim(out%labels(j)) == trim(int_to_string(g(i)))) then
+         seen = .true.
+         exit
+      end if
+   end do
+   if (seen) cycle
+   ngrp = ngrp + 1
+   out%labels(ngrp) = trim(int_to_string(g(i)))
+   out%values(ngrp, :) = 0.0_dp
+   cnt = 0
+   do j = 1, n
+      if (g(j) == g(i)) then
+         cnt = cnt + 1
+         do k = 1, size(x, 2)
+            out%values(ngrp, k) = out%values(ngrp, k) + x(j, k)
+         end do
+      end if
+   end do
+   if (trim(fun) == "colmeans" .and. cnt > 0) out%values(ngrp, :) = out%values(ngrp, :) / real(cnt, kind=dp)
+end do
+end function by_real_mat_int
 
 pure function nested_matrix_list_len(x) result(n)
 ! Count non-padding matrix slices in a ragged nested list lowered to rank 3.
@@ -15143,5 +15563,39 @@ else
    call print_dataframe(df, 6)
 end if
 end subroutine print_dataframe_head
+
+subroutine print_aggregate_result(x)
+type(aggregate_result_t), intent(in) :: x
+integer :: i
+if (.not. allocated(x%labels) .or. .not. allocated(x%values)) then
+   write(*,"(a)") "aggregate result with 0 rows"
+   return
+end if
+write(*,"(a,1x,a)") trim(x%group_name), trim(x%value_name)
+do i = 1, min(size(x%labels), size(x%values))
+   write(*,"(i0,1x,a,1x,g0)") i, trim(x%labels(i)), x%values(i)
+end do
+end subroutine print_aggregate_result
+
+subroutine print_by_matrix_result(x)
+type(by_matrix_result_t), intent(in) :: x
+integer :: i, j
+if (.not. allocated(x%labels) .or. .not. allocated(x%values)) then
+   write(*,"(a)") "by result with 0 groups"
+   return
+end if
+do i = 1, min(size(x%labels), size(x%values, 1))
+   write(*,"(a,1x,a)") "INDICES:", trim(x%labels(i))
+   do j = 1, size(x%values, 2)
+      write(*,"(a,i0,1x)", advance="no") "V", j
+   end do
+   write(*,*)
+   do j = 1, size(x%values, 2)
+      write(*,"(g0,1x)", advance="no") x%values(i, j)
+   end do
+   write(*,*)
+   if (i < min(size(x%labels), size(x%values, 1))) write(*,"(a)") "------------------------------------------------------------"
+end do
+end subroutine print_by_matrix_result
 
 end module r_mod
