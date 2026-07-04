@@ -6184,6 +6184,10 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             c_txt = parse_call_text(txt.strip())
             if c_txt is not None:
                 callee_l = c_txt[0].lower()
+                if callee_l in {"solve", "qr.solve", "qr_solve"}:
+                    rhs_src = c_txt[1][1].strip() if len(c_txt[1]) >= 2 else c_txt[2].get("b", "").strip()
+                    if re.fullmatch(re.escape(arg), rhs_src):
+                        rank = max(rank, 1)
                 callee_ranks = _USER_FUNC_ARG_RANK.get(callee_l, {})
                 callee_idx = _USER_FUNC_ARG_INDEX.get(callee_l, {})
                 for pos, actual in enumerate(c_txt[1]):
@@ -6229,6 +6233,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rf"%\*%\s*{re.escape(arg)}\b",
             rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b",
             rf"\bReduce\s*\([^)]*\b{re.escape(arg)}\b",
+            rf"\b(?:solve|qr\.solve|qr_solve)\s*\(.*,\s*{re.escape(arg)}\s*(?:,|\))",
+            rf"\b(?:solve|qr\.solve|qr_solve)\s*\([^)]*\bb\s*=\s*{re.escape(arg)}\b",
         ]
         call_vector_evidence = False
         for txt_call in _stmt_texts_for_rank_scan(fn.body):
@@ -28171,6 +28177,11 @@ def transpile_r_to_fortran(
                     expr_rank_tail = ret_arg_tail
                 c_rank_tail = parse_call_text(expr_rank_tail)
                 if c_rank_tail is not None:
+                    if c_rank_tail[0].lower() in {"solve", "qr.solve", "qr_solve"}:
+                        b_rank_tail_src = c_rank_tail[1][1].strip() if len(c_rank_tail[1]) >= 2 else c_rank_tail[2].get("b", "").strip()
+                        if not b_rank_tail_src:
+                            return 2
+                        return max(1, _infer_assignment_rank_hint(b_rank_tail_src, _ret_rank_hints()))
                     callee_rank_tail = _USER_FUNC_RETURN_RANK.get(c_rank_tail[0].lower())
                     if callee_rank_tail is not None:
                         return callee_rank_tail
@@ -46865,6 +46876,53 @@ def repair_vector_function_result_declarations_text(f90: str) -> str:
     return proc_re.sub(repl_proc, f90)
 
 
+def repair_solve_vector_function_result_decls_text(f90: str) -> str:
+    """Demote function result declarations for solve_real(A, vector_rhs)."""
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+[A-Za-z]\w*\b.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        result = m.group(2)
+        if re.search(
+            rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*,\s*:\s*\)\s*$",
+            block,
+        ) is None:
+            return block
+        assign_m = re.search(
+            rf"(?im)^\s*{re.escape(result)}\s*=\s*solve_real\s*\((.+)\)\s*$",
+            block,
+        )
+        if assign_m is None:
+            return block
+        args = split_top_level_commas(assign_m.group(1))
+        if len(args) < 2:
+            return block
+        rhs = args[1].strip()
+        if re.fullmatch(r"[A-Za-z]\w*", rhs) is None:
+            return block
+        rhs_is_vector = re.search(
+            rf"(?im)^\s*(?:real\(kind=dp\)|integer|complex\(kind=dp\))\s*,[^:\n]*::[^\n]*\b{re.escape(rhs)}\s*\(:\s*\)",
+            block,
+        ) is not None
+        rhs_is_matrix = re.search(
+            rf"(?im)^\s*(?:real\(kind=dp\)|integer|complex\(kind=dp\))\s*,[^:\n]*::[^\n]*\b{re.escape(rhs)}\s*\(:\s*,\s*:\s*\)",
+            block,
+        ) is not None
+        if not rhs_is_vector or rhs_is_matrix:
+            return block
+        return re.sub(
+            rf"(?im)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*,\s*:\s*\)\s*$",
+            rf"\1real(kind=dp), allocatable :: {result}(:)",
+            block,
+            count=1,
+        )
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def rewrite_vector_elemental_write_calls_text(f90: str) -> str:
     """Repair wrapped scalar writes for vector-valued elemental expressions."""
     return f90
@@ -50379,6 +50437,7 @@ def main() -> int:
     f90 = rewrite_scalar_function_vector_prints_text(f90)
     f90 = repair_null_append_function_results_text(f90)
     f90 = repair_vector_function_result_declarations_text(f90)
+    f90 = repair_solve_vector_function_result_decls_text(f90)
     f90 = rewrite_null_sentinel_append_assignments_text(f90)
     f90 = demote_ls_str_runtime_scalar_declarations_text(f90)
     f90 = promote_vector_function_call_local_decls_text(f90)
@@ -50514,6 +50573,7 @@ def main() -> int:
     if args.special_repairs:
         f90 = repair_trend_results_dataframe_text(f90)
     f90 = repair_vector_function_result_declarations_text(f90)
+    f90 = repair_solve_vector_function_result_decls_text(f90)
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
     if args.special_repairs:
