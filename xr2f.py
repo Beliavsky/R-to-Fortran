@@ -5448,7 +5448,7 @@ def classify_vars(
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -7599,7 +7599,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:rle|sapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:rle|sapply|mapply|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -8303,6 +8303,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 fun_src = _call_arg(c_call, 2, "FUN", "fun")
                 if margin_src.strip() in {"2", "2L"} and fun_src.strip().lower() == "cumsum":
                     return 2
+                return 1
+            if fn_name == "mapply":
                 return 1
             if fn_name == "apply_col_cumsum":
                 return 2
@@ -17707,6 +17709,63 @@ def emit_stmts(
                     _wstmt(f"{st.name} = r_seq_int({a_f}, {b_f})", st.comment)
                     need_r_mod.add("r_seq_int")
                 continue
+            mapply_call = _parse_mapply_call(rhs)
+            if mapply_call is not None:
+                fun_src, arg_srcs, anon_args, anon_body = mapply_call
+                idx_nm = f"xr2f_mapply_i_{st.name}"
+                n_nm = f"xr2f_mapply_n_{st.name}"
+                arg_tmps = [f"xr2f_mapply_arg_{st.name}_{i + 1}" for i in range(len(arg_srcs))]
+                fun_l = fun_src.lower()
+                fun_kinds = _USER_FUNC_ARG_KIND.get(fun_l, [])
+                _wstmt("block", st.comment)
+                o.push()
+                o.w(f"integer :: {idx_nm}, {n_nm}")
+                for i_arg, tmp_nm in enumerate(arg_tmps):
+                    kind_i = fun_kinds[i_arg] if i_arg < len(fun_kinds) else "real"
+                    if anon_args is not None:
+                        kind_i = "real"
+                    if kind_i in {"integer", "int"}:
+                        o.w(f"integer, allocatable :: {tmp_nm}(:)")
+                    else:
+                        o.w(f"real(kind=dp), allocatable :: {tmp_nm}(:)")
+                for i_arg, (tmp_nm, src_arg) in enumerate(zip(arg_tmps, arg_srcs)):
+                    src_f = r_expr_to_fortran(src_arg)
+                    kind_i = fun_kinds[i_arg] if i_arg < len(fun_kinds) else "real"
+                    if anon_args is not None:
+                        kind_i = "real"
+                    if kind_i in {"integer", "int"}:
+                        o.w(f"{tmp_nm} = int({src_f})")
+                    else:
+                        o.w(f"{tmp_nm} = real({src_f}, kind=dp)")
+                size_terms = [f"size({tmp_nm})" for tmp_nm in arg_tmps]
+                if len(size_terms) == 1:
+                    o.w(f"{n_nm} = {size_terms[0]}")
+                else:
+                    o.w(f"{n_nm} = min({', '.join(size_terms)})")
+                o.w(f"allocate({st.name}({n_nm}))")
+                o.w(f"do {idx_nm} = 1, {n_nm}")
+                o.push()
+                if anon_args is not None and anon_body is not None:
+                    body_src_m = anon_body
+                    for arg_nm, tmp_nm in zip(anon_args, arg_tmps):
+                        body_src_m = re.sub(rf"\b{re.escape(arg_nm)}\b", f"{tmp_nm}({idx_nm})", body_src_m)
+                    body_f = r_expr_to_fortran(body_src_m)
+                else:
+                    call_args = []
+                    for i_arg, tmp_nm in enumerate(arg_tmps):
+                        actual = f"{tmp_nm}({idx_nm})"
+                        kind_i = fun_kinds[i_arg] if i_arg < len(fun_kinds) else "real"
+                        if kind_i in {"integer", "int"}:
+                            call_args.append(f"int({actual})")
+                        else:
+                            call_args.append(f"real({actual}, kind=dp)")
+                    body_f = f"{fun_src}({', '.join(call_args)})"
+                o.w(f"{st.name}({idx_nm}) = {body_f}")
+                o.pop()
+                o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             sapply_lam = _parse_sapply_shorthand_lambda(rhs)
             if sapply_lam is not None:
                 x_src, arg_nm, body_src = sapply_lam
@@ -25800,6 +25859,49 @@ def _parse_sapply_shorthand_lambda(expr: str) -> tuple[str, str, str] | None:
     if m_lam is None:
         return None
     return x_src, m_lam.group(1), m_lam.group(2).strip()
+
+
+def _parse_mapply_call(expr: str) -> tuple[str, list[str], list[str] | None, str | None] | None:
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "mapply" or not cinfo[1]:
+        return None
+    fun_src = cinfo[1][0].strip()
+    kw = {
+        k: v
+        for k, v in cinfo[2].items()
+        if k.lower() not in {"moreargs", "simplify", "use.names", "use_names"}
+    }
+    arg_srcs = [p.strip() for p in cinfo[1][1:]]
+    anon_args: list[str] | None = None
+    anon_body: str | None = None
+    m_anon = re.match(
+        r"^function\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*(.+)$",
+        fun_src,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_anon is not None:
+        anon_args = [m_anon.group(1), m_anon.group(2)]
+        anon_body = m_anon.group(3).strip()
+    elif re.fullmatch(r"[A-Za-z]\w*", fun_src):
+        idx_map = _USER_FUNC_ARG_INDEX.get(fun_src.lower(), {})
+        if kw and idx_map:
+            for nm, _idx in sorted(idx_map.items(), key=lambda kv: kv[1]):
+                if nm in {k.lower() for k in kw}:
+                    for key, val in kw.items():
+                        if key.lower() == nm:
+                            arg_srcs.append(val.strip())
+                            break
+            used = {nm for nm in idx_map if nm in {k.lower() for k in kw}}
+            arg_srcs.extend(val.strip() for key, val in kw.items() if key.lower() not in used)
+        else:
+            arg_srcs.extend(val.strip() for val in kw.values())
+    else:
+        return None
+    if len(arg_srcs) < 1:
+        return None
+    if anon_args is not None and len(arg_srcs) != len(anon_args):
+        return None
+    return fun_src, arg_srcs, anon_args, anon_body
 
 
 def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set[str]:
