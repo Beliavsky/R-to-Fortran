@@ -7621,7 +7621,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|aggregate|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -10443,6 +10443,27 @@ def r_expr_to_fortran(expr: str) -> str:
             for extra_group_src in group_srcs[1:]:
                 group_f = f"ave_group_key({group_f}, {r_expr_to_fortran(extra_group_src)})"
             return f"ave(real({r_expr_to_fortran(x_src)}, kind=dp), {group_f}, {_fortran_str_literal(fun_txt.lower())})"
+        if sys_nm0 == "aggregate":
+            pos_ag, kw_ag = c_sys0[1], c_sys0[2]
+            x_src = kw_ag.get("x", pos_ag[0] if pos_ag else "").strip()
+            by_src = kw_ag.get("by", pos_ag[1] if len(pos_ag) >= 2 else "").strip()
+            fun_src = kw_ag.get("FUN", kw_ag.get("fun", pos_ag[2] if len(pos_ag) >= 3 else "mean")).strip()
+            if not x_src or not by_src:
+                raise NotImplementedError("aggregate currently requires x and by arguments")
+            c_by = parse_call_text(by_src)
+            if c_by is None or c_by[0].lower() != "list":
+                raise NotImplementedError("aggregate currently supports by = list(name = group)")
+            if len(c_by[2]) != 1 or c_by[1]:
+                raise NotImplementedError("aggregate currently supports one named grouping vector")
+            group_name, group_src = next(iter(c_by[2].items()))
+            group_name = _sanitize_r_var_name(group_name)
+            fun_txt = (_dequote_string_literal(fun_src) or fun_src).strip()
+            if not re.fullmatch(r"(?:mean|sum|length|min|max)", fun_txt, re.IGNORECASE):
+                raise NotImplementedError("aggregate currently supports FUN = mean, sum, length, min, or max")
+            return (
+                f"aggregate(real({r_expr_to_fortran(x_src)}, kind=dp), {r_expr_to_fortran(group_src.strip())}, "
+                f"{_fortran_str_literal(group_name)}, {_fortran_str_literal('x')}, {_fortran_str_literal(fun_txt.lower())})"
+            )
         if sys_nm0 == "sprintf":
             sp_scalar0 = _sprintf_scalar_expr_to_fortran(s)
             if sp_scalar0 is not None:
@@ -20022,6 +20043,10 @@ def emit_stmts(
                         _wstmt(f"call print_integrate_result({one_f_early})", st.comment)
                         need_r_mod.update({"integrate", "integrate_result_t", "print_integrate_result"})
                         continue
+                    if re.match(r"^aggregate\s*\(", one_f_early.strip(), re.IGNORECASE):
+                        _wstmt(f"call print_aggregate_result({one_f_early})", st.comment)
+                        need_r_mod.update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -20093,6 +20118,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "integrate_result_t":
                         _wstmt(f"call print_integrate_result({one})", st.comment)
                         need_r_mod.update({"print_integrate_result", "integrate_result_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "aggregate_result_t":
+                        _wstmt(f"call print_aggregate_result({one})", st.comment)
+                        need_r_mod.update({"print_aggregate_result", "aggregate_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "optim_result_t":
                         _wstmt('write(*,"(g0)") "par:"', st.comment)
@@ -31077,6 +31106,9 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
                 list_vars[st.name] = "integrate_result_t"
                 helper_ctx_main["need_r_mod"].update({"integrate", "integrate_result_t", "print_integrate_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "aggregate":
+                list_vars[st.name] = "aggregate_result_t"
+                helper_ctx_main["need_r_mod"].update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -51595,6 +51627,8 @@ def main() -> int:
         extra_use_names.append("ave")
     if "ave_group_key(" in f90:
         extra_use_names.append("ave_group_key")
+    if "aggregate(" in f90 or "print_aggregate_result(" in f90 or "type(aggregate_result_t)" in f90:
+        extra_use_names.extend(["aggregate", "aggregate_result_t", "print_aggregate_result"])
     if "ks_test(" in f90 or "print_ks_test(" in f90:
         extra_use_names.extend(["ks_test", "ks_test_result_t", "print_ks_test"])
     if "lm_fit_general(" in f90 or "lm_predict_general(" in f90 or "type(lm_fit_t)" in f90:
