@@ -5261,7 +5261,7 @@ def classify_vars(
                         ints.discard(st.name)
                         int_arrays.discard(st.name)
                         real_scalars.discard(st.name)
-                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|ave|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE) or re.match(r"^as\.(?:numeric|double)\s*\(\s*(?:arima\.sim|arima_sim)\s*\(", rhs_l, re.IGNORECASE):
+                elif re.match(r"^(rep|numeric|quantile|rowsums|colsums|rowmeans|colmeans|apply|ave|by|predict|arima\.sim|arima_sim|ARMAacf|as\.vector|pack|rexp|cooks\.distance|lm_cooks_distance)\s*\(", rhs_l, re.IGNORECASE) or re.match(r"^as\.(?:numeric|double)\s*\(\s*(?:arima\.sim|arima_sim)\s*\(", rhs_l, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -5469,7 +5469,7 @@ def classify_vars(
                         real_scalars.add(st.name)
                     else:
                         real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|ave|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|ave|by|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -7621,7 +7621,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|aggregate|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|aggregate|by|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -8504,6 +8504,10 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name == "tapply":
                 return 1
+            if fn_name == "by":
+                fun_src = _call_arg(c_call, 2, "FUN", "fun")
+                fun_txt = (_dequote_string_literal(fun_src.strip()) or fun_src.strip()).lower() if fun_src else ""
+                return 0 if fun_txt in {"colmeans", "colsums"} else 1
             if fn_name == "find":
                 return 0
             if fn_name == "position":
@@ -10464,6 +10468,18 @@ def r_expr_to_fortran(expr: str) -> str:
                 f"aggregate(real({r_expr_to_fortran(x_src)}, kind=dp), {r_expr_to_fortran(group_src.strip())}, "
                 f"{_fortran_str_literal(group_name)}, {_fortran_str_literal('x')}, {_fortran_str_literal(fun_txt.lower())})"
             )
+        if sys_nm0 == "by":
+            pos_by, kw_by = c_sys0[1], c_sys0[2]
+            x_src = pos_by[0].strip() if pos_by else kw_by.get("data", kw_by.get("x", "")).strip()
+            group_src = pos_by[1].strip() if len(pos_by) >= 2 else kw_by.get("INDICES", kw_by.get("indices", "")).strip()
+            fun_src = pos_by[2].strip() if len(pos_by) >= 3 else kw_by.get("FUN", kw_by.get("fun", "")).strip()
+            if not x_src or not group_src or not fun_src:
+                raise NotImplementedError("by currently requires data, INDICES, and FUN")
+            fun_txt = (_dequote_string_literal(fun_src) or fun_src).strip()
+            fun_key = fun_txt.lower()
+            if fun_key not in {"mean", "sum", "length", "min", "max", "colmeans", "colsums"}:
+                raise NotImplementedError("by currently supports mean, sum, length, min, max, colMeans, and colSums")
+            return f"r_by(real({r_expr_to_fortran(x_src)}, kind=dp), {r_expr_to_fortran(group_src)}, {_fortran_str_literal(fun_key)})"
         if sys_nm0 == "sprintf":
             sp_scalar0 = _sprintf_scalar_expr_to_fortran(s)
             if sp_scalar0 is not None:
@@ -20078,6 +20094,12 @@ def emit_stmts(
                         _wstmt(f"call print_aggregate_result({one_f_early})", st.comment)
                         need_r_mod.update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
                         continue
+                    if re.match(r"^r_by\s*\(", one_f_early.strip(), re.IGNORECASE) and re.search(
+                        r'"\s*col(?:means|sums)\s*"', one_f_early, re.IGNORECASE
+                    ):
+                        _wstmt(f"call print_by_matrix_result({one_f_early})", st.comment)
+                        need_r_mod.update({"r_by", "by_matrix_result_t", "print_by_matrix_result"})
+                        continue
                     if c_one is not None and c_one[0].lower() in {"t.test", "t_test"}:
                         _wstmt(f"call print_t_test({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"t_test", "print_t_test", "t_test_result_t"})
@@ -20153,6 +20175,10 @@ def emit_stmts(
                     if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "aggregate_result_t":
                         _wstmt(f"call print_aggregate_result({one})", st.comment)
                         need_r_mod.update({"print_aggregate_result", "aggregate_result_t"})
+                        continue
+                    if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "by_matrix_result_t":
+                        _wstmt(f"call print_by_matrix_result({one})", st.comment)
+                        need_r_mod.update({"print_by_matrix_result", "by_matrix_result_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and object_list_vars.get(one) == "optim_result_t":
                         _wstmt('write(*,"(g0)") "par:"', st.comment)
@@ -31140,6 +31166,12 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "aggregate":
                 list_vars[st.name] = "aggregate_result_t"
                 helper_ctx_main["need_r_mod"].update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "by":
+                fun_src_by = c_fit_main[1][2].strip() if len(c_fit_main[1]) >= 3 else c_fit_main[2].get("FUN", c_fit_main[2].get("fun", "")).strip()
+                fun_txt_by = (_dequote_string_literal(fun_src_by) or fun_src_by).strip().lower()
+                if fun_txt_by in {"colmeans", "colsums"}:
+                    list_vars[st.name] = "by_matrix_result_t"
+                    helper_ctx_main["need_r_mod"].update({"r_by", "by_matrix_result_t", "print_by_matrix_result"})
             if re.match(r"^t\.?test\s*\(", st.expr.strip(), re.IGNORECASE):
                 t_test_vars.add(st.name)
             m = call_pat.match(st.expr.strip())
@@ -35265,8 +35297,14 @@ def _diff_char_tokens_equal(a: str, b: str) -> bool:
     return av is not None and av == bv
 
 
+def _diff_dash_separator_line(s: str) -> bool:
+    return re.fullmatch(r"-+", s.strip()) is not None
+
+
 def _diff_output_lines_equal(a: str, b: str) -> bool:
     if a == b:
+        return True
+    if _diff_dash_separator_line(a) and _diff_dash_separator_line(b):
         return True
     at = a.split()
     bt = b.split()
@@ -51660,6 +51698,8 @@ def main() -> int:
         extra_use_names.append("ave_group_key")
     if "aggregate(" in f90 or "print_aggregate_result(" in f90 or "type(aggregate_result_t)" in f90:
         extra_use_names.extend(["aggregate", "aggregate_result_t", "print_aggregate_result"])
+    if "r_by(" in f90 or "print_by_matrix_result(" in f90 or "type(by_matrix_result_t)" in f90:
+        extra_use_names.extend(["r_by", "by_matrix_result_t", "print_by_matrix_result"])
     if "ks_test(" in f90 or "print_ks_test(" in f90:
         extra_use_names.extend(["ks_test", "ks_test_result_t", "print_ks_test"])
     if "lm_fit_general(" in f90 or "lm_predict_general(" in f90 or "type(lm_fit_t)" in f90:
@@ -52546,7 +52586,7 @@ def main() -> int:
                         for i_line in range(max_len):
                             r_line = r_lines[i_line] if i_line < len(r_lines) else None
                             f_line = f_lines[i_line] if i_line < len(f_lines) else None
-                            if r_line != f_line:
+                            if r_line is None or f_line is None or not _diff_output_lines_equal(r_line, f_line):
                                 mismatches.append((i_line, r_line, f_line))
                         cap = max(0, int(args.run_diff_max))
                         shown = mismatches if cap == 0 else mismatches[:cap]
