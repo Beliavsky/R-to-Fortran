@@ -44872,6 +44872,13 @@ def demote_scalar_reduction_local_declarations_text(f90: str) -> str:
             rhs_inner = ma.group(2)
             if not re.search(r"\bdim\s*=", rhs_inner, re.IGNORECASE):
                 scalar_names.add(ma.group(1).lower())
+        for ma in re.finditer(
+            rf"(?im)^\s*([A-Za-z]\w*)\s*=\s*{reducer_pat}\s*\((.*?)\)\s*/\s*real\s*\(",
+            block,
+        ):
+            rhs_inner = ma.group(2)
+            if not re.search(r"\bdim\s*=", rhs_inner, re.IGNORECASE):
+                scalar_names.add(ma.group(1).lower())
         if not scalar_names:
             return block
 
@@ -53153,6 +53160,7 @@ def main() -> int:
     f90_lines = final_wrapped_lines
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = promote_real_matrix_initializer_decls_text(f90)
     f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = coalesce_final_declarations_text(f90, max_len=132)
