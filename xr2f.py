@@ -23025,6 +23025,10 @@ def _emit_nls_assignment(
         return False
     y_src = form_split[0].strip()
     pred_src = form_split[1].strip()
+    algorithm_src = kw.get("algorithm", "").strip()
+    algorithm_lit = _dequote_string_literal(algorithm_src) if algorithm_src else None
+    if algorithm_src and (algorithm_lit or algorithm_src).lower() not in {"default", "port"}:
+        return False
     start_src = kw.get("start", "").strip()
     start_vals = _named_values_from_call(start_src, "list")
     if not start_vals:
@@ -34823,6 +34827,11 @@ def transpile_r_to_fortran(
     if "print_matrix_rstyle" in main_needed:
         main_needed.discard("print_matrix")
     user_func_names_l = {f.name.lower() for f in funcs}
+    if "print_matrix" in user_func_names_l:
+        if not re.search(r"\bprint_matrix_rstyle\s*\(", mod_text_now, re.IGNORECASE):
+            mod_needed.discard("print_matrix_rstyle")
+        if not re.search(r"\bprint_matrix_rstyle\s*\(", main_text_now, re.IGNORECASE):
+            main_needed.discard("print_matrix_rstyle")
     mod_needed = {nm for nm in mod_needed if nm.lower() not in user_func_names_l}
     main_needed = {nm for nm in main_needed if nm.lower() not in user_func_names_l}
     if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
@@ -45078,6 +45087,14 @@ def add_missing_r_mod_uses_per_scope_text(f90: str, names: set[str]) -> str:
     needed = {_target_name(nm) for nm in names if _target_name(nm)}
     if not needed:
         return f90
+    if "print_matrix_rstyle" in needed and re.search(
+        r"(?im)^\s*(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:subroutine|function)\s+print_matrix\b",
+        f90,
+    ):
+        needed.discard("print_matrix_rstyle")
+    if not needed:
+        return f90
 
     lines = f90.splitlines()
     out: list[str] = []
@@ -46730,6 +46747,25 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
     )
     blocks = list(block_pat.finditer(f90))
     proc_formals: dict[str, list[str]] = {}
+    type_field_ranks: dict[str, dict[str, int]] = {}
+
+    for m_type in re.finditer(
+        r"(?ims)^\s*type\s+::\s+([A-Za-z]\w*)\s*$.*?^\s*end\s+type\b[^\n]*",
+        f90,
+    ):
+        fields: dict[str, int] = {}
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            m_type.group(0),
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*(?:\(([^)]*)\))?", part.strip())
+                if m_item is None:
+                    continue
+                dims = (m_item.group(2) or "").strip()
+                fields[m_item.group(1).lower()] = 0 if not dims else dims.count(":")
+        if fields:
+            type_field_ranks[m_type.group(1).lower()] = fields
 
     def clean_args(arg_text: str) -> list[str]:
         cleaned = re.sub(r"&\s*\n\s*&?", " ", arg_text)
@@ -46738,7 +46774,7 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
     def real_decl_ranks(block: str) -> dict[str, int]:
         ranks: dict[str, int] = {}
         for m_decl in re.finditer(
-            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?::\s*(.+)$",
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
             block,
         ):
             for part in split_top_level_commas(m_decl.group(1)):
@@ -46750,12 +46786,23 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
         return ranks
 
     for m_block in blocks:
-        proc_formals[m_block.group(1).lower()] = clean_args(m_block.group(2))
+        if not re.match(r"(?is)^\s*(?:pure\s+|recursive\s+)*elemental\b", m_block.group(0)):
+            proc_formals[m_block.group(1).lower()] = clean_args(m_block.group(2))
 
     required: dict[tuple[str, int], int] = {}
     conflicts: set[tuple[str, int]] = set()
     for m_block in blocks:
         local_ranks = real_decl_ranks(m_block.group(0))
+        local_types: dict[str, str] = {}
+        for m_type_decl in re.finditer(
+            r"(?im)^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            m_block.group(0),
+        ):
+            type_l = m_type_decl.group(1).lower()
+            for part in split_top_level_commas(m_type_decl.group(2)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\b", part.strip())
+                if m_item is not None:
+                    local_types[m_item.group(1).lower()] = type_l
         flat = re.sub(r"&\s*\n\s*&?", " ", m_block.group(0))
         flat_scan = re.sub(
             r"^\s*(?:pure\s+|recursive\s+|elemental\s+)*(?:function|subroutine)\s+[A-Za-z]\w*\s*\([^)]*\)",
@@ -46787,6 +46834,7 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
                 if formal_i >= len(formals):
                     continue
                 actual_l = actual.lower()
+                m_component = re.fullmatch(r"([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)", actual_l)
                 if actual_l in local_ranks:
                     rank = local_ranks[actual_l]
                     key = (callee_l, formal_i)
@@ -46794,6 +46842,17 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
                         required[key] = max(required.get(key, 0), rank)
                     elif key in required:
                         conflicts.add(key)
+                elif m_component is not None:
+                    owner_l = m_component.group(1).lower()
+                    field_l = m_component.group(2).lower()
+                    type_l = local_types.get(owner_l)
+                    rank = type_field_ranks.get(type_l or "", {}).get(field_l)
+                    if rank is not None:
+                        key = (callee_l, formal_i)
+                        if rank > 0:
+                            required[key] = max(required.get(key, 0), rank)
+                        elif key in required:
+                            conflicts.add(key)
                 elif re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", actual_l):
                     conflicts.add((callee_l, formal_i))
 
@@ -46854,6 +46913,380 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
     for start, end, new_block in reversed(replacements):
         f90 = f90[:start] + new_block + f90[end:]
     return f90
+
+
+def promote_forwardsolve_matrix_lhs_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\(.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
+    )
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in block_pat.finditer(f90):
+        block = m_block.group(0)
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is not None and m_item.group(2).count(":") >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank2_names:
+            continue
+        needed: set[str] = set()
+
+        def observe_forwardsolve(args_src: str, lhs: str) -> str:
+            args = split_top_level_commas(args_src)
+            if len(args) >= 2 and re.fullmatch(r"[A-Za-z]\w*", args[1].strip()):
+                if args[1].strip().lower() in rank2_names:
+                    needed.add(lhs.lower())
+            return f"forwardsolve({args_src})"
+
+        for m_assign in re.finditer(
+            r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.*forwardsolve\s*\()",
+            block,
+        ):
+            lhs = m_assign.group(1)
+            line_start = m_assign.start()
+            line_end = block.find("\n", line_start)
+            if line_end < 0:
+                line_end = len(block)
+            stmt = block[line_start:line_end]
+            _replace_balanced_func_calls(
+                stmt,
+                "forwardsolve",
+                lambda args_src, lhs=lhs: observe_forwardsolve(args_src, lhs),
+            )
+        if not needed:
+            continue
+
+        def rewrite_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            out_parts: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_item = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_item is None:
+                    out_parts.append(p)
+                    continue
+                name = m_item.group(1)
+                dims = (m_item.group(2) or "").strip()
+                cur_rank = 0 if not dims else dims.count(":")
+                if name.lower() in needed and cur_rank < 2:
+                    out_parts.append(f"{name}(:,:)")
+                    changed = True
+                else:
+                    out_parts.append(p)
+            if not changed:
+                return m_decl.group(0)
+            return prefix + ", ".join(out_parts)
+
+        new_block = re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*)(.+)$",
+            rewrite_decl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
+    return f90
+
+
+def promote_transpose_matrix_assignment_lhs_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\(.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
+    )
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in block_pat.finditer(f90):
+        block = m_block.group(0)
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is not None and m_item.group(2).count(":") >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank2_names:
+            continue
+        needed = {
+            lhs.lower()
+            for lhs, rhs in re.findall(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", block)
+            if any(
+                re.search(rf"\btranspose\s*\(\s*{re.escape(name)}\s*\)", rhs, re.IGNORECASE)
+                for name in rank2_names
+            )
+        }
+        if not needed:
+            continue
+
+        def rewrite_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            out_parts: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_item = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_item is None:
+                    out_parts.append(p)
+                    continue
+                name = m_item.group(1)
+                dims = (m_item.group(2) or "").strip()
+                cur_rank = 0 if not dims else dims.count(":")
+                if name.lower() in needed and cur_rank < 2:
+                    out_parts.append(f"{name}(:,:)")
+                    changed = True
+                else:
+                    out_parts.append(p)
+            if not changed:
+                return m_decl.group(0)
+            return prefix + ", ".join(out_parts)
+
+        new_block = re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*)(.+)$",
+            rewrite_decl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
+    return f90
+
+
+def fix_row_slice_assignment_from_rank2_local_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\(.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
+    )
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in block_pat.finditer(f90):
+        block = m_block.group(0)
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is not None and m_item.group(2).count(":") >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank2_names:
+            continue
+
+        def repl(m_assign: re.Match[str]) -> str:
+            rhs = m_assign.group(4)
+            if rhs.lower() not in rank2_names:
+                return m_assign.group(0)
+            return f"{m_assign.group(1)}{m_assign.group(2)} = {rhs}(:, 1){m_assign.group(5) or ''}"
+
+        new_block = re.sub(
+            r"(?m)^(\s*)([A-Za-z]\w*\s*\([^,:\n]+,\s*:\s*\))\s*=\s*([ \t]*)([A-Za-z]\w*)\s*(!.*)?$",
+            repl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
+    return f90
+
+
+def demote_solve_vector_lhs_text(f90: str) -> str:
+    block_pat = re.compile(
+        r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\s*\(.*?"
+        r"^\s*end\s+(?:function|subroutine)\s+\1\s*$"
+    )
+    replacements: list[tuple[int, int, str]] = []
+    for m_block in block_pat.finditer(f90):
+        block = m_block.group(0)
+        rank1_names: set[str] = set()
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is None:
+                    continue
+                rank = m_item.group(2).count(":")
+                if rank == 1:
+                    rank1_names.add(m_item.group(1).lower())
+                elif rank >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank1_names:
+            continue
+        needed: set[str] = set()
+
+        def rhs_is_vector(rhs: str) -> bool:
+            rhs_l = rhs.strip().lower()
+            if rhs_l in rank1_names:
+                return True
+            m_mm = re.fullmatch(
+                r"r_matmul\s*\(\s*transpose\s*\(\s*([A-Za-z]\w*)\s*\)\s*,\s*([A-Za-z]\w*)\s*\)",
+                rhs_l,
+            )
+            return bool(m_mm and m_mm.group(1).lower() in rank2_names and m_mm.group(2).lower() in rank1_names)
+
+        for lhs, args_src in re.findall(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*solve_real\s*\((.+)\)\s*$", block):
+            args = split_top_level_commas(args_src)
+            if len(args) >= 2 and rhs_is_vector(args[1]):
+                needed.add(lhs.lower())
+        if not needed:
+            continue
+
+        def rewrite_decl(m_decl: re.Match[str]) -> str:
+            prefix = m_decl.group(1)
+            out_parts: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_decl.group(2)):
+                p = part.strip()
+                m_item = re.match(r"([A-Za-z]\w*)\s*(?:\(([^)]*)\))?$", p)
+                if m_item is None:
+                    out_parts.append(p)
+                    continue
+                name = m_item.group(1)
+                dims = (m_item.group(2) or "").strip()
+                if name.lower() in needed and dims.count(":") >= 2:
+                    out_parts.append(f"{name}(:)")
+                    changed = True
+                else:
+                    out_parts.append(p)
+            if not changed:
+                return m_decl.group(0)
+            return prefix + ", ".join(out_parts)
+
+        new_block = re.sub(
+            r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*)(.+)$",
+            rewrite_decl,
+            block,
+        )
+        if new_block != block:
+            replacements.append((m_block.start(), m_block.end(), new_block))
+    for start, end, new_block in reversed(replacements):
+        f90 = f90[:start] + new_block + f90[end:]
+    return f90
+
+
+def promote_vector_result_from_vector_dummy_expr_text(f90: str) -> str:
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+[A-Za-z]\w*\s*\(.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*)"
+    )
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        block = m_proc.group(1)
+        result = m_proc.group(2)
+        m_name = re.match(r"(?is)^\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\b", block)
+        if m_name is not None and re.search(
+            rf"\b(?:nlm_optimize_scalar|nlm_optimize_vec|optim|integrate)\s*\(\s*{re.escape(m_name.group(1))}\b",
+            f90,
+            re.IGNORECASE,
+        ):
+            return block
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*{re.escape(result)}\s*$",
+            block,
+        ) is None:
+            return block
+        vector_dummies: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*\)", part.strip())
+                if m_item is not None:
+                    vector_dummies.add(m_item.group(1).lower())
+        if not vector_dummies:
+            return block
+        for m_assign in re.finditer(rf"(?im)^\s*{re.escape(result)}\s*=\s*(.+)$", block):
+            rhs = m_assign.group(1)
+            if re.search(r"\b(?:sum|mean|minval|maxval|dot_product|count|all|any)\s*\(", rhs, re.IGNORECASE):
+                continue
+            if any(re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE) for nm in vector_dummies):
+                return re.sub(
+                    rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*{re.escape(result)}\s*$",
+                    rf"\1real(kind=dp), allocatable :: {result}(:)",
+                    block,
+                    count=1,
+                )
+        return block
+
+    return proc_pat.sub(repl_proc, f90)
+
+
+def flatten_rank2_assignments_to_vector_results_text(f90: str) -> str:
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+[A-Za-z]\w*\s*\(.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*)"
+    )
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        block = m_proc.group(1)
+        result = m_proc.group(2)
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*\)",
+            block,
+        ) is None:
+            return block
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is not None and m_item.group(2).count(":") >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank2_names:
+            return block
+
+        def repl_assign(m_assign: re.Match[str]) -> str:
+            rhs = m_assign.group(2)
+            if rhs.lower() not in rank2_names:
+                return m_assign.group(0)
+            return f"{m_assign.group(1)}{result} = reshape({rhs}, [size({rhs})]){m_assign.group(3) or ''}"
+
+        return re.sub(
+            rf"(?im)^(\s*){re.escape(result)}\s*=\s*([A-Za-z]\w*)\s*(!.*)?$",
+            repl_assign,
+            block,
+        )
+
+    return proc_pat.sub(repl_proc, f90)
+
+
+def rewrite_indexed_matrix_function_results_text(f90: str) -> str:
+    return re.sub(
+        r"\bcov2cor\s*\(\s*([A-Za-z]\w*(?:\s*%\s*[A-Za-z]\w*)?)\s*\)\s*"
+        r"\(\s*([^,\n()]+)\s*,\s*([^()\n]+?)\s*\)",
+        r"matrix_elem(cov2cor(\1), \2, \3)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
+def rewrite_integer_literal_diag_actuals_text(f90: str) -> str:
+    return re.sub(
+        r"(=\s*)diag\s*\(\s*(\d+)\s*\)",
+        r"\1real(diag(\2), kind=dp)",
+        f90,
+        flags=re.IGNORECASE,
+    )
 
 
 def repair_make_pos_def_text(f90: str) -> str:
@@ -53257,6 +53690,8 @@ def main() -> int:
         extra_use_names.append("date_to_char_vec")
     if "r_matrix_index(" in f90:
         extra_use_names.append("r_matrix_index")
+    if "matrix_elem(" in f90:
+        extra_use_names.append("matrix_elem")
     if "r_matrix_rows(" in f90:
         extra_use_names.append("r_matrix_rows")
     if "r_matrix_row_filter(" in f90:
@@ -53569,6 +54004,17 @@ def main() -> int:
     f90 = repair_var_yw_print_labels_text(f90)
     f90 = skip_plotting_blocks_text(f90)
     f90 = promote_forwarded_dummy_ranks_text(f90)
+    f90 = promote_formals_from_call_actual_ranks_text(f90)
+    f90 = promote_forwardsolve_matrix_lhs_text(f90)
+    f90 = promote_transpose_matrix_assignment_lhs_text(f90)
+    f90 = fix_row_slice_assignment_from_rank2_local_text(f90)
+    f90 = demote_solve_vector_lhs_text(f90)
+    f90 = promote_vector_result_from_vector_dummy_expr_text(f90)
+    f90 = flatten_rank2_assignments_to_vector_results_text(f90)
+    f90 = rewrite_indexed_matrix_function_results_text(f90)
+    f90 = rewrite_integer_literal_diag_actuals_text(f90)
+    if "matrix_elem(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"matrix_elem"})
     if args.special_repairs:
         f90 = repair_make_pos_def_text(f90)
         f90 = repair_price_names_decl_text(f90)
