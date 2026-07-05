@@ -91,7 +91,7 @@ def check_cwd_for(item: WorkItem, out_path: Path, args: argparse.Namespace) -> P
 def process_one(item: WorkItem, out_path: Path, args: argparse.Namespace) -> Result:
     try:
         src = item.src.read_text(encoding="utf-8-sig")
-        obfuscated = obfuscate_r_source(src)
+        obfuscated = obfuscate_r_source(src, seed=args.seed)
     except Exception as exc:
         return Result(item.src, None, False, "obfuscate", str(exc))
 
@@ -168,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="output path for a single input file")
     ap.add_argument("--out-dir", help="directory for obfuscated outputs")
     ap.add_argument("--suffix", default="_obfuscated", help="suffix before .r/.R (default: _obfuscated)")
+    ap.add_argument("--seed", type=int, help="seed for randomized obfuscated names; omit for deterministic sequential names")
     ap.add_argument("--recursive", action="store_true", help="recursively discover .r/.R files in input directories")
     ap.add_argument("--check", action="store_true", help="run each generated obfuscated R file with Rscript")
     ap.add_argument("--rscript", default="rscript", help="command used by --check (default: rscript)")
