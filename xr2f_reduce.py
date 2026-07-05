@@ -301,6 +301,36 @@ def _top_level_assigned_names(block: str) -> set[str]:
     return set()
 
 
+def _block_definition_names(block: str) -> set[str]:
+    top = _top_level_assigned_names(block)
+    if top:
+        return top
+    clean = _strip_r_strings_and_comments(block)
+    for line in clean.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^(?:if|while|repeat)\b", stripped):
+            return _assigned_names(block)
+        return set()
+    return set()
+
+
+def _self_referential_top_assignments(block: str) -> set[str]:
+    clean = _strip_r_strings_and_comments(block)
+    for line in clean.splitlines():
+        if not line.strip():
+            continue
+        m = _ASSIGN_RE.match(line)
+        if m is None:
+            return set()
+        name, op, rest = m.group(1), m.group(2), m.group(3)
+        if op == "=" and rest.rstrip().endswith(","):
+            return set()
+        return {name} if re.search(rf"\b{re.escape(name)}\b", rest) else set()
+    return set()
+
+
 def _used_names(block: str) -> set[str]:
     clean = _strip_r_strings_and_comments(block)
     names = set(_IDENT_RE.findall(clean))
@@ -319,7 +349,7 @@ def restore_dependency_blocks(candidate: list[str], all_blocks: list[str]) -> li
     selected = set(candidate)
     assign_blocks: dict[str, set[str]] = {}
     for block in all_blocks:
-        for name in _top_level_assigned_names(block):
+        for name in _block_definition_names(block):
             assign_blocks.setdefault(name, set()).add(block)
 
     changed = True
@@ -329,8 +359,9 @@ def restore_dependency_blocks(candidate: list[str], all_blocks: list[str]) -> li
         needed = set()
         for block in all_blocks:
             if block in selected:
-                top_assigned.update(_top_level_assigned_names(block))
-                needed.update(_used_names(block) - _assigned_names(block))
+                self_refs = _self_referential_top_assignments(block)
+                top_assigned.update(_block_definition_names(block) - self_refs)
+                needed.update((_used_names(block) - _assigned_names(block)) | self_refs)
         for name in needed - top_assigned:
             for dep in assign_blocks.get(name, ()):
                 if dep not in selected:
