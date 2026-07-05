@@ -9974,6 +9974,31 @@ def _int_bound_expr(expr: str) -> str:
     return f"int({t})"
 
 
+def _looks_scalar_subscript_expr(src: str, vector_names: set[str] | None = None) -> bool:
+    """Return true for simple scalar arithmetic usable as a single R subscript."""
+    t = src.strip()
+    if not t or t == ":" or t.startswith("-"):
+        return False
+    if _split_top_level_colon(t) is not None:
+        return False
+    if any(ch in t for ch in "[],"):
+        return False
+    if re.search(r"\b[A-Za-z]\w*\s*\(", t):
+        return False
+    names = {m.group(0) for m in re.finditer(r"\b[A-Za-z]\w*\b", t)}
+    vec_l = {n.lower() for n in (vector_names or set())}
+    known_vec_l = (
+        _KNOWN_VECTOR_NAMES
+        | _KNOWN_INT_VECTOR_NAMES
+        | _KNOWN_LOGICAL_VECTOR_NAMES
+        | _KNOWN_CHAR_VECTOR_NAMES
+        | _KNOWN_COMPLEX_VECTOR_NAMES
+    )
+    if any(n.lower() in vec_l or n.lower() in known_vec_l for n in names):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_+\-*/% ().]+", t))
+
+
 def _strict_int_count_expr(expr: str) -> str:
     """Return an integer expression for Fortran dummy args/extent counts.
 
@@ -19350,6 +19375,15 @@ def emit_stmts(
                                 | _KNOWN_LOGICAL_VECTOR_NAMES
                             )
                             and inner_lhs not in vector_vars
+                        ) or (
+                            _looks_scalar_subscript_expr(
+                                inner_lhs,
+                                vector_vars
+                                | real_vector_vars
+                                | int_vector_vars
+                                | logical_vector_vars
+                                | char_vector_vars_ctx,
+                            )
                         )
                         if idx_is_scalar:
                             _wstmt(f"{base_lhs}({_int_bound_expr(idx_vec_f)}) = {rhs_f}", st.comment)
@@ -22123,6 +22157,15 @@ def emit_stmts(
                                     | _KNOWN_LOGICAL_VECTOR_NAMES
                                 )
                                 and inner_lhs not in vector_vars
+                            ) or (
+                                _looks_scalar_subscript_expr(
+                                    inner_lhs,
+                                    vector_vars
+                                    | real_vector_vars
+                                    | int_vector_vars
+                                    | logical_vector_vars
+                                    | char_vector_vars_ctx,
+                                )
                             )
                             if idx_is_scalar:
                                 _wstmt(f"{base_lhs_f}({_int_bound_expr(idx_vec_f)}) = {rhs}", st.comment)
@@ -43109,6 +43152,45 @@ def rewrite_vector_workvar_ranks_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def promote_real_matrix_initializer_decls_text(f90: str) -> str:
+    real_matrix_names: set[str] = set()
+    for ln in f90.splitlines():
+        m = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*matrix\s*\((.+)$", ln, re.IGNORECASE)
+        if m is None:
+            continue
+        rhs_head = m.group(2).lower()
+        if (
+            "ieee_value" in rhs_head
+            or "0.0_dp" in rhs_head
+            or "_dp" in rhs_head
+            or re.search(r"\breal\s*\(", rhs_head)
+        ):
+            real_matrix_names.add(m.group(1))
+    if not real_matrix_names:
+        return f90
+    lines = f90.splitlines()
+    out: list[str] = []
+    for ln in lines:
+        m = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m is None:
+            out.append(ln)
+            continue
+        keep: list[str] = []
+        move: list[str] = []
+        for part in split_top_level_commas(m.group(2)):
+            p = part.strip()
+            mm = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)$", p)
+            if mm is not None and mm.group(1) in real_matrix_names:
+                move.append(f"{mm.group(1)}(:,:)")
+            else:
+                keep.append(p)
+        if keep:
+            out.append(f"{m.group(1)}integer, allocatable :: {', '.join(keep)}")
+        if move:
+            out.append(f"{m.group(1)}real(kind=dp), allocatable :: {', '.join(move)}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def rewrite_scalar_table_extract_decls_text(f90: str) -> str:
     scalar_names: set[str] = set()
     for ln in f90.splitlines():
@@ -43124,9 +43206,9 @@ def rewrite_scalar_table_extract_decls_text(f90: str) -> str:
     lines = f90.splitlines()
     out: list[str] = []
     pending_scalars: list[str] = []
-    real_alloc_re = re.compile(r"^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*(.+)$", re.IGNORECASE)
+    alloc_re = re.compile(r"^(\s*)(?:real\(kind=dp\)|integer),\s*allocatable\s*::\s*(.+)$", re.IGNORECASE)
     for ln in lines:
-        m = real_alloc_re.match(ln)
+        m = alloc_re.match(ln)
         if m is None:
             if pending_scalars:
                 out.append(f"integer :: {', '.join(pending_scalars)}")
@@ -43144,7 +43226,8 @@ def rewrite_scalar_table_extract_decls_text(f90: str) -> str:
                 keep.append(part)
         if moved:
             if keep:
-                out.append(f"{m.group(1)}real(kind=dp), allocatable :: {', '.join(keep)}")
+                decl_kind = "integer" if re.match(r"^\s*integer\b", ln, re.IGNORECASE) else "real(kind=dp)"
+                out.append(f"{m.group(1)}{decl_kind}, allocatable :: {', '.join(keep)}")
             pending_scalars.extend(moved)
         else:
             if pending_scalars:
@@ -45878,6 +45961,80 @@ def repair_portfolio_print_labels_text(f90: str) -> str:
         pos = i
     f90 = "".join(pieces)
     return f90
+
+
+def repair_var_yw_print_labels_text(f90: str) -> str:
+    if "subroutine print_var_yw_fit(fit)" not in f90:
+        return f90
+
+    def find_asset_names_var() -> str:
+        for cand in ("price_names", "asset_names", "assets"):
+            if re.search(rf"\b{re.escape(cand)}\b", f90):
+                return cand
+        return "price_names"
+
+    asset_names = find_asset_names_var()
+    f90 = f90.replace(
+        "subroutine print_var_yw_fit(fit)\n"
+        "type(fit_var_yw_result_t), intent(in) :: fit\n",
+        "subroutine print_var_yw_fit(fit, asset_names)\n"
+        "type(fit_var_yw_result_t), intent(in) :: fit\n"
+        "character(len=*), intent(in) :: asset_names(:)\n",
+    )
+    f90 = re.sub(
+        r"call\s+print_real_vector\s*\(\s*real\s*\(\s*fit%intercept\s*,\s*kind=dp\s*\)\s*\)",
+        "call print_named_real_vector(real(fit%intercept, kind=dp), asset_names)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"call\s+print_real_vector\s*\(\s*real\s*\(\s*reshape\s*\(\s*fit%a\s*\(\s*:\s*,\s*:\s*,\s*i\s*\)\s*,\s*"
+        r"\[\s*size\s*\(\s*fit%a\s*\(\s*:\s*,\s*:\s*,\s*i\s*\)\s*\)\s*\]\s*\)\s*,\s*kind=dp\s*\)\s*\)",
+        "call print_matrix_rstyle_named(fit%a(:,:,i), asset_names, row_names=asset_names)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"call\s+print_matrix\s*\(\s*fit%sigma\s*\)",
+        "call print_matrix_rstyle_named(fit%sigma, asset_names, row_names=asset_names)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+    call_pat = re.compile(r"\bcall\s+print_var_yw_fit\s*\(", re.IGNORECASE)
+    pieces: list[str] = []
+    pos = 0
+    while True:
+        m = call_pat.search(f90, pos)
+        if m is None:
+            pieces.append(f90[pos:])
+            break
+        open_idx = m.end() - 1
+        i = open_idx + 1
+        depth = 1
+        quote: str | None = None
+        while i < len(f90) and depth > 0:
+            ch = f90[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in {"'", '"'}:
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            pieces.append(f90[pos:])
+            break
+        call_text = f90[m.start():i]
+        if not re.search(rf",\s*{re.escape(asset_names)}\s*\)\s*$", call_text, re.IGNORECASE):
+            call_text = call_text[:-1].rstrip() + f", {asset_names})"
+        pieces.append(f90[pos:m.start()])
+        pieces.append(call_text)
+        pos = i
+    return "".join(pieces)
 
 
 def promote_forwarded_dummy_ranks_text(f90: str) -> str:
@@ -52839,6 +52996,7 @@ def main() -> int:
         f90 = repair_portfolio_stat_named_indices_text(f90)
         f90 = repair_portfolio_stats_scalar_locals_text(f90)
         f90 = repair_portfolio_print_labels_text(f90)
+    f90 = repair_var_yw_print_labels_text(f90)
     f90 = promote_forwarded_dummy_ranks_text(f90)
     if args.special_repairs:
         f90 = repair_make_pos_def_text(f90)
@@ -52995,6 +53153,8 @@ def main() -> int:
     f90_lines = final_wrapped_lines
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = promote_real_matrix_initializer_decls_text(f90)
+    f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = coalesce_final_declarations_text(f90, max_len=132)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
