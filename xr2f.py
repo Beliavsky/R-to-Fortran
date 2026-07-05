@@ -4984,6 +4984,21 @@ def _factor_rep_string_info(expr: str) -> tuple[list[str], str] | None:
     return labels, each_src.strip()
 
 
+def _factor_sample_string_labels(expr: str) -> list[str] | None:
+    """Recognize factor(sample(c("A", ...), ...)) as integer-coded levels."""
+    c_factor = parse_call_text(expr.strip())
+    if c_factor is None or c_factor[0].lower() != "factor" or not c_factor[1]:
+        return None
+    inner = c_factor[1][0].strip()
+    c_sample = parse_call_text(inner)
+    if c_sample is None or c_sample[0].lower() != "sample":
+        return None
+    x_src = c_sample[1][0] if c_sample[1] else c_sample[2].get("x")
+    if x_src is None:
+        return None
+    return _parse_string_c_vector(x_src.strip())
+
+
 def classify_vars(
     stmts: list[object], assign_counts: dict[str, int], known_arrays: set[str] | None = None
 ) -> tuple[set[str], set[str], set[str], set[str], dict[str, str]]:
@@ -5133,6 +5148,13 @@ def classify_vars(
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif _factor_rep_string_info(rhs) is not None:
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif _factor_sample_string_labels(rhs) is not None:
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -9148,6 +9170,11 @@ def rename_conflicting_reused_vars(
                     if re.match(r"^\s*as\.numeric\s*\(", st.expr, re.IGNORECASE) and "%*%" in st.expr:
                         rhs_rank = 1
                     rhs_kind = _infer_assignment_kind_hint(st.expr, var_kinds)
+                    rhs_factor_rep = _factor_rep_string_info(st.expr.strip())
+                    rhs_factor_sample = _factor_sample_string_labels(st.expr.strip())
+                    rhs_factor_labels = rhs_factor_rep[0] if rhs_factor_rep is not None else rhs_factor_sample
+                    if rhs_factor_labels is not None:
+                        rhs_kind = "factor:" + "\x1f".join(rhs_factor_labels)
                 if (
                     name in var_ranks
                     and re.search(rf"\b{re.escape(name)}\b", st.expr)
@@ -11272,11 +11299,17 @@ def r_expr_to_fortran(expr: str) -> str:
                 args_b.append(f"expon_scaled={r_expr_to_fortran(exp_src)}")
             return f"{c_pre[0]}({', '.join(args_b)})"
         if nm_pre in {"cbind", "cbind2"} and c_pre[2]:
-            arg_srcs = [
-                a.strip()
-                for a in (pos_pre + list(c_pre[2].values()))
-                if a.strip().lower() not in _KNOWN_NULL_NAMES
-            ]
+            arg_srcs: list[str] = []
+            for src_cb0 in pos_pre + list(c_pre[2].values()):
+                src_cb = src_cb0.strip()
+                if src_cb.lower() in _KNOWN_NULL_NAMES:
+                    continue
+                fields_cb = _EXPANDED_DATA_FRAME_FIELDS.get(src_cb) or _EXPANDED_DATA_FRAME_FIELDS.get(src_cb.lower())
+                if re.fullmatch(r"[A-Za-z]\w*", src_cb) and fields_cb:
+                    for fld_cb in fields_cb:
+                        arg_srcs.append(_expanded_data_frame_col_expr(src_cb, fld_cb) or f"{src_cb}_{_sanitize_fortran_kwarg_name(fld_cb)}")
+                else:
+                    arg_srcs.append(src_cb)
             if len(arg_srcs) == 1:
                 return r_expr_to_fortran(arg_srcs[0])
             ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
@@ -11284,6 +11317,15 @@ def r_expr_to_fortran(expr: str) -> str:
             args: list[str] = []
             for a in arg_srcs:
                 af = r_expr_to_fortran(a)
+                c_af_pred = parse_call_text(af.strip())
+                if c_af_pred is not None and c_af_pred[0].lower() == "predict":
+                    fit_pred = c_af_pred[1][0].strip() if c_af_pred[1] else c_af_pred[2].get("object", "").strip()
+                    newd_pred = c_af_pred[2].get("newdata", "").strip()
+                    terms_pred = _FIT_TERM_LABELS.get(fit_pred.lower(), [])
+                    if fit_pred and newd_pred and terms_pred:
+                        cols_pred = ", ".join(r_expr_to_fortran(f"{newd_pred}_{t}") for t in terms_pred)
+                        first_pred = r_expr_to_fortran(f"{newd_pred}_{terms_pred[0]}")
+                        af = f"lm_predict_general({fit_pred}, reshape([{cols_pred}], [size({first_pred}), {len(terms_pred)}]))"
                 if ref_f and (_is_int_literal(a) or _is_real_literal(a)):
                     if _is_int_literal(a):
                         af = f"real({_int_bound_expr(af)}, kind=dp)"
@@ -11303,7 +11345,17 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"reshape([{', '.join(args)}], [size({args[0]}), {len(args)}])"
                 return f"{c_pre[0]}({', '.join(args)})"
         if nm_pre in {"cbind", "cbind2"} and len(pos_pre) >= 2 and not c_pre[2]:
-            arg_srcs = [a.strip() for a in pos_pre if a.strip().lower() not in _KNOWN_NULL_NAMES]
+            arg_srcs = []
+            for src_cb0 in pos_pre:
+                src_cb = src_cb0.strip()
+                if src_cb.lower() in _KNOWN_NULL_NAMES:
+                    continue
+                fields_cb = _EXPANDED_DATA_FRAME_FIELDS.get(src_cb) or _EXPANDED_DATA_FRAME_FIELDS.get(src_cb.lower())
+                if re.fullmatch(r"[A-Za-z]\w*", src_cb) and fields_cb:
+                    for fld_cb in fields_cb:
+                        arg_srcs.append(_expanded_data_frame_col_expr(src_cb, fld_cb) or f"{src_cb}_{_sanitize_fortran_kwarg_name(fld_cb)}")
+                else:
+                    arg_srcs.append(src_cb)
             if len(arg_srcs) == 1:
                 return r_expr_to_fortran(arg_srcs[0])
             ref_src = next((a for a in arg_srcs if not (_is_int_literal(a) or _is_real_literal(a))), "")
@@ -11311,6 +11363,15 @@ def r_expr_to_fortran(expr: str) -> str:
             args = []
             for a in arg_srcs:
                 af = r_expr_to_fortran(a)
+                c_af_pred = parse_call_text(af.strip())
+                if c_af_pred is not None and c_af_pred[0].lower() == "predict":
+                    fit_pred = c_af_pred[1][0].strip() if c_af_pred[1] else c_af_pred[2].get("object", "").strip()
+                    newd_pred = c_af_pred[2].get("newdata", "").strip()
+                    terms_pred = _FIT_TERM_LABELS.get(fit_pred.lower(), [])
+                    if fit_pred and newd_pred and terms_pred:
+                        cols_pred = ", ".join(r_expr_to_fortran(f"{newd_pred}_{t}") for t in terms_pred)
+                        first_pred = r_expr_to_fortran(f"{newd_pred}_{terms_pred[0]}")
+                        af = f"lm_predict_general({fit_pred}, reshape([{cols_pred}], [size({first_pred}), {len(terms_pred)}]))"
                 if ref_f and (_is_int_literal(a) or _is_real_literal(a)):
                     if _is_int_literal(a):
                         af = f"real({_int_bound_expr(af)}, kind=dp)"
@@ -11580,12 +11641,12 @@ def r_expr_to_fortran(expr: str) -> str:
             rhs_src = mm_cmp_early[1].strip()
             lhs_label = _dequote_string_literal(lhs_src)
             rhs_label = _dequote_string_literal(rhs_src)
-            if rhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", lhs_src) and lhs_src in _CATEGORICAL_LABELS:
-                labels = _CATEGORICAL_LABELS[lhs_src]
+            if rhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", lhs_src) and lhs_src.lower() in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[lhs_src.lower()]
                 if rhs_label in labels:
                     return f"{r_expr_to_fortran(lhs_src)} {op_f} {labels.index(rhs_label) + 1}"
-            if lhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", rhs_src) and rhs_src in _CATEGORICAL_LABELS:
-                labels = _CATEGORICAL_LABELS[rhs_src]
+            if lhs_label is not None and re.fullmatch(r"[A-Za-z]\w*", rhs_src) and rhs_src.lower() in _CATEGORICAL_LABELS:
+                labels = _CATEGORICAL_LABELS[rhs_src.lower()]
                 if lhs_label in labels:
                     return f"{labels.index(lhs_label) + 1} {op_f} {r_expr_to_fortran(rhs_src)}"
             lhs = r_expr_to_fortran(lhs_src)
@@ -13249,13 +13310,15 @@ def r_expr_to_fortran(expr: str) -> str:
                     if terms:
                         if len(terms) == 1 and _looks_matrix_expr(terms[0]):
                             xpred_inline = r_expr_to_fortran(terms[0])
-                            return f"lm_coef({yv}, real({xpred_inline}, kind=dp))"
+                            intercept_arg_inline = "" if not no_intercept_inline else ", intercept=.false."
+                            return f"lm_coef({yv}, real({xpred_inline}, kind=dp){intercept_arg_inline})"
                         p = len(terms)
                         cols = ", ".join(f"real({r_expr_to_fortran(t)}, kind=dp)" for t in terms)
                         first = r_expr_to_fortran(terms[0])
                         if no_intercept_inline and len(terms) == 1 and not _looks_matrix_expr(terms[0]):
                             return f"qr_coef(qr(reshape([{cols}], [size({first}), {p}])), {yv})"
-                        return f"lm_coef({yv}, reshape([{cols}], [size({first}), {p}]))"
+                        intercept_arg_inline = "" if not no_intercept_inline else ", intercept=.false."
+                        return f"lm_coef({yv}, reshape([{cols}], [size({first}), {p}]){intercept_arg_inline})"
             return f"{r_expr_to_fortran(obj_src)}%coef"
     c_sw = parse_call_text(s)
     if c_sw is not None and c_sw[0].lower() == "sweep":
@@ -16343,6 +16406,89 @@ def emit_stmts(
             return c[1][0].strip()
         return t
 
+    def _split_lm_rhs_terms(rhs: str) -> list[str]:
+        terms: list[str] = []
+        cur: list[str] = []
+        depth = 0
+        quote: str | None = None
+        esc = False
+        for ch in rhs:
+            if quote is not None:
+                cur.append(ch)
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch in "([{":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch in ")]}":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                continue
+            if ch == "+" and depth == 0:
+                term = "".join(cur).strip()
+                if term:
+                    terms.append(term)
+                cur = []
+                continue
+            cur.append(ch)
+        term = "".join(cur).strip()
+        if term:
+            terms.append(term)
+        return [t for t in terms if t.strip() not in {"0", "0L", "-1", "-1L"}]
+
+    def _lm_rhs_has_intercept(rhs: str) -> bool:
+        return not any(t.strip() in {"0", "0L", "-1", "-1L"} for t in _split_lm_rhs_terms_keep_markers(rhs))
+
+    def _split_lm_rhs_terms_keep_markers(rhs: str) -> list[str]:
+        terms: list[str] = []
+        cur: list[str] = []
+        depth = 0
+        quote: str | None = None
+        esc = False
+        for ch in rhs:
+            if quote is not None:
+                cur.append(ch)
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                cur.append(ch)
+                continue
+            if ch in "([{":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch in ")]}":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                continue
+            if ch == "+" and depth == 0:
+                term = "".join(cur).strip()
+                if term:
+                    terms.append(term)
+                cur = []
+                continue
+            cur.append(ch)
+        term = "".join(cur).strip()
+        if term:
+            terms.append(term)
+        return terms
+
     def _lm_design_columns(raw_terms: list[str], data_name: str = "") -> tuple[list[str], list[str], str]:
         labels: list[str] = []
         exprs: list[str] = []
@@ -18840,6 +18986,7 @@ def emit_stmts(
                     glm_family = ""
                 yv = r_expr_to_fortran(form_split[0].strip())
                 rhs_terms = form_split[1].strip()
+                lm_has_intercept = _lm_rhs_has_intercept(rhs_terms)
                 data_name = kw_lm.get("data", "").strip()
                 if rhs_terms == "." and data_name in data_frame_vars:
                     df_y, df_x = data_frame_vars[data_name]
@@ -18865,10 +19012,11 @@ def emit_stmts(
                         continue
                     terms = x_terms
                 else:
-                    terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
+                    terms = _split_lm_rhs_terms(rhs_terms)
                 intercept_only_lm = len(terms) == 1 and terms[0].strip() == "1"
                 if intercept_only_lm:
                     terms = []
+                    lm_has_intercept = True
                 offset_terms: list[str] = []
                 if is_glm:
                     kept_terms: list[str] = []
@@ -18927,7 +19075,8 @@ def emit_stmts(
                     else:
                         o.w(f"{st.name} = glm_binomial_fit({yv}, x_lm)")
                 else:
-                    o.w(f"{st.name} = lm_fit_general({yv}, {term_exprs[0] if single_matrix_term else 'x_lm'})")
+                    lm_intercept_arg = "" if lm_has_intercept else ", intercept=.false."
+                    o.w(f"{st.name} = lm_fit_general({yv}, {term_exprs[0] if single_matrix_term else 'x_lm'}{lm_intercept_arg})")
                 o.pop()
                 o.w("end block")
                 if helper_ctx is not None:
@@ -20376,10 +20525,17 @@ def emit_stmts(
                             o.pop()
                             o.w("end block")
                             continue
-                    if c_one is not None and c_one[0].lower() == "data.frame" and c_one[2]:
+                    c_df_print = c_one
+                    head_n_df = ""
+                    if c_one is not None and c_one[0].lower() == "head" and c_one[1]:
+                        c_head_df = parse_call_text(c_one[1][0].strip())
+                        if c_head_df is not None and c_head_df[0].lower() == "data.frame":
+                            c_df_print = c_head_df
+                            head_n_df = c_one[1][1].strip() if len(c_one[1]) >= 2 else c_one[2].get("n", "6").strip()
+                    if c_df_print is not None and c_df_print[0].lower() == "data.frame" and c_df_print[2]:
                         cols_df = [
                             (k, v)
-                            for k, v in c_one[2].items()
+                            for k, v in c_df_print[2].items()
                             if k.lower() not in {"stringsasfactors", "check_names", "check.names", "row_names", "row.names"}
                         ]
                         if len(cols_df) >= 2:
@@ -20400,7 +20556,13 @@ def emit_stmts(
                                 labels = [_df_label(name) for name, _src in cols_df]
                                 header = ", ".join(f'"{label}"' for label in labels)
                                 _wstmt(f'write(*,"(*(a,1x))") {header}', st.comment)
-                                for row_vals in zip(*col_vals):
+                                n_rows_lit = len(col_vals[0])
+                                if head_n_df:
+                                    try:
+                                        n_rows_lit = min(n_rows_lit, int(float(_strip_named_actual_value(head_n_df).rstrip("Ll"))))
+                                    except ValueError:
+                                        pass
+                                for row_vals in list(zip(*col_vals))[:n_rows_lit]:
                                     row_f = ", ".join(r_expr_to_fortran(v) for v in row_vals)
                                     _wstmt(f'write(*,"(*(g0,1x))") {row_f}', "")
                                 continue
@@ -20413,11 +20575,28 @@ def emit_stmts(
                                     return f"merge(1.0_dp, 0.0_dp, {cf})"
                                 return f"real({cf}, kind=dp)"
                             vals_f = ", ".join(_df_matrix_col_expr(cf) for cf in col_fs)
-                            _wstmt(
-                                f"call print_matrix_rstyle_named(reshape([{vals_f}], [size({first_f}), {len(col_fs)}]), "
-                                f"{_char_array_literal(labels)}, digits=6)",
-                                st.comment,
-                            )
+                            if head_n_df:
+                                nrow_expr = f"min({_int_bound_expr(r_expr_to_fortran(head_n_df))}, size({first_f}))"
+                                if st.comment:
+                                    cmt = st.comment.strip()
+                                    if cmt:
+                                        o.w(f"! {cmt}")
+                                o.w("block")
+                                o.push()
+                                o.w("real(kind=dp), allocatable :: df_print_tmp(:,:)")
+                                o.w(f"df_print_tmp = reshape([{vals_f}], [size({first_f}), {len(col_fs)}])")
+                                o.w(
+                                    f"call print_matrix_rstyle_named(df_print_tmp(1:{nrow_expr}, :), "
+                                    f"{_char_array_literal(labels)}, digits=6)"
+                                )
+                                o.pop()
+                                o.w("end block")
+                            else:
+                                _wstmt(
+                                    f"call print_matrix_rstyle_named(reshape([{vals_f}], [size({first_f}), {len(col_fs)}]), "
+                                    f"{_char_array_literal(labels)}, digits=6)",
+                                    st.comment,
+                                )
                             need_r_mod.add("print_matrix_rstyle_named")
                             continue
                     if has_r_mod and c_one is not None and c_one[0].lower() in {"paste", "paste0"} and len(c_one[1]) >= 2:
@@ -21000,6 +21179,36 @@ def emit_stmts(
                         continue
                     if c_one is not None:
                         nm_one = c_one[0].lower()
+                        if has_r_mod and nm_one in {"cbind", "cbind2"}:
+                            cbind_cols: list[tuple[str, str]] = []
+                            used_expanded_df_cb = False
+                            for arg_cb in c_one[1]:
+                                arg_txt_cb = arg_cb.strip()
+                                df_fields_cb = _EXPANDED_DATA_FRAME_FIELDS.get(arg_txt_cb) or _EXPANDED_DATA_FRAME_FIELDS.get(arg_txt_cb.lower())
+                                if re.fullmatch(r"[A-Za-z]\w*", arg_txt_cb) and df_fields_cb:
+                                    used_expanded_df_cb = True
+                                    for fld_cb in df_fields_cb:
+                                        col_expr_cb = _expanded_data_frame_col_expr(arg_txt_cb, fld_cb) or f"{arg_txt_cb}_{_sanitize_fortran_kwarg_name(fld_cb)}"
+                                        cbind_cols.append((fld_cb, col_expr_cb))
+                                else:
+                                    cbind_cols.append((arg_txt_cb, arg_txt_cb))
+                            for key_cb, val_cb in c_one[2].items():
+                                cbind_cols.append((key_cb, val_cb.strip()))
+                            if len(cbind_cols) >= 2 and used_expanded_df_cb:
+                                labels_cb = [re.sub(r"(?:_\d+)+$", "", lab) for lab, _src in cbind_cols]
+                                vals_cb: list[str] = []
+                                for _lab_cb, src_cb in cbind_cols:
+                                    src_exp_cb = r_expr_to_fortran(src_cb)
+                                    vals_cb.append(r_expr_to_fortran(_rewrite_predict_expr(src_exp_cb)))
+                                first_cb = vals_cb[0]
+                                vals_join_cb = ", ".join(f"real({v}, kind=dp)" for v in vals_cb)
+                                _wstmt(
+                                    f"call print_matrix_rstyle_named(reshape([{vals_join_cb}], [size({first_cb}), {len(vals_cb)}]), "
+                                    f"{_char_array_literal(labels_cb)}, digits=6)",
+                                    st.comment,
+                                )
+                                need_r_mod.add("print_matrix_rstyle_named")
+                                continue
                         is_matrix_expr = nm_one in {"matrix", "cbind", "cbind2", "rbind", "array"} or (
                             nm_one in {"cov", "cor"} and len(c_one[1]) <= 1
                         )
@@ -21107,7 +21316,10 @@ def emit_stmts(
                                 o.pop()
                                 o.w("end block")
                             continue
-                    rank_for_matrix_print = _expr_rank_for_print(one)
+                    if re.match(r"^summary\s*\(", one, re.IGNORECASE):
+                        rank_for_matrix_print = 0
+                    else:
+                        rank_for_matrix_print = _expr_rank_for_print(one)
                     mentions_rank3_for_print = any(
                         re.search(rf"\b{re.escape(nm)}\b", one, re.IGNORECASE)
                         for nm in _KNOWN_RANK3_NAMES
@@ -21137,7 +21349,8 @@ def emit_stmts(
                             if not m_form_csl:
                                 raise NotImplementedError("coef(summary(lm(...))) requires formula like y ~ x1 + x2")
                             y_csl = r_expr_to_fortran(m_form_csl.group(1).strip())
-                            terms_csl = [t.strip() for t in split_top_level_commas(m_form_csl.group(2).strip().replace("+", ",")) if t.strip()]
+                            terms_csl = _split_lm_rhs_terms(m_form_csl.group(2).strip())
+                            has_intercept_csl = _lm_rhs_has_intercept(m_form_csl.group(2).strip())
                             data_csl = kw_csl.get("data", "").strip()
                             _labels_csl, exprs_csl, _first_csl = _lm_design_columns(terms_csl, data_csl)
                             o.w("block")
@@ -21147,7 +21360,8 @@ def emit_stmts(
                             o.w(f"allocate(x_lm(size({y_csl}), {len(exprs_csl)}))")
                             for j_csl, tv_csl in enumerate(exprs_csl, start=1):
                                 o.w(f"x_lm(:, {j_csl}) = {tv_csl}")
-                            o.w(f"fit_coef_tmp = lm_fit_general({y_csl}, x_lm)")
+                            intercept_arg_csl = "" if has_intercept_csl else ", intercept=.false."
+                            o.w(f"fit_coef_tmp = lm_fit_general({y_csl}, x_lm{intercept_arg_csl})")
                             o.w("call print_real_vector(fit_coef_tmp%coef)")
                             o.pop()
                             o.w("end block")
@@ -21164,16 +21378,27 @@ def emit_stmts(
                             if sum_arg_kw:
                                 sum_arg = sum_arg_kw
                         c_sum_lm = parse_call_text(sum_arg)
+                        if c_sum_lm is None or c_sum_lm[0].lower() != "lm":
+                            expanded_sum_arg = r_expr_to_fortran(sum_arg)
+                            c_expanded_sum_lm = parse_call_text(expanded_sum_arg)
+                            if c_expanded_sum_lm is not None and c_expanded_sum_lm[0].lower() == "lm":
+                                c_sum_lm = c_expanded_sum_lm
                         if c_sum_lm is not None and c_sum_lm[0].lower() == "lm":
                             _nm_slm, pos_slm, kw_slm = c_sum_lm
                             form_slm = pos_slm[0].strip() if pos_slm else kw_slm.get("formula", "").strip()
-                            m_form_slm = re.match(r"^([A-Za-z]\w*)\s*~\s*(.+)$", form_slm)
-                            if not m_form_slm:
-                                raise NotImplementedError("summary(lm(...)) requires formula like y ~ x1 + x2")
-                            y_slm = r_expr_to_fortran(m_form_slm.group(1).strip())
+                            form_parts_slm = _split_top_level_token(form_slm, "~", from_right=False)
+                            if form_parts_slm is None:
+                                _wstmt(f"call print_lm_summary({r_expr_to_fortran(sum_arg)})", st.comment)
+                                if has_r_mod:
+                                    need_r_mod.update({"lm_fit_general", "print_lm_summary"})
+                                if helper_ctx is not None:
+                                    helper_ctx["need_lm"] = True
+                                continue
+                            y_slm = r_expr_to_fortran(form_parts_slm[0].strip())
                             data_slm = kw_slm.get("data", "").strip()
-                            rhs_slm = m_form_slm.group(2).strip()
-                            terms_slm = [t.strip() for t in split_top_level_commas(rhs_slm.replace("+", ",")) if t.strip()]
+                            rhs_slm = form_parts_slm[1].strip()
+                            terms_slm = _split_lm_rhs_terms(rhs_slm)
+                            has_intercept_slm = _lm_rhs_has_intercept(rhs_slm)
                             labels_slm, exprs_slm, _first_slm = _lm_design_columns(terms_slm, data_slm)
                             max_len_slm = max(1, max(len(t) for t in labels_slm)) if labels_slm else 1
                             labels_lit_slm = ", ".join(f'"{t}"' for t in labels_slm)
@@ -21201,9 +21426,11 @@ def emit_stmts(
                                 for j_slm, tv_slm in enumerate(exprs_slm, start=1):
                                     o.w(f"x_lm(:, {j_slm}) = {tv_slm}")
                             if labels_lit_slm:
-                                o.w(f'call print_lm_summary(lm_fit_general(y_lm, x_lm), [character(len={max_len_slm}) :: {labels_lit_slm}])')
+                                intercept_arg_slm = "" if has_intercept_slm else ", intercept=.false."
+                                o.w(f'call print_lm_summary(lm_fit_general(y_lm, x_lm{intercept_arg_slm}), [character(len={max_len_slm}) :: {labels_lit_slm}])')
                             else:
-                                o.w("call print_lm_summary(lm_fit_general(y_lm, x_lm))")
+                                intercept_arg_slm = "" if has_intercept_slm else ", intercept=.false."
+                                o.w(f"call print_lm_summary(lm_fit_general(y_lm, x_lm{intercept_arg_slm}))")
                             o.pop()
                             o.w("end block")
                             if has_r_mod:
@@ -22101,7 +22328,8 @@ def emit_stmts(
                             raise NotImplementedError("lm requires formula like y ~ x1 + x2 + ... in this subset")
                         yv = r_expr_to_fortran(m_form.group(1).strip())
                         rhs_terms = m_form.group(2).strip()
-                        terms = [t.strip() for t in split_top_level_commas(rhs_terms.replace("+", ",")) if t.strip()]
+                        terms = _split_lm_rhs_terms(rhs_terms)
+                        has_intercept_inline = _lm_rhs_has_intercept(rhs_terms)
                         if not terms:
                             raise NotImplementedError("lm formula requires at least one predictor")
                         cols = ", ".join(r_expr_to_fortran(t) for t in terms)
@@ -22110,7 +22338,8 @@ def emit_stmts(
                         o.w("block")
                         o.push()
                         o.w("type(lm_fit_t) :: fit_coef_tmp")
-                        o.w(f"fit_coef_tmp = lm_fit_general({yv}, reshape([{cols}], [size({first}), {p}]))")
+                        intercept_arg_inline = "" if has_intercept_inline else ", intercept=.false."
+                        o.w(f"fit_coef_tmp = lm_fit_general({yv}, reshape([{cols}], [size({first}), {p}]){intercept_arg_inline})")
                         o.w('write(*,"(*(g0,1x))") fit_coef_tmp%coef')
                         o.pop()
                         o.w("end block")
@@ -26756,6 +26985,10 @@ def collect_categorical_sample_labels(stmts: list[object]) -> dict[str, list[str
         factor_rep = _factor_rep_string_info(st.expr.strip())
         if factor_rep is not None:
             out[st.name.lower()] = factor_rep[0]
+            return
+        factor_sample = _factor_sample_string_labels(st.expr.strip())
+        if factor_sample is not None:
+            out[st.name.lower()] = factor_sample
             return
         cinfo = parse_call_text(st.expr.strip())
         if cinfo is not None and cinfo[0].lower() == "sample":
@@ -32982,9 +33215,25 @@ def transpile_r_to_fortran(
         mprocs.w("real(kind=dp), allocatable :: yhat(:)")
         mprocs.w("integer :: p")
         mprocs.w("p = size(xpred, 2)")
+        mprocs.w("if (fit%has_intercept) then")
+        mprocs.push()
         mprocs.w("if (size(fit%coef) /= p + 1) error stop \"error: predictor count mismatch\"")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("if (size(fit%coef) /= p) error stop \"error: predictor count mismatch\"")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("allocate(yhat(size(xpred, 1)))")
+        mprocs.w("if (fit%has_intercept) then")
+        mprocs.push()
         mprocs.w("yhat = fit%coef(1) + matmul(xpred, fit%coef(2:p+1))")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("yhat = matmul(xpred, fit%coef)")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("end function lm_predict_general")
         mprocs.w("")
         mprocs.w("pure function lm_confint(fit, level) result(out)")
@@ -33189,9 +33438,10 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.w("end function char_join")
         mprocs.w("")
-        mprocs.w("function lm_fit_general(y, xpred) result(fit)")
+        mprocs.w("function lm_fit_general(y, xpred, intercept) result(fit)")
         mprocs.w("real(kind=dp), intent(in) :: y(:)")
         mprocs.w("real(kind=dp), intent(in) :: xpred(:,:)")
+        mprocs.w("logical, intent(in), optional :: intercept")
         mprocs.w("type(lm_fit_t) :: fit")
         mprocs.w("integer :: i, j, n, p, k, dof")
         mprocs.w("real(kind=dp), allocatable :: a(:,:), a_xtx(:,:), a_work(:,:), b(:), b_work(:), beta(:), sol(:)")
@@ -33204,11 +33454,15 @@ def transpile_r_to_fortran(
         mprocs.w("end if")
         mprocs.w("n = size(y)")
         mprocs.w("p = size(xpred,2)")
-        mprocs.w("k = p + 1")
+        mprocs.w("fit%has_intercept = .true.")
+        mprocs.w("if (present(intercept)) fit%has_intercept = intercept")
+        mprocs.w("k = p + merge(1, 0, fit%has_intercept)")
         mprocs.w("if (n < k) error stop \"error: need n >= number of parameters\"")
         mprocs.w("allocate(a(k,k), b(k), beta(k))")
         mprocs.w("a = 0.0_dp")
         mprocs.w("b = 0.0_dp")
+        mprocs.w("if (fit%has_intercept) then")
+        mprocs.push()
         mprocs.w("a(1,1) = n")
         mprocs.w("b(1) = sum(y)")
         mprocs.w("do j = 1, p")
@@ -33228,6 +33482,26 @@ def transpile_r_to_fortran(
         mprocs.w("end do")
         mprocs.pop()
         mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("do j = 1, p")
+        mprocs.push()
+        mprocs.w("b(j) = sum(xpred(:,j) * y)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("do i = 1, p")
+        mprocs.push()
+        mprocs.w("do j = i, p")
+        mprocs.push()
+        mprocs.w("a(i,j) = sum(xpred(:,i) * xpred(:,j))")
+        mprocs.w("a(j,i) = a(i,j)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("a_xtx = a")
         mprocs.w("call solve_linear(a, b, beta, ok)")
         mprocs.w("if (.not. ok) error stop \"error: singular normal equations\"")
@@ -33245,7 +33519,15 @@ def transpile_r_to_fortran(
         mprocs.w("fit%coef = beta")
         mprocs.w("fit%y = y")
         mprocs.w("fit%xpred = xpred")
+        mprocs.w("if (fit%has_intercept) then")
+        mprocs.push()
         mprocs.w("fit%fitted = beta(1) + matmul(xpred, beta(2:k))")
+        mprocs.pop()
+        mprocs.w("else")
+        mprocs.push()
+        mprocs.w("fit%fitted = matmul(xpred, beta)")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("fit%resid = y - fit%fitted")
         mprocs.w("sse = sum(fit%resid**2)")
         mprocs.w("ybar = sum(y) / n")
@@ -34631,6 +34913,7 @@ def transpile_r_to_fortran(
         o.w("real(kind=dp), allocatable :: coef(:), fitted(:), resid(:), cov_unscaled(:,:), y(:), xpred(:,:)")
         o.w("real(kind=dp) :: sigma, r_squared, adj_r_squared")
         o.w("integer :: df = 0")
+        o.w("logical :: has_intercept = .true.")
         o.pop()
         o.w("end type lm_fit_t")
         o.w("")
