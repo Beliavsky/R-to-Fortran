@@ -85,6 +85,7 @@ _CATEGORICAL_LABELS: dict[str, list[str]] = {}
 _CHAR_INDEX_ALIASES: dict[str, str] = {}
 _TABLE_LABELS: dict[str, tuple[list[str] | None, list[str] | None]] = {}
 _FIT_TERM_LABELS: dict[str, list[str]] = {}
+_OPTIM_RESULT_NAMES: set[str] = set()
 _KNOWN_RANK3_NAMES: set[str] = set()
 _ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
 _RANK3_SLICE_PRINT_LABELS: dict[str, tuple[str, str]] = {}
@@ -4253,7 +4254,7 @@ def _is_integer_arith_expr(txt: str) -> bool:
 
 
 def _is_integerish_expr_with_names(txt: str) -> bool:
-    t = txt.strip()
+    t = re.sub(r"(?<=\d)[lL]\b", "", txt.strip())
     if not t:
         return False
     if re.search(r"(?<![A-Za-z_])(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?", t):
@@ -4267,7 +4268,7 @@ def _is_integerish_expr_with_names(txt: str) -> bool:
 
 def _integerish_expr_names(txt: str) -> set[str] | None:
     """Return sanitized names in an integer-looking expression, or None if unsafe."""
-    t = txt.strip()
+    t = re.sub(r"(?<=\d)[lL]\b", "", txt.strip())
     if not _is_integerish_expr_with_names(t):
         return None
     if "/" in t:
@@ -5857,6 +5858,14 @@ def classify_vars(
                         int_arrays.discard(st.name)
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
+                elif (
+                    assign_counts.get(st.name, 0) == 1
+                    and (rhs_names_empty := _integerish_expr_names(rhs)) is not None
+                    and not rhs_names_empty
+                    and st.name not in real_scalars
+                    and st.name not in real_arrays
+                ):
+                    params[st.name] = r_expr_to_fortran(rhs)
                 elif (
                     assign_counts.get(st.name, 0) == 1
                     and (rhs_names := _integerish_expr_names(rhs)) is not None
@@ -10709,6 +10718,12 @@ def r_expr_to_fortran(expr: str) -> str:
         idx_dims_clean_subset = [d for d in idx_dims_subset if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
         base_subset_name = base_subset.strip().lower()
         c_name_subset = parse_call_text(base_subset.strip())
+        if len(idx_dims_clean_subset) == 1 and re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
+            name_idx_subset = _name_indices_from_subscript(base_subset.strip(), idx_dims_clean_subset[0].strip())
+            if name_idx_subset is not None:
+                if len(name_idx_subset) == 1:
+                    return f"{r_expr_to_fortran(base_subset)}({name_idx_subset[0]})"
+                return f"{r_expr_to_fortran(base_subset)}([{', '.join(str(i) for i in name_idx_subset)}])"
         if (
             len(idx_dims_clean_subset) == 1
             and c_name_subset is not None
@@ -12166,6 +12181,10 @@ def r_expr_to_fortran(expr: str) -> str:
         if not fit_src:
             raise NotImplementedError("cooks.distance requires a fitted model")
         return f"lm_cooks_distance({r_expr_to_fortran(fit_src)})"
+    if c_usr is not None and c_usr[0].lower() == "coef":
+        fit_src = _first_call_arg(c_usr, "object")
+        if fit_src and fit_src.lower() in _OPTIM_RESULT_NAMES:
+            return f"{r_expr_to_fortran(fit_src)}%par"
     if c_usr is not None and c_usr[0].lower() in {"resid", "residuals"}:
         _nm_res, pos_res, kw_res = c_usr
         fit_src = _first_call_arg((_nm_res, pos_res, kw_res), "object")
@@ -14052,7 +14071,11 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bsummary\s*\(\s*([A-Za-z]\w*)\s*\)\s*\$\s*r\.squared\b", r"\1%r_squared", s)
     s = re.sub(r"\bsummary\s*\(\s*([A-Za-z]\w*)\s*\)\s*\$\s*adj\.r\.squared\b", r"\1%adj_r_squared", s)
     s = re.sub(r"\bsummary\s*\(\s*([A-Za-z]\w*)\s*\)\s*\$\s*sigma\b", r"\1%sigma", s)
-    s = re.sub(r"\bcoef\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%coef", s)
+    def _coef_accessor_repl(m: re.Match[str]) -> str:
+        nm = m.group(1)
+        return f"{nm}%par" if nm.lower() in _OPTIM_RESULT_NAMES else f"{nm}%coef"
+
+    s = re.sub(r"\bcoef\s*\(\s*([A-Za-z]\w*)\s*\)", _coef_accessor_repl, s)
     s = re.sub(r"\bfitted\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%fitted", s)
     s = re.sub(r"\bresiduals\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%resid", s)
     s = re.sub(r"\bresid\s*\(\s*([A-Za-z]\w*)\s*\)", r"\1%resid", s)
@@ -18282,6 +18305,17 @@ def emit_stmts(
                 continue
             if _emit_assign_array_expr_scalar_subset(st.name, st.expr.strip(), st.comment):
                 continue
+            if _emit_nls_assignment(o, st.name, st.expr.strip(), st.comment, helper_ctx):
+                continue
+            m_coef_assign_labels = re.match(r"^coef\s*\(\s*([A-Za-z]\w*)\s*\)\s*$", st.expr.strip(), re.IGNORECASE)
+            if m_coef_assign_labels is not None:
+                coef_src_nm = m_coef_assign_labels.group(1).lower()
+                labs_coef = _FIT_TERM_LABELS.get(coef_src_nm) or _NAMED_VECTOR_LABELS.get(coef_src_nm)
+                if labs_coef:
+                    _NAMED_VECTOR_LABELS[st.name.lower()] = [str(x) for x in labs_coef]
+                    labels_map = helper_ctx.get("named_vector_labels") if helper_ctx is not None else None
+                    if isinstance(labels_map, dict):
+                        labels_map[st.name.lower()] = [str(x) for x in labs_coef]
             c_grep_char_assign = parse_call_text(st.expr.strip())
             if (
                 c_grep_char_assign is not None
@@ -21229,6 +21263,11 @@ def emit_stmts(
                                     need_r_mod.add("print_lm_summary")
                             if helper_ctx is not None:
                                 helper_ctx["need_lm"] = True
+                        elif re.fullmatch(r"[A-Za-z]\w*", sum_arg) and sum_arg.lower() in _OPTIM_RESULT_NAMES:
+                            _wstmt('write(*,"(g0)") "par:"', st.comment)
+                            o.w(f'write(*,"(*(g0,:,1x))") {sum_arg_f}%par')
+                            o.w(f'write(*,"(*(g0,:,1x))") "value:", {sum_arg_f}%value')
+                            o.w(f'write(*,"(*(g0,:,1x))") "convergence:", {sum_arg_f}%convergence')
                         elif has_r_mod:
                             _wstmt(f"call print_summary({sum_arg_f})", st.comment)
                             need_r_mod.add("print_summary")
@@ -22680,6 +22719,147 @@ def _control_value_from_list(control_src: str, name: str) -> str | None:
     if c is None or c[0].lower() != "list":
         return None
     return c[2].get(name)
+
+
+def _named_values_from_call(src: str, call_name: str) -> list[tuple[str, str]] | None:
+    c = parse_call_text(src.strip())
+    if c is None or c[0].lower() != call_name.lower():
+        return None
+    out: list[tuple[str, str]] = []
+    for key, val in c[2].items():
+        out.append((_sanitize_fortran_kwarg_name(key), val.strip()))
+    if not out:
+        return None
+    return out
+
+
+def _emit_nls_assignment(
+    o: FEmit,
+    target: str,
+    rhs: str,
+    comment: str = "",
+    helper_ctx: dict[str, object] | None = None,
+) -> bool:
+    c = parse_call_text(rhs.strip())
+    if c is None or c[0].lower() != "nls":
+        return False
+    _nm, pos, kw = c
+    form = (pos[0] if pos else kw.get("formula", "")).strip()
+    form_split = _split_top_level_token(form, "~", from_right=False)
+    if form_split is None:
+        return False
+    y_src = form_split[0].strip()
+    pred_src = form_split[1].strip()
+    start_src = kw.get("start", "").strip()
+    start_vals = _named_values_from_call(start_src, "list")
+    if not start_vals:
+        return False
+    labels = [name for name, _val in start_vals]
+    p_init = "[" + ", ".join(f"real({r_expr_to_fortran(val)}, kind=dp)" for _name, val in start_vals) + "]"
+
+    def _bounds_array(src: str, default: str) -> str:
+        vals = _named_values_from_call(src.strip(), "c") if src.strip() else None
+        by_name = {name: val for name, val in vals} if vals else {}
+        parts: list[str] = []
+        for name in labels:
+            val = by_name.get(name, default)
+            parts.append(f"real({r_expr_to_fortran(val)}, kind=dp)")
+        return "[" + ", ".join(parts) + "]"
+
+    lower_f = _bounds_array(kw.get("lower", ""), "-huge(1.0_dp)")
+    upper_f = _bounds_array(kw.get("upper", ""), "huge(1.0_dp)")
+
+    def _objective_expr(pvar: str) -> str:
+        pred_p = pred_src
+        for idx, name in enumerate(labels, start=1):
+            pred_p = re.sub(rf"\b{re.escape(name)}\b", f"{pvar}({idx})", pred_p)
+        pred_f = r_expr_to_fortran(pred_p)
+        return f"sum(({r_expr_to_fortran(y_src)} - ({pred_f}))**2)"
+
+    p = f"{target}_nls_p"
+    trial_p = f"{target}_nls_trial_p"
+    lower = f"{target}_nls_lower"
+    upper = f"{target}_nls_upper"
+    best = f"{target}_nls_best"
+    trial = f"{target}_nls_trial"
+    step = f"{target}_nls_step"
+    iter_nm = f"{target}_nls_iter"
+    j = f"{target}_nls_j"
+    best_j = f"{target}_nls_best_j"
+    best_dir = f"{target}_nls_best_dir"
+    tol = "1.0e-8_dp"
+    if comment:
+        cmt = comment.strip()
+        if cmt:
+            o.w(f"! {cmt}")
+    o.w("block")
+    o.push()
+    o.w(f"integer :: {iter_nm}, {j}, {best_j}, {best_dir}")
+    o.w(f"real(kind=dp) :: {best}, {trial}, {step}")
+    o.w(f"real(kind=dp), allocatable :: {p}(:), {trial_p}(:), {lower}(:), {upper}(:)")
+    o.w(f"{p} = {p_init}")
+    o.w(f"{lower} = {lower_f}")
+    o.w(f"{upper} = {upper_f}")
+    o.w(f"{p} = min(max({p}, {lower}), {upper})")
+    o.w(f"{trial_p} = {p}")
+    o.w(f"{best} = {_objective_expr(p)}")
+    o.w(f"{step} = 0.25_dp * max(1.0_dp, maxval(abs({p})))")
+    o.w(f"do {iter_nm} = 1, 3000")
+    o.push()
+    o.w(f"{best_j} = 0")
+    o.w(f"{best_dir} = 0")
+    o.w(f"do {j} = 1, size({p})")
+    o.push()
+    o.w(f"{trial_p} = {p}")
+    o.w(f"{trial_p}({j}) = min(max({p}({j}) + {step}, {lower}({j})), {upper}({j}))")
+    o.w(f"{trial} = {_objective_expr(trial_p)}")
+    o.w(f"if ({trial} < {best}) then")
+    o.push()
+    o.w(f"{best} = {trial}")
+    o.w(f"{best_j} = {j}")
+    o.w(f"{best_dir} = 1")
+    o.pop()
+    o.w("end if")
+    o.w(f"{trial_p} = {p}")
+    o.w(f"{trial_p}({j}) = min(max({p}({j}) - {step}, {lower}({j})), {upper}({j}))")
+    o.w(f"{trial} = {_objective_expr(trial_p)}")
+    o.w(f"if ({trial} < {best}) then")
+    o.push()
+    o.w(f"{best} = {trial}")
+    o.w(f"{best_j} = {j}")
+    o.w(f"{best_dir} = -1")
+    o.pop()
+    o.w("end if")
+    o.pop()
+    o.w("end do")
+    o.w(f"if ({best_j} == 0) then")
+    o.push()
+    o.w(f"{step} = 0.5_dp * {step}")
+    o.w(f"if ({step} < {tol}) exit")
+    o.pop()
+    o.w("else")
+    o.push()
+    o.w(f"{p}({best_j}) = min(max({p}({best_j}) + real({best_dir}, kind=dp) * {step}, {lower}({best_j})), {upper}({best_j}))")
+    o.pop()
+    o.w("end if")
+    o.pop()
+    o.w("end do")
+    o.w(f"{target}%par = {p}")
+    o.w(f"{target}%value = {best}")
+    o.w(f"{target}%convergence = merge(0, 1, {step} < 1.0e-6_dp)")
+    o.pop()
+    o.w("end block")
+    _OPTIM_RESULT_NAMES.add(target.lower())
+    _FIT_TERM_LABELS[target.lower()] = labels
+    _NAMED_VECTOR_LABELS[target.lower()] = labels
+    if helper_ctx is not None:
+        nr = helper_ctx.get("need_r_mod")
+        if isinstance(nr, set):
+            nr.add("optim_result_t")
+        labels_map = helper_ctx.get("named_vector_labels")
+        if isinstance(labels_map, dict):
+            labels_map[target.lower()] = labels
+    return True
 
 
 def _emit_optim_bfgs_assignment(
@@ -29097,7 +29277,7 @@ def transpile_r_to_fortran(
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
-    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
+    global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
@@ -29123,6 +29303,7 @@ def transpile_r_to_fortran(
     _CHAR_INDEX_ALIASES = {}
     _TABLE_LABELS = {}
     _FIT_TERM_LABELS = {}
+    _OPTIM_RESULT_NAMES = set()
     _LAST_COLNAME_SOURCES = {}
     _LAST_ROWNAME_SOURCES = {}
     _LAST_MATRIX_COL_LABELS = {}
@@ -31101,6 +31282,10 @@ def transpile_r_to_fortran(
     # Main program declarations/body (without header/footer).
     pbody = FEmit()
     main_param_comments = collect_assignment_comments(main_stmts)
+    for nm in set(complex_scalars) | set(complex_arrays) | set(complex_matrices):
+        params.pop(nm, None)
+        real_params.pop(nm, None)
+        array_params.pop(nm, None)
     int_param_pairs: list[tuple[str, str]] = list(params.items())
     # Reuse named size constants when multiple array-parameters share extent.
     size_groups: dict[int, list[str]] = {}
@@ -31308,6 +31493,11 @@ def transpile_r_to_fortran(
                 helper_ctx_main["need_r_mod"].update({"nlm_stub", "nlm_optimize_scalar", "nlm_optimize_vec", "nlm_result_t", "print_nlm_result"})
             if c_fit_main is not None and c_fit_main[0].lower() in {"optim", "constroptim"}:
                 list_vars[st.name] = "optim_result_t"
+                _OPTIM_RESULT_NAMES.add(st.name.lower())
+            if c_fit_main is not None and c_fit_main[0].lower() == "nls":
+                list_vars[st.name] = "optim_result_t"
+                _OPTIM_RESULT_NAMES.add(st.name.lower())
+                helper_ctx_main["need_r_mod"].add("optim_result_t")
             if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
                 list_vars[st.name] = "integrate_result_t"
                 helper_ctx_main["need_r_mod"].update({"integrate", "integrate_result_t", "print_integrate_result"})
