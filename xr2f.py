@@ -3057,7 +3057,53 @@ def _find_unquoted_brace(txt: str) -> int:
     return -1
 
 
+def _lower_trycatch_assignment_blocks(src: str) -> str:
+    """Lower simple tryCatch assignment blocks before parser line joining."""
+    lines = src.splitlines()
+    out: list[str] = []
+    i = 0
+    start_re = re.compile(r"^(\s*)([A-Za-z]\w*)\s*(<-|=)\s*tryCatch\s*\(\s*\{\s*$", re.IGNORECASE)
+    handler_re = re.compile(r"^\s*\}\s*,\s*error\s*=\s*function\s*\([^)]*\)\s*\{\s*$", re.IGNORECASE)
+    while i < len(lines):
+        m_start = start_re.match(lines[i])
+        if m_start is None:
+            out.append(lines[i])
+            i += 1
+            continue
+
+        indent, target = m_start.group(1), m_start.group(2)
+        body: list[str] = []
+        start_line = lines[i]
+        i += 1
+        while i < len(lines) and handler_re.match(lines[i]) is None:
+            body.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            out.append(start_line)
+            out.extend(body)
+            continue
+
+        i += 1
+        while i < len(lines) and lines[i].strip() != "})":
+            i += 1
+        if i < len(lines) and lines[i].strip() == "})":
+            i += 1
+
+        nonblank = [j for j, ln in enumerate(body) if ln.strip()]
+        if not nonblank:
+            out.append(f"{indent}{target} <- NA_real_")
+            continue
+        last_idx = nonblank[-1]
+        for j, ln in enumerate(body):
+            if j == last_idx:
+                out.append(f"{indent}{target} <- {ln.strip()}")
+            else:
+                out.append(ln)
+    return "\n".join(out) + ("\n" if src.endswith("\n") else "")
+
+
 def preprocess_r_lines(src: str) -> list[str]:
+    src = _lower_trycatch_assignment_blocks(src)
     lines0: list[str] = []
     seen_code = False
     for raw in src.splitlines():
