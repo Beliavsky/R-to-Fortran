@@ -4,6 +4,16 @@
 
 This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, static data structures, and a growing subset of base R statistical and filesystem workflows.  The project includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, random-number generation, formatted printing, and file/directory I/O patterns used by the example corpus.
 
+The current workflow is test-driven and pragmatic: translate supported R code, compile it, compare it with R where useful, reduce failures to small reproducers, and reuse generated or hand-edited Fortran modules when that is the better engineering path.
+
+## Why Fortran?
+
+Fortran is a practical compilation target for numerical R code.  It is a fast, standardized language with mature compilers available on major platforms.  Like R, it has first-class multidimensional arrays, array operations, array sections, and 1-based indexing, so many numerical and statistical kernels have a natural Fortran shape rather than needing to be rewritten around zero-based scalar loops.
+
+Fortran also has a long history in statistics and numerical computing.  Many statistical algorithms have reference or production implementations in Fortran, parts of R itself are written in Fortran, and R has an established interface for calling compiled Fortran routines.  Translating suitable R scripts to readable Fortran can therefore produce code that is fast, portable, and close to an ecosystem that R already knows how to call.
+
+As an example of the possible speedup, `r_examples\xgarch_dcc.r` fits univariate GARCH/NAGARCH models and a multivariate DCC-GARCH model in base R.  In one `--time-both` run where the R and Fortran results matched, the R run took 19.61 seconds and the generated Fortran run took 1.14 seconds.  Timings are workload- and machine-dependent, but this illustrates the kind of numerical script where translation can pay off.
+
 ## Quick Start
 
 Translate an R script:
@@ -48,6 +58,26 @@ Create a single self-contained Fortran file with the needed runtime support prep
 
 ```bat
 python xr2f.py r_examples\xrunif.r --self-contained --compile
+```
+
+Emit reusable Fortran module and main program files separately:
+
+```bat
+python xr2f.py r_examples\xfunc.r --split-module --compile
+```
+
+Use an existing Fortran module that provides procedures compatible with R functions in the input:
+
+```bat
+python xr2f.py foo.r custom_helpers.f90 --compile
+```
+
+Write source-analysis artifacts without changing the original R file:
+
+```bat
+python xr2f.py foo.r --annotate-r
+python xr2f.py foo.r --integerize-r
+python xr2f.py foo.r --obfuscate --check-obfuscated-r
 ```
 
 Start the interactive REPL:
@@ -112,14 +142,18 @@ end program xr2f_smoke
 - `xr2f.py`: main R-to-Fortran transpiler.
 - `xr2f_repl.py`: interactive R-to-Fortran session runner.  It can load an R file, accept more R statements, run the generated Fortran, run R, compare both, benchmark compiler choices, and run generated Fortran through `ofort`.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
+- `xr_obfuscate.py`: standalone batch obfuscator for R sources.  It renames user-defined functions and variables, can preserve directory layout under an output directory, can run the generated R with `Rscript`, and can continue through failures with a quiet summary mode.
+- `xr2f_reduce.py`: reducer for R scripts that trigger a reproducible `xr2f.py` Fortran compile failure.  It can infer the first compile-error signature, reduce while preserving that signature, optionally check R validity, and backtrack to the smallest reduced R file that still runs.
 - `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, string, filesystem, and file-I/O helpers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
+- `xr2p.py`, `xp2f.py`, `xr2r.py`: alternate and normalization pipelines used by selected modes such as `--via-python` and `--via-core-r`.
 - `compare_project_files.py`: helper for comparing selected source files against another checkout.
 - `tests/`: pytest tests for the standalone command-line tools.
 - `r_examples/`: small R scripts used as examples and regression inputs.  These include both R syntax probes and statistical algorithm examples.
 - `r_stat_examples/`: numbered statistical examples, including data-reading examples and base-R statistical workflows.
 
 Generated files normally use the suffix `_r.f90`, for example `foo.r` becomes `foo_r.f90`.
+With `--split-module`, `foo_r_mod.f90` contains the generated module and `foo_r.f90` contains the main program.
 
 ## Supported R Subset
 
@@ -134,6 +168,7 @@ The supported subset is intentionally focused on numerical scripts:
 - Reductions and statistics such as `sum`, `prod`, `mean`, `sd`, `var`, `min`, `max`, `quantile`, `median`, `summary`, `cumsum`, `cumprod`, `cummax`, and `diff`.
 - Matrix helpers such as `matrix`, `array`, `t`, `%*%`, `crossprod`, `tcrossprod`, `rowSums`, `colSums`, `det`, `kappa`, `diag`, `chol`, `forwardsolve`, `backsolve`, and `solve(a, b)` for selected cases.
 - `apply(x, 1, f)` and `apply(x, 2, f)` for selected matrix/array cases, including common reducers and some user-defined scalar callbacks.
+- Higher-order/vectorized helpers for selected static cases: `sapply`, `vapply`, `mapply`, `tapply`, `ave`, `aggregate`, `by`, `Filter`, `Find`, `Position`, `Negate`, and simple `Vectorize` aliases.
 - Ordering and ranking helpers such as `sort`, `order`, and `rank` for selected vectors.
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
 - Optional use of R's RNG through an R-linked shim with `--r-rng`.
@@ -141,6 +176,8 @@ The supported subset is intentionally focused on numerical scripts:
 - Basic named vectors: construction with names, `names(v)`, `unname(v)`, named printing, positional indexing, literal-name indexing, and name-preserving printed arithmetic.
 - Static R lists with fixed fields for selected cases.  Named fields become Fortran derived-type components; unnamed fields use generated component names `item1`, `item2`, and so on.  Scalar, vector/array, character, logical, and nested static-list components are supported for common `$`, `[[...]]`, indexing, assignment, and printing patterns.
 - Homogeneous positional numeric lists such as `list(c(...), c(...))` or `list(matrix(...), matrix(...))` are kept as numerical array/list-of-matrix structures where the numerical examples expect array semantics.
+- Grouped operations include selected `tapply`, `ave`, `aggregate`, and `by` forms.  Current support is intentionally first-tier: one or more static grouping vectors for `ave`, one named grouping vector for `aggregate`, and one grouping vector for `by`; supported summaries include common reducers such as `mean`, `sum`, `length`, `min`, `max`, plus `colMeans`/`colSums` for selected matrix-by-group cases.
+- Static environment patterns using `new.env()` and `eapply()` are supported when bindings and callbacks are known at translation time.  General environment mutation remains out of scope.
 - Static S3/S4-style examples are supported for narrow, compile-time-known method dispatch patterns.  General object systems and dynamic dispatch are still out of scope.
 - Selected data-frame and file-reading patterns such as `read.table(..., header = TRUE)`, CSV matrix/header readers, `scan`, and simple numeric file writes.
 - Filesystem helpers including selected `getwd`, `tempfile`, `file.path`, `file.exists`, `file.create`, `file.remove`, `file.info`, `dir.exists`, `dir.create`, `dir`/`list.files`, and `ls`/`ls.str` static introspection patterns.
@@ -148,6 +185,7 @@ The supported subset is intentionally focused on numerical scripts:
 - User-defined binary operators of the form `"%op%" <- function(a, b) ...` for simple static definitions.
 - Statistical distributions and tests such as normal/exponential/gamma/beta-related helpers, `t.test`, empirical CDF/KS-style helpers, and related summaries.
 - Linear-model helpers including selected `lm`, prediction, coefficients, summaries, confidence intervals, and simple stepwise model selection support.
+- Optimization helpers including selected `optim`, `nlm`, and `constrOptim` patterns.  `optim` lowering includes runtime helpers for BFGS, Nelder-Mead, CG, SANN, and selected L-BFGS-B-like bounded workflows.  `constrOptim` support is for static linear-constraint cases and uses a log-barrier outer loop with BFGS/Nelder-Mead inner solves.
 - Smoothing and time-series helpers such as moving filters, running medians, lowess/loess-style approximations, spline/decomposition helpers, `acf`/`pacf`-style routines, AR/ARMA/ARIMA-related subsets, and VAR/VARMA example support.
 - Clustering and multivariate helpers such as distance matrices, hierarchical clustering/cutting, `kmeans`, covariance/correlation helpers, Cholesky/QR helpers, and selected mixture-model routines.
 
@@ -164,7 +202,7 @@ print(y[[2]][-1])
 
 The generated Fortran uses static derived types for heterogeneous lists, so field names and field kinds must be stable.  Adding a field in all branches with the same inferred kind is allowed in selected cases, but unconditional dynamic field creation or changing a field's kind after construction is rejected with a transpile error.  General R list concatenation and fully dynamic list mutation are not complete R-compatible object semantics.
 
-Unsupported or incomplete areas include packages, data frames beyond narrow patterns, formulas beyond simple cases, closures with general lexical scoping, environments, arbitrary S3/S4 dispatch, complex regular-expression behavior, and dynamic or arbitrary list manipulation where field sets or field kinds change at runtime.  Dynamic environment mutation features such as `assign()` and superassignment `<<-` are intentionally rejected rather than translated incorrectly.  General `get()` is supported only for feasible static name lookups.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
+Unsupported or incomplete areas include packages, data frames beyond narrow patterns, formulas beyond simple cases, closures with general lexical scoping, arbitrary S3/S4 dispatch, complex regular-expression behavior, dynamic environments, and dynamic or arbitrary list manipulation where field sets or field kinds change at runtime.  Dynamic environment mutation features such as `assign()` and superassignment `<<-` are intentionally rejected rather than translated incorrectly.  General `get()` is supported only for feasible static name lookups.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
 
 ## Runtime Modes
 
@@ -179,6 +217,22 @@ Use `--self-contained` to embed a pruned `r_mod` runtime in the generated Fortra
 ```bat
 python xr2f.py foo.r --self-contained --compile
 ```
+
+Use `--split-module` when the translated R file defines procedures you want to reuse:
+
+```bat
+python xr2f.py foo.r --split-module --compile
+```
+
+The generated module is written to `<output-stem>_mod.f90`, and the generated main program remains at the requested output path.  Generated modules are emitted `private` by default, with explicit `public :: ...` lines for procedures, result types, parameters, and module variables that the generated program must initialize or use.  This makes the module boundary closer to normal reusable Fortran while keeping the generated main program buildable.
+
+You can also pass one or more `.f90` helper modules as positional arguments:
+
+```bat
+python xr2f.py foo.r hand_tuned_stats.f90 --compile
+```
+
+These files must contain modules only.  Source files with a main program or top-level procedures outside a module are rejected.  If a helper module exports a procedure with a compatible Fortran name for an R function, `xr2f.py` can use that module procedure instead of emitting a translated copy of the R function.  This is useful when a translated procedure has been hand-optimized or when several R scripts should share an existing Fortran implementation.
 
 Use recycling diagnostics when porting R vector code:
 
@@ -210,6 +264,46 @@ python xr2f.py foo.r --r-rng --run-both
 ```
 
 On Windows this requires an R installation with headers/libraries available to the C and Fortran compilers.  `xr2f.py` caches compiled runtime objects to reduce repeat compile time where possible.
+
+## Source Annotation, Integerization, Obfuscation, and Reduction
+
+`xr2f.py` includes source-level tools that are useful when improving the translator or preparing R code for translation.
+
+Write an annotated R copy with inferred `declare(type(...))` hints:
+
+```bat
+python xr2f.py foo.r --annotate-r
+python xr2f.py foo.r --annotate-r-args
+```
+
+Write an R copy where safe numeric literal assignments used in integer contexts are rewritten with `L` suffixes:
+
+```bat
+python xr2f.py foo.r --integerize-r
+```
+
+Obfuscate user-defined R function and variable names before translation.  This is mainly a regression tool: if a translation only works because the source variable was named `weights`, `print_portfolio`, or another special name, obfuscation should expose that bug.
+
+```bat
+python xr2f.py foo.r --obfuscate
+python xr2f.py foo.r --obfuscate --check-obfuscated-r
+python xr2f.py foo.r --obfuscate-r foo_obf.r
+```
+
+For batches of R files, use `xr_obfuscate.py`:
+
+```bat
+python xr_obfuscate.py r_examples r_stat_examples --recursive --out-dir obfuscated_r --check --keep-going --summary --quiet
+```
+
+When a script fails during Fortran compilation, `xr2f_reduce.py` can build a smaller R reproducer that preserves the same compile-error signature:
+
+```bat
+python xr2f_reduce.py foo.r
+python xr2f_reduce.py foo.r --check-r-final --backtrack
+```
+
+If `--match` is omitted, the reducer first runs `xr2f.py` and infers a signature from the first compile error.  `--check-r` validates every reduced candidate with `Rscript`; `--check-r-final` validates only the final reduced output; `--backtrack` emits the smallest earlier reduction that still runs under R if the smallest compile-error reproducer is not valid R.  Reduced files include a one-line banner naming the original source file.
 
 ## Partial Translation
 
@@ -340,6 +434,8 @@ Save batch output to a results file:
 python xr2f_batch.py r_stat_examples\*.R --compile --tee
 ```
 
+For obfuscation-specific batch testing, prefer `xr_obfuscate.py` rather than `xr2f_batch.py`, because it understands obfuscated output paths and optional R validity checks.
+
 ## Tests
 
 The repository includes a focused pytest suite and R fixture scripts:
@@ -348,7 +444,7 @@ The repository includes a focused pytest suite and R fixture scripts:
 pytest -q
 ```
 
-The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.  Many tests use scripts from `r_examples/` and generated one-off R programs in temporary directories.
+The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.  Many tests use scripts from `r_examples/`, `r_stat_examples/`, local root-level regression scripts, and generated one-off R programs in temporary directories.  As of July 4, 2026, pytest collects 373 tests; recent local full-corpus runs have passed with `XR2F_FULL_EXAMPLES=1`.
 
 Run the full example corpus by opting in:
 
@@ -376,19 +472,23 @@ Run both and compare normalized output:
 python xr2f.py foo.r --run-diff --normalize-num-output
 ```
 
+`--run-diff` compares normalized lines rather than raw text.  It tolerates common R-vs-Fortran formatting differences such as numeric spellings, logical spellings, quoted character tokens, stripped R vector indices, and different lengths of dash-only separator lines.
+
 For prettier comparisons:
 
 ```bat
 python xr2f.py foo.r --run-both --pretty --round-both 4 --wrap-out 80 --trim-zd
 ```
 
-Differences can be legitimate when the R script uses random numbers, platform-dependent formatting, or unsupported R semantics.  For deterministic numerical scripts, `--run-diff` is the preferred regression check.
+Differences can be legitimate when the R script uses random numbers, platform-dependent formatting, or unsupported R semantics.  For deterministic numerical scripts, `--run-diff` is the preferred regression check.  Use `--run-diff-all` when the first mismatch is not enough context.
 
 ## Project Status
 
 This project is experimental and test-driven.  The practical strategy is to add support for real scripts one feature at a time while checking that existing translated scripts still compile and run.  Most new behavior starts from a small reproducer script and then becomes either a pytest regression test or part of the full example corpus.
 
-The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, and filesystem helpers used by the example corpus.  Coverage is still selective and pragmatic.  The translator favors real regression examples over full language completeness, and it generally prefers explicit unsupported-feature errors over silently generating misleading Fortran.
+The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, optimization routines, table-formatting helpers, and filesystem helpers used by the example corpus.  It can emit reusable modules, use external Fortran modules, create obfuscated R copies to detect name-specific lowering, integerize selected R literals, and reduce compile failures to reproducers.
+
+Coverage is still selective and pragmatic.  The translator favors real regression examples over full language completeness, and it generally prefers explicit unsupported-feature errors over silently generating misleading Fortran.  Some final post-codegen repairs remain intentionally pragmatic; `--no-post-repairs` and `--special-repairs` exist to separate generic translator behavior from corpus-specific compatibility repairs.
 
 Good bug reports include:
 
