@@ -3994,7 +3994,7 @@ def _index_inner_1d_to_fortran(inner: str) -> str:
         a, b = raw_seq
         a_f = _int_bound_expr(r_expr_to_fortran(a))
         b_f = _int_bound_expr(r_expr_to_fortran(b))
-        return f"({a_f}):{b_f}"
+        return f"r_seq_int({a_f}, {b_f})"
     t = fscan.strip_redundant_outer_parens_expr(raw_t)
     m_lag_upper = re.match(r"^1\s*:\s*([A-Za-z]\w*)\s*-\s*lag$", t, re.IGNORECASE)
     if m_lag_upper is not None:
