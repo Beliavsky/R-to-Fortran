@@ -17264,9 +17264,9 @@ def emit_stmts(
                     if r1 == 1 and r2 == 1:
                         return 0
         if re.match(r"^[A-Za-z]\w*$", t):
-            if t in int_matrix_vars or t in real_matrix_vars:
+            if t in int_matrix_vars or t in real_matrix_vars or t.lower() in _KNOWN_COMPLEX_MATRIX_NAMES:
                 return 2
-            if t in int_vector_vars or t in real_vector_vars:
+            if t in int_vector_vars or t in real_vector_vars or t.lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
                 return 1
         if re.match(r"^[A-Za-z]\w*(?:[$%][A-Za-z]\w*)+$", t):
             fld = re.split(r"[$%]", t)[-1].lower()
@@ -17311,9 +17311,10 @@ def emit_stmts(
         # Non-call arithmetic expressions that reference known matrix/vector vars.
         if not re.search(r"\b[A-Za-z]\w*\s*\(", t):
             names = set(re.findall(r"\b[A-Za-z]\w*\b", t))
-            if names & (int_matrix_vars | real_matrix_vars):
+            names_l = {n.lower() for n in names}
+            if names & (int_matrix_vars | real_matrix_vars) or names_l & _KNOWN_COMPLEX_MATRIX_NAMES:
                 return 2
-            if names & (int_vector_vars | real_vector_vars):
+            if names & (int_vector_vars | real_vector_vars) or names_l & _KNOWN_COMPLEX_VECTOR_NAMES:
                 return 1
         return None
 
@@ -19973,6 +19974,16 @@ def emit_stmts(
                         _wstmt(f'write(*,"(*(g0,1x))") {one_in_f}', st.comment)
                         need_r_mod.add("r_in")
                         continue
+                    m_eigen_field_print = re.match(r"^([A-Za-z]\w*)\s*\$\s*(values|vectors)\s*$", one.strip(), re.IGNORECASE)
+                    if m_eigen_field_print is not None and m_eigen_field_print.group(1) in eigen_vars_ctx:
+                        one_eig_f = r_expr_to_fortran(one)
+                        if m_eigen_field_print.group(2).lower() == "values":
+                            _wstmt(f"call print_complex_vector({one_eig_f})", st.comment)
+                            need_r_mod.add("print_complex_vector")
+                        else:
+                            _wstmt(f"call print_matrix({one_eig_f})", st.comment)
+                            need_r_mod.add("print_matrix_rstyle")
+                        continue
                     c_complex_print = parse_call_text(one)
                     if c_complex_print is not None and c_complex_print[0].lower() == "as.complex":
                         arg_cxp = c_complex_print[1][0].strip() if c_complex_print[1] else c_complex_print[2].get("x", "").strip()
@@ -19998,10 +20009,30 @@ def emit_stmts(
                             _wstmt(f'write(*,"(*(g0,1x))") {one_cxp}', st.comment)
                         continue
                     if one.lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
-                        _wstmt(f'write(*,"(*(g0,1x))") {r_expr_to_fortran(one)}', st.comment)
+                        _wstmt(f"call print_complex_vector({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.add("print_complex_vector")
                         continue
                     if one.lower() in _KNOWN_COMPLEX_SCALAR_NAMES or _is_complex_expr_source(one):
-                        _wstmt(f'write(*,"(g0)") {r_expr_to_fortran(one)}', st.comment)
+                        rank_complex_expr = _expr_rank_for_print(one)
+                        if rank_complex_expr == 1:
+                            if one.lower().startswith("r_matmul(") or _split_top_level_token(one, "%*%", from_right=True) is not None:
+                                one_cmat_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                                o.w("block")
+                                o.push()
+                                o.w("complex(kind=dp), allocatable :: v_pr(:)")
+                                o.w(f"v_pr = {one_cmat_f}")
+                                _wstmt("call print_matrix(reshape(v_pr, [size(v_pr), 1]))", st.comment)
+                                need_r_mod.add("print_matrix_rstyle")
+                                o.pop()
+                                o.w("end block")
+                            else:
+                                _wstmt(f"call print_complex_vector({r_expr_to_fortran(one)})", st.comment)
+                                need_r_mod.add("print_complex_vector")
+                        elif rank_complex_expr == 2:
+                            _wstmt(f"call print_matrix({r_expr_to_fortran(one)})", st.comment)
+                            need_r_mod.add("print_matrix_rstyle")
+                        else:
+                            _wstmt(f'write(*,"(g0)") {r_expr_to_fortran(one)}', st.comment)
                         continue
                     m_pca_head_scores_early = re.match(
                         r"^head\s*\(\s*([A-Za-z]\w*)\s*(?:\$|%)\s*x\s*(?:,\s*([^)]+))?\)\s*$",
@@ -20019,6 +20050,32 @@ def emit_stmts(
                         need_r_mod.update({"print_qr", "qr_fit_t"})
                         continue
                     one_rank_for_label_print = _expr_rank_for_print(one)
+                    if (
+                        (
+                            one_rank_for_label_print == 1
+                            or _is_complex_expr_source(one)
+                        )
+                        and (
+                            one.lower().startswith("r_matmul(")
+                            or _split_top_level_token(one, "%*%", from_right=True) is not None
+                        )
+                    ):
+                        one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
+                        if has_r_mod:
+                            o.w("block")
+                            o.push()
+                            if _is_complex_expr_source(one):
+                                o.w("complex(kind=dp), allocatable :: v_pr(:)")
+                            else:
+                                o.w("real(kind=dp), allocatable :: v_pr(:)")
+                            o.w(f"v_pr = {one_f}")
+                            _wstmt("call print_matrix(reshape(v_pr, [size(v_pr), 1]))", st.comment)
+                            need_r_mod.add("print_matrix_rstyle")
+                            o.pop()
+                            o.w("end block")
+                        else:
+                            _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
+                        continue
                     if _looks_matrix_expr(one) or (
                         _has_matrix_label_metadata(one) and one_rank_for_label_print != 1
                     ):
@@ -20855,7 +20912,10 @@ def emit_stmts(
                         if has_r_mod:
                             o.w("block")
                             o.push()
-                            o.w("real(kind=dp), allocatable :: v_pr(:)")
+                            if _is_complex_expr_source(one):
+                                o.w("complex(kind=dp), allocatable :: v_pr(:)")
+                            else:
+                                o.w("real(kind=dp), allocatable :: v_pr(:)")
                             o.w(f"v_pr = {one_f}")
                             _wstmt("call print_matrix(reshape(v_pr, [size(v_pr), 1]))", st.comment)
                             need_r_mod.add("print_matrix_rstyle")
@@ -31918,6 +31978,73 @@ def transpile_r_to_fortran(
 
     _force_main_list_component_alias_types(main_stmts)
 
+    def _force_main_eigen_component_alias_types(ss_eig: list[object]) -> None:
+        for st_eig in ss_eig:
+            if isinstance(st_eig, Assign):
+                rhs_eig = st_eig.expr.strip()
+                m_eig_field = re.match(r"^([A-Za-z]\w*)\s*\$\s*(values|vectors)\s*$", rhs_eig, re.IGNORECASE)
+                if m_eig_field is not None and m_eig_field.group(1) in eigen_vars:
+                    params.pop(st_eig.name, None)
+                    ints.discard(st_eig.name)
+                    real_scalars.discard(st_eig.name)
+                    int_arrays.discard(st_eig.name)
+                    real_arrays.discard(st_eig.name)
+                    int_matrices.discard(st_eig.name)
+                    real_matrices.discard(st_eig.name)
+                    if m_eig_field.group(2).lower() == "values":
+                        complex_arrays.add(st_eig.name)
+                    else:
+                        complex_matrices.add(st_eig.name)
+                    continue
+                split_eig = _split_trailing_r_subset(rhs_eig)
+                if split_eig is not None:
+                    base_eig, idx_eig = split_eig
+                    m_eig_base = re.match(r"^([A-Za-z]\w*)\s*\$\s*(values|vectors)\s*$", base_eig.strip(), re.IGNORECASE)
+                    if m_eig_base is not None and m_eig_base.group(1) in eigen_vars:
+                        field_eig = m_eig_base.group(2).lower()
+                        dims_eig = _split_index_dims(idx_eig)
+                        params.pop(st_eig.name, None)
+                        ints.discard(st_eig.name)
+                        real_scalars.discard(st_eig.name)
+                        int_arrays.discard(st_eig.name)
+                        real_arrays.discard(st_eig.name)
+                        int_matrices.discard(st_eig.name)
+                        real_matrices.discard(st_eig.name)
+                        if field_eig == "values":
+                            if len(dims_eig) == 1 and dims_eig[0].strip() and ":" not in dims_eig[0] and _split_top_level_colon(dims_eig[0].strip()) is None:
+                                complex_scalars.add(st_eig.name)
+                                complex_arrays.discard(st_eig.name)
+                            else:
+                                complex_arrays.add(st_eig.name)
+                                complex_scalars.discard(st_eig.name)
+                        else:
+                            scalar_dims = [
+                                d.strip() != ""
+                                and ":" not in d
+                                and _split_top_level_colon(d.strip()) is None
+                                for d in dims_eig
+                            ]
+                            if len(dims_eig) >= 2 and sum(1 for x in scalar_dims if x) == 1:
+                                complex_arrays.add(st_eig.name)
+                                complex_scalars.discard(st_eig.name)
+                            elif len(dims_eig) >= 2 and all(scalar_dims):
+                                complex_scalars.add(st_eig.name)
+                                complex_arrays.discard(st_eig.name)
+                            else:
+                                complex_matrices.add(st_eig.name)
+                        continue
+            elif isinstance(st_eig, IfStmt):
+                _force_main_eigen_component_alias_types(st_eig.then_body)
+                _force_main_eigen_component_alias_types(st_eig.else_body)
+            elif isinstance(st_eig, ForStmt):
+                _force_main_eigen_component_alias_types(st_eig.body)
+            elif isinstance(st_eig, WhileStmt):
+                _force_main_eigen_component_alias_types(st_eig.body)
+            elif isinstance(st_eig, RepeatStmt):
+                _force_main_eigen_component_alias_types(st_eig.body)
+
+    _force_main_eigen_component_alias_types(main_stmts)
+
     if glm_vars:
         for nm in glm_vars:
             ints.discard(nm)
@@ -36910,6 +37037,101 @@ def lower_rbind_dataframe_appends_text(f90: str) -> str:
         rewrite,
         f90,
     )
+
+
+def rewrite_complex_vector_prints_text(f90: str) -> str:
+    complex_vectors: set[str] = set()
+    real_matrices: set[str] = set()
+    for m in re.finditer(r"(?im)^\s*complex\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([^\n]+)$", f90):
+        for part in split_top_level_commas(m.group(1).replace("&", " ")):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", part.strip())
+            if mm is not None:
+                complex_vectors.add(mm.group(1))
+    for m in re.finditer(r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*([^\n]+)$", f90):
+        for part in split_top_level_commas(m.group(1).replace("&", " ")):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:,\s*:\)", part.strip())
+            if mm is not None:
+                real_matrices.add(mm.group(1))
+    if not complex_vectors:
+        return f90
+
+    def matmul_repl(m: re.Match[str]) -> str:
+        indent, lhs, rhs = m.group(1), m.group(2), m.group(3)
+        if rhs not in complex_vectors:
+            return m.group(0)
+        return "\n".join(
+            [
+                f"{indent}block",
+                f"{indent}   complex(kind=dp), allocatable :: v_pr(:)",
+                f"{indent}   v_pr = r_matmul({lhs}, {rhs})",
+                f"{indent}   call print_matrix(reshape(v_pr, [size(v_pr), 1]))",
+                f"{indent}end block",
+            ]
+        )
+
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_matrix\s*\(\s*r_matmul\s*\(\s*([A-Za-z]\w*)\s*,\s*([A-Za-z]\w*)\s*\)\s*\)\s*$",
+        matmul_repl,
+        f90,
+    )
+
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_complex_vector\s*\(\s*size\s*\((.*?)\)\s*\)\s*$",
+        r'\1write(*,"(g0)") size(\2)',
+        f90,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_complex_vector\s*\(\s*shape\s*\((.*?)\)\s*\)\s*$",
+        r"\1call print_integer_vector(shape(\2))",
+        f90,
+    )
+
+    def complex_to_real_print_repl(m: re.Match[str]) -> str:
+        indent, expr = m.group(1), m.group(2).strip()
+        if re.search(r"\bcmplx\s*\(", expr, re.IGNORECASE):
+            return m.group(0)
+        if re.search(r"\b(?:real|aimag|abs|atan2)\s*\(", expr, re.IGNORECASE):
+            return f"{indent}call print_real_vector({expr})"
+        return m.group(0)
+
+    f90 = re.sub(
+        r"(?m)^(\s*)call\s+print_complex_vector\s*\((.*)\)\s*$",
+        complex_to_real_print_repl,
+        f90,
+    )
+
+    def write_repl(m: re.Match[str]) -> str:
+        indent, expr = m.group(1), m.group(2).strip()
+        if _dequote_string_literal(expr) is not None:
+            return m.group(0)
+        if re.match(r"^(?:size|shape|lbound|ubound|len|allocated)\s*\(", expr, re.IGNORECASE):
+            return m.group(0)
+        names = set(re.findall(r"\b[A-Za-z]\w*\b", expr))
+        if not (names & complex_vectors):
+            return m.group(0)
+        return f"{indent}call print_complex_vector({expr})"
+
+    f90 = re.sub(r'(?m)^(\s*)write\(\*,"\(g0\)"\)\s+(.+)$', write_repl, f90)
+    f90 = re.sub(
+        r"\b([A-Za-z]\w*)%values\s*([<>]=?)\s*([0-9]+(?:\.[0-9]*)?(?:_dp)?)",
+        r"real(\1%values, kind=dp) \2 \3",
+        f90,
+    )
+    if real_matrices:
+        def real_matrix_assign_repl(m: re.Match[str]) -> str:
+            indent, lhs, rhs = m.group(1), m.group(2), m.group(3).strip()
+            if lhs not in real_matrices or "%vectors" not in rhs or "r_matmul(" not in rhs:
+                return m.group(0)
+            if rhs.lower().startswith("real("):
+                return m.group(0)
+            return f"{indent}{lhs} = real({rhs}, kind=dp)"
+
+        f90 = re.sub(
+            r"(?m)^(\s*)([A-Za-z]\w*)\s*=\s*(.*%vectors.*r_matmul.*)$",
+            real_matrix_assign_repl,
+            f90,
+        )
+    return f90
 
 
 def lower_dataframe_minloc_row_assignments_text(f90: str) -> str:
@@ -52288,6 +52510,8 @@ def main() -> int:
         extra_use_names.append("print_named_real_vector")
     if "call print_real_vector(" in f90:
         extra_use_names.append("print_real_vector")
+    if "call print_complex_vector(" in f90:
+        extra_use_names.append("print_complex_vector")
     if "call print_integer_vector(" in f90:
         extra_use_names.append("print_integer_vector")
     if "call print_matrix(" in f90:
@@ -52406,8 +52630,11 @@ def main() -> int:
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = promote_locals_from_derived_component_assignments_text(f90)
     f90 = rewrite_rank1_component_matrix_prints_text(f90)
+    f90 = rewrite_complex_vector_prints_text(f90)
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
+    if "call print_complex_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_complex_vector"})
     f90 = remove_allocatable_result_entry_deallocate_text(f90)
     f90 = demote_scalar_reduction_result_declarations_text(f90)
     f90 = promote_vector_workvars_from_vector_assignments_text(f90)
@@ -52672,6 +52899,13 @@ def main() -> int:
     )
     if "call print_real_vector(" in f90:
         f90 = "\n".join(balance_print_real_vector_calls(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = rewrite_complex_vector_prints_text(f90)
+    if "call print_complex_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_complex_vector"})
+    if "call print_integer_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
+    if "call print_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     f90 = promote_scalar_pure_functions_to_elemental_text(f90)
     f90 = demote_elemental_allocatable_result_functions_text(f90)
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
