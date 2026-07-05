@@ -36875,8 +36875,15 @@ def promote_derived_result_call_locals_text(f90: str) -> str:
 
 
 def lower_rbind_dataframe_appends_text(f90: str) -> str:
+    integer_arrays: set[str] = set()
+    for decl in re.finditer(r"(?im)^\s*integer(?:\([^)]*\))?\s*,\s*allocatable\s*::\s*([^\n]+)$", f90):
+        for part in split_top_level_commas(decl.group(1).replace("&", " ")):
+            mm = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)", part.strip())
+            if mm is not None:
+                integer_arrays.add(mm.group(1))
+
     def rewrite(m: re.Match[str]) -> str:
-        indent, base, args = m.group(1), m.group(3), m.group(4)
+        indent, if_prefix, base, args = m.group(1), (m.group(2) or "").strip(), m.group(4), m.group(5)
         compact_args = re.sub(r"&\s*\n\s*&?", " ", args)
         lines: list[str] = []
         for part in split_top_level_commas(compact_args):
@@ -36886,12 +36893,20 @@ def lower_rbind_dataframe_appends_text(f90: str) -> str:
             field = name.strip()
             if not re.fullmatch(r"[A-Za-z]\w*", field):
                 continue
-            lines.append(f"{indent}{base}_{field} = [{base}_{field}, {expr.strip()}]")
-        return "\n".join(lines) if lines else m.group(0)
+            rhs = expr.strip()
+            if f"{base}_{field}" in integer_arrays:
+                rhs = f"int({rhs})"
+            lines.append(f"{base}_{field} = [{base}_{field}, {rhs}]")
+        if not lines:
+            return m.group(0)
+        if if_prefix:
+            body = "\n".join(f"{indent}   {line}" for line in lines)
+            return f"{indent}{if_prefix} then\n{body}\n{indent}end if"
+        return "\n".join(f"{indent}{line}" for line in lines)
 
     return re.sub(
-        r"(?ms)^(\s*)([A-Za-z]\w*)\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[\s*([A-Za-z]\w*)\s*,\s*"
-        r"data\.frame\s*\((.*?)\)\s*\]\s*,\s*\[\s*size\s*\(\s*\3\s*\)\s*,\s*2\s*\]\s*\)\s*\)\s*$",
+        r"(?ms)^(\s*)(if\s*\(.*\)\s*)?([A-Za-z]\w*)\s*=\s*transpose\s*\(\s*reshape\s*\(\s*\[\s*([A-Za-z]\w*)\s*,\s*"
+        r"data\.frame\s*\((.*?)\)\s*\]\s*,\s*\[\s*size\s*\(\s*\4\s*\)\s*,\s*2\s*\]\s*\)\s*\)\s*$",
         rewrite,
         f90,
     )
