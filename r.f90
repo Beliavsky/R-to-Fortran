@@ -28,7 +28,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, r
    & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_matrix_index, r_head, rev_int, rev_real, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
-   & print_real_vector, print_integer_vector, print_char_vector, &
+   & print_real_vector, print_complex_vector, print_integer_vector, print_char_vector, &
    & print_named_real_vector, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
@@ -151,7 +151,7 @@ end interface dir_exists
 
 type :: eigen_result_t
 ! Container for R-like eigen result results.
-   real(kind=dp), allocatable :: values(:), vectors(:,:)
+   complex(kind=dp), allocatable :: values(:), vectors(:,:)
 end type eigen_result_t
 
 type :: arima_fit_t
@@ -831,7 +831,11 @@ interface r_matmul
    module procedure r_matmul_mm_real_int
    module procedure r_matmul_mm_int_real
    module procedure r_matmul_mv_complex
+   module procedure r_matmul_mv_real_complex
+   module procedure r_matmul_mv_int_complex
    module procedure r_matmul_mm_complex
+   module procedure r_matmul_mm_complex_real
+   module procedure r_matmul_mm_real_complex
 end interface r_matmul
 
 interface r_add
@@ -1025,12 +1029,14 @@ interface print_matrix
    module procedure print_matrix_real
    module procedure print_matrix_int
    module procedure print_matrix_logical
+   module procedure print_matrix_complex
 end interface print_matrix
 
 interface print_matrix_rstyle
    module procedure print_matrix_rstyle_real
    module procedure print_matrix_rstyle_int
    module procedure print_matrix_rstyle_logical
+   module procedure print_matrix_complex
 end interface print_matrix_rstyle
 
 interface print_matrix_rstyle_named
@@ -1063,6 +1069,9 @@ interface diag
    module procedure diag_mat_real
    module procedure diag_vec_real
    module procedure diag_vec_real_n
+   module procedure diag_mat_complex
+   module procedure diag_vec_complex
+   module procedure diag_vec_complex_n
    module procedure diag_mat_int
    module procedure diag_vec_int
    module procedure diag_vec_int_n
@@ -4540,6 +4549,23 @@ else
 end if
 end subroutine print_real_vector
 
+subroutine print_complex_vector(x)
+! Print one complex vector using a compact R-like complex format.
+complex(kind=dp), intent(in) :: x(:) ! values to print
+integer :: i
+do i = 1, size(x)
+   if (abs(aimag(x(i))) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(real(x(i), kind=dp)))) then
+      write(*,"(g0)", advance="no") real(x(i), kind=dp)
+   else if (abs(real(x(i), kind=dp)) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(aimag(x(i))))) then
+      write(*,"(g0,sp,g0,ss,a)", advance="no") 0.0_dp, aimag(x(i)), "i"
+   else
+      write(*,"(g0,sp,g0,ss,a)", advance="no") real(x(i), kind=dp), aimag(x(i)), "i"
+   end if
+   if (i < size(x)) write(*,"(a)", advance="no") " "
+end do
+write(*,*)
+end subroutine print_complex_vector
+
 subroutine print_integer_vector(x)
 ! Print one integer vector with R-like line wrapping.
 integer, intent(in) :: x(:) ! values to print
@@ -4870,7 +4896,11 @@ do i = 1, size(x, 1)
       write(*,'(i0,1x)', advance='no') i
    end if
    do j = 1, size(x, 2)
-      write(*,real_fmt, advance='no') x(i, j)
+      if (ieee_is_finite(x(i, j))) then
+         write(*,real_fmt, advance='no') x(i, j)
+      else
+         write(*,col_fmt, advance='no') "NA"
+      end if
    end do
    write(*,*)
 end do
@@ -6456,9 +6486,11 @@ real(kind=dp), intent(in) :: x(:,:) ! input matrix
 logical, intent(in), optional :: symmetric, only_values
 type(eigen_result_t) :: fit
 real(kind=dp), allocatable :: a(:,:), vecs(:,:), tmpv(:), qmat(:,:), rmat(:,:), v(:), w(:), bmat(:,:), coeff(:), bwork(:,:)
+complex(kind=dp), allocatable :: tmpcv(:)
 real(kind=dp) :: off, app, aqq, apq, tau, t, c, s, phi, tmp, normv, rkk, delta, mu
 real(kind=dp) :: aa, bb, cc, dd, tr, disc, root, lam
 real(kind=dp) :: bound, left, right, mid, fleft, fright, fmid, xval, root_tol
+complex(kind=dp) :: clam, ctmp
 integer :: n, i, j, k, q, iter, max_iter, imax, m, root_count, grid, ig
 logical :: do_symmetric, only_vals
 n = size(x, 1)
@@ -6611,13 +6643,13 @@ if ((.not. do_symmetric) .and. n > 2) then
          if (abs(fit%values(j)) > abs(fit%values(imax))) imax = j
       end do
       if (imax /= i) then
-         tmp = fit%values(i)
+         ctmp = fit%values(i)
          fit%values(i) = fit%values(imax)
-         fit%values(imax) = tmp
+         fit%values(imax) = ctmp
       end if
    end do
    do j = 1, n
-      lam = fit%values(j)
+      lam = real(fit%values(j), kind=dp)
       do i = 1, n
          v(i) = 1.0_dp + real(i + j - 2, kind=dp) / real(max(1, n), kind=dp)
       end do
@@ -6638,7 +6670,7 @@ if ((.not. do_symmetric) .and. n > 2) then
       end do
       fit%values(j) = lam
       fit%vectors(:, j) = v
-      if (fit%vectors(1, j) < 0.0_dp) fit%vectors(:, j) = -fit%vectors(:, j)
+      if (real(fit%vectors(1, j), kind=dp) < 0.0_dp) fit%vectors(:, j) = -fit%vectors(:, j)
    end do
    do i = 1, n - 1
       imax = i
@@ -6646,12 +6678,13 @@ if ((.not. do_symmetric) .and. n > 2) then
          if (abs(fit%values(j)) > abs(fit%values(imax))) imax = j
       end do
       if (imax /= i) then
-         tmp = fit%values(i)
+         ctmp = fit%values(i)
          fit%values(i) = fit%values(imax)
-         fit%values(imax) = tmp
-         tmpv = fit%vectors(:, i)
+         fit%values(imax) = ctmp
+         if (.not. allocated(tmpcv)) allocate(tmpcv(n))
+         tmpcv = fit%vectors(:, i)
          fit%vectors(:, i) = fit%vectors(:, imax)
-         fit%vectors(:, imax) = tmpv
+         fit%vectors(:, imax) = tmpcv
       end if
    end do
    if (only_vals) then
@@ -6671,7 +6704,7 @@ if ((.not. do_symmetric) .and. n == 2) then
       root = sqrt(disc)
       fit%values = [(0.5_dp * (tr + root)), (0.5_dp * (tr - root))]
       do j = 1, 2
-         lam = fit%values(j)
+         lam = real(fit%values(j), kind=dp)
          if (abs(bb) >= abs(cc) .and. abs(bb) > tiny(1.0_dp)) then
             fit%vectors(:, j) = [bb, lam - aa]
          else if (abs(cc) > tiny(1.0_dp)) then
@@ -6680,12 +6713,34 @@ if ((.not. do_symmetric) .and. n == 2) then
             fit%vectors(:, j) = 0.0_dp
             fit%vectors(j, j) = 1.0_dp
          end if
-         normv = sqrt(max(tiny(1.0_dp), sum(fit%vectors(:, j)**2)))
+         normv = sqrt(max(tiny(1.0_dp), sum(abs(fit%vectors(:, j))**2)))
          fit%vectors(:, j) = fit%vectors(:, j) / normv
       end do
       return
    end if
-   error stop "complex eigenvalues are not supported by xr2f eigen() runtime"
+   ! The complex conjugate eigenpair path follows the same real/imaginary
+   ! eigenvalue convention used by Alan Miller's complex_eigen module, adapted
+   ! from the NSWC/EISPACK routines.
+   root = sqrt(-disc)
+   fit%values = [cmplx(0.5_dp * tr, 0.5_dp * root, kind=dp), cmplx(0.5_dp * tr, -0.5_dp * root, kind=dp)]
+   do j = 1, 2
+      clam = fit%values(j)
+      if (abs(bb) >= abs(cc) .and. abs(bb) > tiny(1.0_dp)) then
+         fit%vectors(:, j) = [cmplx(bb, 0.0_dp, kind=dp), clam - cmplx(aa, 0.0_dp, kind=dp)]
+      else if (abs(cc) > tiny(1.0_dp)) then
+         fit%vectors(:, j) = [clam - cmplx(dd, 0.0_dp, kind=dp), cmplx(cc, 0.0_dp, kind=dp)]
+      else
+         fit%vectors(:, j) = cmplx(0.0_dp, 0.0_dp, kind=dp)
+         fit%vectors(j, j) = cmplx(1.0_dp, 0.0_dp, kind=dp)
+      end if
+      normv = sqrt(max(tiny(1.0_dp), sum(abs(fit%vectors(:, j))**2)))
+      fit%vectors(:, j) = fit%vectors(:, j) / normv
+   end do
+   if (only_vals) then
+      if (allocated(fit%vectors)) deallocate(fit%vectors)
+      allocate(fit%vectors(0, 0))
+   end if
+   return
 end if
 a = x
 allocate(vecs(n, n))
@@ -6741,12 +6796,12 @@ allocate(tmpv(n))
 do i = 1, n - 1
    imax = i
    do j = i + 1, n
-      if (fit%values(j) > fit%values(imax)) imax = j
+      if (real(fit%values(j), kind=dp) > real(fit%values(imax), kind=dp)) imax = j
    end do
    if (imax /= i) then
-      tmp = fit%values(i)
+      ctmp = fit%values(i)
       fit%values(i) = fit%values(imax)
-      fit%values(imax) = tmp
+      fit%values(imax) = ctmp
       tmpv = vecs(:, i)
       vecs(:, i) = vecs(:, imax)
       vecs(:, imax) = tmpv
@@ -6755,7 +6810,7 @@ end do
 do j = 1, n
    normv = sqrt(max(tiny(1.0_dp), sum(vecs(:, j)**2)))
    fit%vectors(:, j) = vecs(:, j) / normv
-   if (fit%vectors(1, j) < 0.0_dp) fit%vectors(:, j) = -fit%vectors(:, j)
+   if (real(fit%vectors(1, j), kind=dp) < 0.0_dp) fit%vectors(:, j) = -fit%vectors(:, j)
 end do
 if (only_vals) then
    if (allocated(fit%vectors)) deallocate(fit%vectors)
@@ -6767,11 +6822,20 @@ subroutine print_eigen(fit)
 ! Print eigen values in an R-like format.
 type(eigen_result_t), intent(in) :: fit ! input value
 write(*,'(a)') "$values"
-call print_real_vector(fit%values)
+if (allocated(fit%values) .and. size(fit%values) > 0 .and. maxval(abs(aimag(fit%values))) <= &
+   100.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(real(fit%values, kind=dp))))) then
+   call print_real_vector(real(fit%values, kind=dp))
+else
+   call print_complex_vector(fit%values)
+end if
 write(*,*)
 write(*,'(a)') "$vectors"
 if (allocated(fit%vectors) .and. size(fit%vectors, 1) > 0 .and. size(fit%vectors, 2) > 0) then
-   call print_matrix_rstyle(fit%vectors)
+   if (maxval(abs(aimag(fit%vectors))) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(real(fit%vectors, kind=dp))))) then
+      call print_matrix_rstyle(real(fit%vectors, kind=dp))
+   else
+      call print_matrix(fit%vectors)
+   end if
 else
    write(*,'(a)') "NULL"
 end if
@@ -8106,6 +8170,39 @@ integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:,:)
 out = diag_vec_real(v)
 end function diag_vec_real_n
+
+pure function diag_mat_complex(a) result(out)
+! Return diagonal of a complex matrix.
+complex(kind=dp), intent(in) :: a(:,:)
+complex(kind=dp), allocatable :: out(:)
+integer :: i, n
+n = min(size(a, 1), size(a, 2))
+allocate(out(n))
+do i = 1, n
+   out(i) = a(i, i)
+end do
+end function diag_mat_complex
+
+pure function diag_vec_complex(v) result(out)
+! Create diagonal complex matrix from a complex vector.
+complex(kind=dp), intent(in) :: v(:)
+complex(kind=dp), allocatable :: out(:,:)
+integer :: i, n
+n = size(v)
+allocate(out(n, n))
+out = cmplx(0.0_dp, 0.0_dp, kind=dp)
+do i = 1, n
+   out(i, i) = v(i)
+end do
+end function diag_vec_complex
+
+pure function diag_vec_complex_n(v, n) result(out)
+! Create diagonal complex matrix from a complex vector; n is accepted for R compatibility.
+complex(kind=dp), intent(in) :: v(:)
+integer, intent(in) :: n
+complex(kind=dp), allocatable :: out(:,:)
+out = diag_vec_complex(v)
+end function diag_vec_complex_n
 
 pure function diag_mat_int(a) result(out)
 ! Return diagonal of an integer matrix.
@@ -10523,6 +10620,24 @@ allocate(out(size(a, 1)))
 out = matmul(a, b)
 end function r_matmul_mv_complex
 
+pure function r_matmul_mv_real_complex(a, b) result(out)
+! Matrix-product helper for real matrix and complex vector multiplication.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+complex(kind=dp), intent(in) :: b(:) ! right operand vector
+complex(kind=dp), allocatable :: out(:)
+allocate(out(size(a, 1)))
+out = matmul(cmplx(a, 0.0_dp, kind=dp), b)
+end function r_matmul_mv_real_complex
+
+pure function r_matmul_mv_int_complex(a, b) result(out)
+! Matrix-product helper for integer matrix and complex vector multiplication.
+integer, intent(in) :: a(:,:) ! left operand matrix
+complex(kind=dp), intent(in) :: b(:) ! right operand vector
+complex(kind=dp), allocatable :: out(:)
+allocate(out(size(a, 1)))
+out = matmul(cmplx(real(a, kind=dp), 0.0_dp, kind=dp), b)
+end function r_matmul_mv_int_complex
+
 pure function r_matmul_vm_real(a, b) result(out)
 ! Matrix-product helper for real vector-matrix multiplication.
 real(kind=dp), intent(in) :: a(:) ! left operand vector
@@ -10603,6 +10718,24 @@ complex(kind=dp), allocatable :: out(:,:)
 allocate(out(size(a, 1), size(b, 2)))
 out = matmul(a, b)
 end function r_matmul_mm_complex
+
+pure function r_matmul_mm_complex_real(a, b) result(out)
+! Matrix-product helper for complex matrix and real matrix multiplication.
+complex(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+real(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+complex(kind=dp), allocatable :: out(:,:)
+allocate(out(size(a, 1), size(b, 2)))
+out = matmul(a, cmplx(b, 0.0_dp, kind=dp))
+end function r_matmul_mm_complex_real
+
+pure function r_matmul_mm_real_complex(a, b) result(out)
+! Matrix-product helper for real matrix and complex matrix multiplication.
+real(kind=dp), intent(in) :: a(:,:) ! left operand matrix
+complex(kind=dp), intent(in) :: b(:,:) ! right operand matrix
+complex(kind=dp), allocatable :: out(:,:)
+allocate(out(size(a, 1), size(b, 2)))
+out = matmul(cmplx(a, 0.0_dp, kind=dp), b)
+end function r_matmul_mm_real_complex
 
 function r_add_vv(a, b) result(out)
 ! Recycle and add two vectors (R-style recycling).
@@ -11867,6 +12000,8 @@ do i = 1, size(x, 1)
    do j = 1, size(x, 2)
       if (all_int) then
          write(*,'(i12,1x)', advance='no') nint(x(i, j), kind=int64)
+      else if (.not. ieee_is_finite(x(i, j))) then
+         write(*,'(a12,1x)', advance='no') "NA"
       else if (present(digits)) then
          write(*,fmt, advance='no') x(i, j)
       else if (x(i, j) == 0.0_dp .or. (abs(x(i, j)) >= 1.0e-4_dp .and. abs(x(i, j)) < 1.0e6_dp)) then
@@ -11912,6 +12047,8 @@ do i = 1, size(x, 1)
       end if
       if (as_int_col .and. ieee_is_finite(x(i, j))) then
          write(*,'(i12,1x)', advance='no') nint(x(i, j))
+      else if (.not. ieee_is_finite(x(i, j))) then
+         write(*,'(a12,1x)', advance='no') "NA"
       else if (present(digits)) then
          write(*,fmt, advance='no') x(i, j)
       else
@@ -11953,6 +12090,15 @@ do i = 1, size(x, 1)
    write(*,"(*(i0,1x))") x(i, :)
 end do
 end subroutine print_matrix_int
+
+subroutine print_matrix_complex(x)
+! Print a complex matrix row-by-row.
+complex(kind=dp), intent(in) :: x(:,:) ! matrix to print
+integer :: i
+do i = 1, size(x, 1)
+   call print_complex_vector(x(i, :))
+end do
+end subroutine print_matrix_complex
 
 subroutine print_matrix_logical(x)
 ! Print a logical matrix row-by-row.
@@ -14924,7 +15070,7 @@ nf = max(1, min(factors, size(x, 2)))
 eg = eigen(cor(x))
 allocate(loadings(size(x, 2), nf))
 do j = 1, nf
-   loadings(:, j) = eg%vectors(:, j) * sqrt(max(0.0_dp, eg%values(j)))
+   loadings(:, j) = real(eg%vectors(:, j), kind=dp) * sqrt(max(0.0_dp, real(eg%values(j), kind=dp)))
 end do
 write(*,'(a)') "Factor Analysis (principal-factor approximation)"
 write(*,'(a)') "Loadings:"
