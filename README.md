@@ -1,6 +1,6 @@
 # R-to-Fortran
 
-`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran.  The goal is to translate numeric, array-oriented, statistical, and file-oriented R scripts into readable Fortran that can be compiled with `gfortran` or `ifx`, or run interactively through the `ofort` Fortran interpreter from the REPL.
+`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran, written using Codex.  The goal is to translate numeric, array-oriented, statistical, and file-oriented R scripts into readable Fortran that can be compiled with `gfortran` or `ifx`, or run interactively through the `ofort` Fortran interpreter from the REPL.
 
 This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, static data structures, and a growing subset of base R statistical and filesystem workflows.  The project includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, random-number generation, formatted printing, and file/directory I/O patterns used by the example corpus.
 
@@ -13,6 +13,14 @@ Fortran is a practical compilation target for numerical R code.  It is a fast, s
 Fortran also has a long history in statistics and numerical computing.  Many statistical algorithms have reference or production implementations in Fortran, parts of R itself are written in Fortran, and R has an established interface for calling compiled Fortran routines.  Translating suitable R scripts to readable Fortran can therefore produce code that is fast, portable, and close to an ecosystem that R already knows how to call.
 
 As an example of the possible speedup, `r_examples\xgarch_dcc.r` fits univariate GARCH/NAGARCH models and a multivariate DCC-GARCH model in base R.  In one `--time-both` run where the R and Fortran results matched, the R run took 19.61 seconds and the generated Fortran run took 1.14 seconds.  Timings are workload- and machine-dependent, but this illustrates the kind of numerical script where translation can pay off.
+
+## Relationship To quickr
+
+[`quickr`](https://github.com/t-kalinowski/quickr) is another R-to-Fortran project.  It is an R package focused on accelerating individual R functions from inside R: the user calls `quick()`, supplies explicit `declare(type(...))` metadata for function arguments, and gets back an accelerated R-callable function.  Its documented target is high-performance numerical kernels with atomic vectors, matrices, and arrays.
+
+`xr2f.py` is a standalone script-oriented transpiler.  It aims to emit readable Fortran source for whole scripts or selected functions, compile and run that source from the command line, and compare output with R when useful.  It relies more heavily on inference and runtime support, which makes it useful for script, example-corpus, and standalone Fortran workflows, but also means it supports a selective and experimental subset of R rather than all dynamic R code.
+
+The two projects are complementary.  `quickr` is a good fit when the desired result is an accelerated function that remains in an R workflow.  `xr2f.py` is a good fit when the desired result is inspectable Fortran source or a standalone Fortran executable.  The `--annotate-r-args` option in `xr2f.py` emits `declare(type(...))` argument declarations in R source form, which can be used as a starting point for the declarations required by `quickr`.
 
 ## Quick Start
 
@@ -275,6 +283,8 @@ Write an annotated R copy with inferred `declare(type(...))` hints:
 python xr2f.py foo.r --annotate-r
 python xr2f.py foo.r --annotate-r-args
 ```
+
+`--annotate-r-args` emits only function-argument declarations.  This is useful when preparing a function for [`quickr`](https://github.com/t-kalinowski/quickr), which requires explicit `declare(type(...))` declarations for function arguments.
 
 Write an R copy where safe numeric literal assignments used in integer contexts are rewritten with `L` suffixes:
 
