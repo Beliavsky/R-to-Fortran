@@ -47654,6 +47654,72 @@ def restore_matrix_row_seq_index_text(f90: str) -> str:
     )
 
 
+def rewrite_integerish_real_seq_subscripts_text(f90: str) -> str:
+    def strip_real_wrapper(arg: str) -> str:
+        cinfo = parse_call_text(arg.strip())
+        if cinfo is None or cinfo[0].lower() != "real":
+            return arg.strip()
+        pos, kw = cinfo[1], cinfo[2]
+        if not pos:
+            return arg.strip()
+        kind_src = kw.get("kind", pos[1] if len(pos) >= 2 else "")
+        if kind_src.strip().lower() != "dp":
+            return arg.strip()
+        return pos[0].strip()
+
+    def looks_integerish(arg: str) -> bool:
+        t = strip_real_wrapper(arg)
+        return re.search(r"(?<![A-Za-z_])\d+\.\d|\d+[eE][+-]?\d|_dp\b", t) is None
+
+    def find_close(src: str, open_idx: int) -> int:
+        depth = 0
+        for idx in range(open_idx, len(src)):
+            ch = src[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return -1
+
+    def repl_line(line: str) -> str:
+        out = line
+        start = 0
+        needle = "r_seq_real_by("
+        while True:
+            idx = out.find(needle, start)
+            if idx < 0:
+                break
+            prefix = out[:idx]
+            if re.search(r"\b[A-Za-z]\w*\s*\(\s*$", prefix) is None:
+                start = idx + len(needle)
+                continue
+            close = find_close(out, idx + len("r_seq_real_by"))
+            if close < 0:
+                break
+            suffix = out[close + 1 :]
+            if suffix.lstrip()[:1] not in {")", ","}:
+                start = close + 1
+                continue
+            call_txt = out[idx : close + 1]
+            cinfo = parse_call_text(call_txt)
+            if cinfo is None or cinfo[0].lower() != "r_seq_real_by":
+                start = close + 1
+                continue
+            args = cinfo[1] + list(cinfo[2].values())
+            if len(args) != 3 or not all(looks_integerish(a) for a in args):
+                start = close + 1
+                continue
+            int_args = [_int_bound_expr(strip_real_wrapper(a)) for a in args]
+            repl = f"r_seq_int_by({int_args[0]}, {int_args[1]}, {int_args[2]})"
+            out = out[:idx] + repl + out[close + 1 :]
+            start = idx + len(repl)
+        return out
+
+    return "\n".join(repl_line(line) for line in f90.splitlines()) + ("\n" if f90.endswith("\n") else "")
+
+
 def rewrite_allocatable_array_merge_assignments_text(f90: str) -> str:
     def repl(block_m: re.Match[str]) -> str:
         block = block_m.group(0)
@@ -52162,6 +52228,7 @@ def main() -> int:
     f90 = repair_rank3_apply_sum_prints_text(f90)
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = promote_complex_constructor_vector_decls_text(f90)
+    f90 = rewrite_integerish_real_seq_subscripts_text(f90)
     extra_use_names: list[str] = []
     if "type(decompose_result_t)" in f90 or "decompose(" in f90:
         extra_use_names.extend(["decompose", "decompose_result_t"])
@@ -52231,6 +52298,8 @@ def main() -> int:
         extra_use_names.append("which_last")
     if "call print_char_vector(" in f90:
         extra_use_names.append("print_char_vector")
+    if "r_seq_int_by(" in f90:
+        extra_use_names.append("r_seq_int_by")
     if extra_use_names:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90 = promote_logical_pack_result_decls_text(f90)
