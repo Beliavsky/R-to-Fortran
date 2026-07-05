@@ -43408,7 +43408,14 @@ def fix_result_field_ranks_from_local_assignments_text(f90: str) -> str:
                         continue
             rhs_low = rhs_expr.lower()
             rhs_rank: int | None = None
-            if _looks_matrix_expr(rhs_expr):
+            if (
+                _is_int_literal(rhs_expr.strip())
+                or _is_real_literal(rhs_expr.strip())
+                or rhs_expr.strip().lower() in {".true.", ".false."}
+                or _dequote_string_literal(rhs_expr.strip()) is not None
+            ):
+                rhs_rank = 0
+            elif _looks_matrix_expr(rhs_expr):
                 rhs_rank = 2
             elif re.search(r"\b(?:sum|product|minval|maxval)\s*\(.*\bdim\s*=", rhs_low) is not None:
                 rhs_rank = 1
