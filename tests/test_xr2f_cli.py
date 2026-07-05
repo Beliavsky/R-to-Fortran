@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +12,15 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 XR2F_PATH = REPO_ROOT / "xr2f.py"
+
+
+def _load_xr2f_module():
+    spec = importlib.util.spec_from_file_location("xr2f_for_test", XR2F_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 # Refreshed from a local corpus sweep using:
 #   python xr2f.py <file.r> r.f90 --compile
@@ -82,6 +93,71 @@ def _run_xr2f_compile(tmp_path: Path, example_name: str) -> subprocess.Completed
         text=True,
         check=False,
     )
+
+
+def _split_top_level_commas_for_test(src: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    paren = bracket = 0
+    for idx, ch in enumerate(src):
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren:
+            paren -= 1
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]" and bracket:
+            bracket -= 1
+        elif ch == "," and paren == 0 and bracket == 0:
+            parts.append(src[start:idx].strip())
+            start = idx + 1
+    tail = src[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _logical_fortran_lines_for_test(src: str) -> list[str]:
+    logical: list[str] = []
+    current = ""
+    for physical in src.splitlines():
+        line = physical.rstrip()
+        if current:
+            stripped = line.lstrip()
+            if stripped.startswith("&"):
+                stripped = stripped[1:].lstrip()
+            current += " " + stripped
+        else:
+            current = line
+        if current.rstrip().endswith("&"):
+            current = current.rstrip()[:-1].rstrip()
+            continue
+        logical.append(current)
+        current = ""
+    if current:
+        logical.append(current)
+    return logical
+
+
+def _has_fortran_decl(src: str, spec: str, entity: str) -> bool:
+    spec_re = re.escape(spec.strip()).replace(r"\ ", r"\s+")
+    entity_norm = re.sub(r"\s+", "", entity)
+    for line in _logical_fortran_lines_for_test(src):
+        code = line.split("!", 1)[0].strip()
+        m_decl = re.match(rf"^{spec_re}\s*::\s*(.+)$", code, re.IGNORECASE)
+        if m_decl is None:
+            continue
+        for part in _split_top_level_commas_for_test(m_decl.group(1)):
+            if re.sub(r"\s+", "", part) == entity_norm:
+                return True
+    return False
+
+
+def _has_fortran_decl_fragment(src: str, fragment: str) -> bool:
+    m_decl = re.match(r"\s*(.+?)\s*::\s*(.+?)\s*$", fragment)
+    if m_decl is None:
+        return fragment in " ".join(src.replace("&", " ").split())
+    return _has_fortran_decl(src, m_decl.group(1), m_decl.group(2))
 
 
 def test_xr2f_accepts_positional_output_path_for_compile(tmp_path: Path) -> None:
@@ -181,9 +257,9 @@ def test_xr2f_annotate_r_writes_inferred_declares(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert f"wrote {ann_path}" in proc.stdout
     assert ann_text.index("# top comment") < ann_text.index("declare(type(")
-    assert "n = integer()" in ann_text
-    assert "z = double()" in ann_text
-    assert "max.iter = integer()" in ann_text
+    assert "n = integer(1)" in ann_text
+    assert "z = double(1)" in ann_text
+    assert "max.iter = integer(1)" in ann_text
     assert "max_iter = integer()" not in ann_text
     assert ann_text.index("f <- function") < ann_text.index("  declare(type(") < ann_text.index("  y <- numeric")
 
@@ -227,12 +303,12 @@ def test_xr2f_annotate_r_args_writes_only_argument_declares(tmp_path: Path) -> N
     ann_text = ann_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert f"wrote {ann_path}" in proc.stdout
-    assert "x = double()" in ann_text
-    assert "max.iter = integer()" in ann_text
+    assert "x = double(NA)" in ann_text
+    assert "max.iter = integer(1)" in ann_text
     assert "y = double()" not in ann_text
     assert "i = integer()" not in ann_text
-    assert "n = integer()" not in ann_text
-    assert "z = double()" not in ann_text
+    assert "n = integer(1)" not in ann_text
+    assert "z = double(1)" not in ann_text
 
 
 def test_xr2f_dotted_for_loop_variable_compile(tmp_path: Path) -> None:
@@ -299,6 +375,80 @@ def test_xr2f_leading_dot_variable_compile_and_run(tmp_path: Path) -> None:
     assert "dot_n = 4" in out_text
     assert "n = 5" in out_text
     assert ".n" not in out_text
+
+
+def test_xr2f_dotted_function_direct_logical_return_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xis_prime_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "is.prime <- function(n) {",
+                "  n == 2L || all(n %% 2L:max(2, floor(sqrt(n))) != 0)",
+                "}",
+                "for (i in 1:7) cat(i, is.prime(i), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xis_prime_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1 T" in proc.stdout
+    assert "2 T" in proc.stdout
+    assert "4 F" in proc.stdout
+    assert "logical :: is_prime_result" in out_text
+    assert "= =" not in out_text
+    assert "logical :: n_2" not in out_text
+
+
+def test_xr2f_sapply_shorthand_lambda_logical_mask_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsapply_lambda_mask_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "digitsum <- function(x) sum(floor(x / 10^(0:(nchar(x) - 1))) %% 10)",
+                "is.prime <- function(n) n == 2L || all(n %% 2L:max(2, floor(sqrt(n))) != 0)",
+                "range_int <- 2:50",
+                "v <- sapply(range_int, \\(x) is.prime(x) && is.prime(digitsum(x)))",
+                'cat(paste("Found", length(range_int[v]), "additive primes less than 50"))',
+                "print(range_int[v])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsapply_lambda_mask_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "Found 10 additive primes less than 50" in proc.stdout
+    assert "less than 50 2" in proc.stdout
+    assert "2 3 5 7 11 23 29 41 43 47" in proc.stdout
+    assert "logical, allocatable :: v(:)" in out_text
+    assert "sapply(" not in out_text
+    assert "pack(range_int, v)" in out_text
 
 
 def test_xr2f_printing_r_function_emits_subroutine(tmp_path: Path) -> None:
@@ -509,6 +659,83 @@ def test_xr2f_scalar_reduction_result_and_vector_constructor_result_ranks(tmp_pa
     assert "real(kind=dp), allocatable :: xc(:)" in out_text
     assert "real(kind=dp), allocatable :: return_stats_result(:)" in out_text
     assert "return_stats_result = [" in out_text
+
+
+def test_xr2f_filtered_renamed_argument_keeps_dummy_declaration_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfiltered_arg_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "return_stats <- function(x) {",
+                "  x <- x[is.finite(x)]",
+                "  c(x[1], sd(x))",
+                "}",
+                "print(return_stats(c(1.0, 2.0, NA, 4.0)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfiltered_arg_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "function return_stats(x) result(return_stats_result)" in out_text
+    assert "real(kind=dp), intent(in) :: x(:)" in out_text
+    assert "real(kind=dp), allocatable :: x_2(:)" in out_text
+    assert "x_2 = pack(x," in out_text.replace("&\n&", "")
+
+
+def test_xr2f_function_returning_numeric_dataframe_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdataframe_return_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_stats <- function(x) {",
+                "  y <- x * x",
+                "  data.frame(",
+                "    time = seq_along(x),",
+                "    value = y,",
+                "    se = sqrt(y)",
+                "  )",
+                "}",
+                "df <- make_stats(c(1.0, 2.0, 3.0))",
+                "print(head(df))",
+                "v <- df$value",
+                "print(v)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdataframe_return_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type :: make_stats_result_t" in out_text
+    assert "type(make_stats_result_t) :: make_stats_result" in out_text
+    assert "call print_make_stats_result_head(df, 6)" in out_text
+    assert "v = df%value" in out_text
 
 
 def test_xr2f_parenthesized_power_base_preserves_grouping(tmp_path: Path) -> None:
@@ -771,6 +998,241 @@ def test_xr2f_vector_filter_arithmetic_predicate_run(tmp_path: Path) -> None:
     assert "pack(z, r_mul(z, z) > 8)" in out_text
 
 
+def test_xr2f_filter_anonymous_predicate_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfilter_anonymous_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1, 2, 3, 4, 5, 6)",
+                "y <- Filter(function(z) z %% 2 == 0, x)",
+                "cat(y)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfilter_anonymous_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "2.0000000000000000" in proc.stdout
+    assert "4.0000000000000000" in proc.stdout
+    assert "6.0000000000000000" in proc.stdout
+    assert "Filter(" not in out_text
+    assert "pack(x, mod(x, real(2, kind=dp)) == 0)" in out_text
+
+
+def test_xr2f_find_anonymous_named_and_assignment_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfind_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(3, 7, 10, 15, 20)",
+                "print(Find(function(z) z %% 5 == 0, x))",
+                "a <- Find(function(z) z > 12, x)",
+                "print(a)",
+                'words <- c("cat", "dog", "elephant", "fox")',
+                "first_word <- Find(function(s) nchar(s) > 5, words)",
+                "print(first_word)",
+                "x2 <- c(1, 3, 5, 7)",
+                "print(Find(function(z) z %% 2 == 0, x2, nomatch = NA))",
+                "is_large_even <- function(z) {",
+                "  z %% 2 == 0 && z > 10",
+                "}",
+                "print(Find(is_large_even, x))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfind_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "10" in proc.stdout
+    assert "15" in proc.stdout
+    assert "elephant" in proc.stdout
+    assert "NA" in proc.stdout
+    assert "20" in proc.stdout
+    assert "Find(" not in out_text
+    assert "first_word =" in out_text
+    assert "is_large_even(int(x(" in out_text
+
+
+def test_xr2f_position_anonymous_named_right_and_assignment_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xposition_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(3, 7, 10, 15, 20)",
+                "print(Position(function(z) z %% 2 == 0, x))",
+                "print(Position(function(z) z %% 5 == 0, x, right = TRUE))",
+                "p <- Position(function(z) z > 12, x)",
+                "print(p)",
+                'words <- c("cat", "dog", "elephant", "fox")',
+                "print(Position(function(s) nchar(s) > 5, words))",
+                "x2 <- c(1, 3, 5, 7)",
+                "print(Position(function(z) z %% 2 == 0, x2))",
+                "print(Position(function(z) z %% 2 == 0, x2, nomatch = 0))",
+                "is_large_even <- function(z) {",
+                "  z %% 2 == 0 && z > 10",
+                "}",
+                "print(Position(is_large_even, x))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xposition_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    for expected in ["3", "5", "4", "NA", "0"]:
+        assert expected in proc.stdout
+    assert "Position(" not in out_text
+    assert "p =" in out_text
+    assert "do i_pos_" in out_text
+    assert "size(x), 1, -1" in out_text
+    assert "is_large_even(int(x(" in out_text
+
+
+def test_xr2f_negate_predicates_in_filter_find_and_position_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xnegate_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "is_even <- function(x) x %% 2 == 0",
+                "x <- c(1, 2, 3, 4, 5, 6)",
+                "print(Filter(Negate(is_even), x))",
+                "x <- c(10, NA, 20, NA, 30)",
+                "print(Filter(Negate(is.na), x))",
+                'words <- c("cat", "", "dog", "", "fox")',
+                'print(Filter(Negate(function(s) s == ""), words))',
+                "is_positive <- function(x) x > 0",
+                "x <- c(3, 2, 1, 0, -1)",
+                "print(Find(Negate(is_positive), x))",
+                "is_short <- function(s) nchar(s) <= 3",
+                'words <- c("cat", "dog", "elephant", "fox")',
+                "print(Position(Negate(is_short), words))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xnegate_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1.0000000000000000 3.0000000000000000 5.0000000000000000" in proc.stdout
+    assert "10.000000000000000 20.000000000000000 30.000000000000000" in proc.stdout
+    assert "cat dog fox" in proc.stdout
+    assert "0" in proc.stdout
+    assert "3" in proc.stdout
+    assert "Negate(" not in out_text
+    assert ".not." in out_text
+
+
+def test_xr2f_simple_vectorize_numeric_and_logical_wrappers_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xvectorize_supported_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "square_plus_one <- function(x) {",
+                "  x^2 + 1",
+                "}",
+                "vsquare_plus_one <- Vectorize(square_plus_one)",
+                "x <- c(-2, 0, 4, 7)",
+                "print(vsquare_plus_one(x))",
+                "between <- function(x, lo, hi) {",
+                "  x >= lo && x <= hi",
+                "}",
+                "vbetween <- Vectorize(between)",
+                "x <- c(1, 5, 10, 15)",
+                "lo <- c(0, 4, 8, 20)",
+                "hi <- c(2, 6, 12, 25)",
+                "print(vbetween(x, lo, hi))",
+                "payoff_call <- function(price, strike) {",
+                "  max(price - strike, 0)",
+                "}",
+                "vpayoff_call <- Vectorize(payoff_call)",
+                "prices <- c(80, 90, 100, 110, 120)",
+                "strike <- 100",
+                "print(vpayoff_call(prices, strike))",
+                "grid_value <- function(x, y) {",
+                "  x^2 + y^2",
+                "}",
+                "vgrid_value <- Vectorize(grid_value)",
+                "x <- 1:3",
+                "y <- 10:12",
+                "print(vgrid_value(x, y))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xvectorize_supported_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "5 1 17 50" in proc.stdout
+    assert "T T T F" in proc.stdout
+    assert "0 0 0 10 20" in proc.stdout
+    assert "101 125 153" in proc.stdout
+    assert "Vectorize(" not in out_text
+    assert "do i_vec_" in out_text
+    assert "payoff_call(prices(i_vec_" in out_text
+
+
 def test_xr2f_literal_vector_with_later_logical_assignment_not_parameter_run(tmp_path: Path) -> None:
     local_input = tmp_path / "xset_probe.r"
     local_input.write_text(
@@ -1021,6 +1483,146 @@ def test_xr2f_function_vector_formal_flattens_matrix_actual_for_c_return_run(tmp
     assert "z12([100.0_dp])" in flat_out
 
 
+def test_xr2f_transposed_sapply_named_c_fields_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsapply_named_c_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_fit <- function(x) {",
+                "  list(",
+                "    mu = x,",
+                "    omega = x + 1,",
+                "    alpha = x + 2,",
+                "    beta = x + 3,",
+                "    loglik = x + 4,",
+                "    convergence = 0",
+                "  )",
+                "}",
+                "fits <- vector(\"list\", 2)",
+                "for (i in seq_along(fits)) {",
+                "  fits[[i]] <- make_fit(i)",
+                "}",
+                "garch_parameters <- t(sapply(fits, function(f) {",
+                "  c(",
+                "    mu = f$mu,",
+                "    omega = f$omega,",
+                "    alpha = f$alpha,",
+                "    beta = f$beta,",
+                "    persistence = f$alpha + f$beta,",
+                "    loglik = f$loglik,",
+                "    convergence = f$convergence",
+                "  )",
+                "}))",
+                "print(garch_parameters)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsapply_named_c_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1" in proc.stdout
+    assert "9" in proc.stdout
+    assert "t(sapply" not in out_text
+    assert "function(f)" not in out_text
+
+
+def test_xr2f_obfuscates_transposed_sapply_named_c_fields_as_valid_r(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsapply_named_c_obf_probe.r"
+    obf_path = tmp_path / "xsapply_named_c_obf_probe_obfuscated.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_fit <- function(x) {",
+                "  list(mu = x, omega = x + 1, alpha = x + 2, beta = x + 3)",
+                "}",
+                "fits <- vector(\"list\", 2)",
+                "for (i in seq_along(fits)) {",
+                "  fits[[i]] <- make_fit(i)",
+                "}",
+                "garch_parameters <- t(sapply(fits, function(f) {",
+                "  c(",
+                "    mu = f$mu,",
+                "    omega = f$omega,",
+                "    persistence = f$alpha + f$beta",
+                "  )",
+                "}))",
+                "print(garch_parameters)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XR2F_PATH),
+            str(local_input),
+            "--obfuscate-r",
+            str(obf_path),
+            "--check-obfuscated-r",
+            "--compile",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    obf_text = obf_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run (obfuscated r): PASS" in proc.stdout
+    assert "function(f)" not in obf_text
+    assert "sapply" not in obf_text
+
+
+def test_xr2f_keeps_column_reshape_matrix_print_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreshape_print_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "A <- matrix(c(2, 0, 0, 3), nrow = 2, byrow = TRUE)",
+                "ea <- eigen(A)",
+                "lambda <- ea$values[1]",
+                "v_pr <- ea$vectors[, 1]",
+                "print(A %*% v_pr)",
+                "print(lambda * v_pr)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreshape_print_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_matrix(reshape(v_pr, [size(v_pr), 1]))" in flat_out
+    assert "call print_real_vector(reshape(v_pr, [size(v_pr), 1]))" not in flat_out
+
+
 def test_xr2f_vector_constructor_assignment_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xvector_probe.r"
     local_input.write_text(
@@ -1162,6 +1764,43 @@ def test_xr2f_file_exists_and_file_create_run(tmp_path: Path) -> None:
     assert "file_create(fname)" in out_text
 
 
+def test_xr2f_optional_file_arg_does_not_rewrite_file_exists_name(tmp_path: Path) -> None:
+    local_input = tmp_path / "xoptional_file_exists_repro.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'check_file <- function(file = "xr2f_optional_file_exists_probe.tmp") {',
+                '  if (!file.exists(file)) stop("missing: ", file)',
+                "  file.exists(file)",
+                "}",
+                'fname <- "xr2f_optional_file_exists_probe.tmp"',
+                "file.create(fname)",
+                "print(check_file())",
+                "file.remove(fname)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xoptional_file_exists_repro.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "T" in proc.stdout
+    assert "file_def.exists" not in out_text
+    assert "file_exists(file_def)" in out_text
+
+
 def test_xr2f_getwd_and_dir_create_run(tmp_path: Path) -> None:
     local_input = tmp_path / "xdir_repro.r"
     local_input.write_text(
@@ -1247,6 +1886,193 @@ def test_xr2f_file_info_print_and_fields_run(tmp_path: Path) -> None:
     assert "call print_file_info(xinfo)" in out_text
     assert "xinfo%size" in out_text
     assert "xinfo%isdir" in out_text
+
+
+def test_xr2f_ave_group_mean_sum_length_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xave_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 12, 14, 20, 25, 30)",
+                'g <- c("A", "A", "A", "B", "B", "B")',
+                "print(ave(x, g, FUN = mean))",
+                "x_centered <- x - ave(x, g, FUN = mean)",
+                "print(x_centered)",
+                "print(ave(x, g, FUN = sum))",
+                "print(ave(x, g, FUN = length))",
+                "ratio_to_group_mean <- x / ave(x, g, FUN = mean)",
+                "print(ratio_to_group_mean)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xave_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_stdout = " ".join(proc.stdout.split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "12 12 12 25 25 25" in flat_stdout
+    assert "-2.000000" in flat_stdout
+    assert "-5.000000" in flat_stdout
+    assert "36 36 36 75 75 75" in flat_stdout
+    assert "3 3 3 3 3 3" in flat_stdout
+    assert "0.833333" in flat_stdout
+    assert 'ave(real(x, kind=dp), g, "mean")' in out_text
+    assert "FUN =" not in out_text
+
+
+def test_xr2f_ave_multiple_groups_min_max_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xave_tier2_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 12, 14, 20, 25, 30, 40, 50)",
+                'sector <- c("A", "A", "A", "B", "B", "B", "A", "B")',
+                'bucket <- c("old", "old", "new", "old", "new", "new", "new", "old")',
+                "print(ave(x, sector, bucket, FUN = mean))",
+                "print(ave(x, sector, bucket, FUN = length))",
+                "y <- c(3, 7, 2, 9, 4, 8)",
+                "id <- c(1L, 1L, 2L, 2L, 2L, 1L)",
+                "print(ave(y, id, FUN = max))",
+                'name <- c("red", "red", "blue", "blue", "blue", "red")',
+                "print(ave(y, name, FUN = min))",
+                "ratio_to_cell_mean <- x / ave(x, sector, bucket, FUN = mean)",
+                "print(ratio_to_cell_mean)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xave_tier2_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_stdout = " ".join(proc.stdout.split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "11.000000" in flat_stdout
+    assert "27.500000" in flat_stdout
+    assert "2 2 2 2 2 2 2 2" in flat_stdout
+    assert "8 8 9 9 9 8" in flat_stdout
+    assert "3 3 2 2 2 3" in flat_stdout
+    assert "0.909090" in flat_stdout
+    assert "ave_group_key(sector, bucket)" in out_text
+    assert 'ave(real(y, kind=dp), id, "max")' in out_text
+    assert 'ave(real(y, kind=dp), name, "min")' in out_text
+    assert "FUN =" not in out_text
+
+
+def test_xr2f_aggregate_vector_by_one_group_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xaggregate_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 12, 14, 20, 25, 30)",
+                'g <- c("A", "A", "A", "B", "B", "B")',
+                "res <- aggregate(x = x, by = list(group = g), FUN = mean)",
+                "print(res)",
+                "print(aggregate(x = x, by = list(group = g), FUN = sum))",
+                "print(aggregate(x = x, by = list(group = g), FUN = length))",
+                "print(aggregate(x = x, by = list(group = g), FUN = min))",
+                "print(aggregate(x = x, by = list(group = g), FUN = max))",
+                "y <- c(3, 7, 2, 9, 4, 8)",
+                "id <- c(1L, 1L, 2L, 2L, 2L, 1L)",
+                "print(aggregate(x = y, by = list(id = id), FUN = max))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xaggregate_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_stdout = " ".join(proc.stdout.split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "group x 1 A 12.000000" in flat_stdout
+    assert "1 A 36.000000" in flat_stdout
+    assert "1 A 3.000000" in flat_stdout
+    assert "1 A 10.000000" in flat_stdout
+    assert "1 A 14.000000" in flat_stdout
+    assert "id x 1 1 8.000000" in flat_stdout
+    assert "type(aggregate_result_t) :: res" in out_text
+    assert 'res = aggregate(x, g, "group", "x", "mean")' in out_text
+    assert "call print_aggregate_result(res)" in out_text
+    assert "FUN =" not in out_text
+
+
+def test_xr2f_by_vector_and_matrix_groups_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xby_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 12, 14, 20, 25, 30)",
+                'g <- c("A", "A", "A", "B", "B", "B")',
+                "res1 <- by(x, g, mean)",
+                "cat(res1, \"\\n\")",
+                "print(by(x, g, sum))",
+                "m <- matrix(1:12, nrow = 6, ncol = 2)",
+                "res2 <- by(m, g, colMeans)",
+                "print(res2)",
+                "print(by(m, g, colSums))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xby_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_stdout = " ".join(proc.stdout.split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "12.000000" in flat_stdout
+    assert "25.000000" in flat_stdout
+    assert "36.000000" in flat_stdout
+    assert "75.000000" in flat_stdout
+    assert "INDICES: A" in proc.stdout
+    assert "INDICES: B" in proc.stdout
+    assert "type(by_matrix_result_t) :: res2" in out_text
+    assert 'res1 = r_by(x, g, "mean")' in out_text
+    assert 'res2 = r_by(real(m, kind=dp), g, "colmeans")' in out_text
+    assert "call print_by_matrix_result(res2)" in out_text
 
 
 def test_xr2f_as_vector_scalar_mod_and_mixed_numeric_c_run(tmp_path: Path) -> None:
@@ -1363,12 +2189,490 @@ def test_xr2f_set_functions_for_integer_real_and_character_vectors(tmp_path: Pat
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
-    assert "integer, parameter :: xi" in out_text
+    assert _has_fortran_decl(out_text, "integer, parameter", "xi(n_param) = [2, 4, 6]")
     assert "real(kind=dp), parameter :: xr" in out_text
     assert 'write(*,"(*(1x,i0))") union(xi, yi)' in out_text
     assert "call print_real_vector(union(xr, yr))" in out_text
     assert "call print_char_vector(union(xc, yc))" in out_text
     assert "two four six one nine" in proc.stdout
+
+
+def test_xr2f_probability_wrapper_keyword_args_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xprob_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "print(pchisq(q = 3.0, df = 2.0))",
+                "print(pchisq(3.0, 2.0))",
+                "print(pnorm(q = 1.0, mean = 0.0, sd = 1.0, lower.tail = FALSE, log.p = TRUE))",
+                "print(pnorm(1.0, 0.0, 1.0))",
+                "print(ppois(q = 2.0, lambda = 3.0))",
+                "print(qpois(p = 0.5, lambda = 3.0))",
+                "print(pcauchy(q = 1.0, location = 0.0, scale = 1.0))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xprob_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "pchisq(real(3.0_dp, kind=dp), real(2.0_dp, kind=dp))" in out_text
+    assert "1.0_dp - normal_cdf" in out_text
+    assert "ppois(real(2.0_dp, kind=dp), lambda=real(3.0_dp, kind=dp))" in out_text
+    assert "qpois(real(0.5_dp, kind=dp), lambda=real(3.0_dp, kind=dp))" in out_text
+    assert "pcauchy(real(1.0_dp, kind=dp), location=real(0.0_dp, kind=dp), scale=real(1.0_dp, kind=dp))" in out_text
+
+
+def test_xr2f_kruskal_formula_keyword_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xkruskal_keyword.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "y <- c(1.0, 2.0, 1.5, 3.5, 4.0, 3.0)",
+                "g <- c(1L, 1L, 1L, 2L, 2L, 2L)",
+                "print(kruskal.test(formula = y ~ g))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xkruskal_keyword.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_kruskal_test(kruskal_test(y, g))" in out_text
+
+
+def test_xr2f_chisq_test_keyword_x_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xchisq_keyword.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 20, 30)",
+                "print(chisq.test(x = x))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xchisq_keyword.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_chisq_test(chisq_test(x=x))" in out_text
+
+
+def test_xr2f_cor_cov_quantile_sample_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xstat_keyword_args.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0, 4.0)",
+                "y <- c(2.0, 4.0, 6.0, 8.0)",
+                "rho <- cor(x = x, y = y, use = \"complete.obs\")",
+                "cv <- cov(x = x, y = y, use = \"complete.obs\")",
+                "print(quantile(x = x, probs = c(0.25, 0.75), type = 7))",
+                "idx <- sample(x = x, size = 2L, replace = TRUE, prob = c(0.1, 0.2, 0.3, 0.4))",
+                "print(idx)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xstat_keyword_args.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "rho = cor(x, y)" in out_text
+    assert "cv = cov(x, y)" in out_text
+    assert "quantile(x, probs=[0.25_dp, 0.75_dp], type=7)" in out_text
+    assert "idx = x(sample_int(size(x), size_=2, replace=.true., prob=[0.1_dp, 0.2_dp, 0.3_dp, 0.4_dp]))" in out_text
+
+
+def test_xr2f_list_result_matrix_slice_by_order_keeps_field_rank2(tmp_path: Path) -> None:
+    local_input = tmp_path / "xlist_result_matrix_slice_order.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_fit <- function() {",
+                "  resp <- matrix(c(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), nrow = 3, ncol = 2)",
+                "  scores <- c(2.0, 1.0)",
+                "  ord <- order(scores)",
+                "  list(resp = resp[, ord])",
+                "}",
+                "fit <- make_fit()",
+                "print(fit$resp)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xlist_result_matrix_slice_order.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "real(kind=dp), allocatable :: resp(:,:)" in out_text
+    assert "make_fit_result%resp = resp(:, ord)" in out_text
+    assert "real(kind=dp), allocatable :: resp(:)\n" not in out_text
+
+
+def test_xr2f_rng_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xrng_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "set.seed(1)",
+                "u <- runif(n = 3, min = 2.0, max = 5.0)",
+                "z <- rnorm(n = 3, mean = 10.0, sd = 2.0)",
+                "zp <- rnorm(3, 10.0, 2.0)",
+                "e <- rexp(n = 3, rate = 2.0)",
+                "b <- rbinom(n = 3, size = 2L, prob = 0.25)",
+                "p <- rpois(n = 3, lambda = 4.0)",
+                "idx <- sample.int(n = 5L, size = 2L, replace = TRUE)",
+                'cat("ok", sum(u) + sum(z) + sum(zp) + sum(e) + sum(b) + sum(p) + sum(idx), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xrng_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "runif_vec(3)" in out_text
+    assert "rnorm_vec(3)" in out_text and "10.0_dp" in out_text and "2.0_dp" in out_text
+    assert "rbinom(3, 2, 0.25_dp)" in out_text
+    assert "rpois(3, 4.0_dp)" in out_text
+    assert "sample_int(5, size_=2, replace=.true.)" in out_text
+
+
+def test_xr2f_seq_rep_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xseq_rep_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10.0, 20.0, 30.0)",
+                "a <- seq(from = 2, to = 8, by = 2)",
+                "b <- seq.int(from = 3L, to = 7L, by = 2L)",
+                "c <- seq_len(length.out = 3L)",
+                "d <- seq_along(along.with = x)",
+                "e <- rep(x = c(1L, 2L), times = c(2L, 3L))",
+                "f <- rep(x = 4.0, each = 2L, length.out = 5L)",
+                "g <- rep.int(x = 9L, times = 3L)",
+                'cat("ok", sum(a) + sum(b) + sum(c) + sum(d) + sum(e) + sum(f) + sum(g), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xseq_rep_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "r_seq_real_by" in out_text
+    assert "r_seq_int_by(3, 7, 2)" in out_text
+    assert "r_seq_len(3)" in out_text
+    assert "r_seq_len(size(x))" in out_text
+    assert "times_vec=[2, 3]" in out_text
+    assert "r_rep_real([4.0_dp], each=2, len_out=5)" in out_text
+    assert "r_rep_int([9], times=3)" in " ".join(out_text.replace("&", " ").split())
+
+
+def test_xr2f_seq_by_subscript_uses_integer_helper_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xseq_by_subscript.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "limit <- 50",
+                "is_prime <- rep(TRUE, limit - 1)",
+                "is_prime[1] <- FALSE",
+                "for (p in 2:floor(sqrt(limit - 1))) {",
+                "  if (is_prime[p]) is_prime[seq(p * p, limit - 1, by = p)] <- FALSE",
+                "}",
+                'cat("largest", max(which(is_prime)), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xseq_by_subscript.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "largest 47" in proc.stdout
+    assert "r_seq_int_by(p * p, int(limit - 1), p)" in out_text
+
+
+def test_xr2f_stat_test_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xstat_test_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0, 4.0)",
+                "y <- c(1.5, 2.5, 3.5, 4.5)",
+                "print(t.test(x = x, mu = 0.0))",
+                "print(t.test(x = x, y = y, paired = FALSE))",
+                "print(wilcox.test(x = x, y = y, paired = FALSE))",
+                "print(ks.test(x = x, mean = 0.0, sd = 1.0))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xstat_test_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_t_test(t_test(x, mu=0.0_dp))" in out_text
+    assert "call print_t_test(t_test(x, y, paired=.false.))" in out_text
+    assert "call print_wilcox_test(wilcox_test(x, y, paired=.false.))" in out_text
+    assert "call print_ks_test(ks_test(x, mean=real(0.0_dp, kind=dp), sd=real(1.0_dp, kind=dp)))" in out_text
+
+
+def test_xr2f_matrix_constructor_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmatrix_constructor_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(data = c(1.0, 2.0, 3.0, 4.0), nrow = 2, ncol = 2, byrow = TRUE)",
+                "a <- array(data = 1:8, dim = c(2, 2, 2))",
+                "centered <- sweep(x = x, MARGIN = 2, STATS = c(1.0, 2.0), FUN = \"-\")",
+                "z <- outer(X = c(1.0, 2.0), Y = c(10.0, 20.0), FUN = \"*\")",
+                "print(x)",
+                "print(a[, , 1])",
+                "print(centered)",
+                "print(z)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmatrix_constructor_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "call print_matrix(x)" in out_text
+    assert "a = reshape(r_seq_int(1, 8), [2, 2, 2], pad=r_seq_int(1, 8))" in out_text
+    assert "spread([1.0_dp, 2.0_dp], dim=1, ncopies=size(x,1))" in out_text
+    assert "z(i_out, j_out) = ox(i_out) * oy(j_out)" in out_text
+
+
+def test_xr2f_outer_direct_prints_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xouter_direct_print_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- 1:3",
+                "y <- 1:3",
+                'print(outer(x, y, FUN = "*"))',
+                'print(outer(x, y, FUN = "+"))',
+                "a <- c(10, 20)",
+                "b <- c(1, 2, 3)",
+                'print(abs(outer(a, b, FUN = "-")))',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xouter_direct_print_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "outer_print_tmp(i_out, j_out) = ox(i_out) * oy(j_out)" in out_text
+    assert "outer_print_tmp(i_out, j_out) = ox(i_out) + oy(j_out)" in out_text
+    assert "outer_print_tmp = abs(outer_print_tmp)" in out_text
+    assert 'write(*,"(g0)") outer(' not in out_text
+
+
+def test_xr2f_outer_named_function_fun_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xouter_named_fun_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(a, b) {",
+                "  10*a + b",
+                "}",
+                "x <- 2:6",
+                "y <- 7:11",
+                "res <- outer(x, y, FUN = f)",
+                "print(res)",
+                "score_pair <- function(a, b) {",
+                "  z <- a*a + b",
+                "  ifelse(z > 30, z - 5, z + 5)",
+                "}",
+                "x <- c(1, 2, 3, 4)",
+                "y <- c(5, 10, 15)",
+                "print(outer(x, y, FUN = score_pair))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xouter_named_fun_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_stdout = " ".join(proc.stdout.split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "27" in flat_stdout
+    assert "71" in flat_stdout
+    assert "31" in flat_stdout
+    assert "res(i_out, j_out) = f(ox(i_out), oy(j_out))" in out_text
+    assert "outer_print_tmp(i_out, j_out) = score_pair(ox(i_out), oy(j_out))" in out_text
+    assert "FUN =" not in out_text
+
+
+def test_xr2f_data_shaping_named_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdata_shaping_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0)",
+                "y <- c(4.0, 5.0, 6.0)",
+                "m1 <- cbind(alpha = x, beta = y)",
+                "m2 <- rbind(first = x, second = y)",
+                "df <- data.frame(alpha = x, beta = y, check.names = FALSE)",
+                "m3 <- as.matrix(x = m1)",
+                "print(m1)",
+                "print(m2)",
+                "print(m3)",
+                'cat("df:", sum(df$alpha + df$beta), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdata_shaping_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "cbind(alpha=" not in out_text
+    assert "rbind(first=" not in out_text
+    assert "data.frame" not in out_text
+    assert "df_alpha" not in out_text
+    assert "x = m1" not in out_text
 
 
 def test_xr2f_in_operator_for_integer_real_character_and_logical_vectors(tmp_path: Path) -> None:
@@ -1495,6 +2799,7 @@ def test_xr2f_unique_for_numeric_character_logical_and_mixed_vectors(tmp_path: P
                 "length(u)",
                 "x <- c(4, 2, 3, 2, 1, 4)",
                 "unique(x)",
+                "unique(x = x)",
                 "sort(unique(x))",
             ]
         )
@@ -1537,6 +2842,39 @@ def test_xr2f_unique_for_numeric_character_logical_and_mixed_vectors(tmp_path: P
     assert "red blue green" in proc.stdout
 
 
+def test_xr2f_sort_sort_list_head_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsort_head_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(3.0, 1.0, 2.0)",
+                "idx <- sort.list(x = x)",
+                "print(sort(x = x, decreasing = TRUE))",
+                "print(idx)",
+                "print(head(x = x, n = 2))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsort_head_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "sort(x, decreasing=.true.)" in out_text
+    assert "sort_list(x)" in out_text
+    assert "r_head(x, 2)" in out_text
+
+
 def test_xr2f_duplicated_and_anyduplicated_vectors(tmp_path: Path) -> None:
     local_input = tmp_path / "xduplicated_probe.r"
     local_input.write_text(
@@ -1545,8 +2883,10 @@ def test_xr2f_duplicated_and_anyduplicated_vectors(tmp_path: Path) -> None:
                 "xd <- c(10, 20, 30, 20, 40, 30)",
                 "print(xd)",
                 "print(duplicated(xd))",
+                "print(duplicated(x = xd))",
                 "print(duplicated(xd, fromLast = TRUE))",
                 "print(anyDuplicated(xd))",
+                "print(anyDuplicated(x = xd))",
                 "print(anyDuplicated(xd, fromLast = TRUE))",
                 "xi <- as.integer(xd)",
                 "print(xi)",
@@ -1612,6 +2952,7 @@ def test_xr2f_replace_vectors_compile_and_run(tmp_path: Path) -> None:
                 "print(replace(x, which(x > 10), 999))",
                 "x <- c(10, 20, 30, 40, 50, 60)",
                 "print(replace(x, c(2, 4, 6), c(100, 200)))",
+                "print(replace(x = x, list = c(1, 3), values = c(111, 333)))",
                 "xi <- 1:6",
                 "yi <- replace(xi, c(2, 4), c(20L, 40L))",
                 "print(typeof(yi))",
@@ -1654,9 +2995,338 @@ def test_xr2f_replace_vectors_compile_and_run(tmp_path: Path) -> None:
     assert "a b dup c dup dup" in proc.stdout
     assert "first first a first b a" in proc.stdout
     assert "10 100 30 200 50 100" in proc.stdout
+    assert "111 20 333 40 50 60" in proc.stdout
     assert "integer" in proc.stdout
     assert "1 20 3 40 5 6" in proc.stdout
     assert "T T T T" in proc.stdout
+
+
+def test_xr2f_rev_which_diff_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xvector_keyword_args.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 3.0, 6.0, 10.0, 15.0)",
+                "b <- x > 4.0",
+                "print(rev(x = x))",
+                "print(which(x = b))",
+                "print(diff(x = x, lag = 1, differences = 1))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xvector_keyword_args.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "rev_real(x)" in out_text or "x(size(x):1:-1)" in out_text
+    assert "which(" in out_text
+    assert "diff(x" in out_text
+
+
+def test_xr2f_io_and_difftime_keyword_args_compile(tmp_path: Path) -> None:
+    (tmp_path / "csv_in.csv").write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    (tmp_path / "tbl_in.txt").write_text("a b\n1 2\n3 4\n", encoding="utf-8")
+    local_input = tmp_path / "xio_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'csv <- read.csv(file = "csv_in.csv", stringsAsFactors = FALSE)',
+                'tbl <- read.table(file = "tbl_in.txt", header = TRUE)',
+                'write.table(x = tbl, file = "tbl_out.txt")',
+                "t0 <- Sys.time()",
+                "t1 <- t0 + 60",
+                'cat("dt:", difftime(time1 = t1, time2 = t0, units = "mins"), "\\n")',
+                "print(dim(csv))",
+                "print(dim(tbl))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xio_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert 'call read_csv_real_matrix("csv_in.csv", csv)' in out_text
+    assert 'call read_table_real_matrix("tbl_in.txt", tbl, header=.true.)' in out_text
+    assert 'call write_table_real_matrix("tbl_out.txt", tbl)' in out_text
+    assert "/ 60.0_dp" in out_text
+
+
+def test_xr2f_string_helper_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xstring_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'x <- c("alpha", "beta", "gamma")',
+                'print(grepl(pattern = "a", x = x))',
+                'print(grep(pattern = "a", x = x))',
+                'print(startsWith(x = x, prefix = "a"))',
+                'print(endsWith(x = x, suffix = "a"))',
+                'print(strsplit(x = "a-b-c", split = "-"))',
+                's <- "abcdef"',
+                'cat(substr(x = s, start = 2, stop = 4), "\\n")',
+                'cat(substring(text = s, first = 3, last = 5), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xstring_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "grepl(" not in out_text
+    assert "grep(" not in out_text
+    assert "startsWith(" not in out_text
+    assert "endsWith(" not in out_text
+    assert "strsplit(" not in out_text
+    assert "strsplit_fixed" in out_text
+    assert "(2:4)" in out_text
+    assert "(3:5)" in out_text
+
+
+def test_xr2f_command_args_grep_value_header_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xheader_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "print_script_header <- function() {",
+                '  f <- grep("--file=", commandArgs(FALSE), value = TRUE)',
+                '  if (length(f)) cat("program:", sub("--file=", "", f[[1L]], fixed = TRUE),',
+                '                     "  ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\\n\\n", sep = "")',
+                "}",
+                "print_script_header()",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xheader_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "program:" in proc.stdout
+    assert str(out_path) in proc.stdout
+    assert "grep_value_char" in out_text
+    assert "r_command_args" in out_text
+    assert "function r_command_args" not in out_text
+    assert "if (size(f) > 0) then" in out_text
+    assert "replace_first_fixed(f(1)" in out_text
+    assert "f(:, 1)" not in out_text
+
+
+def test_xr2f_switch_named_string_cases_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xswitch_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'infile <- "mortgage_reit_related.csv"',
+                "switch(",
+                "  infile,",
+                '  "asset_class_etf_prices.csv" = {',
+                '    signal_assets <- c("LQD", "HYG")',
+                '    traded_assets <- c("SPY")',
+                "  },",
+                '  "mortgage_reit_related.csv" = {',
+                '    signal_assets <- c("MBB", "NLY", "AGNC")',
+                '    traded_assets <- c("NLY", "AGNC", "MFA", "ORC", "ARR")',
+                "  }",
+                ")",
+                'cat("signal_assets:", signal_assets, "\\n")',
+                'cat("traded_assets:", traded_assets, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xswitch_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "select case (trim(infile))" in out_text
+    assert 'case ("mortgage_reit_related.csv")' in out_text
+    assert "switch(" not in out_text
+    stdout_flat = " ".join(proc.stdout.split())
+    assert "signal_assets: MBB NLY AGNC" in stdout_flat
+    assert "traded_assets: NLY AGNC MFA ORC ARR" in stdout_flat
+
+
+def test_xr2f_switch_integer_positional_cases_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xswitch_int_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "for (ifile in 1:2) {",
+                "  switch(",
+                "    ifile,",
+                "    {",
+                '      signal_assets <- c("LQD", "HYG")',
+                '      traded_assets <- c("SPY")',
+                "    },",
+                "    {",
+                '      signal_assets <- c("MBB", "NLY", "AGNC")',
+                '      traded_assets <- c("NLY", "AGNC", "MFA", "ORC", "ARR")',
+                "    }",
+                "  )",
+                '  cat("ifile:", ifile, "\\n")',
+                '  cat("signal_assets:", signal_assets, "\\n")',
+                '  cat("traded_assets:", traded_assets, "\\n\\n")',
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xswitch_int_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "select case (ifile)" in out_text
+    assert "case (1)" in out_text and "case (2)" in out_text
+    assert "switch(" not in out_text
+    stdout_flat = " ".join(proc.stdout.split())
+    assert "ifile: 1 signal_assets: LQD HYG traded_assets: SPY" in stdout_flat
+    assert "ifile: 2 signal_assets: MBB NLY AGNC traded_assets: NLY AGNC MFA ORC ARR" in stdout_flat
+
+
+def test_xr2f_switch_integer_expression_cases_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xswitch_int_one_line_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "i <- 2",
+                "result <- switch(",
+                "  i,",
+                '  "first",',
+                '  "second",',
+                '  "third"',
+                ")",
+                "print(result)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xswitch_int_one_line_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "select case (i)" in out_text
+    assert "case (2)" in out_text
+    assert 'result = "second"' in out_text
+    assert "switch(" not in out_text
+    assert "second" in proc.stdout
+
+
+def test_xr2f_reducer_keyword_x_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreducer_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0)",
+                "m <- matrix(c(1.0, 2.0, 3.0, 4.0), nrow = 2)",
+                "cat(sum(x = x), mean(x = x), sd(x = x), prod(x = x), min(x = x), max(x = x), \"\\n\")",
+                "cat(sum(x == 2.0), mean(x == 2.0), \"\\n\")",
+                "print(rowSums(x = m))",
+                "print(colSums(x = m))",
+                "print(rowMeans(x = m))",
+                "print(colMeans(x = m))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreducer_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "sum(x =" not in out_text
+    assert "mean(x =" not in out_text
+    assert "sd(x =" not in out_text
+    assert "product(x =" not in out_text
+    assert "sum(x)" in out_text
+    assert "count(x == 2.0_dp)" in out_text
+    assert "sum(m, dim=2)" in out_text
+    assert "sum(m, dim=1)" in out_text
 
 
 def test_xr2f_sweep_matrix_scale_apply_and_rank3_compile_and_run(tmp_path: Path) -> None:
@@ -1718,6 +3388,67 @@ def test_xr2f_sweep_matrix_scale_apply_and_rank3_compile_and_run(tmp_path: Path)
     assert "24" in proc.stdout
     assert "-99 -198" in proc.stdout
     assert "-594" in proc.stdout
+
+
+def test_xr2f_apply_keyword_margin_fun_cumsum_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xapply_keyword_cumsum.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(c(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), nrow = 2)",
+                "y <- apply(x, MARGIN = 2, FUN = cumsum)",
+                "print(y)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xapply_keyword_cumsum.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "apply_col_cumsum(" in out_text
+    assert "apply(x" not in out_text
+
+
+def test_xr2f_scale_keyword_args_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xscale_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(c(1.0, 2.0, 3.0, 4.0), nrow = 2)",
+                "z <- scale(x = x, center = TRUE, scale = TRUE)",
+                "z2 <- scale(x, TRUE, TRUE)",
+                "print(z)",
+                "print(z2)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xscale_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert out_text.count("call print_matrix(scale(x, center=.true., scale=.true.))") == 2
 
 
 def test_xr2f_apply_user_function_anonymous_and_extra_args_run(tmp_path: Path) -> None:
@@ -1805,6 +3536,295 @@ def test_xr2f_rank3_apply_sum_print_compile(tmp_path: Path) -> None:
     assert "call print_real_vector(real(sum(sum(x, dim=3), dim=2), kind=dp))" in flat_out
     assert "call print_real_vector(real(sum(sum(x, dim=3), dim=1), kind=dp))" in flat_out
     assert "call print_real_vector(real(sum(x, dim=2), kind=dp))" not in flat_out
+
+
+def test_xr2f_captures_global_complex_vector_in_function_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xcapture_complex_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "z <- c(1+2i, 3+4i)",
+                "use_complex_vec <- function(x) {",
+                "  sum(Mod(z)) + x",
+                "}",
+                "cat(use_complex_vec(5.0), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xcapture_complex_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "complex(kind=dp), allocatable :: z(:)" in out_text
+    assert "12.236067" in proc.stdout
+
+
+def test_xr2f_captures_global_real_rank3_in_function_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xcapture_rank3_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "a <- array(1.0, dim = c(2, 2, 2))",
+                "use_array3 <- function(x) {",
+                "  sum(a[, , 1]) + x",
+                "}",
+                "cat(use_array3(5.0), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xcapture_rank3_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "real(kind=dp), allocatable :: a(:,:,:)" in out_text
+    assert "9.000000" in proc.stdout
+
+
+@pytest.mark.parametrize("method", ["BFGS", "Nelder-Mead"])
+def test_xr2f_constroptim_log_barrier_methods_run(tmp_path: Path, method: str) -> None:
+    local_input = tmp_path / "xconstroptim_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "f <- function(theta) {",
+                "  x <- theta[1]",
+                "  y <- theta[2]",
+                "  (x - 2)^2 + (y - 3)^2",
+                "}",
+                "theta0 <- c(1, 1)",
+                "ui <- rbind(c(1, 0), c(0, 1))",
+                "ci <- c(0, 0)",
+                f'fit <- constrOptim(theta = theta0, f = f, grad = NULL, ui = ui, ci = ci, method = "{method}")',
+                "print(fit$par)",
+                'cat("value:", fit$value, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xconstroptim_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "constr_optim_bfgs" in out_text or "constr_optim_nelder_mead" in out_text
+    assert "2.000" in proc.stdout
+    assert "3.000" in proc.stdout
+
+
+def test_xr2f_uses_external_fortran_module_function_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xexternal_module_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "sum_squares <- function(x) {",
+                "  sum(x*x)",
+                "}",
+                "x <- c(1.0, 2.0, 3.0)",
+                'cat(sum_squares(x), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    helper = tmp_path / "fast_stats.f90"
+    helper.write_text(
+        "\n".join(
+            [
+                "module fast_stats",
+                "use, intrinsic :: iso_fortran_env, only: dp => real64",
+                "implicit none",
+                "contains",
+                "function sum_squares(x) result(out)",
+                "real(kind=dp), intent(in) :: x(:)",
+                "real(kind=dp) :: out",
+                "out = 100.0_dp + sum(x*x)",
+                "end function sum_squares",
+                "end module fast_stats",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xexternal_module_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), str(helper), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "use fast_stats, only: sum_squares" in out_text
+    assert "function sum_squares" not in out_text
+    assert "114.000000" in proc.stdout
+
+
+def test_xr2f_rejects_external_fortran_main_program(tmp_path: Path) -> None:
+    local_input = tmp_path / "xexternal_bad_probe.r"
+    local_input.write_text('cat("ok\\n")\n', encoding="utf-8")
+    helper = tmp_path / "bad_main.f90"
+    helper.write_text("program bad_main\nend program bad_main\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), str(helper), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "contains a main program" in proc.stdout + proc.stderr
+
+
+def test_xr2f_rejects_external_fortran_top_level_procedure(tmp_path: Path) -> None:
+    local_input = tmp_path / "xexternal_bad_proc_probe.r"
+    local_input.write_text('cat("ok\\n")\n', encoding="utf-8")
+    helper = tmp_path / "bad_proc.f90"
+    helper.write_text(
+        "function foo() result(x)\nreal :: x\nx = 1.0\nend function foo\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), str(helper), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "contains top-level procedures" in proc.stdout + proc.stderr
+
+
+def test_xr2f_split_module_writes_reusable_module_and_main_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsplit_module_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "square_sum <- function(x) {",
+                "  sum(x*x)",
+                "}",
+                "cat(square_sum(c(1.0, 2.0, 3.0)), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsplit_module_probe.f90"
+    mod_path = tmp_path / "xsplit_module_probe_mod.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--split-module", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    main_text = out_path.read_text(encoding="utf-8")
+    mod_text = mod_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert f"wrote {mod_path}" in proc.stdout
+    assert re.search(r"(?im)^\s*module\s+split_module_probe_mod\b", mod_text)
+    assert "function square_sum" in mod_text
+    assert re.search(r"(?im)^\s*program\s+xsplit_module_probe\b", main_text)
+    assert "function square_sum" not in main_text
+    assert "14.000000" in proc.stdout
+
+
+def test_xr2f_generated_module_is_private_with_explicit_publics(tmp_path: Path) -> None:
+    local_input = tmp_path / "xprivate_module_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "twice <- function(x) {",
+                "  2 * x",
+                "}",
+                "print(twice(c(1.0, 2.0)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xprivate_module_probe.f90"
+    mod_path = tmp_path / "xprivate_module_probe_mod.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--split-module", "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    mod_text = mod_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert re.search(r"(?im)^\s*private\s*$", mod_text)
+    assert re.search(r"(?im)^\s*public\s*::\s*twice\b", mod_text)
+
+
+def test_xr2f_split_module_without_module_writes_single_main(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsplit_nomodule_probe.r"
+    local_input.write_text('cat("ok\\n")\n', encoding="utf-8")
+    out_path = tmp_path / "xsplit_nomodule_probe.f90"
+    mod_path = tmp_path / "xsplit_nomodule_probe_mod.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--split-module", "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert out_path.exists()
+    assert not mod_path.exists()
 
 
 def test_xr2f_ls_static_top_level_names_run(tmp_path: Path) -> None:
@@ -2005,10 +4025,12 @@ def test_xr2f_rle_inverse_and_fields_compile_and_run(tmp_path: Path) -> None:
             [
                 "x <- c(1, 1, 1, 2, 2, 5, 5, 5, 5, 1)",
                 "r <- rle(x)",
+                "rk <- rle(x = x)",
                 "r",
                 "r$lengths",
                 "r$values",
                 "inverse.rle(r)",
+                "inverse.rle(x = rk)",
                 "identical(x, inverse.rle(r))",
                 'xc <- c("a", "a", "b", "b", "b", "a", "c", "c")',
                 "rle(xc)",
@@ -2050,6 +4072,8 @@ def test_xr2f_rle_inverse_and_fields_compile_and_run(tmp_path: Path) -> None:
     assert "call print_rle(r)" in out_text
     assert 'write(*,"(*(1x,i0))") r%lengths' in out_text
     assert "call print_real_vector(inverse_rle(r))" in out_text
+    assert "rk = rle(x)" in out_text
+    assert "call print_real_vector(inverse_rle(rk))" in out_text
     assert "all_equal(x, inverse_rle(r))" in out_text
     assert 'write(*,"(*(1x,i0))") pack(r2%lengths, r2%lengths >= 3)' in out_text
     assert "Run Length Encoding" in proc.stdout
@@ -2205,6 +4229,17 @@ def test_xr2f_run_diff_accepts_numeric_format_differences(tmp_path: Path) -> Non
     assert "Run: PASS" in proc.stdout
     assert "Run diff: MATCH" in proc.stdout
     assert "Run diff: DIFF" not in proc.stdout
+
+
+def test_xr2f_run_diff_accepts_different_dash_separator_lengths() -> None:
+    xr2f = _load_xr2f_module()
+
+    assert xr2f._diff_output_lines_equal("-" * 160, "-" * 60)
+    assert xr2f._diff_output_matches(["header", "-" * 160, "tail"], ["header", "-" * 60, "tail"]) == (
+        True,
+        None,
+    )
+    assert not xr2f._diff_output_lines_equal("-" * 60, "---------- x")
 
 
 def test_xr2f_round_formats_fortran_runtime_output(tmp_path: Path) -> None:
@@ -2375,7 +4410,8 @@ def test_xr2f_named_matrix_column_which_min_compile(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
     assert "table(minloc(table(:, 2), dim=1), 1)" in flat_out
     assert "table(minloc(table(:, 3), dim=1), 1)" in flat_out
-    assert "integer :: aic_order, bic_order" in out_text
+    assert "integer :: aic_order" in flat_out
+    assert _has_fortran_decl(out_text, "integer", "bic_order")
     assert "call print_matrix_rstyle_named(" in out_text
     assert '"order"' in out_text
     assert '"aic"' in out_text
@@ -2763,7 +4799,8 @@ def test_xr2f_s4_inheritance_slots_and_inherited_methods(tmp_path: Path) -> None
     out_text = out_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "type :: weighted_point_result_t" in out_text
-    assert "real(kind=dp), allocatable :: x(:), weight(:)" in out_text
+    assert "real(kind=dp), allocatable :: x(:)" in out_text
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "weight(:)")
     assert "pure elemental function spread_weighted_point" in out_text
     assert "type(weighted_point_result_t), intent(in) :: object" in out_text
     assert 'write(*,"(*(g0,:,1x))") "weighted class: ", "weighted_point"' in out_text
@@ -2839,6 +4876,188 @@ def test_xr2f_quickr_gap_helpers_compile(tmp_path: Path) -> None:
     assert "0.0_dp * real(3, kind=dp)" in out_text
     flat_out = " ".join(out_text.replace("&", " ").split())
     assert "merge(acos(-1.0_dp), 0.0_dp, real(-3, kind=dp) < 0.0_dp)" in flat_out
+
+
+def test_xr2f_multiline_assignment_if_expression_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmultiline_if_expr.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0)",
+                "y <- if (length(x) > 1L && sd(x) > 0)",
+                "       mean(x) / sd(x) else NA_real_",
+                "print(y)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmultiline_if_expr.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "size(x) > 1 .and. sd(x) > 0" in out_text
+    assert "else ieee_value" not in out_text
+
+
+def test_xr2f_mapply_named_and_anonymous_functions_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmapply_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "power_plus <- function(x, p) x^p + 1",
+                "res1 <- mapply(power_plus, x = c(2, 3, 4), p = c(1, 2, 3))",
+                "print(res1)",
+                "x <- c(1, 2, 3)",
+                "y <- c(10, 20, 30)",
+                "res2 <- mapply(function(a, b) a + b, x, y)",
+                "print(res2)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmapply_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "3 10 65" in proc.stdout
+    assert "11 22 33" in proc.stdout
+    assert "mapply(" not in out_text
+    assert "xr2f_mapply_i_res1" in out_text
+    assert "xr2f_mapply_i_res2" in out_text
+
+
+def test_xr2f_tapply_grouped_mean_and_anonymous_function_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xtapply_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(10, 20, 30, 40)",
+                'g <- c("A", "A", "B", "B")',
+                "y1 <- tapply(x, g, mean)",
+                'cat(y1, "\\n")',
+                "y2 <- tapply(x, g, function(a) 10*mean(a))",
+                "cat(y2)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xtapply_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "15.000000000000000 35.000000000000000" in proc.stdout
+    assert "150.00000000000000 350.00000000000000" in proc.stdout
+    assert "tapply(" not in out_text
+    assert "xr2f_tapply_i_y1" in out_text
+    assert "xr2f_tapply_i_y2" in out_text
+
+
+def test_xr2f_static_new_env_and_eapply_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xnew_env_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "twice <- function(x) return(2*x)",
+                "e <- new.env()",
+                "e$x <- 10",
+                "e$y <- 20",
+                "print(e$x)",
+                "e$x <- 100",
+                "print(e$x)",
+                "res1 <- eapply(e, twice)",
+                "print(res1)",
+                "res2 <- eapply(e, function(a) 10*a)",
+                "print(res2)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xnew_env_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run", "--no-warn"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "200 40" in proc.stdout
+    assert "1000 200" in proc.stdout
+    assert "new.env" not in out_text
+    assert "eapply(" not in out_text
+    assert "e$x" not in out_text
+    assert "e_x" in out_text and "e_y" in out_text
+
+
+def test_xr2f_branch_logical_scalar_local_decl_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xbranch_logical_scalar_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "if (TRUE) {",
+                "  ok <- file.exists(\"missing.txt\")",
+                "} else {",
+                "  ok <- FALSE",
+                "}",
+                "flag <- ok",
+                "print(flag)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xbranch_logical_scalar_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "logical :: ok" in out_text
+    assert 'write(*,"(l1)") ok' in out_text
 
 
 def test_xr2f_colnames_variable_drives_integer_table_columns(tmp_path: Path) -> None:
@@ -3051,6 +5270,467 @@ def test_xr2f_scalar_loglik_and_invisible_side_effect_call_run(tmp_path: Path) -
     assert "print *, show_fit(fit)" not in out_text
 
 
+def test_xr2f_list_scalar_field_demote_no_embedded_declaration_prefix(tmp_path: Path) -> None:
+    local_input = tmp_path / "xscalar_field_prefix_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "summarize <- function(x) {",
+                "  mu <- mean(x)",
+                "  s <- sd(x)",
+                "  out <- list(mu = mu, s = s)",
+                "  return(out)",
+                "}",
+                "fit <- summarize(c(1.0, 2.0, 3.0))",
+                "mu_value <- fit$mu",
+                'cat("mu:", mu_value, "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xscalar_field_prefix_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ":: real(kind=dp) ::" not in out_text
+    assert ":: integer ::" not in out_text
+    assert "real(kind=dp) :: mu" in out_text
+    assert _has_fortran_decl(out_text, "real(kind=dp)", "s")
+
+
+def test_xr2f_list_character_vector_fields_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xlist_character_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'config <- list(signal_assets = c("LQD", "HYG"), traded_assets = c("SPY"), v = c(10L, 20L))',
+                "print(config)",
+                'config$signal_assets <- c("QQQ")',
+                "print(config)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xlist_character_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: signal_assets(:)" in out_text
+    assert "character(len=:), allocatable :: traded_assets(:)" in out_text
+    assert "integer, allocatable :: v(:)" in out_text
+    assert "real(kind=dp), allocatable :: signal_assets(:)" not in out_text
+    assert "config%v = [10, 20]" in out_text
+    assert "QQQ" in proc.stdout
+
+
+def test_xr2f_main_list_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmain_list_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'nm <- c("aa", "bb")',
+                "cnt <- c(1L, 2L)",
+                "flg <- c(TRUE, FALSE)",
+                "config <- list(names = nm, counts = cnt, flags = flg)",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmain_list_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_main_list_chained_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmain_list_chained_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'nm0 <- c("aa", "bb")',
+                "cnt0 <- c(1L, 2L)",
+                "ok0 <- c(TRUE, FALSE)",
+                "nm <- nm0",
+                "cnt <- cnt0",
+                "ok <- ok0",
+                "config <- list(names = nm, counts = cnt, flags = ok)",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xmain_list_chained_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_branch_list_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xbranch_list_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "if (TRUE) {",
+                '  nm <- c("aa", "bb")',
+                "  cnt <- c(1L, 2L)",
+                "  ok <- c(TRUE, FALSE)",
+                "  config <- list(names = nm, counts = cnt, flags = ok)",
+                "} else {",
+                '  nm <- c("cc")',
+                "  cnt <- c(3L)",
+                "  ok <- c(FALSE)",
+                "  config <- list(names = nm, counts = cnt, flags = ok)",
+                "}",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xbranch_list_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(config_result_t) :: config" in out_text
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_switch_integer_list_cases_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xswitch_list_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "ifile <- 2",
+                "config <- switch(",
+                "  ifile,",
+                "  list(",
+                '    signal_assets = c("LQD", "HYG"),',
+                '    traded_assets = c("SPY")',
+                "  ),",
+                "  list(",
+                '    signal_assets = c("MBB", "NLY", "AGNC"),',
+                '    traded_assets = c("NLY", "AGNC", "MFA", "ORC", "ARR")',
+                "  )",
+                ")",
+                "print(config$signal_assets)",
+                "print(config$traded_assets)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xswitch_list_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(config_result_t) :: config" in out_text
+    assert "select case (ifile)" in out_text
+    assert "character(len=:), allocatable :: signal_assets(:)" in out_text
+    assert "character(len=:), allocatable :: traded_assets(:)" in out_text
+    assert "call print_char_vector(config%signal_assets)" in out_text
+    assert "call print_char_vector(config%traded_assets)" in out_text
+    assert "MBB" in proc.stdout and "ARR" in proc.stdout
+
+
+def test_xr2f_function_list_literal_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfunction_list_literal_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_config <- function() {",
+                '  list(names = c("aa", "bb"), counts = c(1L, 2L), flags = c(TRUE, FALSE))',
+                "}",
+                "config <- make_config()",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfunction_list_literal_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_function_list_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfunction_list_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_config <- function() {",
+                '  nm <- c("aa", "bb")',
+                "  cnt <- c(1L, 2L)",
+                "  flg <- c(TRUE, FALSE)",
+                "  list(names = nm, counts = cnt, flags = flg)",
+                "}",
+                "config <- make_config()",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfunction_list_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_function_branch_list_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfunction_branch_list_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_config <- function() {",
+                "  if (TRUE) {",
+                '    nm <- c("aa", "bb")',
+                "    cnt <- c(1L, 2L)",
+                "    ok <- c(TRUE, FALSE)",
+                "  } else {",
+                '    nm <- c("cc")',
+                "    cnt <- c(3L)",
+                "    ok <- c(FALSE)",
+                "  }",
+                "  list(names = nm, counts = cnt, flags = ok)",
+                "}",
+                "config <- make_config()",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfunction_branch_list_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_function_list_chained_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xfunction_list_chained_alias_fields.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_config <- function() {",
+                '  nm0 <- c("aa", "bb")',
+                "  cnt0 <- c(1L, 2L)",
+                "  ok0 <- c(TRUE, FALSE)",
+                "  nm <- nm0",
+                "  cnt <- cnt0",
+                "  ok <- ok0",
+                "  list(names = nm, counts = cnt, flags = ok)",
+                "}",
+                "config <- make_config()",
+                "print(config$names)",
+                "print(config$counts)",
+                "print(config$flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xfunction_list_chained_alias_fields.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "character(len=:), allocatable :: names(:)" in out_text
+    assert "integer, allocatable :: counts(:)" in out_text
+    assert "logical, allocatable :: flags(:)" in out_text
+    assert "call print_char_vector(config%names)" in out_text
+    assert "call print_integer_vector(config%counts)" in out_text
+    assert 'write(*,"(*(g0,1x))") config%flags' in out_text
+
+
+def test_xr2f_coerces_positional_real_actual_for_integer_formal_from_decls(tmp_path: Path) -> None:
+    local_input = tmp_path / "xpositional_int_actual_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "rolling_sum <- function(x, h) {",
+                "  if (h < 1) stop(\"bad h\")",
+                "  out <- numeric(length(x) - h + 1)",
+                "  for (i in seq_along(out)) {",
+                "    out[i] <- sum(x[i:(i + h - 1)])",
+                "  }",
+                "  out",
+                "}",
+                "driver <- function(x, horizons) {",
+                "  h <- horizons[1]",
+                "  sum(rolling_sum(x, h))",
+                "}",
+                "cat(driver(c(1.0, 2.0, 3.0, 4.0), c(2.0)), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xpositional_int_actual_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "rolling_sum(x, int(h))" in flat_out
+
+
 def test_xr2f_lm_fit_list_return_alias_reused_name_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xar_probe.r"
     local_input.write_text(
@@ -3093,9 +5773,57 @@ def test_xr2f_lm_fit_list_return_alias_reused_name_compile(tmp_path: Path) -> No
     assert "type :: fit_ar1_result_t" in out_text
     assert "type(lm_fit_t) :: fit" in out_text
     assert "type(lm_fit_t) :: lm_fit" in out_text
-    assert "real(kind=dp), allocatable :: lagx(:), resid(:), y(:)" in out_text
+    assert "real(kind=dp), allocatable :: lagx(:)" in out_text
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "resid(:)")
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "y(:)")
     assert "type(fit_ar1_result_t) :: y_list" in out_text
     assert "call print_lm_summary(fit%lm_fit)" in out_text
+
+
+def test_xr2f_lm_accessor_keyword_object_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xlm_accessor_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, 2.0, 3.0, 4.0)",
+                "y <- c(2.0, 4.1, 5.9, 8.2)",
+                "fit <- lm(y ~ x)",
+                "r <- resid(object = fit)",
+                "r2 <- residuals(object = fit)",
+                "cf <- coef(object = fit)",
+                "fv <- fitted(object = fit)",
+                "pv <- predict(object = fit)",
+                "cd <- cooks.distance(object = fit)",
+                "print(summary(object = fit))",
+                "print(r)",
+                "print(r2)",
+                "print(cf)",
+                "print(fv)",
+                "print(pv)",
+                "print(cd)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xlm_accessor_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "fit%resid" in out_text
+    assert "fit%coef" in out_text
+    assert "fit%fitted" in out_text
+    assert "call print_lm_summary(fit" in out_text
+    assert "lm_cooks_distance(fit)" in out_text
 
 
 def test_xr2f_list_return_alias_uses_base_name_for_renamed_symbol(tmp_path: Path) -> None:
@@ -3129,7 +5857,8 @@ def test_xr2f_list_return_alias_uses_base_name_for_renamed_symbol(tmp_path: Path
 
     out_text = out_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "type(f_result_t) :: f_result, y_list" in out_text
+    assert "type(f_result_t) :: f_result" in out_text
+    assert "type(f_result_t) :: y_list" in out_text
     assert "y_2_list" not in out_text
 
 
@@ -3234,6 +5963,87 @@ def test_xr2f_manual_design_matrix_ar_compile(tmp_path: Path) -> None:
     assert "pure function solve_real" not in out_text
 
 
+def test_xr2f_solve_rhs_keyword_rank_extraction_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsolve_rhs_keywords.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "A <- matrix(c(2.0, 0.0, 0.0, 3.0), nrow = 2, byrow = TRUE)",
+                "b <- c(4.0, 9.0)",
+                "L <- chol(A)",
+                "U <- t(L)",
+                "x1 <- solve(A, b = b)",
+                "x2 <- qr.solve(A, b = b)",
+                "x3 <- forwardsolve(L, x = b)",
+                "x4 <- backsolve(U, x = b)",
+                "x5 <- solve(a = A, b = b)",
+                "x6 <- qr.solve(a = A, b = b)",
+                "x7 <- forwardsolve(l = L, x = b)",
+                "x8 <- backsolve(r = U, x = b)",
+                "L2 <- chol(x = A)",
+                "print(x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + L2[, 1])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsolve_rhs_keywords.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "solve_real(A, b)" in out_text
+    assert "qr_coef(qr(real(A, kind=dp)), b)" in out_text
+    assert "forwardsolve(L, b, transpose=.false.)" in out_text
+    assert "backsolve(U, b, transpose=.false.)" in out_text
+    assert "L2 = chol(A)" in out_text
+    assert "Build: PASS" in proc.stdout
+
+
+def test_xr2f_solve_tangency_vector_rhs_return_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xsolve_tangency_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "solve_tangency <- function(cov_mat, mu_vec) {",
+                "  ridge <- 1e-4 * mean(diag(cov_mat))",
+                "  solve(cov_mat + diag(ridge, nrow(cov_mat)), mu_vec)",
+                "}",
+                "cov_mat <- matrix(c(0.04, 0.01, 0.01, 0.09), nrow = 2, byrow = TRUE)",
+                "mu_vec <- c(0.08, 0.12)",
+                "print(solve_tangency(cov_mat, mu_vec))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xsolve_tangency_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert _has_fortran_decl(out_text, "real(kind=dp), intent(in)", "mu_vec(:)")
+    assert "real(kind=dp), allocatable :: solve_tangency_result(:)" in out_text
+    assert "solve_tangency_result(:,:)" not in out_text
+    assert "solve_real(cov_mat + diag" in out_text
+
+
 def test_xr2f_var_drop_false_and_matrix_solve_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xvar_probe.r"
     local_input.write_text(
@@ -3297,7 +6107,9 @@ def test_xr2f_var_drop_false_and_matrix_solve_compile(tmp_path: Path) -> None:
     assert "drop =" not in out_text
     assert "solve_real(r_matmul(transpose(design), design)" in out_text
     assert "reshape(rmvnorm_chol(" in out_text
-    assert "real(kind=dp), allocatable :: a(:,:), amat(:,:), coef_mat(:,:)" in out_text
+    assert "real(kind=dp), allocatable :: a(:,:)" in out_text
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "amat(:,:)")
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "coef_mat(:,:)")
 
 
 def test_xr2f_row_index_matrix_assignment_keeps_matrix_rhs_compile(tmp_path: Path) -> None:
@@ -3364,7 +6176,8 @@ def test_xr2f_roc_auc_manual_logical_subsets_compile(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "real(kind=dp) :: count, neg, pos" not in out_text
-    assert "real(kind=dp), allocatable :: neg(:), pos(:)" in out_text
+    assert "real(kind=dp), allocatable :: neg(:)" in out_text
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "pos(:)")
 
 
 def test_xr2f_logical_vector_subset_inference_compile(tmp_path: Path) -> None:
@@ -3395,7 +6208,9 @@ def test_xr2f_logical_vector_subset_inference_compile(tmp_path: Path) -> None:
     out_text = out_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
-    assert "allocatable :: x(:), y(:), z(:)" in out_text or "allocatable :: y(:), z(:)" in out_text
+    flat_out = " ".join(out_text.split())
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "y(:)")
+    assert _has_fortran_decl(out_text, "real(kind=dp), allocatable", "z(:)")
     assert "y = pack(x, g == 1)" in out_text
     assert "z = pack(x, g == 0)" in out_text
 
@@ -3460,6 +6275,374 @@ def test_xr2f_preserves_named_vector_and_matrix_prints_compile(tmp_path: Path) -
     assert '"alpha"' in out_text
     assert '"c1"' in out_text
     assert '"r1"' in out_text
+
+
+def test_xr2f_switch_body_character_index_alias_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xswitch_character_index_alias_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "mode <- 1",
+                'labels <- c("low", "high")',
+                "switch(",
+                "  mode,",
+                "  {",
+                "    idx <- c(1L, 2L)",
+                "    grp <- labels[idx]",
+                "  },",
+                "  {",
+                "    idx <- c(2L)",
+                "    grp <- labels[idx]",
+                "  }",
+                ")",
+                "print(grp)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xswitch_character_index_alias_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert '"low"' in out_text
+    assert '"high"' in out_text
+    assert "integer, allocatable :: idx(:)" in out_text
+    assert "real(kind=dp), allocatable :: idx(:)" not in out_text
+    assert "call print_char_vector(grp)" in out_text
+
+
+def test_xr2f_named_c_function_return_string_subscripts_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xnamed_c_return_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_par <- function(x) {",
+                "  c(omega = x[1], alpha = x[2], beta = x[3])",
+                "}",
+                "p <- make_par(c(1, 2, 3))",
+                'cat(p["omega"], p["alpha"], p["beta"], "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xnamed_c_return_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1.000000" in proc.stdout and "2.000000" in proc.stdout and "3.000000" in proc.stdout
+    assert '("omega")' not in flat_out
+    assert '("alpha")' not in flat_out
+    assert '("beta")' not in flat_out
+    assert "p(1)" in flat_out and "p(2)" in flat_out and "p(3)" in flat_out
+
+
+def test_xr2f_named_c_local_alias_return_string_subscripts_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xnamed_c_alias_return_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_par <- function(x) {",
+                "  y <- c(omega = x[1], alpha = x[2], beta = x[3])",
+                "  return(y)",
+                "}",
+                "p <- make_par(c(1, 2, 3))",
+                'cat(p["omega"], p["alpha"], p["beta"], "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xnamed_c_alias_return_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1.000000" in proc.stdout and "2.000000" in proc.stdout and "3.000000" in proc.stdout
+    assert '("omega")' not in flat_out
+    assert '("alpha")' not in flat_out
+    assert '("beta")' not in flat_out
+    assert "p(1)" in flat_out and "p(2)" in flat_out and "p(3)" in flat_out
+
+
+def test_xr2f_named_c_local_alias_chain_return_string_subscripts_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xnamed_c_alias_chain_return_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_par <- function(x) {",
+                "  y <- c(omega = x[1], alpha = x[2], beta = x[3])",
+                "  z <- y",
+                "  z",
+                "}",
+                "p <- make_par(c(1, 2, 3))",
+                'cat(p["omega"], p["alpha"], p["beta"], "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xnamed_c_alias_chain_return_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "1.000000" in proc.stdout and "2.000000" in proc.stdout and "3.000000" in proc.stdout
+    assert '("omega")' not in flat_out
+    assert '("alpha")' not in flat_out
+    assert '("beta")' not in flat_out
+    assert "p(1)" in flat_out and "p(2)" in flat_out and "p(3)" in flat_out
+
+
+def test_xr2f_function_return_rank_through_local_alias_chain_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_rank_alias_chain_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "take3 <- function(x) {",
+                "  y <- x[1:3]",
+                "  z <- y",
+                "  z",
+                "}",
+                "out <- take3(c(1, 2, 3, 4))",
+                "print(out)",
+                "cat(length(out), \"\\n\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_rank_alias_chain_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "real(kind=dp), allocatable :: take3_result(:)" in out_text
+    assert "real(kind=dp) :: take3_result" not in out_text
+    assert "3" in proc.stdout
+
+
+def test_xr2f_function_return_kind_through_local_alias_chain_compile(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_kind_alias_chain_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_idx <- function(n) {",
+                "  y <- integer(n)",
+                "  y[1] <- 2L",
+                "  z <- y",
+                "  z",
+                "}",
+                "idx <- make_idx(3)",
+                "print(idx)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_kind_alias_chain_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "integer, allocatable :: make_idx_result(:)" in out_text
+    assert "real(kind=dp), allocatable :: make_idx_result(:)" not in out_text
+
+
+def test_xr2f_function_return_integer_c_kind_through_alias_chain_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_integer_c_alias_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_idx <- function() {",
+                "  y <- c(1L, 2L, 3L)",
+                "  z <- y",
+                "  z",
+                "}",
+                "idx <- make_idx()",
+                "print(idx)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_integer_c_alias_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "integer, allocatable :: make_idx_result(:)" in out_text
+    assert "real(kind=dp), allocatable :: make_idx_result(:)" not in out_text
+
+
+def test_xr2f_function_return_integer_c_kind_through_local_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_integer_c_local_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_idx <- function() {",
+                "  y <- c(1L, 2L, 3L)",
+                "  y",
+                "}",
+                "idx <- make_idx()",
+                "print(idx)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_integer_c_local_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "integer, allocatable :: make_idx_result(:)" in out_text
+    assert "real(kind=dp), allocatable :: make_idx_result(:)" not in out_text
+
+
+def test_xr2f_function_return_logical_c_kind_through_alias_chain_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_logical_c_alias_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_flags <- function() {",
+                "  y <- c(TRUE, FALSE, TRUE)",
+                "  z <- y",
+                "  z",
+                "}",
+                "flags <- make_flags()",
+                "print(flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_logical_c_alias_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "logical, allocatable :: make_flags_result(:)" in out_text
+    assert "real(kind=dp), allocatable :: make_flags_result(:)" not in out_text
+
+
+def test_xr2f_function_return_logical_c_kind_through_local_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreturn_logical_c_local_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "make_flags <- function() {",
+                "  y <- c(TRUE, FALSE, TRUE)",
+                "  y",
+                "}",
+                "flags <- make_flags()",
+                "print(flags)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreturn_logical_c_local_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "logical, allocatable :: make_flags_result(:)" in out_text
+    assert "real(kind=dp), allocatable :: make_flags_result(:)" not in out_text
 
 
 def test_xr2f_paste0_numeric_vector_names_compile(tmp_path: Path) -> None:
@@ -3583,13 +6766,28 @@ def _run_xr2f_compile_source(tmp_path: Path, source_path: Path) -> subprocess.Co
     local_input = tmp_path / source_path.name
     local_input.write_text(source_path.read_text(encoding="utf-8-sig"), encoding="utf-8")
     out_path = tmp_path / f"{source_path.stem}.f90"
-    return subprocess.run(
-        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+    cmd = [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"]
+    proc = subprocess.run(
+        cmd,
         cwd=tmp_path,
         capture_output=True,
         text=True,
         check=False,
     )
+    if (
+        os.name == "nt"
+        and proc.returncode == 0xC000070A
+        and not proc.stdout
+        and not proc.stderr
+    ):
+        proc = subprocess.run(
+            cmd,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    return proc
 
     out_text = out_path.read_text(encoding="utf-8")
     flat_out = " ".join(out_text.replace("&", " ").split())
@@ -3761,9 +6959,17 @@ def test_xr2f_compiles_recent_regression_stress_examples(tmp_path: Path, example
 @pytest.mark.parametrize(
     ("example_name", "required_fragments", "forbidden_fragments"),
     [
-        ("xgarch_dcc_t.r", ["call read_csv_real_matrix(price_file, dat)", "dat(:,:)"], ["dat(:), garch_fit"]),
+        (
+            "xgarch_dcc_t.r",
+            ["call read_csv_real_matrix(price_file, dat)", "dat(:,:)"],
+            [
+                "dat(:), garch_fit",
+                "real(kind=dp), allocatable :: opt_p(:), real",
+                "real(:,:), allocatable ::",
+            ],
+        ),
         ("xvar.r", ["xlag(:,:)", "xlag = x(r_seq_int(1, n - 1), :)"], ["xlag(:), y(:,:)"]),
-        ("xvar_ic.r", ["integer :: aic_order, bic_order"], ["aic_order(:)", "bic_order(:)"]),
+        ("xvar_ic.r", ["integer :: aic_order", "integer :: bic_order"], ["aic_order(:)", "bic_order(:)"]),
         ("xxarray.r", ["b(:,:)", "b = r_array_real([10.0_dp, 20.0_dp], [3, 4])"], ["b(:,:,:)"]),
         ("xsolve.r", ["complex(kind=dp), allocatable :: A_2(:,:)"], ["real(kind=dp), allocatable :: A_2(:,:)"]),
     ],
@@ -3781,9 +6987,9 @@ def test_xr2f_recent_regression_generated_fragments(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     for fragment in required_fragments:
-        assert fragment in flat_out
+        assert _has_fortran_decl_fragment(out_text, fragment)
     for fragment in forbidden_fragments:
-        assert fragment not in flat_out
+        assert not _has_fortran_decl_fragment(out_text, fragment)
 
 
 @pytest.mark.parametrize(
@@ -4281,7 +7487,8 @@ def test_xr2f_viterbi_no_decl_benchmark_wrapper_compiles(tmp_path: Path) -> None
     out_text = out_path.read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
-    assert "integer, allocatable :: observations(:), states(:)" in out_text
+    assert "integer, allocatable :: observations(:)" in out_text
+    assert _has_fortran_decl(out_text, "integer, allocatable", "states(:)")
     assert "real(kind=dp), allocatable :: slow_viterbi_result(:)" in out_text
     assert 'write(*,"(g0)") mark(' not in out_text
 
@@ -4315,6 +7522,41 @@ def test_xr2f_read_csv_result_stays_matrix_rank(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
     assert "call read_csv_real_matrix" in out_text
     assert "dat(:,:)" in " ".join(out_text.replace("&", " ").split())
+
+
+def test_xr2f_as_data_frame_list_field_lowers_to_matrix_value(tmp_path: Path) -> None:
+    (tmp_path / "prices.csv").write_text("Date,SPY,EFA\n1,10,20\n2,11,21\n", encoding="utf-8")
+    local_input = tmp_path / "xas_data_frame_field_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "read_price_file <- function() {",
+                '  dat <- read.csv("prices.csv", stringsAsFactors = FALSE, check.names = FALSE)',
+                "  dates <- dat[[1]]",
+                "  prices <- dat[-1]",
+                "  list(dates = dates, prices = as.data.frame(prices, check.names = FALSE))",
+                "}",
+                "dat <- read_price_file()",
+                "print(dim(dat$prices))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xas_data_frame_field_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "as.data.frame" not in out_text
+    assert "read_price_file_result%prices = prices" in out_text
 
 
 def test_xr2f_prints_integer_vector_expressions_as_integers(tmp_path: Path) -> None:
