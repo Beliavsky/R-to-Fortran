@@ -10469,6 +10469,12 @@ def r_expr_to_fortran(expr: str) -> str:
     c_sys0 = parse_call_text(s)
     if c_sys0 is not None:
         sys_nm0 = c_sys0[0].lower()
+        if sys_nm0 == "i":
+            pos_i, kw_i = c_sys0[1], c_sys0[2]
+            inner_i = pos_i[0].strip() if pos_i else kw_i.get("x", "").strip()
+            if not inner_i:
+                raise NotImplementedError("I() requires an argument")
+            return r_expr_to_fortran(inner_i)
         if sys_nm0 == "ave":
             pos_ave, kw_ave = c_sys0[1], c_sys0[2]
             x_src = pos_ave[0].strip() if pos_ave else kw_ave.get("x", "").strip()
@@ -18850,12 +18856,12 @@ def emit_stmts(
                 lm_terms_by_fit[st.name] = term_labels
                 lm_anova_terms_by_fit[st.name] = anova_labels
                 lm_anova_dfs_by_fit[st.name] = anova_dfs
+                _FIT_TERM_LABELS[st.name.lower()] = term_labels
                 if is_aov:
                     aov_fits.add(st.name)
                 if is_glm:
                     glm_fits.add(st.name)
                     glm_terms_by_fit[st.name] = term_labels
-                    _FIT_TERM_LABELS[st.name.lower()] = term_labels
                 lm_design_exprs_by_fit[st.name] = term_exprs
                 lm_design_first_by_fit[st.name] = r_expr_to_fortran(first_src) if first_src else ""
                 p = len(term_exprs)
@@ -46044,6 +46050,44 @@ def repair_var_yw_print_labels_text(f90: str) -> str:
     return "".join(pieces)
 
 
+def skip_plotting_blocks_text(f90: str) -> str:
+    graphics_re = re.compile(r"\b(?:plot|points|lines|legend|abline|curve)\s*\(", re.IGNORECASE)
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        m_if = re.match(r"^(\s*)if\s*\(.*\)\s*then\s*$", ln, re.IGNORECASE)
+        if m_if is None:
+            if graphics_re.search(ln):
+                indent = re.match(r"^\s*", ln).group(0)
+                out.append(f'{indent}write(*,"(g0)") "plotting block skipped by xr2f"')
+            else:
+                out.append(ln)
+            i += 1
+            continue
+        block = [ln]
+        depth = 1
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            cur = lines[j]
+            block.append(cur)
+            if re.match(r"^\s*if\s*\(.*\)\s*then\s*$", cur, re.IGNORECASE):
+                depth += 1
+            elif re.match(r"^\s*end\s+if\s*$", cur, re.IGNORECASE):
+                depth -= 1
+            j += 1
+        if depth == 0 and graphics_re.search("\n".join(block)):
+            indent = m_if.group(1)
+            out.append(ln)
+            out.append(f'{indent}   write(*,"(g0)") "plotting block skipped by xr2f"')
+            out.append(f"{indent}end if")
+        else:
+            out.extend(block)
+        i = j
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def promote_forwarded_dummy_ranks_text(f90: str) -> str:
     block_pat = re.compile(
         r"(?ims)^(?:pure\s+|recursive\s+|elemental\s+)*"
@@ -53004,6 +53048,7 @@ def main() -> int:
         f90 = repair_portfolio_stats_scalar_locals_text(f90)
         f90 = repair_portfolio_print_labels_text(f90)
     f90 = repair_var_yw_print_labels_text(f90)
+    f90 = skip_plotting_blocks_text(f90)
     f90 = promote_forwarded_dummy_ranks_text(f90)
     if args.special_repairs:
         f90 = repair_make_pos_def_text(f90)
