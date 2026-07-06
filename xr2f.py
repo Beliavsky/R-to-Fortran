@@ -15996,6 +15996,22 @@ def r_expr_to_fortran(expr: str) -> str:
         if not any(p.strip() for p in parts):
             return "numeric(0)"
         nonempty_c_parts = [p for p in parts if p.strip()]
+
+        def _lower_inline_if_arg(src: str) -> str:
+            src_s = src.strip()
+            ih_arg = _parse_if_head(src_s)
+            if ih_arg is None:
+                return src_s
+            cond_src, tail_src = ih_arg
+            split_tail = _split_top_level_else(" " + tail_src)
+            if split_tail is None:
+                return src_s
+            then_src, else_src = split_tail
+            return (
+                f"merge({r_expr_to_fortran(then_src)}, "
+                f"{r_expr_to_fortran(else_src)}, {r_expr_to_fortran(cond_src)})"
+            )
+
         if len(nonempty_c_parts) == 6:
             p0 = _strip_named_actual_value(nonempty_c_parts[0]).strip()
             p1 = _strip_named_actual_value(nonempty_c_parts[1]).strip()
@@ -16069,7 +16085,7 @@ def r_expr_to_fortran(expr: str) -> str:
             return "[" + ", ".join(vals_i) + "]"
         vals = []
         for p in parts:
-            t = _strip_named_actual_value(p)
+            t = _lower_inline_if_arg(_strip_named_actual_value(p))
             if _is_int_literal(t):
                 vals.append(f"{t}.0_dp")
             elif _is_real_literal(t) and "_dp" not in t:
