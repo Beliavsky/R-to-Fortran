@@ -15259,14 +15259,49 @@ def r_expr_to_fortran(expr: str) -> str:
         "sum",
         _sum_to_fortran,
     )
+
+    def _prod_to_fortran(inner: str) -> str:
+        parts_prod = split_top_level_commas(inner)
+        kept_prod: list[str] = []
+        na_rm_prod = False
+        for part_prod in parts_prod:
+            t_prod = part_prod.strip()
+            m_na_prod = re.match(r"^na(?:\.|_)rm\s*=\s*(.+)$", t_prod, re.IGNORECASE)
+            if m_na_prod is not None:
+                na_rm_prod = m_na_prod.group(1).strip().lower() in {"true", ".true.", "t", "1"}
+                continue
+            if t_prod:
+                kept_prod.append(_strip_named_actual_value(t_prod).strip())
+
+        def one_prod(x_src: str) -> str:
+            inner_f = r_expr_to_fortran(x_src)
+            if (
+                re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)*", inner_f.strip()) is not None
+                or "r_seq_" in inner_f
+                or re.search(r"\[[^\]]*\]", inner_f)
+            ):
+                if na_rm_prod:
+                    return f"product({_non_na_pack_expr(inner_f)})"
+                return f"product({inner_f})"
+            if (
+                _infer_assignment_rank_hint(inner_f, {}) == 0
+                and "[" not in inner_f
+                and "]" not in inner_f
+            ):
+                return inner_f
+            if na_rm_prod:
+                return f"product({_non_na_pack_expr(inner_f)})"
+            return f"product({inner_f})"
+
+        if not kept_prod:
+            return "1"
+        pieces_prod = [one_prod(x_src) for x_src in kept_prod]
+        return pieces_prod[0] if len(pieces_prod) == 1 else "(" + " * ".join(pieces_prod) + ")"
+
     s = _replace_balanced_func_calls(
         s,
         "prod",
-        lambda inner: (
-            f"product({_non_na_pack_expr(r_expr_to_fortran(_split_reduction_args(inner)[0]))})"
-            if _split_reduction_args(inner)[1]
-            else f"product({r_expr_to_fortran(_split_reduction_args(inner)[0])})"
-        ),
+        _prod_to_fortran,
     )
     def _rowsums_to_fortran(inner: str) -> str:
         c_rs = parse_call_text("rowSums(" + inner.strip() + ")")
@@ -15318,19 +15353,40 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "colSums", _colsums_to_fortran)
     s = _replace_balanced_func_calls(s, "rowMeans", _rowmeans_to_fortran)
     s = _replace_balanced_func_calls(s, "colMeans", _colmeans_to_fortran)
-    def _max_to_fortran(inner: str) -> str:
+    def _extreme_to_fortran(inner: str, op_name: str, reducer_name: str) -> str:
         parts, na_rm = _split_reduction_arg_list(inner)
         if len(parts) <= 1:
-            x_f = r_expr_to_fortran(parts[0] if parts else "")
-            return f"maxval({_non_na_pack_expr(x_f)})" if na_rm else f"maxval({x_f})"
-        return f"max({_normalize_numeric_args(', '.join(parts))})"
+            x_src = parts[0] if parts else ""
+            x_f = r_expr_to_fortran(x_src)
+            if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", x_f.strip()):
+                return x_f
+            return f"{reducer_name}({_non_na_pack_expr(x_f)})" if na_rm else f"{reducer_name}({x_f})"
+        any_real_part = any(
+            re.fullmatch(r"[+-]?\d+", p.strip()) is not None
+            or re.search(r"(?:\d+\.\d*|\d*\.\d+|[eE][+-]?\d+)", p)
+            for p in parts
+        )
+        pieces: list[str] = []
+        for p in parts:
+            p_s = p.strip()
+            x_f = r_expr_to_fortran(p_s)
+            if _infer_assignment_rank_hint(x_f, {}) == 0 and "[" not in x_f and "]" not in x_f:
+                piece = f"{p_s}.0_dp" if re.fullmatch(r"[+-]?\d+", p_s) is not None else x_f
+            else:
+                piece = f"{reducer_name}({_non_na_pack_expr(x_f)})" if na_rm else f"{reducer_name}({x_f})"
+            if any_real_part and (
+                re.match(r"^\s*(?:floor|ceiling|int|count|size|minloc|maxloc)\s*\(", piece, re.IGNORECASE)
+                or ("_dp" not in piece and re.search(r"\breal\s*\(", piece, re.IGNORECASE) is None)
+            ):
+                piece = f"real({piece}, kind=dp)"
+            pieces.append(piece)
+        return f"{op_name}(" + ", ".join(pieces) + ")"
+
+    def _max_to_fortran(inner: str) -> str:
+        return _extreme_to_fortran(inner, "max", "maxval")
 
     def _min_to_fortran(inner: str) -> str:
-        parts, na_rm = _split_reduction_arg_list(inner)
-        if len(parts) <= 1:
-            x_f = r_expr_to_fortran(parts[0] if parts else "")
-            return f"minval({_non_na_pack_expr(x_f)})" if na_rm else f"minval({x_f})"
-        return f"min({_normalize_numeric_args(', '.join(parts))})"
+        return _extreme_to_fortran(inner, "min", "minval")
 
     s = _replace_balanced_func_calls(s, "max", _max_to_fortran)
     s = _replace_balanced_func_calls(s, "min", _min_to_fortran)
@@ -42511,7 +42567,7 @@ def demote_integer_sum_scalar_locals_text(f90: str) -> str:
         lhs = m_assign.group(1)
         rhs = m_assign.group(2).strip()
         rhs_l = rhs.lower()
-        if "sum(r_seq_int(" not in rhs_l:
+        if "sum(r_seq_int(" not in rhs_l and "product(r_seq_int(" not in rhs_l:
             continue
         if (
             "_dp" in rhs_l
@@ -42523,7 +42579,7 @@ def demote_integer_sum_scalar_locals_text(f90: str) -> str:
             or re.search(r"\b(?:r_matmul|matmul|solve_real|pack|reshape|spread|matrix|diff)\s*\(", rhs, re.IGNORECASE)
         ):
             continue
-        tmp = re.sub(r"\bsum\s*\(\s*r_seq_int\s*\([^()]*\)\s*\)", "0", rhs, flags=re.IGNORECASE)
+        tmp = re.sub(r"\b(?:sum|product)\s*\(\s*r_seq_int\s*\([^()]*\)\s*\)", "0", rhs, flags=re.IGNORECASE)
         tmp = re.sub(r"\b[+-]?\d+\b", "0", tmp)
         if re.fullmatch(r"[\s()+\-*/0]+", tmp) and re.search(r"[A-Za-z_]", tmp) is None:
             int_targets.add(lhs.lower())
@@ -42580,6 +42636,173 @@ def demote_integer_sum_scalar_locals_text(f90: str) -> str:
         repl_decl,
         f90,
     )
+
+
+def promote_variadic_reduction_plain_numeric_literals_text(f90: str, src: str) -> str:
+    targets: set[str] = set()
+    int_targets: set[str] = set()
+    for m_assign in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*(?:<-|=)\s*((?:sum|prod|min|max)\s*\(.*\))\s*$", src):
+        lhs = _sanitize_r_var_name(m_assign.group(1))
+        cinfo = parse_call_text(m_assign.group(2).strip())
+        if cinfo is None or cinfo[0].lower() not in {"sum", "prod", "min", "max"}:
+            continue
+        fn_l = cinfo[0].lower()
+        pos_args = []
+        for arg in cinfo[1]:
+            t = arg.strip()
+            if re.match(r"^na(?:\.|_)rm\s*=", t, re.IGNORECASE) or re.match(r"^dim\s*=", t, re.IGNORECASE):
+                continue
+            pos_args.append(t)
+        if len(pos_args) < 2:
+            continue
+        has_plain_numeric = any(re.fullmatch(r"[+-]?\d+", arg.strip()) is not None for arg in pos_args[1:])
+        if has_plain_numeric:
+            targets.add(lhs.lower())
+        elif fn_l in {"min", "max"} and all(
+            re.fullmatch(r"[+-]?\d+[lL]?", arg.strip()) is not None
+            or _split_top_level_colon(arg.strip()) is not None
+            for arg in pos_args
+        ):
+            int_targets.add(lhs.lower())
+    if not targets and not int_targets:
+        return f90
+
+    def repl_integer_decl(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            text = part.strip()
+            base = re.sub(r"\s*=.*$", "", text).strip()
+            if base.lower() in targets:
+                moved.append(base)
+            else:
+                kept.append(text)
+        if not moved:
+            return m_decl.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        lines.append(re.sub(r"integer", "real(kind=dp)", prefix, count=1, flags=re.IGNORECASE) + ", ".join(moved))
+        return "\n".join(lines)
+
+    def repl_real_decl_to_integer(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            text = part.strip()
+            base = re.sub(r"\s*=.*$", "", text).strip()
+            if base.lower() in int_targets:
+                moved.append(base)
+            else:
+                kept.append(text)
+        if not moved:
+            return m_decl.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        lines.append(re.sub(r"real\s*\(\s*kind\s*=\s*dp\s*\)", "integer", prefix, count=1, flags=re.IGNORECASE) + ", ".join(moved))
+        return "\n".join(lines)
+
+    def repl_real_alloc_decl(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved_real: list[str] = []
+        moved_int: list[str] = []
+        for part in parts:
+            text = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*\(:\s*\)$", text)
+            if m_item is not None and m_item.group(1).lower() in targets:
+                moved_real.append(m_item.group(1))
+            elif m_item is not None and m_item.group(1).lower() in int_targets:
+                moved_int.append(m_item.group(1))
+            else:
+                kept.append(text)
+        if not moved_real and not moved_int:
+            return m_decl.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        if moved_real:
+            lines.append(re.sub(r",\s*allocatable\s*", "", prefix, flags=re.IGNORECASE) + ", ".join(moved_real))
+        if moved_int:
+            int_prefix = re.sub(r"real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable", "integer", prefix, flags=re.IGNORECASE)
+            lines.append(int_prefix + ", ".join(moved_int))
+        return "\n".join(lines)
+
+    f90 = re.sub(r"(?im)^(\s*integer\s*::\s*)(.+)$", repl_integer_decl, f90)
+    f90 = re.sub(r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*)(.+)$", repl_real_decl_to_integer, f90)
+    f90 = re.sub(
+        r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*)(.+)$",
+        repl_real_alloc_decl,
+        f90,
+    )
+
+    def repl_assignment(m_assign: re.Match[str]) -> str:
+        lhs = m_assign.group(1)
+        rhs = m_assign.group(2)
+        lhs_l = lhs.lower()
+        if lhs_l in int_targets:
+            def strip_real_kind_dp(inner: str) -> str:
+                cinfo = parse_call_text("real(" + inner + ")")
+                if cinfo is None:
+                    return "real(" + inner + ")"
+                pos, kw = cinfo[1], cinfo[2]
+                if not pos:
+                    return "real(" + inner + ")"
+                kind_src = kw.get("kind", pos[1] if len(pos) >= 2 else "")
+                if kind_src.strip().lower() == "dp":
+                    return pos[0].strip()
+                return "real(" + inner + ")"
+
+            rhs = _replace_balanced_func_calls(rhs, "real", strip_real_kind_dp)
+            rhs = re.sub(r"(?<![\w.])([+-]?\d+)\.0_dp(?![\w.])", r"\1", rhs)
+            return f"{lhs} = {rhs}"
+        if lhs_l not in targets:
+            return m_assign.group(0)
+        rhs = re.sub(r"(?<![\w.])([+-])\s*(\d+)(?![\w.])", lambda m: f"{m.group(1)} {m.group(2)}.0_dp", rhs)
+        return f"{lhs} = {rhs}"
+
+    return re.sub(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", repl_assignment, f90)
+
+
+def repair_scalar_minmax_reductions_text(f90: str) -> str:
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+[A-Za-z]\w*\b.*?^\s*end\s+function\b[^\n]*$)"
+    )
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        block = m_proc.group(1)
+        scalar_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*(?:real\s*\(\s*kind\s*=\s*dp\s*\)|integer|logical|complex\s*\(\s*kind\s*=\s*dp\s*\))\s*(?:,\s*intent\s*\([^)]*\))?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                item = part.strip()
+                name = re.sub(r"\s*=.*$", "", item).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", name):
+                    scalar_names.add(name.lower())
+        if not scalar_names:
+            return block
+
+        def repl_reducer(m_red: re.Match[str]) -> str:
+            expr = m_red.group(2).strip()
+            ids = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", expr)}
+            intrinsic_ids = {"real", "int", "kind", "dp", "abs", "sqrt", "exp", "log"}
+            if ids and ids - scalar_names - intrinsic_ids:
+                return m_red.group(0)
+            if not ids and not re.search(r"\d", expr):
+                return m_red.group(0)
+            return expr
+
+        return re.sub(r"\b(minval|maxval)\s*\(([^()\n]+)\)", repl_reducer, block, flags=re.IGNORECASE)
+
+    return proc_pat.sub(repl_proc, f90)
 
 
 def promote_logical_function_result_assignments(lines: list[str]) -> list[str]:
@@ -54643,6 +54866,8 @@ def main() -> int:
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
     f90 = demote_scalar_reducer_allocatable_locals_text(f90)
     f90 = demote_integer_sum_scalar_locals_text(f90)
+    f90 = promote_variadic_reduction_plain_numeric_literals_text(f90, src)
+    f90 = repair_scalar_minmax_reductions_text(f90)
     f90 = declare_missing_matrix_aliases_text(f90)
     f90_lines = promote_rank3_slice_matrix_assignments(f90.splitlines())
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
@@ -54670,6 +54895,8 @@ def main() -> int:
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
     f90 = demote_scalar_reducer_allocatable_locals_text(f90)
     f90 = demote_integer_sum_scalar_locals_text(f90)
+    f90 = promote_variadic_reduction_plain_numeric_literals_text(f90, src)
+    f90 = repair_scalar_minmax_reductions_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
