@@ -3338,8 +3338,11 @@ def parse_block(
                 stmts.append(CommentStmt(text=txt))
             i += 1
             continue
-        if ln == "}":
+        if ln == "}" or (stop_at_rbrace and ln.lower().startswith("} else")):
             if stop_at_rbrace:
+                if ln.lower().startswith("} else"):
+                    lines[i] = ln[2:].strip()
+                    return stmts, i
                 return stmts, i + 1
             i += 1
             continue
@@ -3448,8 +3451,12 @@ def parse_block(
                             if anm:
                                 args.append(anm)
             if fn_tail:
-                body = [parse_single_statement(fn_tail, comment_lookup=comment_lookup)]
-                i += 1
+                if fn_tail == "{":
+                    i += 1
+                    body, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                else:
+                    body = [parse_single_statement(fn_tail, comment_lookup=comment_lookup)]
+                    i += 1
             else:
                 i += 1
                 if i < len(lines) and lines[i].strip() == "{":
@@ -3464,6 +3471,73 @@ def parse_block(
             stmts.append(FuncDef(name=fname, args=args, defaults=defaults, body=body))
             continue
 
+        asn_if = split_top_level_assignment(ln)
+        if asn_if is not None:
+            lhs_if, rhs_if = asn_if[0].strip(), asn_if[1].strip()
+            ih_assign = _parse_if_head(rhs_if)
+            if ih_assign is not None:
+                cond, tail = ih_assign
+                then_body_raw: list[object] = []
+                else_body_raw: list[object] = []
+                if tail:
+                    if tail == "{":
+                        i += 1
+                        then_body_raw, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    else:
+                        split_tail = _split_top_level_else(" " + tail)
+                        if split_tail is not None:
+                            then_body_raw = [parse_single_statement(split_tail[0], comment_lookup=comment_lookup)]
+                            else_body_raw = [parse_single_statement(split_tail[1], comment_lookup=comment_lookup)]
+                        else:
+                            then_body_raw = [parse_single_statement(tail, comment_lookup=comment_lookup)]
+                        i += 1
+                else:
+                    i += 1
+                    if i < len(lines) and lines[i].strip() == "{":
+                        then_body_raw, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    else:
+                        if i >= len(lines):
+                            raise NotImplementedError("assignment if missing body")
+                        split_next = _split_top_level_else(" " + lines[i].strip())
+                        if split_next is not None:
+                            then_body_raw = [parse_single_statement(split_next[0], comment_lookup=comment_lookup)]
+                            else_body_raw = [parse_single_statement(split_next[1], comment_lookup=comment_lookup)]
+                        else:
+                            then_body_raw = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
+                        i += 1
+                if i < len(lines):
+                    else_ln = lines[i].strip()
+                    if else_ln in {"else", "else {"}:
+                        i += 1
+                        if else_ln == "else {":
+                            else_body_raw, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                        elif i < len(lines) and lines[i].strip() == "{":
+                            else_body_raw, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                        else:
+                            if i >= len(lines):
+                                raise NotImplementedError("assignment else missing body")
+                            else_body_raw = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
+                            i += 1
+
+                def _branch_as_assignment(branch: list[object]) -> list[object]:
+                    if len(branch) != 1:
+                        return branch
+                    only = branch[0]
+                    if isinstance(only, ExprStmt):
+                        return [Assign(lhs_if, only.expr, only.comment)]
+                    if isinstance(only, Assign):
+                        return [Assign(lhs_if, only.expr, only.comment)]
+                    return branch
+
+                stmts.append(
+                    IfStmt(
+                        cond=cond,
+                        then_body=_branch_as_assignment(then_body_raw),
+                        else_body=_branch_as_assignment(else_body_raw),
+                    )
+                )
+                continue
+
         ih = _parse_if_head(ln)
         if ih is not None:
             cond, tail = ih
@@ -3471,7 +3545,10 @@ def parse_block(
             else_body: list[object] = []
             if tail:
                 split_tail = _split_top_level_else(" " + tail)
-                if split_tail is not None:
+                if tail == "{":
+                    i += 1
+                    then_body, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                elif split_tail is not None:
                     then_body = [parse_single_statement(split_tail[0], comment_lookup=comment_lookup)]
                     else_body = [parse_single_statement(split_tail[1], comment_lookup=comment_lookup)]
                     i += 1
@@ -3488,9 +3565,12 @@ def parse_block(
                         raise NotImplementedError("if missing body")
                     then_body = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
                     i += 1
-                if i < len(lines) and lines[i].strip() == "else":
+                if i < len(lines) and lines[i].strip() in {"else", "else {"}:
+                    else_line = lines[i].strip()
                     i += 1
-                    if i < len(lines) and lines[i].strip() == "{":
+                    if else_line == "else {":
+                        else_body, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    elif i < len(lines) and lines[i].strip() == "{":
                         else_body, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
                     else:
                         if i >= len(lines):
@@ -3532,10 +3612,13 @@ def parse_block(
                 if head_else_if is not None:
                     else_body = [head_else_if]
 
-                if i < len(lines) and lines[i].strip() == "else":
+                if i < len(lines) and lines[i].strip() in {"else", "else {"}:
+                    else_line_final = lines[i].strip()
                     i += 1
                     e_final: list[object] = []
-                    if i < len(lines) and lines[i].strip() == "{":
+                    if else_line_final == "else {":
+                        e_final, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    elif i < len(lines) and lines[i].strip() == "{":
                         e_final, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
                     else:
                         if i >= len(lines):
@@ -3547,6 +3630,18 @@ def parse_block(
                     else:
                         else_body = e_final
             stmts.append(IfStmt(cond=cond, then_body=then_body, else_body=else_body))
+            continue
+
+        if ln.startswith("list(") and not ln.endswith(")"):
+            parts = [ln]
+            depth = ln.count("(") - ln.count(")")
+            i += 1
+            while i < len(lines) and depth > 0:
+                part = lines[i].strip()
+                parts.append(part)
+                depth += part.count("(") - part.count(")")
+                i += 1
+            stmts.append(ExprStmt(expr=" ".join(parts), comment=""))
             continue
 
         try:
@@ -10645,6 +10740,16 @@ def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src:
     return actual_f
 
 
+def _acf_series_name_arg(expr: str) -> str:
+    c_acf_name = parse_call_text(expr.strip())
+    if c_acf_name is None or c_acf_name[0].lower() not in {"acf", "pacf"}:
+        return ""
+    x_src = c_acf_name[1][0].strip() if c_acf_name[1] else c_acf_name[2].get("x", "").strip()
+    if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", x_src):
+        return f', series_name="{x_src}"'
+    return ""
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
@@ -11359,7 +11464,7 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"{r_expr_to_fortran(m_var_pred.group(1))}%var_pred"
     m_order_field = re.match(r"^([A-Za-z]\w*)\s*\$\s*order\s*$", s, re.IGNORECASE)
     if m_order_field is not None:
-        return f"real({r_expr_to_fortran(m_order_field.group(1))}%order, kind=dp)"
+        return f"{r_expr_to_fortran(m_order_field.group(1))}%order"
     m_asnum_loglik = re.match(r"^as\.numeric\s*\(\s*logLik\s*\((.*)\)\s*\)\s*$", s, re.IGNORECASE)
     if m_asnum_loglik is not None:
         fit_src = m_asnum_loglik.group(1).strip()
@@ -18945,6 +19050,11 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            m_obj_list_extract_rhs = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+)\s*\]\]$", rhs)
+            if m_obj_list_extract_rhs is not None and m_obj_list_extract_rhs.group(1) in object_list_vars:
+                idx_obj_rhs = _int_bound_expr(r_expr_to_fortran(m_obj_list_extract_rhs.group(2).strip()))
+                _wstmt(f"{st.name} = {m_obj_list_extract_rhs.group(1)}({idx_obj_rhs})", st.comment)
+                continue
             c_cooks_assign = parse_call_text(rhs)
             if c_cooks_assign is not None and c_cooks_assign[0].lower() in {"cooks.distance", "lm_cooks_distance"}:
                 fit_src_cook = c_cooks_assign[1][0].strip() if c_cooks_assign[1] else c_cooks_assign[2].get("object", "").strip()
@@ -20347,6 +20457,18 @@ def emit_stmts(
                         continue
                     if _emit_find_print(one, st.comment):
                         continue
+                    c_one_acf_print = parse_call_text(one)
+                    if c_one_acf_print is not None and c_one_acf_print[0].lower() in {"acf", "pacf"}:
+                        acf_series_arg = _acf_series_name_arg(one)
+                        if print_digits_src is not None:
+                            _wstmt(
+                                f"call print_acf({r_expr_to_fortran(one)}, digits={_int_bound_expr(r_expr_to_fortran(print_digits_src))}{acf_series_arg})",
+                                st.comment,
+                            )
+                        else:
+                            _wstmt(f"call print_acf({r_expr_to_fortran(one)}{acf_series_arg})", st.comment)
+                        need_r_mod.update({"r_acf", "print_acf", "acf_fit_t"})
+                        continue
                     if print_digits_src is not None and has_r_mod:
                         digits_raw_f = _int_bound_expr(r_expr_to_fortran(print_digits_src))
                         if re.fullmatch(r"[+-]?\d+[lL]?", print_digits_src.strip()):
@@ -20889,7 +21011,7 @@ def emit_stmts(
                         o.w(f'write(*,"(*(g0,:,1x))") "convergence:", {one}%convergence')
                         continue
                     if c_one is not None and c_one[0].lower() == "acf":
-                        _wstmt(f"call print_acf({r_expr_to_fortran(one)})", st.comment)
+                        _wstmt(f"call print_acf({r_expr_to_fortran(one)}{_acf_series_name_arg(one)})", st.comment)
                         need_r_mod.update({"r_acf", "print_acf", "acf_fit_t"})
                         continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in rle_vars_ctx:
@@ -21351,6 +21473,8 @@ def emit_stmts(
                         m_int_arr_scalar = re.match(r"^([A-Za-z]\w*)\s*\(.*\)$", one_f.strip())
                         if m_int_arr_scalar is not None and m_int_arr_scalar.group(1) in int_matrix_vars:
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
+                        elif re.match(r"^[A-Za-z]\w*%(?:order|nobs|ncomp|ndim|nfit|iter|convergence)$", one_f.strip(), re.IGNORECASE):
+                            _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
                         elif re.match(r"^[A-Za-z]\w*%rank$", one_f.strip(), re.IGNORECASE):
                             _wstmt(f"call print_real_scalar(real({one_f}, kind=dp))", st.comment)
                         elif re.match(r"^[A-Za-z]\w*\s*\(.*\)$", one_f.strip()):
@@ -23045,7 +23169,7 @@ def emit_stmts(
                 need_r_mod.update({"rle", "print_rle"})
                 continue
             if c_expr_print is not None and c_expr_print[0].lower() == "acf":
-                _wstmt(f"call print_acf({r_expr_to_fortran(expr_print_src)})", st.comment)
+                _wstmt(f"call print_acf({r_expr_to_fortran(expr_print_src)}{_acf_series_name_arg(expr_print_src)})", st.comment)
                 need_r_mod.update({"r_acf", "print_acf", "acf_fit_t"})
                 continue
             rank_expr_print = _expr_rank_for_print(expr_print_src)
@@ -25437,6 +25561,30 @@ def emit_function(
             real_arrays.discard(nm_ssl)
             if nm_ssl not in real_scalars:
                 ints.add(nm_ssl)
+        which_index_scalar_locals: set[str] = set()
+        def _collect_which_index_scalar_locals(ss_wisl: list[object]) -> None:
+            for st_wisl in ss_wisl:
+                if isinstance(st_wisl, Assign):
+                    if re.search(r"\b(?:which\.min|which\.max|minloc|maxloc)\s*\(", st_wisl.expr.strip(), re.IGNORECASE):
+                        which_index_scalar_locals.add(st_wisl.name)
+                elif isinstance(st_wisl, IfStmt):
+                    _collect_which_index_scalar_locals(st_wisl.then_body)
+                    _collect_which_index_scalar_locals(st_wisl.else_body)
+                elif isinstance(st_wisl, ForStmt):
+                    _collect_which_index_scalar_locals(st_wisl.body)
+                elif isinstance(st_wisl, WhileStmt):
+                    _collect_which_index_scalar_locals(st_wisl.body)
+                elif isinstance(st_wisl, RepeatStmt):
+                    _collect_which_index_scalar_locals(st_wisl.body)
+        _collect_which_index_scalar_locals(body_use)
+        for nm_wisl in which_index_scalar_locals:
+            int_arrays.discard(nm_wisl)
+            real_arrays.discard(nm_wisl)
+            real_scalars.discard(nm_wisl)
+            logical_arrays.discard(nm_wisl)
+            logical_scalars.discard(nm_wisl)
+            ints.add(nm_wisl)
+            params.pop(nm_wisl, None)
         qnorm_scalar_locals: set[str] = set()
         def _collect_qnorm_scalar_locals(ss_qsl: list[object]) -> None:
             for st_qsl in ss_qsl:
@@ -25597,6 +25745,25 @@ def emit_function(
                 elif isinstance(st_ol, RepeatStmt):
                     _collect_object_list_locals(st_ol.body)
         _collect_object_list_locals(body_use)
+        def _collect_object_list_extract_aliases(ss_olea: list[object]) -> None:
+            for st_olea in ss_olea:
+                if isinstance(st_olea, Assign):
+                    rhs_olea = st_olea.expr.strip()
+                    m_olea = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*.+\s*\]\]$", rhs_olea)
+                    if m_olea is not None:
+                        src_obj_list = m_olea.group(1)
+                        if src_obj_list in object_list_locals:
+                            local_list_types[st_olea.name] = object_list_locals[src_obj_list]
+                elif isinstance(st_olea, IfStmt):
+                    _collect_object_list_extract_aliases(st_olea.then_body)
+                    _collect_object_list_extract_aliases(st_olea.else_body)
+                elif isinstance(st_olea, ForStmt):
+                    _collect_object_list_extract_aliases(st_olea.body)
+                elif isinstance(st_olea, WhileStmt):
+                    _collect_object_list_extract_aliases(st_olea.body)
+                elif isinstance(st_olea, RepeatStmt):
+                    _collect_object_list_extract_aliases(st_olea.body)
+        _collect_object_list_extract_aliases(body_use)
         for a in fn.args:
             ints.discard(a)
             real_scalars.discard(a)
@@ -25885,12 +26052,78 @@ def emit_function(
             if isinstance(st_read_mat, Assign) and st_read_mat.expr.strip().lower().startswith(("read.csv(", "read.table(")):
                 local_read_table_matrices.add(st_read_mat.name)
                 _force_local_real_array(st_read_mat.name)
+        def _has_explicit_local_vector_assignment(name_vec: str, ss_vec: list[object]) -> bool:
+            for st_vec in ss_vec:
+                if isinstance(st_vec, Assign) and st_vec.name == name_vec:
+                    c_vec = parse_call_text(st_vec.expr.strip())
+                    if c_vec is not None and c_vec[0].lower() in {
+                        "numeric",
+                        "double",
+                        "integer",
+                        "logical",
+                        "c",
+                        "seq",
+                        "seq_len",
+                        "seq_along",
+                        "rnorm",
+                        "runif",
+                        "rexp",
+                        "rgamma",
+                        "rbeta",
+                        "rchisq",
+                        "rt",
+                        "rf",
+                        "rlogis",
+                        "rlnorm",
+                        "rweibull",
+                        "rcauchy",
+                        "rbinom",
+                        "rpois",
+                        "rgeom",
+                        "rnbinom",
+                        "rhyper",
+                        "rwilcox",
+                        "rsignrank",
+                    }:
+                        return True
+                elif isinstance(st_vec, IfStmt):
+                    if _has_explicit_local_vector_assignment(name_vec, st_vec.then_body) or _has_explicit_local_vector_assignment(name_vec, st_vec.else_body):
+                        return True
+                elif isinstance(st_vec, ForStmt):
+                    if _has_explicit_local_vector_assignment(name_vec, st_vec.body):
+                        return True
+                elif isinstance(st_vec, WhileStmt):
+                    if _has_explicit_local_vector_assignment(name_vec, st_vec.body):
+                        return True
+                elif isinstance(st_vec, RepeatStmt):
+                    if _has_explicit_local_vector_assignment(name_vec, st_vec.body):
+                        return True
+            return False
+
         for metric_scalar in {"loglik", "loglik_old", "aic", "bic", "npar", "ridge", "sigma2"} & assigned_locals:
+            if _has_explicit_local_vector_assignment(metric_scalar, body_use):
+                continue
             ints.discard(metric_scalar)
             int_arrays.discard(metric_scalar)
             real_arrays.discard(metric_scalar)
             params.pop(metric_scalar, None)
             real_scalars.add(metric_scalar)
+        def _visit_which_index_scalar_predecl(st_wisl_pre: object) -> None:
+            if isinstance(st_wisl_pre, Assign) and re.search(
+                r"\b(?:which\.min|which\.max|minloc|maxloc)\s*\(",
+                st_wisl_pre.expr.strip(),
+                re.IGNORECASE,
+            ):
+                which_index_scalar_locals.add(st_wisl_pre.name)
+        _walk_statements_recursive(body_use, _visit_which_index_scalar_predecl)
+        for nm_wisl in which_index_scalar_locals:
+            int_arrays.discard(nm_wisl)
+            real_arrays.discard(nm_wisl)
+            real_scalars.discard(nm_wisl)
+            logical_arrays.discard(nm_wisl)
+            logical_scalars.discard(nm_wisl)
+            ints.add(nm_wisl)
+            params.pop(nm_wisl, None)
         param_comments = collect_assignment_comments(body_use)
         for p, v in sorted(params.items()):
             cmt = param_comments.get(p, "").strip()
@@ -25928,6 +26161,17 @@ def emit_function(
                     out_rk.extend(_walk_assigns(st_rk.body))
             return out_rk
         assign_nodes = _walk_assigns(body_use)
+        for st_wisl in assign_nodes:
+            if re.search(r"\b(?:which\.min|which\.max|minloc|maxloc)\s*\(", st_wisl.expr.strip(), re.IGNORECASE):
+                which_index_scalar_locals.add(st_wisl.name)
+        for nm_wisl in which_index_scalar_locals:
+            int_arrays.discard(nm_wisl)
+            real_arrays.discard(nm_wisl)
+            real_scalars.discard(nm_wisl)
+            logical_arrays.discard(nm_wisl)
+            logical_scalars.discard(nm_wisl)
+            ints.add(nm_wisl)
+            params.pop(nm_wisl, None)
         scalar_reduction_fns = {"mean", "sum", "sd", "var", "prod", "min", "max", "det"}
 
         def _force_real_scalar_local(nm_scalar: str) -> None:
@@ -26371,6 +26615,13 @@ def emit_function(
                 real_arrays.discard(st_scalar_reduction.name)
                 local_ranks[st_scalar_reduction.name] = 0
                 params.pop(st_scalar_reduction.name, None)
+            elif re.search(r"\b(?:which\.max|which\.min|maxloc|minloc)\s*\(", st_scalar_reduction.expr.strip(), re.IGNORECASE):
+                ints.add(st_scalar_reduction.name)
+                int_arrays.discard(st_scalar_reduction.name)
+                real_scalars.discard(st_scalar_reduction.name)
+                real_arrays.discard(st_scalar_reduction.name)
+                local_ranks[st_scalar_reduction.name] = 0
+                params.pop(st_scalar_reduction.name, None)
         changed_scalar = True
         while changed_scalar:
             changed_scalar = False
@@ -26428,6 +26679,13 @@ def emit_function(
                 rhs_index_scalar,
                 re.IGNORECASE,
             ) or re.match(r"^\s*(?:maxloc|minloc)\s*\(", rhs_index_scalar_f, re.IGNORECASE):
+                ints.add(st_index_scalar.name)
+                int_arrays.discard(st_index_scalar.name)
+                real_scalars.discard(st_index_scalar.name)
+                real_arrays.discard(st_index_scalar.name)
+                local_ranks[st_index_scalar.name] = 0
+                params.pop(st_index_scalar.name, None)
+            elif re.search(r"\b(?:which\.max|which\.min|maxloc|minloc)\s*\(", rhs_index_scalar, re.IGNORECASE):
                 ints.add(st_index_scalar.name)
                 int_arrays.discard(st_index_scalar.name)
                 real_scalars.discard(st_index_scalar.name)
@@ -38216,6 +38474,68 @@ def lower_dataframe_minloc_row_assignments_text(f90: str) -> str:
         r"\1\2 = minloc(\4, dim=1)",
         f90,
     )
+
+
+def demote_minloc_index_declarations_text(f90: str) -> str:
+    scalar_index_names = {
+        m.group(1)
+        for m in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*(?:minloc|maxloc)\s*\([^,\n]+,\s*dim\s*=\s*1\s*\)(?:\s*[-+]\s*\d+)?\s*$",
+            f90,
+        )
+    }
+    if not scalar_index_names:
+        return f90
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_decl = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None or "!" in line:
+            out.append(line)
+            continue
+        indent, rest = m_decl.groups()
+        kept: list[str] = []
+        demoted: list[str] = []
+        for part in split_top_level_commas(rest):
+            txt = part.strip()
+            m_part = re.match(r"^([A-Za-z]\w*)\s*\(:\)\s*$", txt)
+            if m_part is not None and m_part.group(1) in scalar_index_names:
+                demoted.append(m_part.group(1))
+            else:
+                kept.append(txt)
+        if kept:
+            out.append(f"{indent}integer, allocatable :: {', '.join(kept)}")
+        if demoted:
+            out.append(f"{indent}integer :: {', '.join(demoted)}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_arima_fit_list_result_text(f90: str) -> str:
+    if "arima_fit_t" not in f90:
+        return f90
+    f90 = re.sub(
+        r'coefs\s*\(\s*r_paste0_real\s*\(\s*"ar"\s*,\s*real\s*\(\s*r_seq_int\s*\(\s*1\s*,\s*([A-Za-z]\w*)\s*\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*\)',
+        r"coefs(r_seq_int(1, \1))",
+        f90,
+    )
+    f90 = re.sub(
+        r'coefs\s*\(\s*r_paste0_int\s*\(\s*"ar"\s*,\s*r_seq_int\s*\(\s*1\s*,\s*([A-Za-z]\w*)\s*\)\s*\)\s*\)',
+        r"coefs(r_seq_int(1, \1))",
+        f90,
+    )
+    f90 = re.sub(r'coefs\s*\(\s*"intercept"\s*\)', "coefs(best_p + 1)", f90)
+    f90 = re.sub(
+        r"if\s*\(\s*any\s*\(\s*r_in\s*\(\s*\[character\(len=\d+\)\s*::\s*&\s*\n\s*&\s*\"intercept\"\s*\]\s*,\s*r_paste0_int\s*\(\"\",\s*r_seq_int\(1,\s*size\(coefs\)\)\)\s*\)\s*\)\s*\)\s*then",
+        "if (size(coefs) >= best_p + 1) then",
+        f90,
+        flags=re.IGNORECASE,
+    )
+    f90 = re.sub(
+        r"(?m)^(\s*)real\(kind=dp\),\s*allocatable\s*::\s*residuals\(:\),\s*fit\(:\)\s*$",
+        r"\1real(kind=dp), allocatable :: residuals(:)\n\1type(arima_fit_t) :: fit",
+        f90,
+    )
+    return f90
 
 
 def rewrite_lowered_dataframe_prints_text(f90: str) -> str:
@@ -55114,6 +55434,8 @@ def main() -> int:
     f90 = lower_rbind_dataframe_appends_text(f90)
     f90 = demote_scalar_dataframe_append_temporaries_text(f90)
     f90 = lower_dataframe_minloc_row_assignments_text(f90)
+    f90 = demote_minloc_index_declarations_text(f90)
+    f90 = repair_arima_fit_list_result_text(f90)
     f90 = rewrite_lowered_dataframe_prints_text(f90)
     f90 = rewrite_guarded_index_merge_assignments_text(f90)
     f90 = broadcast_matrix_row_reducer_arithmetic_text(f90)
@@ -55164,6 +55486,8 @@ def main() -> int:
         f90 = lower_rbind_dataframe_appends_text(f90)
         f90 = demote_scalar_dataframe_append_temporaries_text(f90)
         f90 = lower_dataframe_minloc_row_assignments_text(f90)
+        f90 = demote_minloc_index_declarations_text(f90)
+        f90 = repair_arima_fit_list_result_text(f90)
         f90 = rewrite_lowered_dataframe_prints_text(f90)
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = promote_cluster_field_assignments_text(f90)
@@ -55191,6 +55515,8 @@ def main() -> int:
         f90 = lower_rbind_dataframe_appends_text(f90)
         f90 = demote_scalar_dataframe_append_temporaries_text(f90)
         f90 = lower_dataframe_minloc_row_assignments_text(f90)
+        f90 = demote_minloc_index_declarations_text(f90)
+        f90 = repair_arima_fit_list_result_text(f90)
         f90 = rewrite_lowered_dataframe_prints_text(f90)
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
         f90 = lower_supported_vapply_writes_text(f90)
@@ -55390,6 +55716,7 @@ def main() -> int:
     f90 = promote_real_matrix_initializer_decls_text(f90)
     f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = coalesce_final_declarations_text(f90, max_len=132)
+    f90 = repair_arima_fit_list_result_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
