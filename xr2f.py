@@ -46853,6 +46853,10 @@ def promote_formals_from_call_actual_ranks_text(f90: str) -> str:
                             required[key] = max(required.get(key, 0), rank)
                         elif key in required:
                             conflicts.add(key)
+                elif _infer_assignment_rank_hint(actual, {}) > 0:
+                    rank = _infer_assignment_rank_hint(actual, {})
+                    key = (callee_l, formal_i)
+                    required[key] = max(required.get(key, 0), rank)
                 elif re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", actual_l):
                     conflicts.add((callee_l, formal_i))
 
@@ -47227,6 +47231,152 @@ def promote_vector_result_from_vector_dummy_expr_text(f90: str) -> str:
         return block
 
     return proc_pat.sub(repl_proc, f90)
+
+
+def promote_diff_matrix_function_results_text(f90: str) -> str:
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\(.*?"
+        r"\bresult\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\b[^\n]*)"
+    )
+    rank2_result_fns: set[str] = set()
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        block = m_proc.group(1)
+        fn_name = m_proc.group(2)
+        result = m_proc.group(3)
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*\)",
+            block,
+        ) is None:
+            return block
+        rank2_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(([^)]*)\)", part.strip())
+                if m_item is not None and m_item.group(2).count(":") >= 2:
+                    rank2_names.add(m_item.group(1).lower())
+        if not rank2_names:
+            return block
+        if not any(
+            re.search(
+                rf"(?im)^\s*{re.escape(result)}\s*=\s*diff\s*\(\s*{re.escape(name)}\s*\)\s*$",
+                block,
+            )
+            for name in rank2_names
+        ):
+            return block
+        rank2_result_fns.add(fn_name.lower())
+        return re.sub(
+            rf"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*){re.escape(result)}\s*\(:\s*\)",
+            rf"\1{result}(:,:)",
+            block,
+            count=1,
+        )
+
+    f90 = proc_pat.sub(repl_proc, f90)
+    if not rank2_result_fns:
+        return f90
+    out_lines: list[str] = []
+    for ln in f90.splitlines():
+        m_call = re.match(r"^(\s*)call\s+(.*)$", ln, re.IGNORECASE)
+        if m_call is None or "print_real_vector" not in ln:
+            out_lines.append(ln)
+            continue
+
+        changed = False
+
+        def repl_print(args_src: str) -> str:
+            nonlocal changed
+            arg = args_src.strip()
+            m_arg = re.match(r"([A-Za-z]\w*)\s*\(", arg)
+            if m_arg is not None and m_arg.group(1).lower() in rank2_result_fns:
+                changed = True
+                return f"print_matrix({arg})"
+            return f"print_real_vector({args_src})"
+
+        tail = _replace_balanced_func_calls(m_call.group(2), "print_real_vector", repl_print)
+        out_lines.append(f"{m_call.group(1)}call {tail}" if changed else ln)
+    return "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_diff_function_from_matrix_calls_text(f90: str) -> str:
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\((.*?)\)"
+        r"(?:\s+result\s*\(\s*([A-Za-z]\w*)\s*\))?.*?^\s*end\s+function\b[^\n]*)"
+    )
+    promoted: dict[str, tuple[str, str]] = {}
+    for m_proc in proc_pat.finditer(f90):
+        block = m_proc.group(1)
+        fn_name = m_proc.group(2)
+        args = [a.strip() for a in split_top_level_commas(m_proc.group(3)) if a.strip()]
+        result = m_proc.group(4)
+        if len(args) != 1 or not result:
+            continue
+        arg = args[0]
+        if re.search(
+            rf"(?im)^\s*{re.escape(result)}\s*=\s*diff\s*\(\s*{re.escape(arg)}\s*\)\s*$",
+            block,
+        ) is None:
+            continue
+        if "(:,:)" in block:
+            continue
+        call_pat = re.compile(rf"\b{re.escape(fn_name)}\s*\(", re.IGNORECASE)
+        matrix_call = False
+
+        def observe_call(args_src: str) -> str:
+            nonlocal matrix_call
+            actuals = split_top_level_commas(args_src)
+            if len(actuals) == 1 and _infer_assignment_rank_hint(actuals[0].strip(), {}) >= 2:
+                matrix_call = True
+            return f"{fn_name}({args_src})"
+
+        if call_pat.search(f90):
+            _replace_balanced_func_calls(f90, fn_name, observe_call)
+        if matrix_call:
+            promoted[fn_name.lower()] = (arg, result)
+    if not promoted:
+        return f90
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        fn_l = m_proc.group(2).lower()
+        if fn_l not in promoted:
+            return m_proc.group(1)
+        arg, result = promoted[fn_l]
+        block = m_proc.group(1)
+        block = re.sub(
+            rf"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*){re.escape(arg)}\s*$",
+            rf"\1{arg}(:,:)",
+            block,
+            count=1,
+        )
+        block = re.sub(
+            rf"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,\s*allocatable)?\s*::\s*){re.escape(result)}(?:\s*\(:\s*\))?\s*$",
+            rf"\1{result}(:,:)",
+            block,
+            count=1,
+        )
+        block = re.sub(
+            rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*{re.escape(result)}\s*\(:\s*,\s*:\s*\)\s*$",
+            rf"\1real(kind=dp), allocatable :: {result}(:,:)",
+            block,
+            count=1,
+        )
+        return block
+
+    f90 = proc_pat.sub(repl_proc, f90)
+    for fn_l in promoted:
+        out_lines: list[str] = []
+        for ln in f90.splitlines():
+            m_print = re.match(r"^(\s*)write\(\*,\"(?:(?:\(g0\))|(?:\(\*\(g0,1x\)\)))\"\)\s+(.+)$", ln, re.IGNORECASE)
+            if m_print is not None and re.match(rf"\s*{re.escape(fn_l)}\s*\(", m_print.group(2), re.IGNORECASE):
+                out_lines.append(f"{m_print.group(1)}call print_matrix({m_print.group(2).strip()})")
+                continue
+            out_lines.append(ln)
+        f90 = "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
+    return f90
 
 
 def flatten_rank2_assignments_to_vector_results_text(f90: str) -> str:
@@ -54010,6 +54160,8 @@ def main() -> int:
     f90 = fix_row_slice_assignment_from_rank2_local_text(f90)
     f90 = demote_solve_vector_lhs_text(f90)
     f90 = promote_vector_result_from_vector_dummy_expr_text(f90)
+    f90 = promote_diff_matrix_function_results_text(f90)
+    f90 = promote_diff_function_from_matrix_calls_text(f90)
     f90 = flatten_rank2_assignments_to_vector_results_text(f90)
     f90 = rewrite_indexed_matrix_function_results_text(f90)
     f90 = rewrite_integer_literal_diag_actuals_text(f90)
