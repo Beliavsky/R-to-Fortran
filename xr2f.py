@@ -15224,21 +15224,35 @@ def r_expr_to_fortran(expr: str) -> str:
                 dim_src = m_dim_sum.group(1).strip()
             else:
                 kept_sum.append(part_sum)
-        x_src, na_rm = _split_reduction_args(", ".join(kept_sum))
-        masked = _logical_mask_subset_fortran(x_src)
-        if masked is not None:
-            inner_f_masked, _n_f_masked = masked
-            dim_suffix_masked = f", dim={_int_bound_expr(r_expr_to_fortran(dim_src))}" if dim_src is not None else ""
-            if na_rm:
-                return f"sum({_non_na_pack_expr(inner_f_masked)}{dim_suffix_masked})"
-            return f"sum({inner_f_masked}{dim_suffix_masked})"
-        inner_f = r_expr_to_fortran(x_src)
+        x_parts_sum, na_rm = _split_reduction_arg_list(", ".join(kept_sum))
         dim_suffix = f", dim={_int_bound_expr(r_expr_to_fortran(dim_src))}" if dim_src is not None else ""
-        if _is_logical_reduction_arg(x_src, inner_f):
-            return f"count({inner_f}{dim_suffix})"
-        if na_rm:
-            return f"sum({_non_na_pack_expr(inner_f)}{dim_suffix})"
-        return f"sum({inner_f}{dim_suffix})"
+
+        def one_sum(x_src: str) -> str:
+            masked = _logical_mask_subset_fortran(x_src)
+            if masked is not None:
+                inner_f_masked, _n_f_masked = masked
+                if na_rm:
+                    return f"sum({_non_na_pack_expr(inner_f_masked)}{dim_suffix})"
+                return f"sum({inner_f_masked}{dim_suffix})"
+            inner_f = r_expr_to_fortran(x_src)
+            if _is_logical_reduction_arg(x_src, inner_f):
+                return f"count({inner_f}{dim_suffix})"
+            if (
+                dim_src is None
+                and _infer_assignment_rank_hint(inner_f, {}) == 0
+                and "[" not in inner_f
+                and "]" not in inner_f
+                and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", inner_f.strip())
+            ):
+                return inner_f
+            if na_rm:
+                return f"sum({_non_na_pack_expr(inner_f)}{dim_suffix})"
+            return f"sum({inner_f}{dim_suffix})"
+
+        if not x_parts_sum:
+            return "0"
+        pieces_sum = [one_sum(x_src) for x_src in x_parts_sum]
+        return pieces_sum[0] if len(pieces_sum) == 1 else "(" + " + ".join(pieces_sum) + ")"
 
     s = _replace_balanced_func_calls(
         s,
@@ -42437,6 +42451,137 @@ def demote_scalar_reducer_allocatable_results_text(f90: str) -> str:
     return proc_re.sub(repl_proc, f90)
 
 
+def demote_scalar_reducer_allocatable_locals_text(f90: str) -> str:
+    scalar_targets: set[str] = set()
+    for m_assign in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", f90):
+        lhs = m_assign.group(1)
+        rhs = re.sub(r"&\s*\n\s*&\s*", " ", m_assign.group(2).strip())
+        rhs_l = rhs.lower()
+        if "[" in rhs or "]" in rhs or ":" in rhs or "dim=" in rhs_l:
+            continue
+        if re.search(
+            r"\b(?:pack|reshape|spread|matrix|r_rep_|r_seq_|rbind|cbind|r_matmul|matmul|solve_real|diff)\s*\(",
+            rhs,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.search(r"\b(?:sum|maxval|minval|dot_product|size|count|sd|var|mean)\s*\(", rhs, re.IGNORECASE) is None:
+            continue
+        tmp = re.sub(
+            r"\b(?:sum|maxval|minval|dot_product|size|count|sd|var|mean)\s*\([^()]*\)",
+            "0",
+            rhs,
+            flags=re.IGNORECASE,
+        )
+        tmp = re.sub(r"\b[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?\b", "0", tmp)
+        if re.search(r"[A-Za-z_]", tmp) is None and re.fullmatch(r"[\s()+\-*/0.]+", tmp):
+            scalar_targets.add(lhs.lower())
+    if not scalar_targets:
+        return f90
+
+    def repl_decl(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            text = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*\(:\s*\)$", text)
+            if m_item is not None and m_item.group(1).lower() in scalar_targets:
+                moved.append(m_item.group(1))
+            else:
+                kept.append(text)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        for name in moved:
+            lines.append(re.sub(r",\s*allocatable\s*", "", prefix, flags=re.IGNORECASE) + name)
+        return "\n".join(lines) if moved else m_decl.group(0)
+
+    return re.sub(
+        r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*)(.+)$",
+        repl_decl,
+        f90,
+    )
+
+
+def demote_integer_sum_scalar_locals_text(f90: str) -> str:
+    int_targets: set[str] = set()
+    for m_assign in re.finditer(r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(.+)$", f90):
+        lhs = m_assign.group(1)
+        rhs = m_assign.group(2).strip()
+        rhs_l = rhs.lower()
+        if "sum(r_seq_int(" not in rhs_l:
+            continue
+        if (
+            "_dp" in rhs_l
+            or "dim=" in rhs_l
+            or ":" in rhs
+            or "[" in rhs
+            or "]" in rhs
+            or re.search(r"\d+\.\d*", rhs)
+            or re.search(r"\b(?:r_matmul|matmul|solve_real|pack|reshape|spread|matrix|diff)\s*\(", rhs, re.IGNORECASE)
+        ):
+            continue
+        tmp = re.sub(r"\bsum\s*\(\s*r_seq_int\s*\([^()]*\)\s*\)", "0", rhs, flags=re.IGNORECASE)
+        tmp = re.sub(r"\b[+-]?\d+\b", "0", tmp)
+        if re.fullmatch(r"[\s()+\-*/0]+", tmp) and re.search(r"[A-Za-z_]", tmp) is None:
+            int_targets.add(lhs.lower())
+    if not int_targets:
+        return f90
+
+    def repl_decl(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            text = part.strip()
+            base = re.sub(r"\s*=.*$", "", text).strip()
+            if base.lower() in int_targets:
+                moved.append(base)
+            else:
+                kept.append(text)
+        if not moved:
+            return m_decl.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        lines.append(re.sub(r"real\s*\(\s*kind\s*=\s*dp\s*\)", "integer", prefix, flags=re.IGNORECASE) + ", ".join(moved))
+        return "\n".join(lines)
+
+    def repl_alloc_decl(m_decl: re.Match[str]) -> str:
+        prefix = m_decl.group(1)
+        parts = split_top_level_commas(m_decl.group(2))
+        kept: list[str] = []
+        moved: list[str] = []
+        for part in parts:
+            text = part.strip()
+            m_item = re.match(r"([A-Za-z]\w*)\s*\(:\s*\)$", text)
+            if m_item is not None and m_item.group(1).lower() in int_targets:
+                moved.append(m_item.group(1))
+            else:
+                kept.append(text)
+        if not moved:
+            return m_decl.group(0)
+        lines: list[str] = []
+        if kept:
+            lines.append(prefix + ", ".join(kept))
+        lines.append(re.sub(r"real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable", "integer", prefix, flags=re.IGNORECASE) + ", ".join(moved))
+        return "\n".join(lines)
+
+    f90 = re.sub(
+        r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*)(.+)$",
+        repl_alloc_decl,
+        f90,
+    )
+    return re.sub(
+        r"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*::\s*)(.+)$",
+        repl_decl,
+        f90,
+    )
+
+
 def promote_logical_function_result_assignments(lines: list[str]) -> list[str]:
     logical_funcs: set[str] = set()
     current_fn: str | None = None
@@ -47340,12 +47485,18 @@ def promote_diff_function_from_matrix_calls_text(f90: str) -> str:
     if not promoted:
         return f90
 
+    concrete_by_generic: dict[str, list[str]] = {}
+
     def repl_proc(m_proc: re.Match[str]) -> str:
         fn_l = m_proc.group(2).lower()
         if fn_l not in promoted:
             return m_proc.group(1)
         arg, result = promoted[fn_l]
         block = m_proc.group(1)
+        fn_name = m_proc.group(2)
+        real_matrix_name = f"{fn_name}_real_matrix"
+        real_vector_name = f"{fn_name}_real_vector"
+        int_vector_name = f"{fn_name}_int_vector"
         block = re.sub(
             rf"(?im)^(\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*){re.escape(arg)}\s*$",
             rf"\1{arg}(:,:)",
@@ -47364,9 +47515,47 @@ def promote_diff_function_from_matrix_calls_text(f90: str) -> str:
             block,
             count=1,
         )
-        return block
+        block = re.sub(
+            rf"(?im)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+){re.escape(fn_name)}(\s*\()",
+            rf"\1{real_matrix_name}\2",
+            block,
+            count=1,
+        )
+        block = re.sub(
+            rf"(?im)^(\s*end\s+function\s+){re.escape(fn_name)}\s*$",
+            rf"\1{real_matrix_name}",
+            block,
+            count=1,
+        )
+        real_vector_block = (
+            f"pure function {real_vector_name}({arg}) result({result})\n"
+            f"real(kind=dp), intent(in) :: {arg}(:)\n"
+            f"real(kind=dp), allocatable :: {result}(:)\n"
+            f"{result} = diff({arg})\n"
+            f"end function {real_vector_name}"
+        )
+        int_vector_block = (
+            f"pure function {int_vector_name}({arg}) result({result})\n"
+            f"integer, intent(in) :: {arg}(:)\n"
+            f"integer, allocatable :: {result}(:)\n"
+            f"{result} = diff({arg})\n"
+            f"end function {int_vector_name}"
+        )
+        concrete_by_generic[fn_name] = [real_matrix_name, real_vector_name, int_vector_name]
+        return block + "\n\n" + real_vector_block + "\n\n" + int_vector_block
 
     f90 = proc_pat.sub(repl_proc, f90)
+    if concrete_by_generic:
+        def add_interfaces(m_contains: re.Match[str]) -> str:
+            blocks: list[str] = []
+            for generic_name, concrete_names in concrete_by_generic.items():
+                blocks.append(f"interface {generic_name}")
+                for concrete_name in concrete_names:
+                    blocks.append(f"   module procedure {concrete_name}")
+                blocks.append(f"end interface {generic_name}")
+            return "\n".join(blocks) + "\n" + m_contains.group(0)
+
+        f90 = re.sub(r"(?im)^\s*contains\s*$", add_interfaces, f90, count=1)
     for fn_l in promoted:
         out_lines: list[str] = []
         for ln in f90.splitlines():
@@ -47376,6 +47565,217 @@ def promote_diff_function_from_matrix_calls_text(f90: str) -> str:
                 continue
             out_lines.append(ln)
         f90 = "\n".join(out_lines) + ("\n" if f90.endswith("\n") else "")
+    return f90
+
+
+def specialize_matrix_diff_function_generics_text(f90: str) -> str:
+    if re.search(r"(?im)^\s*interface\s+\w+\s*$", f90):
+        # Avoid duplicating interface blocks on repeated repair passes.
+        existing_interfaces = {m.group(1).lower() for m in re.finditer(r"(?im)^\s*interface\s+([A-Za-z]\w*)\s*$", f90)}
+    else:
+        existing_interfaces = set()
+    proc_pat = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+([A-Za-z]\w*)\s*\((.*?)\)"
+        r"(?:\s+result\s*\(\s*([A-Za-z]\w*)\s*\))?.*?^\s*end\s+function\s+\2\s*$)"
+    )
+    specializations: dict[str, list[str]] = {}
+
+    def repl_proc(m_proc: re.Match[str]) -> str:
+        block = m_proc.group(1)
+        fn_name = m_proc.group(2)
+        args = [a.strip() for a in split_top_level_commas(m_proc.group(3)) if a.strip()]
+        result = m_proc.group(4)
+        if len(args) != 1 or not result or fn_name.lower() in existing_interfaces:
+            return block
+        arg = args[0]
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*intent\s*\(\s*in\s*\)\s*::\s*{re.escape(arg)}\s*\(:\s*,\s*:\s*\)\s*$",
+            block,
+        ) is None:
+            return block
+        if re.search(
+            rf"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*,\s*:\s*\)\s*$",
+            block,
+        ) is None:
+            return block
+        if re.search(
+            rf"(?im)^\s*{re.escape(result)}\s*=\s*diff\s*\(\s*{re.escape(arg)}\s*\)\s*$",
+            block,
+        ) is None:
+            return block
+        real_matrix_name = f"{fn_name}_real_matrix"
+        real_vector_name = f"{fn_name}_real_vector"
+        int_vector_name = f"{fn_name}_int_vector"
+        matrix_block = re.sub(
+            rf"(?im)^(\s*(?:pure\s+|recursive\s+|elemental\s+)*function\s+){re.escape(fn_name)}(\s*\()",
+            rf"\1{real_matrix_name}\2",
+            block,
+            count=1,
+        )
+        matrix_block = re.sub(
+            rf"(?im)^(\s*end\s+function\s+){re.escape(fn_name)}\s*$",
+            rf"\1{real_matrix_name}",
+            matrix_block,
+            count=1,
+        )
+        real_vector_block = (
+            f"pure function {real_vector_name}({arg}) result({result})\n"
+            f"real(kind=dp), intent(in) :: {arg}(:)\n"
+            f"real(kind=dp), allocatable :: {result}(:)\n"
+            f"{result} = diff({arg})\n"
+            f"end function {real_vector_name}"
+        )
+        int_vector_block = (
+            f"pure function {int_vector_name}({arg}) result({result})\n"
+            f"integer, intent(in) :: {arg}(:)\n"
+            f"integer, allocatable :: {result}(:)\n"
+            f"{result} = diff({arg})\n"
+            f"end function {int_vector_name}"
+        )
+        specializations[fn_name] = [real_matrix_name, real_vector_name, int_vector_name]
+        return matrix_block + "\n\n" + real_vector_block + "\n\n" + int_vector_block
+
+    f90_new = proc_pat.sub(repl_proc, f90)
+    if not specializations:
+        return f90
+
+    def add_interfaces(m_contains: re.Match[str]) -> str:
+        blocks: list[str] = []
+        for generic_name, concrete_names in specializations.items():
+            blocks.append(f"interface {generic_name}")
+            for concrete_name in concrete_names:
+                blocks.append(f"   module procedure {concrete_name}")
+            blocks.append(f"end interface {generic_name}")
+        return "\n".join(blocks) + "\n" + m_contains.group(0)
+
+    return re.sub(r"(?im)^\s*contains\s*$", add_interfaces, f90_new, count=1)
+
+
+def repair_diff_generic_specializations_text(f90: str) -> str:
+    generic_to_concretes: dict[str, set[str]] = {}
+    for m_iface in re.finditer(
+        r"(?ims)^\s*interface\s+([A-Za-z]\w*)\s*$.*?^\s*end\s+interface\s+\1\s*$",
+        f90,
+    ):
+        concrete = set(re.findall(r"(?im)^\s*module\s+procedure\s+([A-Za-z]\w*)\s*$", m_iface.group(0)))
+        if any(name.endswith("_int_vector") for name in concrete):
+            generic_to_concretes[m_iface.group(1)] = concrete
+    if not generic_to_concretes:
+        return f90
+
+    all_concretes_l = {name.lower() for names in generic_to_concretes.values() for name in names}
+
+    def repl_public(m_pub: re.Match[str]) -> str:
+        prefix = m_pub.group(1)
+        items = [item.strip() for item in split_top_level_commas(m_pub.group(2)) if item.strip()]
+        kept = [item for item in items if item.lower() not in all_concretes_l]
+        for generic_name in generic_to_concretes:
+            if generic_name.lower() not in {item.lower() for item in kept}:
+                kept.insert(0, generic_name)
+        return prefix + ", ".join(kept)
+
+    f90 = re.sub(r"(?im)^(\s*public\s*::\s*)(.+)$", repl_public, f90)
+    for concrete_names in generic_to_concretes.values():
+        for concrete in concrete_names:
+            if not concrete.endswith("_int_vector"):
+                continue
+            block_pat = re.compile(
+                rf"(?ims)^(\s*pure\s+function\s+{re.escape(concrete)}\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\).*?^\s*end\s+function\s+{re.escape(concrete)}\s*$)"
+            )
+
+            def repl_block(m_block: re.Match[str]) -> str:
+                block = m_block.group(1)
+                result = m_block.group(2)
+                return re.sub(
+                    rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*{re.escape(result)}\s*\(:\s*\)\s*$",
+                    rf"\1integer, allocatable :: {result}(:)",
+                    block,
+                    count=1,
+                )
+
+            f90 = block_pat.sub(repl_block, f90)
+    return f90
+
+
+def repair_real_matrix_integer_print_calls_text(f90: str) -> str:
+    real_mats: set[str] = set()
+    for m_decl in re.finditer(
+        r"(?im)^\s*real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*(.+)$",
+        f90,
+    ):
+        for part in split_top_level_commas(m_decl.group(1)):
+            m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\s*\)", part.strip())
+            if m_item is not None:
+                real_mats.add(m_item.group(1).lower())
+    if not real_mats:
+        return f90
+
+    def repl(m_call: re.Match[str]) -> str:
+        name = m_call.group(2)
+        if name.lower() not in real_mats:
+            return m_call.group(0)
+        return f"{m_call.group(1)}call print_matrix({name})"
+
+    return re.sub(
+        r"(?im)^(\s*)call\s+print_integer_vector\s*\(\s*([A-Za-z]\w*)\s*\)\s*$",
+        repl,
+        f90,
+    )
+
+
+def repair_integer_duck_diff_calls_from_source_text(f90: str, src: str) -> str:
+    int_duck_calls: dict[str, tuple[str, list[str]]] = {}
+    for m_call in re.finditer(
+        r"(?im)^\s*([A-Za-z]\w*)\s*(?:<-|=)\s*([A-Za-z]\w*)\s*\(\s*c\s*\(([^)]*\b\d+L\b[^)]*)\)\s*\)\s*$",
+        src,
+    ):
+        lhs = _sanitize_r_var_name(m_call.group(1))
+        fn = _sanitize_r_var_name(m_call.group(2))
+        vals: list[str] = []
+        ok = True
+        for part in split_top_level_commas(m_call.group(3)):
+            tok = part.strip()
+            if not re.fullmatch(r"[+-]?\d+L", tok):
+                ok = False
+                break
+            vals.append(tok[:-1])
+        if ok and vals:
+            int_duck_calls[lhs.lower()] = (fn, vals)
+    if not int_duck_calls:
+        return f90
+
+    lines = f90.splitlines()
+    out: list[str] = []
+    inserted_int_decls: set[str] = set()
+    for ln in lines:
+        m_decl = re.match(r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
+        if m_decl is not None:
+            kept: list[str] = []
+            moved: list[str] = []
+            for part in split_top_level_commas(m_decl.group(2)):
+                m_item = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*\)\s*$", part.strip())
+                if m_item is not None and m_item.group(1).lower() in int_duck_calls:
+                    moved.append(m_item.group(1))
+                else:
+                    kept.append(part.strip())
+            if kept:
+                out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: {', '.join(kept)}")
+            for name in moved:
+                out.append(f"{m_decl.group(1)}integer, allocatable :: {name}(:)")
+                inserted_int_decls.add(name.lower())
+            if moved:
+                continue
+        out.append(ln)
+    f90 = "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+    for lhs_l, (fn, vals) in int_duck_calls.items():
+        if lhs_l not in inserted_int_decls:
+            continue
+        f90 = re.sub(
+            rf"(?im)^(\s*{re.escape(lhs_l)}\s*=\s*){re.escape(fn)}\s*\(\s*\[[^\]\n]*_dp[^\]\n]*\]\s*\)\s*$",
+            rf"\1{fn}([{', '.join(vals)}])",
+            f90,
+        )
     return f90
 
 
@@ -54162,6 +54562,7 @@ def main() -> int:
     f90 = promote_vector_result_from_vector_dummy_expr_text(f90)
     f90 = promote_diff_matrix_function_results_text(f90)
     f90 = promote_diff_function_from_matrix_calls_text(f90)
+    f90 = specialize_matrix_diff_function_generics_text(f90)
     f90 = flatten_rank2_assignments_to_vector_results_text(f90)
     f90 = rewrite_indexed_matrix_function_results_text(f90)
     f90 = rewrite_integer_literal_diag_actuals_text(f90)
@@ -54240,6 +54641,8 @@ def main() -> int:
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = promote_rank3_decls_from_references_text(f90)
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
+    f90 = demote_scalar_reducer_allocatable_locals_text(f90)
+    f90 = demote_integer_sum_scalar_locals_text(f90)
     f90 = declare_missing_matrix_aliases_text(f90)
     f90_lines = promote_rank3_slice_matrix_assignments(f90.splitlines())
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
@@ -54265,6 +54668,8 @@ def main() -> int:
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
     f90 = coerce_positional_integer_actuals_from_decls_text(f90)
     f90 = demote_scalar_reducer_allocatable_results_text(f90)
+    f90 = demote_scalar_reducer_allocatable_locals_text(f90)
+    f90 = demote_integer_sum_scalar_locals_text(f90)
     f90 = demote_scalar_allocatable_function_results_text(f90)
     f90 = add_private_publics_to_generated_modules_text(f90)
     f90 = remove_program_decls_for_public_module_vars_text(f90)
@@ -54284,6 +54689,9 @@ def main() -> int:
     if "date_to_char_vec(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"date_to_char_vec"})
     f90 = repair_integer_vector_print_calls_text(f90)
+    f90 = repair_diff_generic_specializations_text(f90)
+    f90 = repair_real_matrix_integer_print_calls_text(f90)
+    f90 = repair_integer_duck_diff_calls_from_source_text(f90, src)
     if "call print_integer_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
     f90 = repair_matrix_rows_round_prints_text(f90)
