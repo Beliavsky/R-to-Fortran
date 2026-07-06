@@ -3801,6 +3801,15 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
         if text[pos - 1] not in {"e", "E"} or not text[pos + 1].isdigit():
             return False
         return pos >= 2 and (text[pos - 2].isdigit() or text[pos - 2] == ".")
+    def _is_unary_sign(pos: int) -> bool:
+        if token not in {"+", "-"}:
+            return False
+        j = pos - 1
+        while j >= 0 and text[j].isspace():
+            j -= 1
+        if j < 0:
+            return True
+        return text[j] in "([{,=:+-*/^&|!<>~"
 
     in_single = False
     in_double = False
@@ -3856,6 +3865,9 @@ def _split_top_level_token(text: str, token: str, *, from_right: bool = False) -
                 continue
             if pdepth == 0 and bdepth == 0 and cdepth == 0 and text.startswith(token, i):
                 if _is_exponent_sign(i):
+                    i += 1
+                    continue
+                if _is_unary_sign(i):
                     i += 1
                     continue
                 if token == "*" and (
@@ -5125,8 +5137,14 @@ def classify_vars(
             if isinstance(st, Assign):
                 rhs_seed = st.expr.strip()
                 rhs_seed_f = r_expr_to_fortran(rhs_seed)
+                bare_rhs_sequence = (
+                    (_split_top_level_colon(rhs_seed) is not None)
+                    and ("[" not in rhs_seed)
+                    and ("]" not in rhs_seed)
+                    and all(_split_top_level_token(rhs_seed, op, from_right=True) is None for op in ("+", "-", "*", "/"))
+                )
                 if (
-                    ((_split_top_level_colon(rhs_seed) is not None) and ("[" not in rhs_seed) and ("]" not in rhs_seed))
+                    bare_rhs_sequence
                     or re.match(r"^(?:r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs_seed_f, re.IGNORECASE)
                 ):
                     int_arrays.add(st.name)
@@ -5136,6 +5154,15 @@ def classify_vars(
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif re.match(r"^(?:r_seq_real_by|r_seq_real_length)\s*\(", rhs_seed_f, re.IGNORECASE):
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif re.search(r"\br_seq_(?:int|len|int_by|int_length)\s*\(", rhs_seed_f, re.IGNORECASE) and re.search(
+                    r"(?:_dp\b|\d+\.\d*|\.\d+|real\s*\()", rhs_seed_f, re.IGNORECASE
+                ):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -13591,6 +13618,16 @@ def r_expr_to_fortran(expr: str) -> str:
         tr_src = kw_b.get("transpose", ".false.")
         tr_f = r_expr_to_fortran(tr_src)
         return f"{c_back[0].lower()}({r_f}, {x_f}, transpose={tr_f})"
+    for op_seq in ("*", "/"):
+        seq_arith = _split_top_level_token(s, op_seq, from_right=True)
+        if seq_arith is not None:
+            lhs_seq, rhs_seq = seq_arith[0].strip(), seq_arith[1].strip()
+            if lhs_seq and rhs_seq and (
+                _split_top_level_colon(lhs_seq) is not None or _split_top_level_colon(rhs_seq) is not None
+            ):
+                lhs_f = r_expr_to_fortran(lhs_seq)
+                rhs_f = r_expr_to_fortran(rhs_seq)
+                return f"{lhs_f} {op_seq} {rhs_f}"
     # Top-level R sequence operator a:b
     s_seq = _split_top_level_colon(s)
     if s_seq is not None and ("[" not in s) and ("]" not in s):
@@ -18955,7 +18992,12 @@ def emit_stmts(
                 _wstmt(f"{st.name} = merge(1, int(floor(log10({xr_nchar}))) + 1, {xr_nchar} < 1.0_dp)", st.comment)
                 continue
             m_seq_assign = _split_top_level_colon(rhs)
-            if m_seq_assign is not None and ("[" not in rhs) and ("]" not in rhs):
+            if (
+                m_seq_assign is not None
+                and ("[" not in rhs)
+                and ("]" not in rhs)
+                and all(_split_top_level_token(rhs, op, from_right=True) is None for op in ("+", "-", "*", "/"))
+            ):
                 a_src, b_src = m_seq_assign
                 a_f = _int_bound_expr(r_expr_to_fortran(a_src))
                 b_f = _int_bound_expr(r_expr_to_fortran(b_src))
@@ -31793,6 +31835,20 @@ def transpile_r_to_fortran(
         real_rank3_arrays.discard(nm)
         real_rank4_arrays.discard(nm)
         int_matrices.discard(nm)
+    for st_seq_real in main_stmts:
+        if not isinstance(st_seq_real, Assign):
+            continue
+        rhs_seq_real_f = r_expr_to_fortran(st_seq_real.expr.strip())
+        if re.search(r"\br_seq_(?:int|len|int_by|int_length)\s*\(", rhs_seq_real_f, re.IGNORECASE) and re.search(
+            r"(?:_dp\b|\d+\.\d*|\.\d+|real\s*\()", rhs_seq_real_f, re.IGNORECASE
+        ):
+            real_arrays.add(st_seq_real.name)
+            int_arrays.discard(st_seq_real.name)
+            ints.discard(st_seq_real.name)
+            real_scalars.discard(st_seq_real.name)
+            params.pop(st_seq_real.name, None)
+            real_params.pop(st_seq_real.name, None)
+            array_params.pop(st_seq_real.name, None)
     real_matrices.difference_update(int_matrices)
     helper_ctx_main["int_matrix_vars"] = set(int_matrices) | set(int_rank3_arrays)
     helper_ctx_main["real_matrix_vars"] = set(real_matrices) | set(real_rank3_arrays) | set(real_rank4_arrays) | set(int_rank3_arrays)
