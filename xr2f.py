@@ -42395,6 +42395,108 @@ def restore_renamed_hmm_list_fields(lines: list[str]) -> list[str]:
     return out
 
 
+def restore_renamed_list_result_field_uses(lines: list[str]) -> list[str]:
+    """Rewrite stale list field uses to renamed derived-type components.
+
+    A local variable renamed for shape changes can make a list field component
+    become, for example, ``p_2(:)``. Earlier branches that return
+    ``list(p = 1, ...)`` may still emit ``result%p`` even though the generated
+    derived type only has ``p_2``. Keep uses consistent with the component
+    actually declared in each result type.
+    """
+    aliases_by_type: dict[str, dict[str, tuple[str, int]]] = {}
+    current_type: str | None = None
+    fields: dict[str, int] = {}
+    type_fields: dict[str, dict[str, int]] = {}
+    type_start_re = re.compile(r"^\s*type\s*::\s*([A-Za-z]\w*)\b", re.IGNORECASE)
+    type_end_re = re.compile(r"^\s*end\s+type\b", re.IGNORECASE)
+    decl_re = re.compile(r"^\s*(?:integer|real\(kind=dp\)|logical|complex\(kind=dp\)|character\([^)]*\))[^:]*::\s*(.+)$", re.IGNORECASE)
+
+    for ln in lines:
+        m_start = type_start_re.match(ln)
+        if m_start is not None:
+            current_type = m_start.group(1)
+            fields = {}
+            continue
+        if current_type is not None:
+            if type_end_re.match(ln):
+                type_fields[current_type] = fields
+                current_type = None
+                fields = {}
+                continue
+            m_decl = decl_re.match(ln)
+            if m_decl is not None:
+                for part in split_top_level_commas(m_decl.group(1)):
+                    name = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+                    if name:
+                        rank = 0
+                        if re.search(r"\(:\s*,\s*:\)", part):
+                            rank = 2
+                        elif re.search(r"\(:\)", part):
+                            rank = 1
+                        fields[name] = rank
+
+    for typ, names in type_fields.items():
+        aliases: dict[str, tuple[str, int]] = {}
+        for name in sorted(names):
+            m = re.match(r"^([A-Za-z]\w*?)(?:_\d+)+$", name)
+            if m is None:
+                continue
+            base = m.group(1)
+            if base not in names:
+                aliases.setdefault(base, (name, names[name]))
+        if aliases:
+            aliases_by_type[typ] = aliases
+
+    if not aliases_by_type:
+        return lines
+
+    vars_by_type: dict[str, set[str]] = {typ: set() for typ in aliases_by_type}
+    type_var_re = re.compile(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*::\s*(.+)$", re.IGNORECASE)
+    for ln in lines:
+        m = type_var_re.match(ln)
+        if m is None:
+            continue
+        typ = m.group(1)
+        if typ not in vars_by_type:
+            continue
+        for part in split_top_level_commas(m.group(2)):
+            name = re.sub(r"\s*\(.*\)\s*$", "", part.split("=", 1)[0].strip()).strip()
+            if name:
+                vars_by_type[typ].add(name)
+
+    replacements: list[tuple[str, str, str, int]] = []
+    for typ, vars_for_type in vars_by_type.items():
+        for var in vars_for_type:
+            for base, (actual, rank) in aliases_by_type[typ].items():
+                replacements.append((var, base, actual, rank))
+    if not replacements:
+        return lines
+
+    out: list[str] = []
+    for ln in lines:
+        new_ln = ln
+        for var, base, actual, rank in replacements:
+            new_ln = re.sub(
+                rf"\b{re.escape(var)}\s*%\s*{re.escape(base)}\b(?!_\d)",
+                f"{var}%{actual}",
+                new_ln,
+            )
+            if rank == 1:
+                m_assign = re.match(rf"^(\s*{re.escape(var)}%{re.escape(actual)}\s*=\s*)(.+?)\s*$", new_ln)
+                if m_assign is not None:
+                    rhs = m_assign.group(2).strip()
+                    if (
+                        not rhs.startswith("[")
+                        and rhs != actual
+                        and not re.match(r"^[A-Za-z]\w*\s*\(", rhs)
+                        and not re.match(r"^[A-Za-z]\w*(?:_\d+)+$", rhs)
+                    ):
+                        new_ln = f"{m_assign.group(1)}[real({rhs}, kind=dp)]"
+        out.append(new_ln)
+    return out
+
+
 def rewrite_selected_model_object_branch(lines: list[str]) -> list[str]:
     """Lower a heterogeneous selected_objects[[j]] list branch to direct field copies."""
     out: list[str] = []
@@ -54429,6 +54531,7 @@ def main() -> int:
     f90_lines = promote_normalize_result_vectors(f90_lines)
     f90_lines = repair_apply_column_summary_matrix(f90_lines)
     f90_lines = repair_rank3_call_slice_assignments(f90_lines)
+    f90_lines = restore_renamed_list_result_field_uses(f90_lines)
     f90_lines = restore_renamed_hmm_list_fields(f90_lines)
     f90_lines = rewrite_selected_model_object_branch(f90_lines)
     f90_lines = promote_chosen_model_character_vector(f90_lines)
@@ -55733,6 +55836,9 @@ def main() -> int:
     f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = coalesce_final_declarations_text(f90, max_len=132)
     f90 = repair_arima_fit_list_result_text(f90)
+    f90 = "\n".join(restore_renamed_list_result_field_uses(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    if "call print_real_vector(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
