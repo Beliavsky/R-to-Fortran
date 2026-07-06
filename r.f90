@@ -8,7 +8,8 @@ use, intrinsic :: iso_c_binding, only: c_double, c_int
 #endif
 implicit none
 private
-public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rt_vec, rnorm_mat, rbinom, rpois, random_choice2_prob, &
+public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq, rt_vec, rf_rng, rlogis, rlnorm, &
+   & rweibull, rcauchy, rgeom, rnbinom, rhyper, rwilcox, rsignrank, rmultinom, rnorm_mat, rbinom, rpois, random_choice2_prob, &
    & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
@@ -505,6 +506,66 @@ interface rpois
    module procedure rpois_scalar
    module procedure rpois_vector
 end interface rpois
+
+interface rexp
+   module procedure rexp_rng
+end interface rexp
+
+interface rgamma
+   module procedure rgamma_rng
+end interface rgamma
+
+interface rbeta
+   module procedure rbeta_rng
+end interface rbeta
+
+interface rchisq
+   module procedure rchisq_rng
+end interface rchisq
+
+interface rf_rng
+   module procedure rf_rng_vec
+end interface rf_rng
+
+interface rlogis
+   module procedure rlogis_rng
+end interface rlogis
+
+interface rlnorm
+   module procedure rlnorm_rng
+end interface rlnorm
+
+interface rweibull
+   module procedure rweibull_rng
+end interface rweibull
+
+interface rcauchy
+   module procedure rcauchy_rng
+end interface rcauchy
+
+interface rgeom
+   module procedure rgeom_rng
+end interface rgeom
+
+interface rnbinom
+   module procedure rnbinom_rng
+end interface rnbinom
+
+interface rhyper
+   module procedure rhyper_rng
+end interface rhyper
+
+interface rwilcox
+   module procedure rwilcox_rng
+end interface rwilcox
+
+interface rsignrank
+   module procedure rsignrank_rng
+end interface rsignrank
+
+interface rmultinom
+   module procedure rmultinom_rng
+end interface rmultinom
 
 interface dnorm
    module procedure dnorm_vec
@@ -5384,6 +5445,234 @@ u = runif_vec(n)
 chi = qchisq(u, df)
 x = z / sqrt(chi / df)
 end function rt_vec
+
+function rexp_rng(n, rate) result(x)
+! Return n exponential variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in), optional :: rate
+real(kind=dp), allocatable :: x(:)
+real(kind=dp) :: rt
+rt = 1.0_dp
+if (present(rate)) rt = rate
+rt = max(rt, tiny(1.0_dp))
+x = -log(max(tiny(1.0_dp), 1.0_dp - runif_vec(max(0, n)))) / rt
+end function rexp_rng
+
+recursive function rgamma_one(shape, rate) result(x)
+! Draw one gamma variate.
+! Uses the Marsaglia-Tsang method, adapted from Alan Miller's public-domain
+! rng/rgamma.f90 implementation.
+real(kind=dp), intent(in) :: shape, rate
+real(kind=dp) :: x
+real(kind=dp) :: a, rt, d, c, u, v, z
+a = shape
+rt = max(rate, tiny(1.0_dp))
+if (a <= 0.0_dp) then
+   x = ieee_value(1.0_dp, ieee_quiet_nan)
+   return
+end if
+if (a < 1.0_dp) then
+   u = max(tiny(1.0_dp), runif1())
+   x = rgamma_one(a + 1.0_dp, rt) * u**(1.0_dp / a)
+   return
+end if
+d = a - 1.0_dp / 3.0_dp
+c = 1.0_dp / sqrt(9.0_dp * d)
+do
+   do
+      z = rnorm1()
+      v = (1.0_dp + c * z)**3
+      if (v > 0.0_dp) exit
+   end do
+   u = runif1()
+   if (u < 1.0_dp - 0.0331_dp * z**4) exit
+   if (log(max(tiny(1.0_dp), u)) < 0.5_dp * z**2 + d * (1.0_dp - v + log(v))) exit
+end do
+x = d * v / rt
+end function rgamma_one
+
+function rgamma_rng(n, shape, rate, scale) result(x)
+! Return n gamma(shape, rate) variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: shape
+real(kind=dp), intent(in), optional :: rate, scale
+real(kind=dp), allocatable :: x(:)
+integer :: i
+real(kind=dp) :: rt
+rt = 1.0_dp
+if (present(rate)) rt = rate
+if (present(scale)) rt = 1.0_dp / max(scale, tiny(1.0_dp))
+allocate(x(max(0, n)))
+do i = 1, size(x)
+   x(i) = rgamma_one(shape, rt)
+end do
+end function rgamma_rng
+
+function rbeta_rng(n, shape1, shape2) result(x)
+! Return n beta(shape1, shape2) variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: shape1, shape2
+real(kind=dp), allocatable :: x(:)
+integer :: i
+real(kind=dp) :: a, b
+allocate(x(max(0, n)))
+do i = 1, size(x)
+   a = rgamma_one(shape1, 1.0_dp)
+   b = rgamma_one(shape2, 1.0_dp)
+   x(i) = a / max(tiny(1.0_dp), a + b)
+end do
+end function rbeta_rng
+
+function rchisq_rng(n, df) result(x)
+! Return n chi-square variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: df
+real(kind=dp), allocatable :: x(:)
+x = rgamma(n, shape=0.5_dp * df, rate=0.5_dp)
+end function rchisq_rng
+
+function rf_rng_vec(n, df1, df2) result(x)
+! Return n F variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: df1, df2
+real(kind=dp), allocatable :: x(:)
+real(kind=dp), allocatable :: a(:), b(:)
+a = rchisq(n, df1) / max(tiny(1.0_dp), df1)
+b = rchisq(n, df2) / max(tiny(1.0_dp), df2)
+x = a / max(tiny(1.0_dp), b)
+end function rf_rng_vec
+
+function rlogis_rng(n, location, scale) result(x)
+! Return n logistic variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in), optional :: location, scale
+real(kind=dp), allocatable :: x(:)
+real(kind=dp) :: loc, sc
+loc = 0.0_dp
+sc = 1.0_dp
+if (present(location)) loc = location
+if (present(scale)) sc = scale
+x = qlogis(runif_vec(max(0, n)), location=loc, scale=sc)
+end function rlogis_rng
+
+function rlnorm_rng(n, meanlog, sdlog) result(x)
+! Return n lognormal variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in), optional :: meanlog, sdlog
+real(kind=dp), allocatable :: x(:)
+real(kind=dp) :: mu, sig
+mu = 0.0_dp
+sig = 1.0_dp
+if (present(meanlog)) mu = meanlog
+if (present(sdlog)) sig = sdlog
+x = exp(mu + sig * rnorm_vec(max(0, n)))
+end function rlnorm_rng
+
+function rweibull_rng(n, shape, scale) result(x)
+! Return n Weibull variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: shape
+real(kind=dp), intent(in), optional :: scale
+real(kind=dp), allocatable :: x(:)
+real(kind=dp) :: sc
+sc = 1.0_dp
+if (present(scale)) sc = scale
+x = qweibull(runif_vec(max(0, n)), shape=shape, scale=sc)
+end function rweibull_rng
+
+function rcauchy_rng(n, location, scale) result(x)
+! Return n Cauchy variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in), optional :: location, scale
+real(kind=dp), allocatable :: x(:)
+real(kind=dp) :: loc, sc
+loc = 0.0_dp
+sc = 1.0_dp
+if (present(location)) loc = location
+if (present(scale)) sc = scale
+x = qcauchy(runif_vec(max(0, n)), location=loc, scale=sc)
+end function rcauchy_rng
+
+function rgeom_rng(n, prob) result(x)
+! Return n geometric variates.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: prob
+integer, allocatable :: x(:)
+x = int(qgeom(runif_vec(max(0, n)), prob=prob))
+end function rgeom_rng
+
+function rnbinom_rng(n, size_, prob, mu) result(x)
+! Return n negative-binomial variates using the gamma-Poisson mixture.
+integer, intent(in) :: n
+real(kind=dp), intent(in) :: size_
+real(kind=dp), intent(in), optional :: prob, mu
+integer, allocatable :: x(:)
+integer :: i
+real(kind=dp) :: p, m, lambda
+allocate(x(max(0, n)))
+p = 0.5_dp
+if (present(prob)) p = max(tiny(1.0_dp), min(1.0_dp - tiny(1.0_dp), prob))
+do i = 1, size(x)
+   if (present(mu)) then
+      m = max(0.0_dp, mu)
+      lambda = rgamma_one(size_, size_ / max(tiny(1.0_dp), m))
+   else
+      lambda = rgamma_one(size_, p / max(tiny(1.0_dp), 1.0_dp - p))
+   end if
+   x(i) = rpois_one(lambda)
+end do
+end function rnbinom_rng
+
+function rhyper_rng(n, m, nwhite, k) result(x)
+! Return n hypergeometric variates.
+integer, intent(in) :: n, m, nwhite, k
+integer, allocatable :: x(:)
+x = int(qhyper(runif_vec(max(0, n)), m=m, n=nwhite, k=k))
+end function rhyper_rng
+
+function rwilcox_rng(n, m, n2) result(x)
+! Return n Wilcoxon rank-sum variates.
+integer, intent(in) :: n, m, n2
+integer, allocatable :: x(:)
+x = int(qwilcox(runif_vec(max(0, n)), m=m, n=n2))
+end function rwilcox_rng
+
+function rsignrank_rng(n, n_obs) result(x)
+! Return n Wilcoxon signed-rank variates.
+integer, intent(in) :: n, n_obs
+integer, allocatable :: x(:)
+x = int(qsignrank(runif_vec(max(0, n)), n=n_obs))
+end function rsignrank_rng
+
+function rmultinom_rng(n, size_, prob) result(x)
+! Return a category-by-draw matrix of multinomial variates.
+integer, intent(in) :: n, size_
+real(kind=dp), intent(in) :: prob(:)
+integer, allocatable :: x(:,:)
+real(kind=dp), allocatable :: p(:), cp(:)
+integer :: i, j, cat, k
+real(kind=dp) :: total, u
+k = size(prob)
+allocate(x(k, max(0, n)))
+if (k <= 0) return
+p = max(0.0_dp, prob)
+total = sum(p)
+if (total <= 0.0_dp) p = 1.0_dp
+p = p / sum(p)
+allocate(cp(k))
+cp = cumsum(p)
+cp(k) = 1.0_dp
+x = 0
+do j = 1, size(x, 2)
+   do i = 1, max(0, size_)
+      u = runif1()
+      do cat = 1, k
+         if (u <= cp(cat)) exit
+      end do
+      x(min(cat, k), j) = x(min(cat, k), j) + 1
+   end do
+end do
+end function rmultinom_rng
 
 function rnorm_mat(nrow, ncol) result(x)
 ! Return an nrow-by-ncol matrix of N(0,1) variates.

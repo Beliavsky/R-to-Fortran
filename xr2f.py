@@ -5637,14 +5637,14 @@ def classify_vars(
                         real_scalars.add(st.name)
                     else:
                         real_scalars.discard(st.name)
-                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|ave|by|r_drop_index|r_drop_indices|r_rep_real|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(numeric|quantile|colMeans|rowMeans|colSums|rowSums|rev|append|mapply|tapply|ave|by|r_drop_index|r_drop_indices|r_rep_real|runif|rnorm|rexp|rgamma|rbeta|rchisq|rt|rf|rlogis|rlnorm|rweibull|rcauchy|runif_vec|rnorm_vec|rexp_vec)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_drop_index|r_drop_indices|qlogis\s*\(\s*runif_vec)\s*\(", rhs_f, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|rpois|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_rep_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs_f, re.IGNORECASE):
+                elif re.match(r"^(integer|raw|dim|order|max\.col|max_col|which|r_rep_int|sample_int|rbinom|rpois|rgeom|rnbinom|rhyper|rwilcox|rsignrank|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs, re.IGNORECASE) or re.match(r"^(r_rep_int|r_seq_int|r_seq_len|r_seq_int_by|r_seq_int_length)\s*\(", rhs_f, re.IGNORECASE):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -5675,7 +5675,7 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif rhs.startswith("c(") or re.match(r"^(?:runif|rnorm|ifelse)\s*\(", rhs, re.IGNORECASE):
+                elif rhs.startswith("c(") or re.match(r"^(?:runif|rnorm|rexp|rgamma|rbeta|rchisq|rt|rf|rlogis|rlnorm|rweibull|rcauchy|ifelse)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -11938,6 +11938,71 @@ def r_expr_to_fortran(expr: str) -> str:
         vals_cor = [v for v in vals_cor if v]
         if vals_cor:
             return f"{c_cor0[0].lower()}({', '.join(r_expr_to_fortran(v) for v in vals_cor[:2])})"
+
+    def _rng_arg(c_rng: tuple[str, list[str], dict[str, str]], pos: int, name: str, default: str) -> str:
+        return c_rng[2].get(name, c_rng[1][pos] if len(c_rng[1]) > pos else default)
+
+    c_rng_dist0 = parse_call_text(s)
+    if c_rng_dist0 is not None:
+        rng_nm0 = c_rng_dist0[0].lower()
+        if rng_nm0 in {"rgamma", "rbeta", "rchisq", "rf", "rlogis", "rlnorm", "rweibull", "rcauchy", "rgeom", "rnbinom", "rhyper", "rwilcox", "rsignrank", "rmultinom"}:
+            n_count_key0 = "nn" if rng_nm0 in {"rhyper", "rwilcox", "rsignrank"} else "n"
+            n_src0 = _rng_arg(c_rng_dist0, 0, n_count_key0, "1")
+            n_f0 = _int_bound_expr(r_expr_to_fortran(n_src0))
+
+            def rf_arg(pos: int, name: str, default: str) -> str:
+                return f"real({r_expr_to_fortran(_rng_arg(c_rng_dist0, pos, name, default))}, kind=dp)"
+
+            def ri_arg(pos: int, name: str, default: str) -> str:
+                return _int_bound_expr(r_expr_to_fortran(_rng_arg(c_rng_dist0, pos, name, default)))
+
+            if rng_nm0 == "rgamma":
+                args0 = [n_f0, f"shape={rf_arg(1, 'shape', '1.0')}"]
+                rate_src0 = c_rng_dist0[2].get("rate")
+                scale_src0 = c_rng_dist0[2].get("scale")
+                if rate_src0 is None and len(c_rng_dist0[1]) >= 3:
+                    rate_src0 = c_rng_dist0[1][2]
+                if rate_src0 is not None:
+                    args0.append(f"rate=real({r_expr_to_fortran(rate_src0)}, kind=dp)")
+                if scale_src0 is not None:
+                    args0.append(f"scale=real({r_expr_to_fortran(scale_src0)}, kind=dp)")
+                return f"rgamma({', '.join(args0)})"
+            if rng_nm0 == "rbeta":
+                return f"rbeta({n_f0}, shape1={rf_arg(1, 'shape1', '1.0')}, shape2={rf_arg(2, 'shape2', '1.0')})"
+            if rng_nm0 == "rchisq":
+                return f"rchisq({n_f0}, df={rf_arg(1, 'df', '1.0')})"
+            if rng_nm0 == "rf":
+                return f"rf_rng({n_f0}, df1={rf_arg(1, 'df1', '1.0')}, df2={rf_arg(2, 'df2', '1.0')})"
+            if rng_nm0 == "rlogis":
+                return f"rlogis({n_f0}, location={rf_arg(1, 'location', '0.0')}, scale={rf_arg(2, 'scale', '1.0')})"
+            if rng_nm0 == "rlnorm":
+                return f"rlnorm({n_f0}, meanlog={rf_arg(1, 'meanlog', '0.0')}, sdlog={rf_arg(2, 'sdlog', '1.0')})"
+            if rng_nm0 == "rweibull":
+                return f"rweibull({n_f0}, shape={rf_arg(1, 'shape', '1.0')}, scale={rf_arg(2, 'scale', '1.0')})"
+            if rng_nm0 == "rcauchy":
+                return f"rcauchy({n_f0}, location={rf_arg(1, 'location', '0.0')}, scale={rf_arg(2, 'scale', '1.0')})"
+            if rng_nm0 == "rgeom":
+                return f"rgeom({n_f0}, prob={rf_arg(1, 'prob', '0.5')})"
+            if rng_nm0 == "rnbinom":
+                args0 = [n_f0, f"size_={rf_arg(1, 'size', '1.0')}"]
+                prob_src0 = c_rng_dist0[2].get("prob")
+                mu_src0 = c_rng_dist0[2].get("mu")
+                if prob_src0 is None and mu_src0 is None and len(c_rng_dist0[1]) >= 3:
+                    prob_src0 = c_rng_dist0[1][2]
+                if prob_src0 is not None:
+                    args0.append(f"prob=real({r_expr_to_fortran(prob_src0)}, kind=dp)")
+                if mu_src0 is not None:
+                    args0.append(f"mu=real({r_expr_to_fortran(mu_src0)}, kind=dp)")
+                return f"rnbinom({', '.join(args0)})"
+            if rng_nm0 == "rhyper":
+                return f"rhyper({n_f0}, m={ri_arg(1, 'm', '1')}, nwhite={ri_arg(2, 'n', '1')}, k={ri_arg(3, 'k', '1')})"
+            if rng_nm0 == "rwilcox":
+                return f"rwilcox({n_f0}, m={ri_arg(1, 'm', '1')}, n2={ri_arg(2, 'n', '1')})"
+            if rng_nm0 == "rsignrank":
+                return f"rsignrank({n_f0}, n_obs={ri_arg(1, 'n', '1')})"
+            if rng_nm0 == "rmultinom":
+                return f"rmultinom({n_f0}, size_={ri_arg(1, 'size', '1')}, prob=real({r_expr_to_fortran(_rng_arg(c_rng_dist0, 2, 'prob', '1.0'))}, kind=dp))"
+
     c_rbinom0 = parse_call_text(s)
     if c_rbinom0 is not None and c_rbinom0[0].lower() == "rbinom":
         _nm_rb0, pos_rb0, kw_rb0 = c_rbinom0
@@ -13868,7 +13933,7 @@ def r_expr_to_fortran(expr: str) -> str:
         if _is_int_literal(expr_src.strip()):
             return f"r_rep_int([{_int_bound_expr(val_f)}], times={n_f})"
         return f"r_rep_real([{val_f}], times={n_f})"
-    if c_rng is not None and c_rng[0].lower() in {"runif", "rnorm", "rexp"}:
+    if c_rng is not None and c_rng[0].lower() in {"runif", "rnorm", "rexp", "rlogis"}:
         fn = c_rng[0].lower()
         _nm_g, pos_g, kw_g = c_rng
         n_src = pos_g[0] if pos_g else kw_g.get("n", "1")
@@ -13893,10 +13958,16 @@ def r_expr_to_fortran(expr: str) -> str:
                 return rn_base
             return f"({mean_f}) + ({sd_f}) * {rn_base}"
         rate_src = kw_g.get("rate")
-        if rate_src is None and len(pos_g) >= 2:
-            rate_src = pos_g[1]
-        rate_f = r_expr_to_fortran(rate_src or "1.0")
-        return f"(-log(max(tiny(1.0_dp), 1.0_dp - runif_vec({n_f}))) / ({rate_f}))"
+        if fn == "rexp":
+            if rate_src is None and len(pos_g) >= 2:
+                rate_src = pos_g[1]
+            rate_f = r_expr_to_fortran(rate_src or "1.0")
+            return f"(-log(max(tiny(1.0_dp), 1.0_dp - runif_vec({n_f}))) / ({rate_f}))"
+        location_src = pos_g[1] if len(pos_g) >= 2 else kw_g.get("location", "0.0")
+        scale_src = pos_g[2] if len(pos_g) >= 3 else kw_g.get("scale", "1.0")
+        location_f = r_expr_to_fortran(location_src)
+        scale_f = r_expr_to_fortran(scale_src)
+        return f"qlogis(runif_vec({n_f}), location={location_f}, scale={scale_f})"
     # array(data, dim) / array(data, dim=c(...))
     c_arr = parse_call_text(s)
     if c_arr is not None and c_arr[0].lower() == "array":
@@ -16273,6 +16344,7 @@ def r_expr_to_fortran(expr: str) -> str:
         s = mod_pat.sub(_mod_repl, s)
     s = _strip_variadic_actuals_in_calls(s)
     s = _replace_complex_literals_outside_strings(s)
+    s = re.sub(r"(?<![%$\w])pi(?!\w)", "acos(-1.0_dp)", s, flags=re.IGNORECASE)
     return s
 
 
@@ -31129,6 +31201,9 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    for st_rmultinom_mat in main_stmts:
+        if isinstance(st_rmultinom_mat, Assign) and re.match(r"^\s*rmultinom\s*\(", st_rmultinom_mat.expr.strip(), re.IGNORECASE):
+            int_matrices.add(st_rmultinom_mat.name)
     omitted_dim_array_names = {
         st.name
         for st in main_stmts
@@ -31412,6 +31487,56 @@ def transpile_r_to_fortran(
 
     def _force_user_arg_ranks_from_call(c_call_force: tuple[str, list[str], dict[str, str]]) -> None:
         callee_l = c_call_force[0].lower()
+        if callee_l == "optim":
+            pos_opt_force, kw_opt_force = c_call_force[1], c_call_force[2]
+            fn_src_force = kw_opt_force.get("fn") or (pos_opt_force[1] if len(pos_opt_force) >= 2 else "")
+            fn_l_force = fn_src_force.strip().lower()
+            fn_force_obj_opt = user_func_by_lower.get(fn_l_force)
+            if fn_force_obj_opt is None:
+                return
+            objective_args_force = _USER_FUNC_ARG_INDEX.get(fn_l_force, {})
+            forced_ranks_force = _FORCED_FUNC_ARG_RANKS.setdefault(fn_l_force, {})
+            user_ranks_force = _USER_FUNC_ARG_RANK.setdefault(fn_l_force, {})
+            skip_force = {"par", "fn", "gr", "method", "control", "hessian", "lower", "upper"}
+
+            def _optim_actual_rank(actual_src: str) -> int:
+                actual_l = actual_src.strip().lower()
+                if actual_l in _KNOWN_MATRIX_NAMES:
+                    return 2
+                if actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES or actual_l in _KNOWN_CHAR_VECTOR_NAMES:
+                    return 1
+                if re.match(
+                    r"^(?:c|numeric|integer|logical|rep|seq|seq_len|rnorm|runif|rexp|rlogis|sample|sample\.int)\s*\(",
+                    actual_l,
+                    re.IGNORECASE,
+                ):
+                    return 1
+                return _infer_assignment_rank_hint(actual_src, {nm: 1 for nm in _KNOWN_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES})
+
+            for key_force, actual_force in kw_opt_force.items():
+                key_l_force = key_force.lower()
+                if key_l_force in skip_force:
+                    continue
+                candidates_force = [key_l_force]
+                sanitized_force = _sanitize_r_var_name(key_l_force).lower()
+                if sanitized_force not in candidates_force:
+                    candidates_force.append(sanitized_force)
+                matched_formal_force = ""
+                for candidate_force in candidates_force:
+                    if candidate_force in objective_args_force:
+                        matched_formal_force = candidate_force
+                        break
+                if not matched_formal_force:
+                    actual_f_force = r_expr_to_fortran(actual_force).strip().lower()
+                    if re.fullmatch(r"[A-Za-z]\w*", actual_f_force) and actual_f_force in objective_args_force:
+                        matched_formal_force = actual_f_force
+                if not matched_formal_force:
+                    continue
+                rank_force = _optim_actual_rank(actual_force)
+                if rank_force > 0:
+                    forced_ranks_force[matched_formal_force] = max(forced_ranks_force.get(matched_formal_force, 0), rank_force)
+                    user_ranks_force[matched_formal_force] = max(user_ranks_force.get(matched_formal_force, 0), rank_force)
+            return
         fn_force_obj = user_func_by_lower.get(callee_l)
         if fn_force_obj is None:
             return
@@ -31441,7 +31566,7 @@ def transpile_r_to_fortran(
             if actual_l in _KNOWN_VECTOR_NAMES or actual_l in _KNOWN_LOGICAL_VECTOR_NAMES or actual_l in _KNOWN_CHAR_VECTOR_NAMES:
                 return 1
             if re.match(
-                r"^(?:c|numeric|integer|logical|rep|seq|seq_len|rnorm|runif|sample|sample\.int)\s*\(",
+                r"^(?:c|numeric|integer|logical|rep|seq|seq_len|rnorm|runif|rexp|rlogis|sample|sample\.int)\s*\(",
                 actual_l,
                 re.IGNORECASE,
             ):
@@ -34714,7 +34839,22 @@ def transpile_r_to_fortran(
         "runif_vec",
         "rnorm1",
         "rnorm_vec",
+        "rexp",
+        "rgamma",
+        "rbeta",
+        "rchisq",
         "rnorm_mat",
+        "rf_rng",
+        "rlogis",
+        "rlnorm",
+        "rweibull",
+        "rcauchy",
+        "rgeom",
+        "rnbinom",
+        "rhyper",
+        "rwilcox",
+        "rsignrank",
+        "rmultinom",
         "rbinom",
         "rpois",
         "random_choice2_prob",
