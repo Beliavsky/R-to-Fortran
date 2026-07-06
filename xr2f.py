@@ -149,6 +149,9 @@ _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "kruskal.test": {"name": "kruskal.test", "category": "subset_semantics", "reason": "subset implementation"},
 }
 _CALL_COERCION_WARNINGS: set[tuple[str, str, str]] = set()
+_COMPLEX_LENGTH_WARNINGS: set[str] = set()
+_COMPLEX_LENGTH_NONINTEGER_WARNINGS: set[str] = set()
+_INTEGER_ARGUMENT_NONINTEGER_WARNINGS: set[str] = set()
 _SUPPRESS_WARNINGS = False
 _NO_RECYCLE = False
 _R_SD_CALL_NAME = "sd"
@@ -162,10 +165,71 @@ DEBUG_IFX_COMPILER = "ifx /Od /debug:full /traceback /check:all /warn:all /heap-
 _PRETTY_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
+_WARNING_SOURCE_TEXT = ""
+_CURRENT_WARNING_STMT_TEXT: str | None = None
+
+
+def _normalize_warning_source_text(text: str) -> str:
+    return " ".join(strip_r_comment(text).strip().split())
+
+
+def _warning_line_for_current_stmt() -> tuple[int, str] | None:
+    if not _WARNING_SOURCE_TEXT or not _CURRENT_WARNING_STMT_TEXT:
+        return None
+    target = _normalize_warning_source_text(_CURRENT_WARNING_STMT_TEXT)
+    if not target:
+        return None
+    target_l = target.lower()
+    for i, raw in enumerate(_WARNING_SOURCE_TEXT.splitlines(), start=1):
+        code = _normalize_warning_source_text(raw)
+        if not code:
+            continue
+        code_l = code.lower()
+        if code_l == target_l or target_l in code_l or code_l in target_l:
+            return i, code
+    return None
+
+
+def _warning_line_for_literal(lit: str) -> tuple[int, str] | None:
+    if not _WARNING_SOURCE_TEXT:
+        return None
+    raw_lit = lit.strip()
+    candidates = {raw_lit}
+    candidates.add(re.sub(r"_dp\b", "", raw_lit, flags=re.IGNORECASE))
+    candidates.add(raw_lit.replace("D", "E").replace("d", "e"))
+    for i, raw in enumerate(_WARNING_SOURCE_TEXT.splitlines(), start=1):
+        code = _normalize_warning_source_text(raw)
+        if not code:
+            continue
+        if any(c and c in code for c in candidates):
+            return i, code
+    return None
+
+
+def _warning_stmt_source_text(st: object) -> str | None:
+    if isinstance(st, Assign):
+        return f"{st.name} = {st.expr}"
+    if isinstance(st, PrintStmt):
+        return "print(" + ", ".join(st.args) + ")"
+    if isinstance(st, CallStmt):
+        return f"{st.name}(" + ", ".join(st.args) + ")"
+    if isinstance(st, ExprStmt):
+        return st.expr
+    if isinstance(st, ForStmt):
+        return f"for ({st.var} in {st.iter_expr})"
+    if isinstance(st, WhileStmt):
+        return f"while ({st.cond})"
+    if isinstance(st, IfStmt):
+        return f"if ({st.cond})"
+    return None
 
 
 def _emit_warning(msg: str) -> None:
     if not _SUPPRESS_WARNINGS:
+        loc = _warning_line_for_current_stmt()
+        if loc is not None and " at R line " not in msg:
+            line_no, code = loc
+            msg = f"{msg} at R line {line_no}: {code}"
         print(msg)
 
 
@@ -10046,11 +10110,60 @@ def _is_logical_expr_for_complex(expr: str) -> bool:
     return bool(re.search(r"\.true\.|\.false\.", t))
 
 
-def _int_bound_expr(expr: str) -> str:
+def _literal_noninteger_int_source(expr: str) -> str | None:
+    t = expr.strip()
+    if not t:
+        return None
+    m_int = re.fullmatch(r"int\s*\((.+)\)", t, re.IGNORECASE)
+    if m_int is not None:
+        return None
+    m_real = re.fullmatch(r"real\s*\((.+?)(?:,\s*kind\s*=\s*dp|\s*,\s*dp)?\)", t, re.IGNORECASE)
+    if m_real is not None:
+        t = m_real.group(1).strip()
+    if t.startswith("["):
+        inner = t[1:-1].strip() if t.endswith("]") else ""
+        parts = split_top_level_args(inner)
+        if not parts:
+            return None
+        t = parts[0].strip()
+        m_real = re.fullmatch(r"real\s*\((.+?)(?:,\s*kind\s*=\s*dp|\s*,\s*dp)?\)", t, re.IGNORECASE)
+        if m_real is not None:
+            t = m_real.group(1).strip()
+    if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", t):
+        return t
+    if re.fullmatch(r"[+-]?\d+[eEdD][+-]?\d+(?:_dp)?", t):
+        return t
+    return None
+
+
+def _warn_noninteger_integer_argument(expr: str, context: str | None = None) -> None:
+    lit = _literal_noninteger_int_source(expr)
+    if lit is None:
+        return
+    if _WARNING_SOURCE_TEXT and _CURRENT_WARNING_STMT_TEXT is None:
+        return
+    label = context.strip() if context else "integer argument"
+    key = f"{label}:{lit}"
+    if key in _INTEGER_ARGUMENT_NONINTEGER_WARNINGS:
+        return
+    _INTEGER_ARGUMENT_NONINTEGER_WARNINGS.add(key)
+    if _SUPPRESS_WARNINGS:
+        return
+    msg = f"Warning: {label} is non-integer; R truncates it to an integer."
+    loc = _warning_line_for_current_stmt() or _warning_line_for_literal(lit)
+    if loc is not None:
+        line_no, code = loc
+        msg = f"{msg} at R line {line_no}: {code}"
+    print(msg)
+
+
+def _int_bound_expr(expr: str, context: str | None = None, warn_noninteger: bool = True) -> str:
     t = expr.strip()
     m = re.match(r"^int\s*\((.+)\)$", t, re.IGNORECASE)
     if m:
         return m.group(1).strip()
+    if warn_noninteger:
+        _warn_noninteger_integer_argument(t, context)
     if _looks_integer_fortran_expr(t):
         return t
     return f"int({t})"
@@ -12780,6 +12893,14 @@ def r_expr_to_fortran(expr: str) -> str:
         arg_src = kw_zc.get("argument")
         if length_src is None and pos_zc:
             length_src = pos_zc[0]
+        if real_src is None and len(pos_zc) >= 2:
+            real_src = pos_zc[1]
+        if imag_src is None and len(pos_zc) >= 3:
+            imag_src = pos_zc[2]
+        if mod_src is None and len(pos_zc) >= 4:
+            mod_src = pos_zc[3]
+        if arg_src is None and len(pos_zc) >= 5:
+            arg_src = pos_zc[4]
 
         def _complex_real_vec(src: str | None, default: str, n_f: str | None) -> str:
             if src is None:
@@ -12798,7 +12919,46 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"r_rep_real(real({src_f}, kind=dp), len_out={n_f})"
             return f"r_rep_real([real({src_f}, kind=dp)], len_out={n_f})"
 
-        n_f = _int_bound_expr(r_expr_to_fortran(length_src.strip())) if length_src is not None else None
+        def _complex_length_expr(src: str) -> str:
+            src_t = src.strip()
+            src_f = r_expr_to_fortran(src_t)
+            is_vec = (
+                src_t.lower() in _KNOWN_VECTOR_NAMES
+                or src_f.strip().startswith("[")
+                or src_f.strip().startswith(("r_seq_int(", "r_seq_len(", "r_rep_int(", "r_rep_real("))
+                or re.match(r"^[A-Za-z]\w+\s*\(", src_f.strip()) is not None
+            )
+            if is_vec:
+                warn_key = src_t
+                if warn_key not in _COMPLEX_LENGTH_WARNINGS:
+                    _COMPLEX_LENGTH_WARNINGS.add(warn_key)
+                    _emit_warning("Warning: complex() length.out is vector-valued; R uses only the first element.")
+                len_expr = f"{src_f}(1)"
+            else:
+                len_expr = src_f
+            len_probe = len_expr.strip()
+            is_noninteger_literal = (
+                re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?(?:\s*\(\s*1\s*\))?", len_probe) is not None
+                or re.fullmatch(r"[+-]?\d+[eEdD][+-]?\d+(?:_dp)?(?:\s*\(\s*1\s*\))?", len_probe) is not None
+            )
+            if is_noninteger_literal:
+                warn_key = src_t
+                if warn_key not in _COMPLEX_LENGTH_NONINTEGER_WARNINGS:
+                    _COMPLEX_LENGTH_NONINTEGER_WARNINGS.add(warn_key)
+                    _emit_warning("Warning: complex() length.out is non-integer; R truncates it to an integer.")
+            else:
+                c_len = parse_call_text(src_t)
+                first_len_src = c_len[1][0].strip() if c_len is not None and c_len[0].lower() == "c" and c_len[1] else src_t
+                if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?", first_len_src) is not None:
+                    warn_key = src_t
+                    if warn_key not in _COMPLEX_LENGTH_NONINTEGER_WARNINGS:
+                        _COMPLEX_LENGTH_NONINTEGER_WARNINGS.add(warn_key)
+                        _emit_warning("Warning: complex() length.out is non-integer; R truncates it to an integer.")
+            if is_vec:
+                return _int_bound_expr(len_expr, warn_noninteger=False)
+            return _int_bound_expr(src_f, warn_noninteger=False)
+
+        n_f = _complex_length_expr(length_src) if length_src is not None else None
         if real_src is None and imag_src is None and mod_src is None and arg_src is None:
             if n_f is None:
                 n_f = "0"
@@ -15242,7 +15402,10 @@ def r_expr_to_fortran(expr: str) -> str:
                 and _infer_assignment_rank_hint(inner_f, {}) == 0
                 and "[" not in inner_f
                 and "]" not in inner_f
-                and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", inner_f.strip())
+                and (
+                    re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?", inner_f.strip())
+                    or re.search(r"\bcmplx\s*\(", inner_f, re.IGNORECASE)
+                )
             ):
                 return inner_f
             if na_rm:
@@ -16103,6 +16266,7 @@ def emit_stmts(
     helper_ctx: dict[str, object] | None = None,
 ) -> None:
     global _CURRENT_INT_SCALAR_NAMES, _CURRENT_INT_ARRAY_NAMES, _CURRENT_REAL_ARRAY_NAMES, _CURRENT_CHAR_SCALAR_NAMES
+    global _CURRENT_WARNING_STMT_TEXT
     if alloc_seen is None:
         alloc_seen = set()
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
@@ -18541,6 +18705,7 @@ def emit_stmts(
             need_r_mod.add("print_real_vector")
 
     for st in stmts:
+        _CURRENT_WARNING_STMT_TEXT = _warning_stmt_source_text(st)
         if isinstance(st, CommentStmt):
             _wcomment(st.text)
             continue
@@ -27563,6 +27728,11 @@ def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None
             return True
         if _contains_r_complex_literal(rhs_t) and not rhs_t.lower().startswith("c("):
             return True
+        rhs_names = {n.lower() for n in re.findall(r"\b[A-Za-z]\w*\b", rhs_t)}
+        if rhs_names & (arrays | scalars):
+            return True
+        if rhs_names & matrices and _infer_assignment_rank_hint(rhs_t, {n: 2 for n in matrices}) == 0:
+            return True
         return False
 
     def _is_complex_matrix_expr(rhs: str) -> bool:
@@ -29636,6 +29806,7 @@ def transpile_r_to_fortran(
     global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     global _CALL_COERCION_WARNINGS
+    global _WARNING_SOURCE_TEXT, _CURRENT_WARNING_STMT_TEXT
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
     _COMMAND_ARGS_FILE_ARG = source_path
@@ -29676,6 +29847,8 @@ def transpile_r_to_fortran(
     _CUSTOM_INFIX_OPS = {}
     _MIXED_CHARACTER_COERCION_WARNINGS = set()
     _CALL_COERCION_WARNINGS = set()
+    _WARNING_SOURCE_TEXT = src
+    _CURRENT_WARNING_STMT_TEXT = None
     unit_name = _fortran_ident(stem)
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
@@ -36080,6 +36253,64 @@ def _diff_numeric_tokens_equal(a: str, b: str) -> bool:
     return abs(av - bv) <= tol
 
 
+def _parse_diff_complex_token(tok: str) -> complex | None:
+    t = tok.strip().strip(",;")
+    m_pair = re.fullmatch(
+        r"\(?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)\s*,\s*"
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)\s*\)?",
+        t,
+    )
+    if m_pair is not None:
+        return complex(float(m_pair.group(1).replace("d", "e").replace("D", "E")), float(m_pair.group(2).replace("d", "e").replace("D", "E")))
+    m_r = re.fullmatch(
+        r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)"
+        r"([+-](?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)i",
+        t,
+    )
+    if m_r is None:
+        return None
+    try:
+        return complex(float(m_r.group(1).replace("d", "e").replace("D", "E")), float(m_r.group(2).replace("d", "e").replace("D", "E")))
+    except ValueError:
+        return None
+
+
+def _parse_diff_complex_sequence(tokens: list[str]) -> list[complex] | None:
+    vals: list[complex] = []
+    direct_ok = True
+    for tok in tokens:
+        z = _parse_diff_complex_token(tok)
+        if z is None:
+            direct_ok = False
+            break
+        vals.append(z)
+    if direct_ok:
+        return vals
+    if len(tokens) % 2 != 0:
+        return None
+    vals = []
+    for i in range(0, len(tokens), 2):
+        re_part = _parse_diff_numeric_token(tokens[i])
+        im_part = _parse_diff_numeric_token(tokens[i + 1])
+        if re_part is None or im_part is None:
+            return None
+        vals.append(complex(re_part, im_part))
+    return vals
+
+
+def _diff_complex_sequences_equal(a_tokens: list[str], b_tokens: list[str]) -> bool:
+    av = _parse_diff_complex_sequence(a_tokens)
+    bv = _parse_diff_complex_sequence(b_tokens)
+    if av is None or bv is None or len(av) != len(bv):
+        return False
+    for x, y in zip(av, bv):
+        if not _diff_numeric_tokens_equal(str(x.real), str(y.real)):
+            return False
+        if not _diff_numeric_tokens_equal(str(x.imag), str(y.imag)):
+            return False
+    return True
+
+
 def _parse_diff_logical_token(tok: str) -> str | None:
     t = tok.strip().strip(",;")
     tl = t.lower()
@@ -36125,6 +36356,8 @@ def _diff_output_lines_equal(a: str, b: str) -> bool:
         return True
     at = a.split()
     bt = b.split()
+    if at and bt and at[0].lower() == "complex" and bt[0].lower() == "complex":
+        return _diff_complex_sequences_equal(at[1:], bt[1:])
     if len(at) != len(bt):
         return False
     for x, y in zip(at, bt):
