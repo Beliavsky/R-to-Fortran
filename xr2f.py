@@ -25865,6 +25865,10 @@ def emit_function(
             "size": "integer(0)",
             "centers": "numeric(0)",
             "withinss": "numeric(0)",
+            "totss": "0.0",
+            "tot_withinss": "0.0",
+            "betweenss": "0.0",
+            "iter": "0",
         }
         list_type_fields["hclust_result_t"] = {
             "merge": "integer(0)",
@@ -39436,6 +39440,7 @@ def strip_unsupported_kmeans_args_text(f90: str) -> str:
         changed = False
         for arg in split_top_level_commas(args_src):
             if re.match(r"\s*iter[_.]?max\s*=", arg, re.IGNORECASE):
+                args.append(re.sub(r"(?i)^\s*iter[_.]?max\s*=", "iter_max=", arg.strip(), count=1))
                 changed = True
                 continue
             args.append(arg.strip())
