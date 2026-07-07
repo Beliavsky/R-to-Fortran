@@ -15651,6 +15651,21 @@ def r_expr_to_fortran(expr: str) -> str:
 
         def one_prod(x_src: str) -> str:
             inner_f = r_expr_to_fortran(x_src)
+            c_prod_arg = parse_call_text(x_src.strip())
+            if c_prod_arg is not None and c_prod_arg[0].lower() in {
+                "abs", "acos", "asin", "atan", "cos", "cosh", "exp", "floor",
+                "log", "log10", "log2", "round", "sign", "sin", "sinh",
+                "sqrt", "tan", "tanh",
+            }:
+                arg_src = _first_call_arg(c_prod_arg, "x")
+                if arg_src and not (
+                    _is_int_literal(arg_src.strip())
+                    or _is_real_literal(arg_src.strip())
+                    or re.fullmatch(r"[A-Za-z]\w*\s*\(\s*[^,:()]+\s*\)", arg_src.strip())
+                ):
+                    if na_rm_prod:
+                        return f"product({_non_na_pack_expr(inner_f)})"
+                    return f"product({inner_f})"
             if (
                 re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)*", inner_f.strip()) is not None
                 or "r_seq_" in inner_f
@@ -51036,7 +51051,7 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             field = assign_m.group(1)
             rhs = assign_m.group(2).strip()
             rhs_bare = re.fullmatch(r"[A-Za-z]\w*", rhs)
-            if re.match(r"^(?:sum|maxval|minval|dot_product|size|count)\s*\(", rhs, re.IGNORECASE):
+            if re.match(r"^(?:sum|product|maxval|minval|dot_product|size|count)\s*\(", rhs, re.IGNORECASE):
                 demote.setdefault(type_name, {})[field] = "real"
                 continue
             vector_rhs = False
