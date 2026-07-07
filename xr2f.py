@@ -35841,7 +35841,7 @@ def transpile_r_to_fortran(
             return f"real(kind=dp), allocatable :: {k}(:,:)"
         if k_l in {"prob_init_2", "mu_2", "sd_2", "stationary_prob"}:
             return f"real(kind=dp), allocatable :: {k}(:)"
-        if k_l in {"loglik", "loglik_old", "aic", "bic", "npar", "ridge", "sigma2"}:
+        if k_l in {"loglik", "loglik_old", "aic", "bic", "npar", "ridge", "sigma2", "value"}:
             return f"real(kind=dp) :: {k}"
         if txt in {"TRUE", "FALSE"}:
             return f"logical :: {k}"
@@ -35928,6 +35928,8 @@ def transpile_r_to_fortran(
         if c_txt is not None:
             cn, pos_cn, kw_cn = c_txt
             cn_l = cn.lower()
+            if cn_l in {"sum", "prod", "mean", "sd", "var", "min", "max"}:
+                return f"real(kind=dp) :: {k}"
             if cn_l == "c":
                 if _static_character_vector_values(txt) is not None:
                     return f"character(len=:), allocatable :: {k}(:)"
@@ -49465,6 +49467,61 @@ def repair_rank1_recycling_matrix_refs_text(f90: str) -> str:
             f90,
             flags=re.IGNORECASE,
         )
+
+    def compact(s: str) -> str:
+        return re.sub(r"\s+", "", s).lower()
+
+    def collapse_rank1_matrix_ref(text: str, nm: str) -> str:
+        out: list[str] = []
+        pos = 0
+        needle_re = re.compile(rf"\b{re.escape(nm)}\s*\(", re.IGNORECASE)
+        while True:
+            m = needle_re.search(text, pos)
+            if m is None:
+                out.append(text[pos:])
+                break
+            open_pos = text.find("(", m.start())
+            if open_pos < 0:
+                out.append(text[pos:])
+                break
+            depth = 0
+            close_pos: int | None = None
+            for i in range(open_pos, len(text)):
+                ch = text[i]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_pos = i
+                        break
+            if close_pos is None:
+                out.append(text[pos:])
+                break
+            inner = text[open_pos + 1 : close_pos]
+            args = split_top_level_commas(inner)
+            repl: str | None = None
+            if len(args) == 2:
+                first = args[0].strip()
+                first_c = compact(first)
+                second_c = compact(args[1])
+                size_c = f"size({nm.lower()},1)"
+                if (
+                    first_c.startswith("mod(")
+                    and size_c in first_c
+                    and f"/{size_c}" in second_c
+                ):
+                    repl = f"{nm}({first})"
+            out.append(text[pos : m.start()])
+            if repl is None:
+                out.append(text[m.start() : close_pos + 1])
+            else:
+                out.append(repl)
+            pos = close_pos + 1
+        return "".join(out)
+
+    for nm in sorted(rank1_names, key=len, reverse=True):
+        f90 = collapse_rank1_matrix_ref(f90, nm)
     return f90
 
 
@@ -50979,6 +51036,9 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
             field = assign_m.group(1)
             rhs = assign_m.group(2).strip()
             rhs_bare = re.fullmatch(r"[A-Za-z]\w*", rhs)
+            if re.match(r"^(?:sum|maxval|minval|dot_product|size|count)\s*\(", rhs, re.IGNORECASE):
+                demote.setdefault(type_name, {})[field] = "real"
+                continue
             vector_rhs = False
             for name in array_locals:
                 for name_m in re.finditer(rf"\b{re.escape(name)}\b", rhs):
@@ -51018,8 +51078,6 @@ def demote_result_type_scalar_fields_text(f90: str) -> str:
                     re.IGNORECASE,
                 )
             ):
-                demote.setdefault(type_name, {})[field] = "real"
-            elif re.match(r"^(?:sum|maxval|minval|dot_product|size|count)\s*\(", rhs, re.IGNORECASE):
                 demote.setdefault(type_name, {})[field] = "real"
     if not demote:
         return f90
@@ -55813,6 +55871,7 @@ def main() -> int:
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = repair_result_fields_from_array_sections_text(f90)
     f90 = repair_known_scalar_result_fields_text(f90)
+    f90 = demote_result_type_scalar_fields_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
