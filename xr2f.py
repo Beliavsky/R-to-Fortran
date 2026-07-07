@@ -25874,7 +25874,7 @@ def emit_function(
             "merge": "integer(0)",
             "height": "numeric(0)",
             "order": "integer(0)",
-            "labels": "integer(0)",
+            "labels": 'character(0)',
             "method": "0",
         }
         list_type_fields["optim_result_t"] = {
@@ -35747,7 +35747,7 @@ def transpile_r_to_fortran(
         o.w("integer, allocatable :: merge(:,:)")
         o.w("real(kind=dp), allocatable :: height(:)")
         o.w("integer, allocatable :: order(:)")
-        o.w("integer, allocatable :: labels(:)")
+        o.w("character(len=:), allocatable :: labels(:)")
         o.w("integer :: method = 1")
         o.pop()
         o.w("end type hclust_result_t")
@@ -39447,6 +39447,37 @@ def strip_unsupported_kmeans_args_text(f90: str) -> str:
         return "kmeans(" + (", ".join(args) if changed else args_src) + ")"
 
     return _replace_balanced_func_calls(f90, "kmeans", repl)
+
+
+def _char_array_literal_for_labels(labels: list[str]) -> str:
+    width = max(1, max(len(x) for x in labels)) if labels else 1
+    vals = ", ".join(_fortran_str_literal(x) for x in labels)
+    return f"[character(len={width}) :: {vals}]"
+
+
+def add_hclust_dist_static_labels_text(f90: str) -> str:
+    if not _LAST_ROWNAME_SOURCES:
+        return f90
+
+    def repl(args_src: str) -> str:
+        args = split_top_level_commas(args_src)
+        if not args or any(re.match(r"\s*labels\s*=", a, re.IGNORECASE) for a in args):
+            return "hclust(" + args_src + ")"
+        first = args[0].strip()
+        m = re.match(r"^dist\s*\(\s*([A-Za-z]\w*)\s*\)$", first, re.IGNORECASE)
+        if m is None:
+            return "hclust(" + args_src + ")"
+        matrix_name = m.group(1)
+        src = _LAST_ROWNAME_SOURCES.get(matrix_name.lower())
+        if not isinstance(src, str):
+            return "hclust(" + args_src + ")"
+        labels = _static_character_vector_values(src)
+        if not labels:
+            return "hclust(" + args_src + ")"
+        args[0] = f"dist(real({matrix_name}, kind=kind(0.0d0)))"
+        return "hclust(" + ", ".join(args + [f"labels={_char_array_literal_for_labels(labels)}"]) + ")"
+
+    return _replace_balanced_func_calls(f90, "hclust", repl)
 
 
 def promote_cluster_field_assignments_text(f90: str) -> str:
@@ -55702,6 +55733,7 @@ def main() -> int:
         f90 = repair_arima_fit_list_result_text(f90)
         f90 = rewrite_lowered_dataframe_prints_text(f90)
         f90 = rewrite_guarded_index_merge_assignments_text(f90)
+        f90 = add_hclust_dist_static_labels_text(f90)
         f90 = promote_cluster_field_assignments_text(f90)
         f90 = promote_vector_slice_locals_text(f90)
         f90 = split_mixed_real_integer_declarations_text(f90)
