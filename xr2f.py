@@ -30195,6 +30195,7 @@ def transpile_r_to_fortran(
     no_recycle: bool = False,
     recycle_warn: bool = False,
     recycle_stop: bool = False,
+    nlm_method: str = "newton",
     fortran_comments: bool = True,
     obfuscate: bool = False,
     source_path: str | None = None,
@@ -33682,6 +33683,8 @@ def transpile_r_to_fortran(
         pbody.w("call set_recycle_warn(.true.)")
     if ("r_mod" in helper_modules) and recycle_stop:
         pbody.w("call set_recycle_stop(.true.)")
+    if ("r_mod" in helper_modules) and nlm_method != "newton":
+        pbody.w(f'call set_nlm_method("{nlm_method}")')
 
     need_rnorm_main = {"used": False}
     params_for_emit = (
@@ -35366,6 +35369,7 @@ def transpile_r_to_fortran(
         "set_print_int_like",
         "set_recycle_warn",
         "set_recycle_stop",
+        "set_nlm_method",
         "order_real",
         "read_real_vector",
         "read_table_real_matrix",
@@ -35516,6 +35520,8 @@ def transpile_r_to_fortran(
         main_needed.add("set_recycle_warn")
     if ("r_mod" in helper_modules) and recycle_stop:
         main_needed.add("set_recycle_stop")
+    if ("r_mod" in helper_modules) and nlm_method != "newton":
+        main_needed.add("set_nlm_method")
     mod_text_now = "\n".join(mprocs.lines)
     main_text_now = "\n".join(pbody.lines)
     def _external_import_lines(text: str) -> list[str]:
@@ -53485,6 +53491,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.extend(["--obfuscate-seed", str(args.obfuscate_seed)])
     if getattr(args, "r_rng", False):
         cmd.append("--r-rng")
+    if getattr(args, "nlm_method", "newton") != "newton":
+        cmd.extend(["--nlm-method", args.nlm_method])
     if args.out_dir:
         cmd.extend(["--out-dir", args.out_dir])
     if args.real_print_fmt != "f0.6":
@@ -53867,6 +53875,12 @@ def main() -> int:
         "--r-rng",
         action="store_true",
         help="use R's embedded RNG for set.seed(), runif(), and rnorm() helpers; requires R headers/libs",
+    )
+    ap.add_argument(
+        "--nlm-method",
+        choices=("legacy", "newton"),
+        default="newton",
+        help="select r.f90 nlm optimizer implementation (default: newton)",
     )
     ap.add_argument(
         "--normalize-num-output",
@@ -54573,6 +54587,7 @@ def main() -> int:
                 no_recycle=args.no_recycle,
                 recycle_warn=args.recycle_warn,
                 recycle_stop=args.recycle_stop,
+                nlm_method=args.nlm_method,
                 fortran_comments=(not args.no_fortran_comments),
                 obfuscate=(args.obfuscate and not source_already_obfuscated),
                 source_path=str(out_path.resolve()),
