@@ -14,7 +14,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, constr_optim_bfgs, constr_optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, constr_optim_bfgs, constr_optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, set_nlm_method, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -58,6 +58,7 @@ logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
 logical :: recycle_warn_default = .false.
 logical :: recycle_stop_default = .false.
+integer :: nlm_method_default = 2
 #ifdef XR2F_USE_R_RNG
 interface
    subroutine xr2f_r_set_seed(seed) bind(C, name="xr2f_r_set_seed")
@@ -245,6 +246,10 @@ type :: kmeans_result_t
    integer, allocatable :: cluster(:)
    integer, allocatable :: size(:)
    real(kind=dp), allocatable :: withinss(:)
+   real(kind=dp) :: totss = 0.0_dp
+   real(kind=dp) :: tot_withinss = 0.0_dp
+   real(kind=dp) :: betweenss = 0.0_dp
+   integer :: iter = 0
 end type kmeans_result_t
 
 type :: hclust_result_t
@@ -252,7 +257,7 @@ type :: hclust_result_t
    integer, allocatable :: merge(:,:)
    real(kind=dp), allocatable :: height(:)
    integer, allocatable :: order(:)
-   integer, allocatable :: labels(:)
+   character(len=:), allocatable :: labels(:)
    integer :: method = 1
 end type hclust_result_t
 
@@ -1291,6 +1296,11 @@ end interface r_acf_values
 interface r_ccf
    module procedure ccf_vec
 end interface r_ccf
+
+interface ARMAacf
+   module procedure ARMAacf_vecma
+   module procedure ARMAacf_scalarma
+end interface ARMAacf
 
 interface is_na
    module procedure is_na_real_scalar
@@ -2691,6 +2701,19 @@ logical, intent(in) :: flag ! logical flag
 recycle_stop_default = flag
 end subroutine set_recycle_stop
 
+subroutine set_nlm_method(method)
+! Select nlm optimizer: "legacy" preserves the historical gradient-descent helper.
+character(len=*), intent(in) :: method
+character(len=:), allocatable :: m
+m = trim(adjustl(method))
+select case (m)
+case ("newton", "Newton", "NEWTON")
+   nlm_method_default = 2
+case default
+   nlm_method_default = 1
+end select
+end subroutine set_nlm_method
+
 subroutine set_seed_int(seed)
 ! Set Fortran RNG seed deterministically from a single integer.
 integer, intent(in) :: seed ! random seed
@@ -2713,26 +2736,34 @@ deallocate(put)
 #endif
 end subroutine set_seed_int
 
-function kmeans_vec(x, centers, nstart, iter_max) result(out)
+function kmeans_vec(x, centers, nstart, iter_max, algorithm) result(out)
 ! Minimal 1D k-means helper: returns centers and 1-based cluster ids.
 real(kind=dp), intent(in) :: x(:) ! input values
 integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
 integer, intent(in), optional :: iter_max
+character(len=*), intent(in), optional :: algorithm
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:), c_new(:), sums(:), best_withinss(:), withinss(:), best_centers(:)
 integer, allocatable :: cnt(:), cl(:), cl_best(:), best_size(:)
 integer, allocatable :: size_tot(:)
 integer, allocatable :: order_idx(:), remap(:)
-integer :: i, j, k, n, it, jbest, nstart_loc, iter_max_loc, start, idx
-integer :: t
-real(kind=dp) :: xmin, xmax, scale, d, dbest, u, best_score, score
+integer :: i, j, k, n, it, jbest, nstart_loc, iter_max_loc, start, idx, empty_j, far_i, far_j
+integer :: t, best_iter
+real(kind=dp) :: xmin, xmax, scale, d, dbest, u, best_score, score, far_d, xmean, totss
+real(kind=dp) :: delta, best_delta
+logical :: changed, use_macqueen, use_hartigan
+character(len=32) :: alg
 n = size(x)
 k = max(1, centers)
 nstart_loc = 1
 if (present(nstart)) nstart_loc = max(1, nstart)
 iter_max_loc = 50
 if (present(iter_max)) iter_max_loc = max(1, iter_max)
+alg = "Hartigan-Wong"
+if (present(algorithm)) alg = trim(adjustl(algorithm))
+use_macqueen = alg == "MacQueen" .or. alg == "macqueen" .or. alg == "MACQUEEN"
+use_hartigan = alg == "Hartigan-Wong" .or. alg == "hartigan-wong" .or. alg == "HARTIGAN-WONG"
 allocate(c(k), c_new(k), sums(k), cnt(k), cl(n), cl_best(n))
 allocate(withinss(k), best_withinss(k), best_centers(k), best_size(k), size_tot(k))
 if (n <= 0) then
@@ -2753,7 +2784,10 @@ best_withinss = 0.0_dp
 best_size = 0
 cl_best = 1
 best_centers = 0.0_dp
+best_iter = 0
 if (k > 0) cl_best(1) = 1
+xmean = sum(x) / real(n, kind=dp)
+totss = sum((x - xmean)**2)
 do start = 1, nstart_loc
    if (k == 1) then
       if (nstart_loc > 1 .and. start > 1) then
@@ -2773,13 +2807,47 @@ do start = 1, nstart_loc
             c(j) = x(idx)
          end do
       else
-         scale = (xmax - xmin) / real(k - 1, kind=dp)
-         do j = 1, k
-            c(j) = xmin + real(j - 1, kind=dp) * scale
+         c(1) = sum(x) / real(n, kind=dp)
+         do j = 2, k
+            far_i = 1
+            far_d = -1.0_dp
+            do i = 1, n
+               dbest = abs(x(i) - c(1))
+               do t = 2, j - 1
+                  dbest = min(dbest, abs(x(i) - c(t)))
+               end do
+               if (dbest > far_d) then
+                  far_d = dbest
+                  far_i = i
+               end if
+            end do
+            c(j) = x(far_i)
          end do
       end if
    end if
+   cl = 0
    do it = 1, iter_max_loc
+      changed = .false.
+      if (use_macqueen) then
+         cnt = 0
+         do i = 1, n
+            jbest = 1
+            dbest = abs(x(i) - c(1))
+            do j = 2, k
+               d = abs(x(i) - c(j))
+               if (d < dbest) then
+                  dbest = d
+                  jbest = j
+               end if
+            end do
+            if (cl(i) /= jbest) changed = .true.
+            cl(i) = jbest
+            cnt(jbest) = cnt(jbest) + 1
+            c(jbest) = c(jbest) + (x(i) - c(jbest)) / real(cnt(jbest), kind=dp)
+         end do
+         if (.not. changed) exit
+         cycle
+      end if
       do i = 1, n
          jbest = 1
          dbest = abs(x(i) - c(1))
@@ -2790,6 +2858,7 @@ do start = 1, nstart_loc
                jbest = j
             end if
          end do
+         if (cl(i) /= jbest) changed = .true.
          cl(i) = jbest
       end do
       sums = 0.0_dp
@@ -2799,13 +2868,79 @@ do start = 1, nstart_loc
          sums(j) = sums(j) + x(i)
          cnt(j) = cnt(j) + 1
       end do
+      do empty_j = 1, k
+         if (cnt(empty_j) == 0) then
+            far_i = 1
+            far_j = cl(1)
+            far_d = -1.0_dp
+            do i = 1, n
+               j = cl(i)
+               if (cnt(j) > 1) then
+                  d = (x(i) - sums(j) / real(cnt(j), kind=dp))**2
+                  if (d > far_d) then
+                     far_d = d
+                     far_i = i
+                     far_j = j
+                  end if
+               end if
+            end do
+            if (far_d >= 0.0_dp) then
+               sums(far_j) = sums(far_j) - x(far_i)
+               cnt(far_j) = cnt(far_j) - 1
+               cl(far_i) = empty_j
+               sums(empty_j) = x(far_i)
+               cnt(empty_j) = 1
+               changed = .true.
+            end if
+         end if
+      end do
       c_new = c
       do j = 1, k
          if (cnt(j) > 0) c_new(j) = sums(j) / real(cnt(j), kind=dp)
       end do
-      if (maxval(abs(c_new - c)) <= 1.0e-12_dp * max(1.0_dp, maxval(abs(c)))) exit
+      scale = maxval(abs(c_new - c))
       c = c_new
+      if ((.not. changed) .or. scale <= 1.0e-12_dp * max(1.0_dp, maxval(abs(c)))) exit
    end do
+
+   if (use_hartigan .and. k > 1) then
+      do t = 1, iter_max_loc
+         changed = .false.
+         sums = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            sums(cl(i)) = sums(cl(i)) + x(i)
+            cnt(cl(i)) = cnt(cl(i)) + 1
+         end do
+         do i = 1, n
+            far_j = cl(i)
+            if (cnt(far_j) <= 1) cycle
+            best_delta = 0.0_dp
+            jbest = far_j
+            do j = 1, k
+               if (j == far_j) cycle
+               delta = real(cnt(j), kind=dp) / real(cnt(j) + 1, kind=dp) * (x(i) - c(j))**2 &
+                  - real(cnt(far_j), kind=dp) / real(cnt(far_j) - 1, kind=dp) * (x(i) - c(far_j))**2
+               if (delta < best_delta) then
+                  best_delta = delta
+                  jbest = j
+               end if
+            end do
+            if (jbest /= far_j) then
+               sums(far_j) = sums(far_j) - x(i)
+               cnt(far_j) = cnt(far_j) - 1
+               sums(jbest) = sums(jbest) + x(i)
+               cnt(jbest) = cnt(jbest) + 1
+               c(far_j) = sums(far_j) / real(cnt(far_j), kind=dp)
+               c(jbest) = sums(jbest) / real(cnt(jbest), kind=dp)
+               cl(i) = jbest
+               changed = .true.
+            end if
+         end do
+         if (.not. changed) exit
+      end do
+      it = min(iter_max_loc, it + t)
+   end if
 
    size_tot = 0
    withinss = 0.0_dp
@@ -2822,12 +2957,17 @@ do start = 1, nstart_loc
       cl_best = cl
       best_withinss = withinss
       best_size = size_tot
+      best_iter = it
    end if
 end do
 out%centers = reshape(best_centers, [k, 1])
 out%cluster = cl_best
 out%size = best_size
 out%withinss = best_withinss
+out%totss = totss
+out%tot_withinss = sum(best_withinss)
+out%betweenss = out%totss - out%tot_withinss
+out%iter = best_iter
 
 allocate(order_idx(k), remap(k))
 if (k > 1) then
@@ -2864,22 +3004,30 @@ out%centers = reshape(best_centers, [k, 1])
 out%cluster = cl_best
 out%size = best_size
 out%withinss = best_withinss
+out%totss = totss
+out%tot_withinss = sum(best_withinss)
+out%betweenss = out%totss - out%tot_withinss
+out%iter = best_iter
 end function kmeans_vec
 
-function kmeans_mat(x, centers, nstart, iter_max) result(out)
+function kmeans_mat(x, centers, nstart, iter_max, algorithm) result(out)
 ! Minimal row-wise k-means helper for matrix observations.
 real(kind=dp), intent(in) :: x(:,:) ! input data matrix
 integer, intent(in) :: centers ! cluster centers
 integer, intent(in), optional :: nstart
 integer, intent(in), optional :: iter_max
+character(len=*), intent(in), optional :: algorithm
 type(kmeans_result_t) :: out
 real(kind=dp), allocatable :: c(:,:), c_new(:,:), sums(:,:), best_centers(:,:), best_withinss(:), withinss(:)
 integer, allocatable :: cnt(:), cl(:), cl_best(:), best_size(:), size_tot(:)
 integer, allocatable :: order_idx(:), remap(:), ci(:)
-integer :: i, j, k, n, p, it, jbest, nstart_loc, iter_max_loc, start
-integer :: idx
+integer :: i, j, k, n, p, it, jbest, nstart_loc, iter_max_loc, start, empty_j, far_i, far_j
+integer :: idx, best_iter
 integer :: t
-real(kind=dp) :: d, dbest, shift, u, best_score, score
+real(kind=dp) :: d, dbest, shift, u, best_score, score, far_d, totss, delta, best_delta
+real(kind=dp), allocatable :: xmean(:)
+logical :: changed, use_macqueen, use_hartigan
+character(len=32) :: alg
 n = size(x, 1)
 p = size(x, 2)
 k = max(1, centers)
@@ -2887,6 +3035,10 @@ nstart_loc = 1
 if (present(nstart)) nstart_loc = max(1, nstart)
 iter_max_loc = 50
 if (present(iter_max)) iter_max_loc = max(1, iter_max)
+alg = "Hartigan-Wong"
+if (present(algorithm)) alg = trim(adjustl(algorithm))
+use_macqueen = alg == "MacQueen" .or. alg == "macqueen" .or. alg == "MACQUEEN"
+use_hartigan = alg == "Hartigan-Wong" .or. alg == "hartigan-wong" .or. alg == "HARTIGAN-WONG"
 allocate(c(k, p), c_new(k, p), sums(k, p), best_centers(k, p), withinss(k), best_withinss(k))
 allocate(cnt(k), size_tot(k), cl(n), cl_best(n), best_size(k), out%size(k), out%withinss(k))
 if (n <= 0 .or. p <= 0) then
@@ -2894,6 +3046,10 @@ if (n <= 0 .or. p <= 0) then
    out%cluster = cl
    out%size = 0
    out%withinss = 0.0_dp
+   out%totss = 0.0_dp
+   out%tot_withinss = 0.0_dp
+   out%betweenss = 0.0_dp
+   out%iter = 0
    return
 end if
 best_score = huge(1.0_dp)
@@ -2901,6 +3057,13 @@ best_withinss = 0.0_dp
 best_size = 0
 best_centers = 0.0_dp
 cl_best = 1
+best_iter = 0
+allocate(xmean(p))
+xmean = sum(x, dim=1) / real(n, kind=dp)
+totss = 0.0_dp
+do i = 1, n
+   totss = totss + sum((x(i, :) - xmean)**2)
+end do
 do start = 1, nstart_loc
    if (k > 1) then
       if (nstart_loc > 1 .and. start > 1) then
@@ -2911,16 +3074,50 @@ do start = 1, nstart_loc
             c(j, :) = x(idx, :)
          end do
       else
-         do j = 1, k
-            idx = 1 + int(real(j - 1, kind=dp) * real(max(1, n - 1), kind=dp) / real(max(1, k - 1), kind=dp))
-            c(j, :) = x(idx, :)
+         c(1, :) = sum(x, dim=1) / real(n, kind=dp)
+         do j = 2, k
+            far_i = 1
+            far_d = -1.0_dp
+            do i = 1, n
+               dbest = sum((x(i, :) - c(1, :))**2)
+               do t = 2, j - 1
+                  dbest = min(dbest, sum((x(i, :) - c(t, :))**2))
+               end do
+               if (dbest > far_d) then
+                  far_d = dbest
+                  far_i = i
+               end if
+            end do
+            c(j, :) = x(far_i, :)
          end do
       end if
    else
       c(1, :) = sum(x, dim=1) / real(n, kind=dp)
    end if
 
+   cl = 0
    do it = 1, iter_max_loc
+      changed = .false.
+      if (use_macqueen) then
+         cnt = 0
+         do i = 1, n
+            jbest = 1
+            dbest = sum((x(i, :) - c(1, :))**2)
+            do j = 2, k
+               d = sum((x(i, :) - c(j, :))**2)
+               if (d < dbest) then
+                  dbest = d
+                  jbest = j
+               end if
+            end do
+            if (cl(i) /= jbest) changed = .true.
+            cl(i) = jbest
+            cnt(jbest) = cnt(jbest) + 1
+            c(jbest, :) = c(jbest, :) + (x(i, :) - c(jbest, :)) / real(cnt(jbest), kind=dp)
+         end do
+         if (.not. changed) exit
+         cycle
+      end if
       do i = 1, n
          jbest = 1
          dbest = sum((x(i, :) - c(1, :))**2)
@@ -2931,6 +3128,7 @@ do start = 1, nstart_loc
                jbest = j
             end if
          end do
+         if (cl(i) /= jbest) changed = .true.
          cl(i) = jbest
       end do
       sums = 0.0_dp
@@ -2940,14 +3138,79 @@ do start = 1, nstart_loc
          sums(j, :) = sums(j, :) + x(i, :)
          cnt(j) = cnt(j) + 1
       end do
+      do empty_j = 1, k
+         if (cnt(empty_j) == 0) then
+            far_i = 1
+            far_j = cl(1)
+            far_d = -1.0_dp
+            do i = 1, n
+               j = cl(i)
+               if (cnt(j) > 1) then
+                  d = sum((x(i, :) - sums(j, :) / real(cnt(j), kind=dp))**2)
+                  if (d > far_d) then
+                     far_d = d
+                     far_i = i
+                     far_j = j
+                  end if
+               end if
+            end do
+            if (far_d >= 0.0_dp) then
+               sums(far_j, :) = sums(far_j, :) - x(far_i, :)
+               cnt(far_j) = cnt(far_j) - 1
+               cl(far_i) = empty_j
+               sums(empty_j, :) = x(far_i, :)
+               cnt(empty_j) = 1
+               changed = .true.
+            end if
+         end if
+      end do
       c_new = c
       do j = 1, k
          if (cnt(j) > 0) c_new(j, :) = sums(j, :) / real(cnt(j), kind=dp)
       end do
       shift = maxval(abs(c_new - c))
-      if (shift <= 1.0e-12_dp * max(1.0_dp, maxval(abs(c)))) exit
       c = c_new
+      if ((.not. changed) .or. shift <= 1.0e-12_dp * max(1.0_dp, maxval(abs(c)))) exit
    end do
+
+   if (use_hartigan .and. k > 1) then
+      do t = 1, iter_max_loc
+         changed = .false.
+         sums = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            sums(cl(i), :) = sums(cl(i), :) + x(i, :)
+            cnt(cl(i)) = cnt(cl(i)) + 1
+         end do
+         do i = 1, n
+            far_j = cl(i)
+            if (cnt(far_j) <= 1) cycle
+            best_delta = 0.0_dp
+            jbest = far_j
+            do j = 1, k
+               if (j == far_j) cycle
+               delta = real(cnt(j), kind=dp) / real(cnt(j) + 1, kind=dp) * sum((x(i, :) - c(j, :))**2) &
+                  - real(cnt(far_j), kind=dp) / real(cnt(far_j) - 1, kind=dp) * sum((x(i, :) - c(far_j, :))**2)
+               if (delta < best_delta) then
+                  best_delta = delta
+                  jbest = j
+               end if
+            end do
+            if (jbest /= far_j) then
+               sums(far_j, :) = sums(far_j, :) - x(i, :)
+               cnt(far_j) = cnt(far_j) - 1
+               sums(jbest, :) = sums(jbest, :) + x(i, :)
+               cnt(jbest) = cnt(jbest) + 1
+               c(far_j, :) = sums(far_j, :) / real(cnt(far_j), kind=dp)
+               c(jbest, :) = sums(jbest, :) / real(cnt(jbest), kind=dp)
+               cl(i) = jbest
+               changed = .true.
+            end if
+         end do
+         if (.not. changed) exit
+      end do
+      it = min(iter_max_loc, it + t)
+   end if
 
    size_tot = 0
    withinss = 0.0_dp
@@ -2964,12 +3227,17 @@ do start = 1, nstart_loc
       cl_best = cl
       best_size = size_tot
       best_withinss = withinss
+      best_iter = it
    end if
 end do
 out%centers = best_centers
 out%cluster = cl_best
 out%size = best_size
 out%withinss = best_withinss
+out%totss = totss
+out%tot_withinss = sum(best_withinss)
+out%betweenss = out%totss - out%tot_withinss
+out%iter = best_iter
 
 allocate(order_idx(k), remap(k), ci(n))
 if (k > 1) then
@@ -3006,6 +3274,10 @@ out%centers = best_centers
 out%cluster = cl_best
 out%size = best_size
 out%withinss = best_withinss
+out%totss = totss
+out%tot_withinss = sum(best_withinss)
+out%betweenss = out%totss - out%tot_withinss
+out%iter = best_iter
 end function kmeans_mat
 
 pure function dist_mat(x, method) result(out)
@@ -3061,28 +3333,38 @@ end do
 if (n >= 1) out(n, n) = 0.0_dp
 end function dist_mat
 
-pure function hclust_complete(d, method) result(out)
-! Minimal hierarchical clustering helper using complete linkage on a distance matrix.
-! Valid method value: "complete" (default); other values are treated as "complete".
+pure function hclust_complete(d, method, labels) result(out)
+! Minimal hierarchical clustering helper on a distance matrix.
+! Supported method values: complete, single, average, mcquitty, centroid, median, ward.D, ward.D2.
 real(kind=dp), intent(in) :: d(:,:) ! square distance matrix
 character(len=*), intent(in), optional :: method ! linkage method name
+character(len=*), intent(in), optional :: labels(:) ! optional observation labels
 type(hclust_result_t) :: out
 logical, allocatable :: alive(:)
 real(kind=dp), allocatable :: cdist(:,:)
-integer, allocatable :: cluster_rep(:)
+integer, allocatable :: cluster_rep(:), node_size(:)
+integer, allocatable :: stack(:)
 integer :: n, step, i, j, k
-integer :: node_count, new_node
-real(kind=dp) :: best_d, cand_d
+integer :: node_count, new_node, stack_top, entry, order_pos
+real(kind=dp) :: best_d, cand_d, da, db, dab, sa, sb, sk, denom
 integer :: best_a, best_b
 character(len=16) :: meth
+integer :: method_code
 n = size(d, 1)
 if (n <= 1) then
    allocate(out%merge(0, 2))
    allocate(out%height(0))
    allocate(out%order(max(0, n)))
-   allocate(out%labels(max(0, n)))
+   allocate(character(len=32) :: out%labels(max(0, n)))
    if (n == 1) then
-      out%labels = [1]
+      out%labels(1) = "1"
+      if (present(labels)) then
+         if (size(labels) >= 1) then
+            deallocate(out%labels)
+            allocate(character(len=max(1, len_trim(labels(1)))) :: out%labels(1))
+            out%labels(1) = trim(labels(1))
+         end if
+      end if
       out%order = [1]
    end if
    out%method = 1
@@ -3092,7 +3374,7 @@ if (size(d, 2) /= n) then
    allocate(out%merge(0, 2))
    allocate(out%height(0))
    allocate(out%order(0))
-   allocate(out%labels(0))
+   allocate(character(len=32) :: out%labels(0))
    out%method = 1
    return
 end if
@@ -3101,21 +3383,54 @@ if (present(method)) then
 else
    meth = "complete"
 end if
-if (meth /= "complete") meth = "complete"
+select case (meth)
+case ("single", "SINGLE")
+   method_code = 2
+case ("average", "AVERAGE", "UPGMA")
+   method_code = 3
+case ("mcquitty", "MCQUITTY", "WPGMA")
+   method_code = 4
+case ("centroid", "CENTROID", "UPGMC")
+   method_code = 5
+case ("median", "MEDIAN", "WPGMC")
+   method_code = 6
+case ("ward.D", "ward.d", "WARD.D")
+   method_code = 7
+case ("ward.D2", "ward.d2", "WARD.D2")
+   method_code = 8
+case default
+   meth = "complete"
+   method_code = 1
+end select
 allocate(out%merge(max(0, n - 1), 2))
 allocate(out%height(max(0, n - 1)))
 allocate(out%order(n))
-allocate(out%labels(n))
-out%labels = [(i, i = 1, n)]
+allocate(character(len=32) :: out%labels(n))
+do i = 1, n
+   out%labels(i) = int_to_string(i)
+end do
+if (present(labels)) then
+   if (size(labels) >= n) then
+      deallocate(out%labels)
+      allocate(character(len=max(1, maxval(len_trim(labels(1:n))))) :: out%labels(n))
+      do i = 1, n
+         out%labels(i) = trim(labels(i))
+      end do
+   end if
+end if
 out%order = [(i, i = 1, n)]
-out%method = 1
+out%method = method_code
 allocate(alive(2 * n - 1))
 allocate(cdist(2 * n - 1, 2 * n - 1))
 allocate(cluster_rep(max(0, n - 1)))
+allocate(node_size(2 * n - 1))
+allocate(stack(max(1, 2 * n)))
 cdist = 0.0_dp
 alive = .false.
+node_size = 0
 cdist(1:n, 1:n) = d
 alive(1:n) = .true.
+node_size(1:n) = 1
 do step = 1, n - 1
    best_d = huge(1.0_dp)
    best_a = -1
@@ -3148,11 +3463,37 @@ do step = 1, n - 1
    alive(best_a) = .false.
    alive(best_b) = .false.
    alive(new_node) = .true.
+   node_size(new_node) = node_size(best_a) + node_size(best_b)
    cluster_rep(step) = new_node
    do k = 1, node_count
       if (.not. alive(k) .or. k == new_node) cycle
-      if (meth == "complete") then
-         cand_d = max(cdist(best_a, k), cdist(best_b, k))
+      da = cdist(best_a, k)
+      db = cdist(best_b, k)
+      dab = cdist(best_a, best_b)
+      sa = real(node_size(best_a), kind=dp)
+      sb = real(node_size(best_b), kind=dp)
+      sk = real(node_size(k), kind=dp)
+      if (method_code == 2) then
+         cand_d = min(da, db)
+      else if (method_code == 3) then
+         cand_d = (sa * da + sb * db) / (sa + sb)
+      else if (method_code == 4) then
+         cand_d = 0.5_dp * (da + db)
+      else if (method_code == 5) then
+         denom = sa + sb
+         cand_d = (sa * da + sb * db) / denom - (sa * sb * dab) / (denom * denom)
+         cand_d = max(0.0_dp, cand_d)
+      else if (method_code == 6) then
+         cand_d = 0.5_dp * (da + db) - 0.25_dp * dab
+         cand_d = max(0.0_dp, cand_d)
+      else if (method_code == 7) then
+         denom = sa + sb + sk
+         cand_d = ((sa + sk) * da + (sb + sk) * db - sk * dab) / denom
+         cand_d = max(0.0_dp, cand_d)
+      else if (method_code == 8) then
+         denom = sa + sb + sk
+         cand_d = ((sa + sk) * da * da + (sb + sk) * db * db - sk * dab * dab) / denom
+         cand_d = sqrt(max(0.0_dp, cand_d))
       else
          cand_d = max(cdist(best_a, k), cdist(best_b, k))
       end if
@@ -3165,13 +3506,32 @@ do step = 1, n - 1
    cdist(:, best_b) = 0.0_dp
    cdist(best_b, :) = 0.0_dp
 end do
+out%order = 0
+order_pos = 0
+stack_top = 1
+stack(stack_top) = n - 1
+do while (stack_top > 0)
+   entry = stack(stack_top)
+   stack_top = stack_top - 1
+   if (entry < 0) then
+      order_pos = order_pos + 1
+      if (order_pos <= n) out%order(order_pos) = -entry
+   else if (entry >= 1 .and. entry <= n - 1) then
+      stack_top = stack_top + 1
+      stack(stack_top) = out%merge(entry, 2)
+      stack_top = stack_top + 1
+      stack(stack_top) = out%merge(entry, 1)
+   end if
+end do
+if (any(out%order == 0)) out%order = [(i, i = 1, n)]
 end function hclust_complete
 
-pure function cutree_f90(fit, k) result(group)
-! Cut dendrogram at a target number of groups.
-! If k is absent, return one group; provided k is clamped to the range 1:n.
+pure function cutree_f90(fit, k, h) result(group)
+! Cut dendrogram at a target number of groups or height.
+! If k and h are absent, return one group; provided k is clamped to the range 1:n.
 type(hclust_result_t), intent(in) :: fit ! hierarchical clustering result
 integer, intent(in), optional :: k ! requested number of groups
+real(kind=dp), intent(in), optional :: h ! requested cut height
 integer, allocatable :: group(:)
 integer, allocatable :: rep_map(:), parent(:), merge_rep(:)
 integer :: n, nmerge, target_groups, nmerge_apply
@@ -3195,10 +3555,22 @@ if (nmerge <= 0) then
    end do
    return
 end if
-if (present(k)) then
+if (present(h)) then
+   nmerge_apply = 0
+   do i = 1, nmerge
+      if (fit%height(i) <= h) then
+         nmerge_apply = i
+      else
+         exit
+      end if
+   end do
+   target_groups = max(1, n - nmerge_apply)
+else if (present(k)) then
    target_groups = max(1, min(k, n))
+   nmerge_apply = min(nmerge, n - target_groups)
 else
    target_groups = 1
+   nmerge_apply = min(nmerge, n - target_groups)
 end if
 if (target_groups >= n) then
    do i = 1, n
@@ -3206,7 +3578,6 @@ if (target_groups >= n) then
    end do
    return
 end if
-nmerge_apply = min(nmerge, n - target_groups)
 allocate(parent(n))
 allocate(rep_map(n))
 allocate(merge_rep(max(0, nmerge)))
@@ -4694,10 +5065,28 @@ type(nlm_result_t) :: out
 real(kind=dp), allocatable :: pv(:)
 allocate(pv(1))
 pv(1) = p
-out = nlm_optimize_scalar_impl(fn, pv, hessian, stepmax)
+if (nlm_method_default == 2) then
+   out = nlm_optimize_scalar_newton_impl(fn, pv, hessian, stepmax)
+else
+   out = nlm_optimize_scalar_legacy_impl(fn, pv, hessian, stepmax)
+end if
 end function nlm_optimize_scalar
 
 function nlm_optimize_vec(fn, p, hessian, stepmax) result(out)
+! Support nlm-style optimization for optimize vec.
+procedure(nlm_objective_vec) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p(:) ! dimension count
+logical, intent(in), optional :: hessian ! logical flag
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+if (nlm_method_default == 2) then
+   out = nlm_optimize_vec_newton(fn, p, hessian, stepmax)
+else
+   out = nlm_optimize_vec_legacy(fn, p, hessian, stepmax)
+end if
+end function nlm_optimize_vec
+
+function nlm_optimize_vec_legacy(fn, p, hessian, stepmax) result(out)
 ! Support nlm-style optimization for optimize vec.
 procedure(nlm_objective_vec) :: fn ! callback procedure
 real(kind=dp), intent(in) :: p(:) ! dimension count
@@ -4747,9 +5136,79 @@ if (present(hessian)) then
 end if
 out%iterations = min(iter, 500)
 out%code = merge(1, 4, sqrt(sum(out%gradient*out%gradient)) <= 1.0e-4_dp)
-end function nlm_optimize_vec
+end function nlm_optimize_vec_legacy
 
-function nlm_optimize_scalar_impl(fn, p, hessian, stepmax) result(out)
+function nlm_optimize_vec_newton(fn, p, hessian, stepmax) result(out)
+! Newton-style nlm helper using finite-difference gradient and Hessian.
+procedure(nlm_objective_vec) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p(:) ! starting parameters
+logical, intent(in), optional :: hessian ! logical flag
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+integer :: n, iter, damp_iter, i
+real(kind=dp), allocatable :: x(:), g(:), hess(:,:), hwork(:,:), step(:), trial(:)
+real(kind=dp) :: f, f_trial, gnorm, alpha, max_step, step_norm, tol, lambda, slope
+logical :: have_step
+n = size(p)
+allocate(x(n), g(n), hess(n,n), hwork(n,n), step(n), trial(n))
+x = p
+tol = 1.0e-7_dp
+max_step = 100.0_dp
+if (present(stepmax)) max_step = max(stepmax, 1.0e-12_dp)
+f = fn(x)
+do iter = 1, 200
+   call nlm_fd_grad_vec(fn, x, g)
+   gnorm = sqrt(sum(g*g))
+   if (gnorm <= tol * max(1.0_dp, sqrt(sum(x*x)))) exit
+   call nlm_fd_hessian_vec(fn, x, hess)
+   lambda = 1.0e-8_dp
+   have_step = .false.
+   do damp_iter = 1, 8
+      hwork = hess
+      do i = 1, n
+         hwork(i,i) = hwork(i,i) + lambda
+      end do
+      step = solve_real(hwork, -g)
+      if (all(ieee_is_finite(step)) .and. dot_product(g, step) < 0.0_dp) then
+         have_step = .true.
+         exit
+      end if
+      lambda = lambda * 10.0_dp
+   end do
+   if (.not. have_step) step = -g
+   step_norm = sqrt(sum(step*step))
+   if (step_norm > max_step) step = step * (max_step / step_norm)
+   slope = dot_product(g, step)
+   alpha = 1.0_dp
+   do
+      trial = x + alpha * step
+      f_trial = fn(trial)
+      if (ieee_is_finite(f_trial) .and. f_trial <= f + 1.0e-4_dp * alpha * slope) exit
+      alpha = alpha * 0.5_dp
+      if (alpha < 1.0e-10_dp) exit
+   end do
+   if (.not. ieee_is_finite(f_trial) .or. f_trial >= f) exit
+   if (maxval(abs(trial - x)) <= tol * max(1.0_dp, maxval(abs(x)))) then
+      x = trial
+      f = f_trial
+      exit
+   end if
+   x = trial
+   f = f_trial
+end do
+allocate(out%estimate(n), out%gradient(n), out%hessian(n, n))
+out%estimate = x
+out%minimum = f
+call nlm_fd_grad_vec(fn, x, out%gradient)
+out%hessian = 0.0_dp
+if (present(hessian)) then
+   if (hessian) call nlm_fd_hessian_vec(fn, x, out%hessian)
+end if
+out%iterations = min(iter, 200)
+out%code = merge(1, 4, sqrt(sum(out%gradient*out%gradient)) <= 1.0e-4_dp)
+end function nlm_optimize_vec_newton
+
+function nlm_optimize_scalar_legacy_impl(fn, p, hessian, stepmax) result(out)
 ! Support nlm-style optimization for optimize scalar impl.
 procedure(nlm_objective_scalar) :: fn ! callback procedure
 real(kind=dp), intent(in) :: p(:) ! dimension count
@@ -4797,7 +5256,70 @@ if (present(hessian)) then
 end if
 out%iterations = min(iter, 500)
 out%code = merge(1, 4, abs(out%gradient(1)) <= 1.0e-4_dp)
-end function nlm_optimize_scalar_impl
+end function nlm_optimize_scalar_legacy_impl
+
+function nlm_optimize_scalar_newton_impl(fn, p, hessian, stepmax) result(out)
+! Newton-style scalar nlm helper using finite-difference derivative and Hessian.
+procedure(nlm_objective_scalar) :: fn ! callback procedure
+real(kind=dp), intent(in) :: p(:) ! dimension count
+logical, intent(in), optional :: hessian ! logical flag
+real(kind=dp), intent(in), optional :: stepmax
+type(nlm_result_t) :: out
+integer :: iter
+real(kind=dp) :: x, g, f, f_trial, trial, alpha, max_step, tol, h, hess, step, slope
+x = p(1)
+tol = 1.0e-7_dp
+max_step = 100.0_dp
+if (present(stepmax)) max_step = max(stepmax, 1.0e-12_dp)
+f = fn(x)
+do iter = 1, 200
+   g = nlm_fd_grad_scalar(fn, x)
+   if (abs(g) <= tol * max(1.0_dp, abs(x))) exit
+   h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x))
+   hess = (fn(x + h) - 2.0_dp * fn(x) + fn(x - h)) / (h * h)
+   if (ieee_is_finite(hess) .and. hess > sqrt(epsilon(1.0_dp))) then
+      step = -g / hess
+   else
+      step = -g
+   end if
+   if (abs(step) > max_step) step = sign(max_step, step)
+   slope = g * step
+   if (slope >= 0.0_dp) then
+      step = -g
+      if (abs(step) > max_step) step = sign(max_step, step)
+      slope = g * step
+   end if
+   alpha = 1.0_dp
+   do
+      trial = x + alpha * step
+      f_trial = fn(trial)
+      if (ieee_is_finite(f_trial) .and. f_trial <= f + 1.0e-4_dp * alpha * slope) exit
+      alpha = alpha * 0.5_dp
+      if (alpha < 1.0e-10_dp) exit
+   end do
+   if (.not. ieee_is_finite(f_trial) .or. f_trial >= f) exit
+   if (abs(trial - x) <= tol * max(1.0_dp, abs(x))) then
+      x = trial
+      f = f_trial
+      exit
+   end if
+   x = trial
+   f = f_trial
+end do
+allocate(out%estimate(1), out%gradient(1), out%hessian(1, 1))
+out%estimate(1) = x
+out%minimum = f
+out%gradient(1) = nlm_fd_grad_scalar(fn, x)
+out%hessian = 0.0_dp
+if (present(hessian)) then
+   if (hessian) then
+      h = sqrt(epsilon(1.0_dp)) * max(1.0_dp, abs(x))
+      out%hessian(1, 1) = (fn(x + h) - 2.0_dp * fn(x) + fn(x - h)) / (h * h)
+   end if
+end if
+out%iterations = min(iter, 200)
+out%code = merge(1, 4, abs(out%gradient(1)) <= 1.0e-4_dp)
+end function nlm_optimize_scalar_newton_impl
 
 function nlm_fd_grad_scalar(fn, x) result(g)
 ! Support nlm-style optimization for fd grad scalar.
@@ -5717,49 +6239,104 @@ do i = 1, n
 end do
 end function r_filter_linear
 
-pure function runmed(x, k) result(out)
+pure function runmed(x, k, endrule, algorithm, na_action, print_level) result(out)
 ! Compute R-like runmed smoothing output.
 real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: k
-real(kind=dp), allocatable :: out(:), tmp(:)
-integer :: i, n, kk, h
+character(len=*), intent(in), optional :: endrule ! endpoint rule: median, keep, constant
+character(len=*), intent(in), optional :: algorithm ! accepted for API compatibility
+character(len=*), intent(in), optional :: na_action ! accepted for API compatibility
+integer, intent(in), optional :: print_level ! accepted for API compatibility
+real(kind=dp), allocatable :: out(:), y_end(:)
+integer :: i, j, n, kk, h, n_1, n_2
+character(len=32) :: erule
 n = size(x)
 allocate(out(n))
 if (n <= 0) return
 kk = max(1, k)
 if (mod(kk, 2) == 0) kk = kk + 1
+if (kk > n) then
+   kk = n
+   if (mod(kk, 2) == 0) kk = kk - 1
+   kk = max(1, kk)
+end if
 h = kk / 2
-if (kk <= 1 .or. n < kk) then
+if (kk <= 1) then
    out = x
    return
 end if
+erule = "median"
+if (present(endrule)) erule = trim(adjustl(endrule))
 out = x
 do i = h + 1, n - h
-   tmp = sort(x(i - h:i + h))
-   out(i) = tmp(h + 1)
+   out(i) = median(x(i - h:i + h))
 end do
+if (erule == "constant" .or. erule == "Constant" .or. erule == "CONSTANT") then
+   out(1:h) = out(h + 1)
+   out(n - h + 1:n) = out(n - h)
+end if
+if (erule == "median" .or. erule == "Median" .or. erule == "MEDIAN") then
+   y_end = out
+   n_1 = n - 1
+   n_2 = n - 2
+   if (h >= 2) then
+      out(2) = median(y_end(1:3))
+      out(n_1) = median([y_end(n), y_end(n_1), y_end(n_2)])
+      if (h >= 3) then
+         do i = 3, h
+            j = 2 * i - 1
+            out(i) = median(y_end(1:j))
+            out(n - i + 1) = median(y_end(n + 1 - j:n))
+         end do
+      end if
+   end if
+   out(1) = median([y_end(1), out(2), out(2) - 2.0_dp * (out(3) - out(2))])
+   out(n) = median([y_end(n), out(n_1), out(n_1) - 2.0_dp * (out(n_2) - out(n_1))])
+end if
+if (present(algorithm)) continue
+if (present(na_action)) continue
+if (present(print_level)) continue
 end function runmed
 
-pure function smooth(x, kind) result(out)
+pure recursive function smooth(x, kind, twiceit, endrule, do_ends) result(out)
 ! Compute R-like smooth smoothing output.
 real(kind=dp), intent(in) :: x(:) ! input vector
 character(len=*), intent(in), optional :: kind
+logical, intent(in), optional :: twiceit
+character(len=*), intent(in), optional :: endrule
+logical, intent(in), optional :: do_ends
 real(kind=dp), allocatable :: out(:), prev(:), split(:)
 integer :: i, j, n, iter
-logical :: use_3rs3r
+logical :: use_3rs3r, repeat_medians, do_twice
+character(len=:), allocatable :: k, runmed_endrule
 n = size(x)
 allocate(out(n))
 if (n <= 0) return
-use_3rs3r = .true.
-if (present(kind)) use_3rs3r = index(kind, "3RS3R") > 0
-out = runmed(x, 3)
-if (.not. use_3rs3r) return
+k = "3RS3R"
+if (present(kind)) k = kind
+runmed_endrule = "median"
+if (present(endrule)) then
+   if (endrule == "copy") runmed_endrule = "keep"
+end if
+do_twice = .false.
+if (present(twiceit)) do_twice = twiceit
+use_3rs3r = index(k, "3RS3R") > 0
+repeat_medians = index(k, "3R") > 0
+out = runmed(x, 3, endrule=runmed_endrule)
+if (.not. (use_3rs3r .or. repeat_medians)) then
+   if (do_twice) out = out + smooth(x - out, kind=k, twiceit=.false., endrule=endrule, do_ends=do_ends)
+   return
+end if
 if (n < 3) return
 do iter = 1, max(1, n)
    prev = out
-   out = runmed(out, 3)
+   out = runmed(out, 3, endrule=runmed_endrule)
    if (all(abs(out - prev) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, max(maxval(abs(out)), maxval(abs(prev)))))) exit
 end do
+if (.not. use_3rs3r) then
+   if (do_twice) out = out + smooth(x - out, kind=k, twiceit=.false., endrule=endrule, do_ends=do_ends)
+   return
+end if
 split = out
 i = 2
 do while (i <= n - 2)
@@ -5779,7 +6356,9 @@ do while (i <= n - 2)
    end if
    i = j + 1
 end do
-out = runmed(split, 3)
+out = runmed(split, 3, endrule=runmed_endrule)
+if (do_twice) out = out + smooth(x - out, kind=k, twiceit=.false., endrule=endrule, do_ends=do_ends)
+if (present(do_ends)) continue
 end function smooth
 
 pure function smooth_kernel_eval(x, y, x0, bandwidth, kernel) result(v)
@@ -5811,7 +6390,11 @@ do i = 1, min(size(x), size(y))
          w = 0.0_dp
       end if
    else
-      w = exp(-0.5_dp * z * z)
+      if (abs(z) <= 4.0_dp) then
+         w = exp(-0.5_dp * z * z)
+      else
+         w = 0.0_dp
+      end if
    end if
    sw = sw + w
    sy = sy + w * y(i)
@@ -5823,25 +6406,49 @@ else
 end if
 end function smooth_kernel_eval
 
-pure function ksmooth(x, y, kernel, bandwidth, x_points) result(out)
+pure function ksmooth(x, y, kernel, bandwidth, x_points, range_x, n_points) result(out)
 ! Compute R-like ksmooth smoothing output.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: y(:) ! response values
 character(len=*), intent(in), optional :: kernel ! input string
 real(kind=dp), intent(in), optional :: bandwidth ! input value
-real(kind=dp), intent(in), optional :: x_points(:)
+real(kind=dp), intent(in), optional :: x_points(:) ! prediction locations
+real(kind=dp), intent(in), optional :: range_x(:) ! default prediction range
+integer, intent(in), optional :: n_points ! number of default prediction locations
 type(smooth_xy_t) :: out
 character(len=:), allocatable :: kern
-real(kind=dp) :: bw
-integer :: i
+real(kind=dp) :: bw, xmin, xmax
+integer :: i, ngrid
 kern = "normal"
 if (present(kernel)) kern = kernel
 bw = 0.5_dp
 if (present(bandwidth)) bw = bandwidth
 if (present(x_points)) then
-   out%x = x_points
+   out%x = sort(x_points)
 else
-   out%x = x
+   ngrid = max(100, size(x))
+   if (present(n_points)) ngrid = max(1, n_points)
+   allocate(out%x(ngrid))
+   if (size(x) <= 0) then
+      out%x = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (ngrid <= 1) then
+      if (present(range_x) .and. size(range_x) >= 1) then
+         out%x = range_x(1)
+      else
+         out%x = minval(x)
+      end if
+   else
+      if (present(range_x) .and. size(range_x) >= 2) then
+         xmin = range_x(1)
+         xmax = range_x(2)
+      else
+         xmin = minval(x)
+         xmax = maxval(x)
+      end if
+      do i = 1, ngrid
+         out%x(i) = xmin + (xmax - xmin) * real(i - 1, kind=dp) / real(ngrid - 1, kind=dp)
+      end do
+   end if
 end if
 allocate(out%y(size(out%x)))
 do i = 1, size(out%x)
@@ -5850,58 +6457,80 @@ end do
 out%df = real(size(out%x), kind=dp)
 end function ksmooth
 
-pure function lowess(x, y, f, iter) result(out)
+pure function lowess(x, y, f, iter, delta) result(out)
 ! Compute R-like lowess smoothing output.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in) :: y(:) ! response values
 real(kind=dp), intent(in), optional :: f ! callback procedure
 integer, intent(in), optional :: iter
+real(kind=dp), intent(in), optional :: delta
 type(smooth_xy_t) :: out
-real(kind=dp), allocatable :: robust(:), fitted(:), resid(:), abs_resid(:), dist(:), dist_sorted(:)
-real(kind=dp) :: frac, h, d, u, w, sw, sx, sy, sxx, sxy, den, beta, alpha, cmad
-integer :: n, i, j, ns, pass, niter
+real(kind=dp), allocatable :: robust(:), fitted(:), resid(:), abs_resid(:), xs(:), ys(:), xfit(:), yfit(:)
+integer, allocatable :: ord(:)
+real(kind=dp) :: frac, h, h1, h9, r, u, w, sw, sx, sy, sxx, sxy, den, beta, alpha, cmad, del, cut
+integer :: n, i, j, ns, pass, niter, nleft, nright, last, next_i
 n = min(size(x), size(y))
 allocate(out%x(n), out%y(n))
 if (n <= 0) return
-out%x = x(1:n)
+allocate(xs(n), ys(n), ord(n))
+ord = order_real(x(1:n))
+do i = 1, n
+   xs(i) = x(ord(i))
+   ys(i) = y(ord(i))
+end do
+out%x = xs
 frac = 2.0_dp / 3.0_dp
 if (present(f)) frac = max(0.01_dp, min(1.0_dp, f))
 niter = 3
 if (present(iter)) niter = max(0, iter)
+del = 0.01_dp * (maxval(xs) - minval(xs))
+if (present(delta)) del = max(0.0_dp, delta)
 ns = max(2, min(n, int(frac * real(n, kind=dp))))
-allocate(robust(n), fitted(n), resid(n), abs_resid(n), dist(n), dist_sorted(n))
+allocate(robust(n), fitted(n), resid(n), abs_resid(n), xfit(n), yfit(n))
 robust = 1.0_dp
-fitted = y(1:n)
+fitted = ys
 do pass = 0, niter
-   do i = 1, n
-      do j = 1, n
-         dist(j) = abs(out%x(j) - out%x(i))
+   nleft = 1
+   nright = ns
+   last = 0
+   i = 1
+   do
+      if (i > n) exit
+      do while (nright < n)
+         if (xs(i) - xs(nleft) <= xs(nright + 1) - xs(i)) exit
+         nleft = nleft + 1
+         nright = nright + 1
       end do
-      dist_sorted = sort(dist)
-      h = dist_sorted(ns)
-      if (h <= sqrt(tiny(1.0_dp))) h = maxval(dist_sorted)
+      h = max(xs(i) - xs(nleft), xs(nright) - xs(i))
+      h1 = 0.001_dp * h
+      h9 = 0.999_dp * h
       sw = 0.0_dp
       sx = 0.0_dp
       sy = 0.0_dp
       sxx = 0.0_dp
       sxy = 0.0_dp
-      do j = 1, n
+      do j = nleft, nright
+         r = abs(xs(j) - xs(i))
          if (h <= sqrt(tiny(1.0_dp))) then
-            w = merge(robust(j), 0.0_dp, dist(j) <= sqrt(tiny(1.0_dp)))
-         else if (dist(j) <= h) then
-            d = dist(j) / h
-            w = (1.0_dp - d**3)**3 * robust(j)
+            w = merge(robust(j), 0.0_dp, r <= sqrt(tiny(1.0_dp)))
+         else if (r <= h9) then
+            if (r <= h1) then
+               w = robust(j)
+            else
+               r = r / h
+               w = (1.0_dp - r**3)**3 * robust(j)
+            end if
          else
             w = 0.0_dp
          end if
          sw = sw + w
-         sx = sx + w * out%x(j)
-         sy = sy + w * y(j)
-         sxx = sxx + w * out%x(j) * out%x(j)
-         sxy = sxy + w * out%x(j) * y(j)
+         sx = sx + w * xs(j)
+         sy = sy + w * ys(j)
+         sxx = sxx + w * xs(j) * xs(j)
+         sxy = sxy + w * xs(j) * ys(j)
       end do
       if (sw <= sqrt(tiny(1.0_dp))) then
-         fitted(i) = y(i)
+         fitted(i) = ys(i)
       else
          den = sw * sxx - sx * sx
          if (abs(den) <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, abs(sw * sxx), abs(sx * sx))) then
@@ -5909,15 +6538,39 @@ do pass = 0, niter
          else
             beta = (sw * sxy - sx * sy) / den
             alpha = (sy - beta * sx) / sw
-            fitted(i) = alpha + beta * out%x(i)
+            fitted(i) = alpha + beta * xs(i)
          end if
       end if
+      if (last > 0 .and. i > last + 1) then
+         do j = last + 1, i - 1
+            if (xs(i) == xs(last)) then
+               fitted(j) = fitted(i)
+            else
+               fitted(j) = fitted(last) + (fitted(i) - fitted(last)) * (xs(j) - xs(last)) / (xs(i) - xs(last))
+            end if
+         end do
+      end if
+      last = i
+      cut = xs(last) + del
+      next_i = last + 1
+      do while (next_i <= n)
+         if (xs(next_i) > cut) exit
+         if (xs(next_i) > xs(last)) fitted(next_i) = fitted(last)
+         next_i = next_i + 1
+      end do
+      if (next_i > n) then
+         i = n
+      else
+         i = max(last + 1, next_i - 1)
+      end if
+      if (i <= last) exit
    end do
+   if (last < n) fitted(last + 1:n) = fitted(last)
    if (pass >= niter) exit
-   resid = y(1:n) - fitted
+   resid = ys - fitted
    abs_resid = abs(resid)
    cmad = median(abs_resid)
-   if (cmad <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(y(1:n))))) exit
+   if (cmad <= 100.0_dp * epsilon(1.0_dp) * max(1.0_dp, maxval(abs(ys)))) exit
    do j = 1, n
       u = abs_resid(j) / (6.0_dp * cmad)
       if (u >= 1.0_dp) then
@@ -7362,8 +8015,9 @@ integer, intent(in) :: order(:) ! input vector
 logical, intent(in), optional :: include_mean
 type(arima_fit_t) :: fit
 real(kind=dp) :: resid(size(x)), best_resid(size(x))
-real(kind=dp) :: phi, theta, best_phi, best_theta, rss, best_rss, step
-integer :: n, k, i, ip, iq, pass
+real(kind=dp), allocatable :: design(:,:), y(:), beta(:), xtx(:,:), xty(:), params(:), trial(:)
+real(kind=dp) :: rss, best_rss, step, intercept, candidate, trial_rss
+integer :: n, k, i, pass, p_eff, q_eff, n_eff, j, coord, sgn, max_lag
 n = size(x)
 fit%p = merge(order(1), 0, size(order) >= 1)
 fit%d = merge(order(2), 0, size(order) >= 2)
@@ -7371,47 +8025,103 @@ fit%q = merge(order(3), 0, size(order) >= 3)
 allocate(fit%coef(max(1, fit%p + fit%q + merge(1, 0, present(include_mean) .and. include_mean))), source=0.0_dp)
 if (n <= 0) return
 fit%mean = sum(x) / real(n, kind=dp)
-best_phi = 0.0_dp
-best_theta = 0.0_dp
-best_rss = huge(1.0_dp)
-do pass = 1, 3
-   step = 10.0_dp**(-pass)
-   do ip = -10, 10
-      phi = max(-0.98_dp, min(0.98_dp, best_phi + real(ip, kind=dp) * step))
-      do iq = -10, 10
-         theta = max(-0.98_dp, min(0.98_dp, best_theta + real(iq, kind=dp) * step))
-         resid = 0.0_dp
-         rss = 0.0_dp
-         do i = 1, n
-            if (i == 1) then
-               resid(i) = x(i) - fit%mean
-            else
-               resid(i) = x(i) - fit%mean
-               if (fit%p > 0) resid(i) = resid(i) - phi * (x(i - 1) - fit%mean)
-               if (fit%q > 0) resid(i) = resid(i) - theta * resid(i - 1)
-            end if
-            rss = rss + resid(i) * resid(i)
+if (fit%q == 0) then
+   p_eff = max(0, fit%p)
+   n_eff = max(1, n - p_eff)
+   if (p_eff == 0) then
+      resid = x - fit%mean
+      rss = sum(resid * resid)
+      if (present(include_mean)) then
+         if (include_mean) fit%coef(size(fit%coef)) = fit%mean
+      end if
+   else
+      allocate(design(n_eff, p_eff + 1), source=1.0_dp)
+      allocate(y(n_eff), source=0.0_dp)
+      do i = 1, n_eff
+         y(i) = x(p_eff + i)
+         do j = 1, p_eff
+            design(i, j + 1) = x(p_eff + i - j)
          end do
-         if (rss < best_rss) then
-            best_rss = rss
-            best_phi = phi
-            best_theta = theta
+      end do
+      xtx = matmul(transpose(design), design)
+      xty = matmul(transpose(design), y)
+      do i = 1, size(xtx, 1)
+         xtx(i, i) = xtx(i, i) + 1.0e-10_dp
+      end do
+      beta = solve_real(xtx, xty)
+      intercept = beta(1)
+      fit%coef(1:p_eff) = beta(2:p_eff + 1)
+      if (abs(1.0_dp - sum(fit%coef(1:p_eff))) > 100.0_dp * epsilon(1.0_dp)) then
+         fit%mean = intercept / (1.0_dp - sum(fit%coef(1:p_eff)))
+      else
+         fit%mean = sum(x) / real(n, kind=dp)
+      end if
+      if (present(include_mean)) then
+         if (include_mean .and. size(fit%coef) >= p_eff + 1) fit%coef(p_eff + 1) = fit%mean
+      end if
+      resid = 0.0_dp
+      do i = p_eff + 1, n
+         resid(i) = x(i) - intercept
+         do j = 1, p_eff
+            resid(i) = resid(i) - fit%coef(j) * x(i - j)
+         end do
+      end do
+      rss = sum(resid(p_eff + 1:n) * resid(p_eff + 1:n))
+   end if
+   fit%resid = resid
+   fit%last_x = x(n)
+   fit%last_resid = resid(n)
+   fit%sigma2 = max(rss / real(n_eff, kind=dp), tiny(1.0_dp))
+   k = fit%p + merge(1, 0, present(include_mean) .and. include_mean)
+   fit%aic = real(n_eff, kind=dp) * log(fit%sigma2) + 2.0_dp * real(k, kind=dp)
+   return
+end if
+p_eff = max(0, fit%p)
+q_eff = max(0, fit%q)
+max_lag = max(p_eff, q_eff)
+n_eff = max(1, n - max_lag)
+allocate(params(p_eff + q_eff), trial(p_eff + q_eff), source=0.0_dp)
+best_rss = huge(1.0_dp)
+best_resid = 0.0_dp
+step = 0.5_dp
+do pass = 1, 10
+   do coord = 1, size(params)
+      do sgn = -1, 1, 2
+         trial = params
+         candidate = max(-0.98_dp, min(0.98_dp, params(coord) + real(sgn, kind=dp) * step))
+         trial(coord) = candidate
+         resid = 0.0_dp
+         trial_rss = 0.0_dp
+         do i = 1, n
+            resid(i) = x(i) - fit%mean
+            do j = 1, min(p_eff, i - 1)
+               resid(i) = resid(i) - trial(j) * (x(i - j) - fit%mean)
+            end do
+            do j = 1, min(q_eff, i - 1)
+               resid(i) = resid(i) - trial(p_eff + j) * resid(i - j)
+            end do
+            if (i > max_lag) trial_rss = trial_rss + resid(i) * resid(i)
+         end do
+         if (trial_rss < best_rss) then
+            best_rss = trial_rss
+            params = trial
             best_resid = resid
          end if
       end do
    end do
+   step = 0.5_dp * step
 end do
-if (fit%p > 0) fit%coef(1) = best_phi
-if (fit%q > 0 .and. size(fit%coef) >= fit%p + fit%q) fit%coef(fit%p + 1) = best_theta
+if (p_eff > 0) fit%coef(1:p_eff) = params(1:p_eff)
+if (q_eff > 0 .and. size(fit%coef) >= p_eff + q_eff) fit%coef(p_eff + 1:p_eff + q_eff) = params(p_eff + 1:p_eff + q_eff)
 if (present(include_mean)) then
    if (include_mean) fit%coef(size(fit%coef)) = fit%mean
 end if
 fit%resid = best_resid
 fit%last_x = x(n)
 fit%last_resid = best_resid(n)
-fit%sigma2 = max(best_rss / real(max(1, n), kind=dp), tiny(1.0_dp))
+fit%sigma2 = max(best_rss / real(n_eff, kind=dp), tiny(1.0_dp))
 k = size(fit%coef)
-fit%aic = real(n, kind=dp) * log(fit%sigma2) + 2.0_dp * real(k, kind=dp)
+fit%aic = real(n_eff, kind=dp) * log(fit%sigma2) + 2.0_dp * real(k, kind=dp)
 end function arima_fit
 
 pure function arima_predict(fit, n_ahead) result(pred)
@@ -7632,32 +8342,65 @@ fit = acf_mat(x, lag_max=lag_max, type=type, plot=plot)
 vals = reshape(fit%acf, [size(fit%acf)])
 end function acf_values_mat
 
-pure function ARMAacf(ar, ma, lag_max) result(vals)
-! Compute R-like time-series helper ARMAacf.
-real(kind=dp), intent(in), optional :: ar(:) ! input vector
-real(kind=dp), intent(in), optional :: ma ! input value
-integer, intent(in), optional :: lag_max
+pure function ARMAacf_vecma(ar, ma, lag_max) result(vals)
+! Compute R-like theoretical autocorrelations for an ARMA model.
+real(kind=dp), intent(in), optional :: ar(:) ! autoregressive coefficients
+real(kind=dp), intent(in), optional :: ma(:) ! moving-average coefficients
+integer, intent(in), optional :: lag_max ! maximum lag to return
 real(kind=dp), allocatable :: vals(:)
-integer :: lag_n, h, p
-real(kind=dp) :: phi1, phi2, theta
-lag_n = 1
+real(kind=dp), allocatable :: psi(:)
+integer :: lag_n, h, p, q, npsi, j, i
+real(kind=dp) :: denom, numer, tail_scale
+p = 0
+q = 0
+if (present(ar)) p = size(ar)
+if (present(ma)) q = size(ma)
+lag_n = max(p, q + 1)
 if (present(lag_max)) lag_n = max(0, lag_max)
 allocate(vals(lag_n + 1), source=0.0_dp)
 vals(1) = 1.0_dp
-phi1 = 0.0_dp
-phi2 = 0.0_dp
-theta = 0.0_dp
-if (present(ar)) then
-   p = size(ar)
-   if (p >= 1) phi1 = ar(1)
-   if (p >= 2) phi2 = ar(2)
-end if
-if (present(ma)) theta = ma
-if (lag_n >= 1) vals(2) = max(-0.999_dp, min(0.999_dp, (phi1 + theta) / max(1.0_dp + theta * theta + 2.0_dp * phi1 * theta, 1.0e-12_dp)))
-do h = 2, lag_n
-   vals(h + 1) = phi1 * vals(h) + phi2 * vals(h - 1)
+if (p == 0 .and. q == 0) return
+npsi = max(lag_n + q + 1, lag_n + 10000)
+allocate(psi(0:npsi), source=0.0_dp)
+psi(0) = 1.0_dp
+do j = 1, npsi
+   if (present(ma)) then
+      if (j <= q) psi(j) = psi(j) + ma(j)
+   end if
+   if (present(ar)) then
+      do i = 1, min(p, j)
+         psi(j) = psi(j) + ar(i) * psi(j - i)
+      end do
+   end if
 end do
-end function ARMAacf
+denom = sum(psi * psi)
+if (denom <= tiny(1.0_dp)) return
+do h = 1, lag_n
+   if (h <= npsi) then
+      numer = sum(psi(0:npsi-h) * psi(h:npsi))
+      vals(h + 1) = numer / denom
+   end if
+end do
+if (p > 0) then
+   tail_scale = maxval(abs(psi(max(0, npsi - 99):npsi)))
+   if (tail_scale > 1.0e-7_dp) then
+      ! Near-nonstationary models can require more terms than the fixed truncation.
+      ! Preserve finite output but avoid pretending to exactness beyond available precision.
+      vals = max(-1.0_dp, min(1.0_dp, vals))
+   end if
+end if
+end function ARMAacf_vecma
+
+pure function ARMAacf_scalarma(ar, ma, lag_max) result(vals)
+! Scalar-MA compatibility wrapper for calls such as ARMAacf(ar=..., ma=0.5).
+real(kind=dp), intent(in), optional :: ar(:) ! autoregressive coefficients
+real(kind=dp), intent(in) :: ma ! scalar moving-average coefficient
+integer, intent(in), optional :: lag_max ! maximum lag to return
+real(kind=dp), allocatable :: vals(:)
+real(kind=dp) :: ma_vec(1)
+ma_vec = [ma]
+vals = ARMAacf_vecma(ar=ar, ma=ma_vec, lag_max=lag_max)
+end function ARMAacf_scalarma
 
 function ccf_vec(x, y, lag_max, type, plot) result(fit)
 ! Runtime helper for R-compatible ccf vec.
@@ -7723,11 +8466,38 @@ do h = -lag_n, lag_n
 end do
 end function ccf_vec_impl
 
-subroutine print_acf(fit)
+subroutine print_acf(fit, digits, series_name)
 ! Print acf values in an R-like format.
 type(acf_fit_t), intent(in) :: fit ! input value
-write(*,*) "Autocorrelations of series"
-call print_real_vector(reshape(fit%acf, [size(fit%acf)]))
+integer, intent(in), optional :: digits
+character(len=*), intent(in), optional :: series_name
+integer :: d, w, nlag, i, i2, j, per_line
+character(len=32) :: ifmt, rfmt
+d = 4
+if (present(digits)) d = max(0, digits)
+w = max(7, d + 4)
+per_line = max(1, 80 / (w + 1))
+nlag = size(fit%acf, 1)
+write(ifmt, '("(i", i0, ",1x)")') w
+write(rfmt, '("(f", i0, ".", i0, ",1x)")') w, d
+write(*,*)
+if (present(series_name)) then
+   write(*,'(a)') "Autocorrelations of series '" // trim(series_name) // "', by lag"
+else
+   write(*,'(a)') "Autocorrelations of series, by lag"
+end if
+write(*,*)
+do i = 1, nlag, per_line
+   i2 = min(nlag, i + per_line - 1)
+   do j = i, i2
+      write(*, ifmt, advance='no') nint(fit%lag(j))
+   end do
+   write(*,*)
+   do j = i, i2
+      write(*, rfmt, advance='no') fit%acf(j, 1, 1)
+   end do
+   write(*,*)
+end do
 end subroutine print_acf
 
 pure function besselJ_core(x, nu) result(out)
