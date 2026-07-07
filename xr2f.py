@@ -123,7 +123,7 @@ _APPROXIMATE_R_FUNCTIONS: dict[str, dict[str, str]] = {
     "strsplit": {"name": "strsplit", "category": "subset_semantics", "reason": "partial fixed-delimiter support; vector input/list semantics are not fully preserved"},
     "list.files": {"name": "list.files", "category": "subset_semantics", "reason": "platform command backed subset; pattern handling is substring/glob-like rather than full R regex"},
     "arima": {"name": "arima", "category": "approximate_algorithm", "reason": "approximate fitter/predictor; does not reproduce stats::arima exactly"},
-    "armaacf": {"name": "ARMAacf", "category": "approximate_algorithm", "reason": "subset implementation; output and edge-case behavior may differ from R"},
+    "armaacf": {"name": "ARMAacf", "category": "subset_semantics", "reason": "theoretical autocorrelations are implemented for scalar/vector ARMA coefficients; full R error/attribute behavior is not reproduced"},
     "acf": {"name": "acf", "category": "subset_semantics", "reason": "subset implementation; output/lag handling may differ from R"},
     "ccf": {"name": "ccf", "category": "subset_semantics", "reason": "subset implementation; output/lag handling may differ from R"},
     "smooth": {"name": "smooth", "category": "approximate_algorithm", "reason": "approximation of R's Tukey smoothing behavior"},
