@@ -23500,7 +23500,19 @@ def _control_value_from_list(control_src: str, name: str) -> str | None:
     return c[2].get(name)
 
 
-def _optim_control_kwargs(control_src: str, include_scale: bool = True) -> list[str]:
+def _optim_control_value_is_vector(src: str) -> bool:
+    text = src.strip()
+    c = parse_call_text(text)
+    if c is not None and c[0].lower() in {"c", "rep", "rep_len", "rep.int", "seq", "seq_len", "seq_along"}:
+        return True
+    return bool(re.match(r"^\[.*\]$", text))
+
+
+def _optim_control_kwargs(
+    control_src: str,
+    include_scale: bool = True,
+    allow_vector_ndeps: bool = True,
+) -> list[str]:
     if not control_src:
         return []
     maxit_src = _control_value_from_list(control_src, "maxit")
@@ -23512,7 +23524,8 @@ def _optim_control_kwargs(control_src: str, include_scale: bool = True) -> list[
     if reltol_src is not None:
         kwargs.append(f"reltol={r_expr_to_fortran(reltol_src)}")
     if ndeps_src is not None:
-        kwargs.append(f"ndeps={r_expr_to_fortran(ndeps_src)}")
+        ndeps_kw = "ndeps_vec" if allow_vector_ndeps and _optim_control_value_is_vector(ndeps_src) else "ndeps"
+        kwargs.append(f"{ndeps_kw}={r_expr_to_fortran(ndeps_src)}")
     if include_scale:
         fnscale_src = _control_value_from_list(control_src, "fnscale")
         parscale_src = _control_value_from_list(control_src, "parscale")
@@ -23708,7 +23721,7 @@ def _emit_optim_bfgs_assignment(
         if method_lit is None or method not in {"bfgs", "nelder-mead"}:
             return False
         control_src = kw.get("control", "")
-        kwargs = _optim_control_kwargs(control_src, include_scale=False)
+        kwargs = _optim_control_kwargs(control_src, include_scale=False, allow_vector_ndeps=False)
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         helper_name = "constr_optim_bfgs" if method == "bfgs" else "constr_optim_nelder_mead"
         if helper_ctx is not None:
@@ -23795,9 +23808,15 @@ def _emit_optim_bfgs_assignment(
     maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
     reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
     ndeps_src = _control_value_from_list(control_src, "ndeps") if control_src else None
+    fnscale_src = _control_value_from_list(control_src, "fnscale") if control_src else None
+    parscale_src = _control_value_from_list(control_src, "parscale") if control_src else None
+    ndeps_is_vector = bool(ndeps_src and _optim_control_value_is_vector(ndeps_src))
     maxit_f = _int_bound_expr(r_expr_to_fortran(maxit_src or "100"))
     gtol_f = r_expr_to_fortran(reltol_src or "1.0e-8")
-    ndeps_f = r_expr_to_fortran(ndeps_src or "1.0e-3")
+    ndeps_f = r_expr_to_fortran(ndeps_src or "1.0e-3") if not ndeps_is_vector else "1.0e-3_dp"
+    ndeps_vec_f = r_expr_to_fortran(ndeps_src) if ndeps_is_vector and ndeps_src else ""
+    fnscale_f = r_expr_to_fortran(fnscale_src or "1.0")
+    parscale_f = r_expr_to_fortran(parscale_src) if parscale_src else ""
     prefix = re.sub(r"[^A-Za-z0-9_]", "_", target)
     if not prefix or prefix[0].isdigit():
         prefix = "opt_" + prefix
@@ -23894,6 +23913,10 @@ def _emit_optim_bfgs_assignment(
     fminus = f"{prefix}_f_minus"
     eps = f"{prefix}_eps"
     ndeps = f"{prefix}_ndeps"
+    ndeps_vec = f"{prefix}_ndeps_vec"
+    fnscale = f"{prefix}_fnscale"
+    parscale_vec = f"{prefix}_parscale"
+    parscale_i = f"{prefix}_parscale_i"
     gtol = f"{prefix}_gtol"
     alpha = f"{prefix}_alpha"
     slope = f"{prefix}_slope"
@@ -23907,16 +23930,34 @@ def _emit_optim_bfgs_assignment(
         args = ", ".join([first_actual] + extra_actuals)
         return f"{fn_name}({args})"
 
+    def obj_scaled_call(p_expr: str) -> str:
+        return f"({obj_call(p_expr)} / {fnscale})"
+
     def emit_gradient(point: str, grad: str) -> None:
         o.w(f"do {i} = 1, {np}")
         o.push()
-        o.w(f"{eps} = {ndeps} * (abs({point}({i})) + 1.0_dp)")
+        o.w(f"{parscale_i} = 1.0_dp")
+        if parscale_src:
+            o.w(f"if ({i} <= size({parscale_vec})) {parscale_i} = max(abs({parscale_vec}({i})), tiny(1.0_dp))")
+        if ndeps_is_vector:
+            o.w(f"if ({i} <= size({ndeps_vec})) then")
+            o.push()
+            o.w(f"{eps} = {ndeps_vec}({i}) * (abs({point}({i})) + {parscale_i})")
+            o.pop()
+            o.w("else")
+            o.push()
+            o.w(f"{eps} = {ndeps} * (abs({point}({i})) + {parscale_i})")
+            o.pop()
+            o.w("end if")
+            o.w(f"if (abs({eps}) <= tiny(1.0_dp)) {eps} = {ndeps} * (abs({point}({i})) + {parscale_i})")
+        else:
+            o.w(f"{eps} = {ndeps} * (abs({point}({i})) + {parscale_i})")
         o.w(f"{ptmp} = {point}")
         o.w(f"{ptmp}({i}) = {ptmp}({i}) + {eps}")
-        o.w(f"{fplus} = {obj_call(ptmp)}")
+        o.w(f"{fplus} = {obj_scaled_call(ptmp)}")
         o.w(f"{ptmp} = {point}")
         o.w(f"{ptmp}({i}) = {ptmp}({i}) - {eps}")
-        o.w(f"{fminus} = {obj_call(ptmp)}")
+        o.w(f"{fminus} = {obj_scaled_call(ptmp)}")
         o.w(f"{grad}({i}) = ({fplus} - {fminus}) / (2.0_dp * {eps})")
         o.pop()
         o.w("end do")
@@ -23957,11 +23998,15 @@ def _emit_optim_bfgs_assignment(
         o.w(f"logical :: {converged}")
         o.w(
             f"real(kind=dp) :: {fval}, {fnew}, {fplus}, {fminus}, {eps}, "
-            f"{ndeps}, {gtol}, {alpha}, {slope}, {sy}, {rho}, {shift}, "
+            f"{ndeps}, {fnscale}, {parscale_i}, {gtol}, {alpha}, {slope}, {sy}, {rho}, {shift}, "
             f"{nm_fr}, {nm_fe}, {nm_fc}, "
             f"{nm_spread}, {nm_step}, {sann_temp}, {sann_prob}, {sann_u}, {sann_best_f}"
         )
         o.w(f"real(kind=dp), allocatable :: {p}(:), {pnew}(:), {ptmp}(:), {g}(:), {gnew}(:)")
+        if ndeps_is_vector:
+            o.w(f"real(kind=dp), allocatable :: {ndeps_vec}(:)")
+        if parscale_src:
+            o.w(f"real(kind=dp), allocatable :: {parscale_vec}(:)")
         o.w(f"real(kind=dp), allocatable :: {h}(:,:), {d}(:), {svec}(:), {yvec}(:), {amat}(:,:), {tmp}(:,:)")
         o.w(
             f"real(kind=dp), allocatable :: {nm_simplex}(:,:), {nm_fvals}(:), "
@@ -23972,18 +24017,27 @@ def _emit_optim_bfgs_assignment(
         o.w(f"{np} = size({p})")
         o.w(f"{max_iter} = {maxit_f}")
         o.w(f"{ndeps} = {ndeps_f}")
+        if ndeps_is_vector:
+            o.w(f"{ndeps_vec} = {ndeps_vec_f}")
+        o.w(f"{fnscale} = {fnscale_f}")
+        o.w(f"if (abs({fnscale}) <= tiny(1.0_dp)) {fnscale} = 1.0_dp")
+        if parscale_src:
+            o.w(f"{parscale_vec} = {parscale_f}")
         o.w(f"{gtol} = max({gtol_f}, sqrt(epsilon(1.0_dp)))")
         o.w(f"{converged} = .false.")
         o.w(f"{n_iter} = 0")
         o.w(f"select case (trim({method_expr}))")
         o.w('case ("BFGS", "bfgs")')
         o.push()
-        o.w(f"{target} = optim_bfgs({fn_name}, {p}, maxit={max_iter}, reltol={gtol}, ndeps={ndeps})")
+        if ndeps_is_vector:
+            o.w(f"{target} = optim_bfgs({fn_name}, {p}, maxit={max_iter}, reltol={gtol}, ndeps_vec={ndeps_vec})")
+        else:
+            o.w(f"{target} = optim_bfgs({fn_name}, {p}, maxit={max_iter}, reltol={gtol}, ndeps={ndeps})")
         o.pop()
         o.w('case ("CG", "cg")')
         o.push()
         o.w(f"allocate({pnew}({np}), {ptmp}({np}), {g}({np}), {gnew}({np}), {d}({np}), {yvec}({np}))")
-        o.w(f"{fval} = {obj_call(p)}")
+        o.w(f"{fval} = {obj_scaled_call(p)}")
         emit_gradient(p, g)
         o.w(f"{d} = -{g}")
         o.w(f"do {iter_nm} = 1, {max_iter}")
@@ -24006,7 +24060,7 @@ def _emit_optim_bfgs_assignment(
         o.w(f"do {j} = 1, 60")
         o.push()
         o.w(f"{pnew} = {p} + {alpha} * {d}")
-        o.w(f"{fnew} = {obj_call(pnew)}")
+        o.w(f"{fnew} = {obj_scaled_call(pnew)}")
         o.w(f"if ({fnew} <= {fval} + 1.0e-4_dp * {alpha} * {slope}) exit")
         o.w(f"if ({alpha} < 1.0e-12_dp) exit")
         o.w(f"{alpha} = 0.5_dp * {alpha}")
@@ -24029,14 +24083,14 @@ def _emit_optim_bfgs_assignment(
         o.pop()
         o.w("end do")
         o.w(f"{target}%par = {p}")
-        o.w(f"{target}%value = {fval}")
+        o.w(f"{target}%value = {fval} * {fnscale}")
         o.w(f"{target}%convergence = merge(0, 1, {converged})")
         o.w(f"if (allocated({pnew})) deallocate({pnew}, {ptmp}, {g}, {gnew}, {d}, {yvec})")
         o.pop()
         o.w('case ("SANN", "sann")')
         o.push()
         o.w(f"allocate({pnew}({np}), {ptmp}({np}), {sann_best_p}({np}))")
-        o.w(f"{fval} = {obj_call(p)}")
+        o.w(f"{fval} = {obj_scaled_call(p)}")
         o.w(f"{sann_best_p} = {p}")
         o.w(f"{sann_best_f} = {fval}")
         o.w(f"{sann_tmax} = 10")
@@ -24048,8 +24102,11 @@ def _emit_optim_bfgs_assignment(
         o.w(f"{n_iter} = {iter_nm}")
         o.w(f"{sann_temp} = 10.0_dp / log(real((({iter_nm} - 1) / {sann_tmax}) * {sann_tmax}, kind=dp) + exp(1.0_dp))")
         o.w(f"{ptmp} = rnorm_vec({np})")
-        o.w(f"{pnew} = {p} + 0.1_dp * {sann_temp} * {ptmp}")
-        o.w(f"{fnew} = {obj_call(pnew)}")
+        if parscale_src:
+            o.w(f"{pnew} = {p} + 0.1_dp * {sann_temp} * {ptmp} * {parscale_vec}")
+        else:
+            o.w(f"{pnew} = {p} + 0.1_dp * {sann_temp} * {ptmp}")
+        o.w(f"{fnew} = {obj_scaled_call(pnew)}")
         o.w(f"if ({fnew} < {fval}) then")
         o.push()
         o.w(f"{shift} = abs({fval} - {fnew})")
@@ -24082,7 +24139,7 @@ def _emit_optim_bfgs_assignment(
         o.pop()
         o.w("end do")
         o.w(f"{target}%par = {sann_best_p}")
-        o.w(f"{target}%value = {sann_best_f}")
+        o.w(f"{target}%value = {sann_best_f} * {fnscale}")
         o.w(f"{target}%convergence = 0")
         o.w(f"if (allocated({pnew})) deallocate({pnew}, {ptmp}, {sann_best_p})")
         o.pop()
@@ -24093,13 +24150,18 @@ def _emit_optim_bfgs_assignment(
         o.w(f"do {i} = 1, {np}")
         o.push()
         o.w(f"{nm_simplex}(:,{i}+1) = {p}")
-        o.w(f"{nm_step} = 0.05_dp * (abs({p}({i})) + 1.0_dp)")
+        if parscale_src:
+            o.w(f"{parscale_i} = 1.0_dp")
+            o.w(f"if ({i} <= size({parscale_vec})) {parscale_i} = max(abs({parscale_vec}({i})), tiny(1.0_dp))")
+            o.w(f"{nm_step} = 0.05_dp * (abs({p}({i})) + {parscale_i})")
+        else:
+            o.w(f"{nm_step} = 0.05_dp * (abs({p}({i})) + 1.0_dp)")
         o.w(f"{nm_simplex}({i},{i}+1) = {nm_simplex}({i},{i}+1) + {nm_step}")
         o.pop()
         o.w("end do")
         o.w(f"do {j} = 1, {np} + 1")
         o.push()
-        o.w(f"{nm_fvals}({j}) = {obj_call(f'{nm_simplex}(:,{j})')}")
+        o.w(f"{nm_fvals}({j}) = {obj_scaled_call(f'{nm_simplex}(:,{j})')}")
         o.pop()
         o.w("end do")
         o.w(f"do {iter_nm} = 1, {max_iter}")
@@ -24134,11 +24196,11 @@ def _emit_optim_bfgs_assignment(
         o.w("end do")
         o.w(f"{nm_centroid} = {nm_centroid} / real({np}, kind=dp)")
         o.w(f"{nm_xr} = {nm_centroid} + ({nm_centroid} - {nm_simplex}(:,{nm_worst}))")
-        o.w(f"{nm_fr} = {obj_call(nm_xr)}")
+        o.w(f"{nm_fr} = {obj_scaled_call(nm_xr)}")
         o.w(f"if ({nm_fr} < {nm_fvals}({nm_best})) then")
         o.push()
         o.w(f"{nm_xe} = {nm_centroid} + 2.0_dp * ({nm_xr} - {nm_centroid})")
-        o.w(f"{nm_fe} = {obj_call(nm_xe)}")
+        o.w(f"{nm_fe} = {obj_scaled_call(nm_xe)}")
         o.w(f"if ({nm_fe} < {nm_fr}) then")
         o.push()
         o.w(f"{nm_simplex}(:,{nm_worst}) = {nm_xe}")
@@ -24159,7 +24221,7 @@ def _emit_optim_bfgs_assignment(
         o.w("else")
         o.push()
         o.w(f"{nm_xc} = {nm_centroid} + 0.5_dp * ({nm_simplex}(:,{nm_worst}) - {nm_centroid})")
-        o.w(f"{nm_fc} = {obj_call(nm_xc)}")
+        o.w(f"{nm_fc} = {obj_scaled_call(nm_xc)}")
         o.w(f"if ({nm_fc} < {nm_fvals}({nm_worst})) then")
         o.push()
         o.w(f"{nm_simplex}(:,{nm_worst}) = {nm_xc}")
@@ -24172,7 +24234,7 @@ def _emit_optim_bfgs_assignment(
         o.w(f"if ({j} /= {nm_best}) then")
         o.push()
         o.w(f"{nm_simplex}(:,{j}) = {nm_simplex}(:,{nm_best}) + 0.5_dp * ({nm_simplex}(:,{j}) - {nm_simplex}(:,{nm_best}))")
-        o.w(f"{nm_fvals}({j}) = {obj_call(f'{nm_simplex}(:,{j})')}")
+        o.w(f"{nm_fvals}({j}) = {obj_scaled_call(f'{nm_simplex}(:,{j})')}")
         o.pop()
         o.w("end if")
         o.pop()
@@ -24190,7 +24252,7 @@ def _emit_optim_bfgs_assignment(
         o.pop()
         o.w("end do")
         o.w(f"{target}%par = {nm_simplex}(:,{nm_best})")
-        o.w(f"{target}%value = {nm_fvals}({nm_best})")
+        o.w(f"{target}%value = {nm_fvals}({nm_best}) * {fnscale}")
         o.w(f"{target}%convergence = merge(0, 1, {converged})")
         o.pop()
         o.w("case default")
@@ -24216,14 +24278,24 @@ def _emit_optim_bfgs_assignment(
     o.w(f"logical :: {converged}")
     o.w(
         f"real(kind=dp) :: {fval}, {fnew}, {fplus}, {fminus}, {eps}, {ndeps}, {gtol}, "
-        f"{alpha}, {slope}, {sy}, {rho}, {shift}"
+        f"{fnscale}, {parscale_i}, {alpha}, {slope}, {sy}, {rho}, {shift}"
     )
     o.w(f"real(kind=dp), allocatable :: {p}(:), {pnew}(:), {ptmp}(:), {g}(:), {gnew}(:)")
+    if ndeps_is_vector:
+        o.w(f"real(kind=dp), allocatable :: {ndeps_vec}(:)")
+    if parscale_src:
+        o.w(f"real(kind=dp), allocatable :: {parscale_vec}(:)")
     o.w(f"real(kind=dp), allocatable :: {h}(:,:), {d}(:), {svec}(:), {yvec}(:), {amat}(:,:), {tmp}(:,:)")
     o.w(f"{p} = {par_f}")
     o.w(f"{np} = size({p})")
     o.w(f"{max_iter} = {maxit_f}")
     o.w(f"{ndeps} = {ndeps_f}")
+    if ndeps_is_vector:
+        o.w(f"{ndeps_vec} = {ndeps_vec_f}")
+    o.w(f"{fnscale} = {fnscale_f}")
+    o.w(f"if (abs({fnscale}) <= tiny(1.0_dp)) {fnscale} = 1.0_dp")
+    if parscale_src:
+        o.w(f"{parscale_vec} = {parscale_f}")
     o.w(f"{gtol} = max({gtol_f}, sqrt(epsilon(1.0_dp)))")
     o.w(f"allocate({pnew}({np}), {ptmp}({np}), {g}({np}), {gnew}({np}), {h}({np},{np}), {d}({np}), {svec}({np}), {yvec}({np}), {amat}({np},{np}), {tmp}({np},{np}))")
     o.w(f"{h} = 0.0_dp")
@@ -24232,7 +24304,7 @@ def _emit_optim_bfgs_assignment(
     o.w(f"{h}({i},{i}) = 1.0_dp")
     o.pop()
     o.w("end do")
-    o.w(f"{fval} = {obj_call(p)}")
+    o.w(f"{fval} = {obj_scaled_call(p)}")
     emit_gradient(p, g)
     o.w(f"{converged} = .false.")
     o.w(f"{n_iter} = 0")
@@ -24266,7 +24338,7 @@ def _emit_optim_bfgs_assignment(
     o.w(f"do {j} = 1, 60")
     o.push()
     o.w(f"{pnew} = {p} + {alpha} * {d}")
-    o.w(f"{fnew} = {obj_call(pnew)}")
+    o.w(f"{fnew} = {obj_scaled_call(pnew)}")
     o.w(f"if ({fnew} <= {fval} + 1.0e-4_dp * {alpha} * {slope}) exit")
     o.w(f"if ({alpha} < 1.0e-12_dp) exit")
     o.w(f"{alpha} = 0.5_dp * {alpha}")
@@ -24322,7 +24394,7 @@ def _emit_optim_bfgs_assignment(
     o.pop()
     o.w("end do")
     o.w(f"{target}%par = {p}")
-    o.w(f"{target}%value = {fval}")
+    o.w(f"{target}%value = {fval} * {fnscale}")
     o.w(f"{target}%convergence = merge(0, 1, {converged})")
     o.pop()
     o.w("end block")

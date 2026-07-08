@@ -1379,12 +1379,12 @@ end interface r_typeof
 
 contains
 
-function optim_bfgs(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
+function optim_bfgs(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
 ! Quasi-Newton optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
+real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, n_iter, i, j, iter
 logical :: converged
@@ -1413,7 +1413,7 @@ do i = 1, n
    h(i,i) = 1.0_dp
 end do
 f = scaled_fn(p)
-call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale)
+call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale, ndeps_vec)
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1441,7 +1441,7 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale)
+   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale, ndeps_vec)
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1484,12 +1484,12 @@ value = fn(x) / fscale
 end function scaled_fn
 end function optim_bfgs
 
-function optim_cg(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
+function optim_cg(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
 ! Nonlinear conjugate-gradient optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
+real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, j
 logical :: converged
@@ -1512,7 +1512,7 @@ p = par
 pscale = 1.0_dp
 if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
 f = scaled_fn(p)
-call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale)
+call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale, ndeps_vec)
 d = -g
 converged = .false.
 do iter = 1, max_iter
@@ -1533,7 +1533,7 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale)
+   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale, ndeps_vec)
    shift = abs(f - f_new)
    y = g_new - g
    beta = max(0.0_dp, dot_product(g_new, y) / max(dot_product(g, g), tiny(1.0_dp)))
@@ -1557,12 +1557,12 @@ value = fn(x) / fscale
 end function scaled_fn
 end function optim_cg
 
-function optim_sann(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
+function optim_sann(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
 ! Simulated annealing optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
+real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, tmax
 real(kind=dp) :: f, f_new, best_f, temp, prob, u, fscale
@@ -1614,12 +1614,12 @@ value = fn(x) / fscale
 end function scaled_fn
 end function optim_sann
 
-function optim_nelder_mead(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
+function optim_nelder_mead(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
 ! Nelder-Mead simplex optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
+real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, i, j, best, worst, second
 logical :: converged
@@ -1823,13 +1823,14 @@ end if
 end function barrier_obj
 end function constr_optim_nelder_mead
 
-subroutine optim_fd_gradient(fn, p, step_eps, g, parscale)
+subroutine optim_fd_gradient(fn, p, step_eps, g, parscale, ndeps_vec)
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: p(:), step_eps
 real(kind=dp), intent(in), optional :: parscale(:)
+real(kind=dp), intent(in), optional :: ndeps_vec(:)
 real(kind=dp), intent(out) :: g(:)
 real(kind=dp), allocatable :: p_tmp(:)
-real(kind=dp) :: eps, f_plus, f_minus, scale_i
+real(kind=dp) :: eps, f_plus, f_minus, scale_i, step_i
 integer :: i
 allocate(p_tmp(size(p)))
 do i = 1, size(p)
@@ -1837,7 +1838,13 @@ do i = 1, size(p)
    if (present(parscale)) then
       if (i <= size(parscale)) scale_i = max(abs(parscale(i)), tiny(1.0_dp))
    end if
-   eps = step_eps * (abs(p(i)) + scale_i)
+   step_i = step_eps
+   if (present(ndeps_vec)) then
+      if (i <= size(ndeps_vec)) step_i = ndeps_vec(i)
+   end if
+   eps = step_i * (abs(p(i)) + scale_i)
+   if (abs(eps) <= tiny(1.0_dp)) eps = step_eps * (abs(p(i)) + scale_i)
+   if (abs(eps) <= tiny(1.0_dp)) eps = sqrt(epsilon(1.0_dp))
    p_tmp = p
    p_tmp(i) = p_tmp(i) + eps
    f_plus = fn(p_tmp)
