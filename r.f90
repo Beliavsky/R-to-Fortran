@@ -1379,35 +1379,41 @@ end interface r_typeof
 
 contains
 
-function optim_bfgs(fn, par, maxit, reltol, ndeps) result(out)
+function optim_bfgs(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
 ! Quasi-Newton optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps
+real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, n_iter, i, j, iter
 logical :: converged
-real(kind=dp) :: f, f_new, step_eps, gtol
+real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
-real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:)
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:)
 real(kind=dp), allocatable :: h(:,:), d(:), s(:), y(:), a(:,:), tmp(:,:)
 n = size(par)
 max_iter = 100
 if (present(maxit)) max_iter = maxit
 step_eps = 1.0e-3_dp
 if (present(ndeps)) step_eps = ndeps
+fscale = 1.0_dp
+if (present(fnscale)) then
+   if (abs(fnscale) > tiny(1.0_dp)) fscale = fnscale
+end if
 gtol = 1.0e-8_dp
 if (present(reltol)) gtol = reltol
 gtol = max(gtol, sqrt(epsilon(1.0_dp)))
-allocate(p(n), p_new(n), g(n), g_new(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
+allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
 p = par
+pscale = 1.0_dp
+if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
 h = 0.0_dp
 do i = 1, n
    h(i,i) = 1.0_dp
 end do
-f = fn(p)
-call optim_fd_gradient(fn, p, step_eps, g)
+f = scaled_fn(p)
+call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale)
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1430,12 +1436,12 @@ do iter = 1, max_iter
    slope = dot_product(g, d)
    do j = 1, 60
       p_new = p + alpha * d
-      f_new = fn(p_new)
+      f_new = scaled_fn(p_new)
       if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(fn, p_new, step_eps, g_new)
+   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale)
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1468,33 +1474,45 @@ do iter = 1, max_iter
    end if
 end do
 out%par = p
-out%value = f
+out%value = f * fscale
 out%convergence = merge(0, 1, converged)
+contains
+pure function scaled_fn(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+value = fn(x) / fscale
+end function scaled_fn
 end function optim_bfgs
 
-function optim_cg(fn, par, maxit, reltol, ndeps) result(out)
+function optim_cg(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
 ! Nonlinear conjugate-gradient optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps
+real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, j
 logical :: converged
-real(kind=dp) :: f, f_new, step_eps, gtol, alpha, slope, beta, shift
-real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), d(:), y(:)
+real(kind=dp) :: f, f_new, step_eps, gtol, alpha, slope, beta, shift, fscale
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), d(:), y(:), pscale(:)
 n = size(par)
 max_iter = 100
 if (present(maxit)) max_iter = maxit
 step_eps = 1.0e-3_dp
 if (present(ndeps)) step_eps = ndeps
+fscale = 1.0_dp
+if (present(fnscale)) then
+   if (abs(fnscale) > tiny(1.0_dp)) fscale = fnscale
+end if
 gtol = 1.0e-8_dp
 if (present(reltol)) gtol = reltol
 gtol = max(gtol, sqrt(epsilon(1.0_dp)))
-allocate(p(n), p_new(n), g(n), g_new(n), d(n), y(n))
+allocate(p(n), p_new(n), g(n), g_new(n), d(n), y(n), pscale(n))
 p = par
-f = fn(p)
-call optim_fd_gradient(fn, p, step_eps, g)
+pscale = 1.0_dp
+if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
+f = scaled_fn(p)
+call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale)
 d = -g
 converged = .false.
 do iter = 1, max_iter
@@ -1510,12 +1528,12 @@ do iter = 1, max_iter
    alpha = 1.0_dp
    do j = 1, 60
       p_new = p + alpha * d
-      f_new = fn(p_new)
+      f_new = scaled_fn(p_new)
       if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(fn, p_new, step_eps, g_new)
+   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale)
    shift = abs(f - f_new)
    y = g_new - g
    beta = max(0.0_dp, dot_product(g_new, y) / max(dot_product(g, g), tiny(1.0_dp)))
@@ -1529,34 +1547,46 @@ do iter = 1, max_iter
    end if
 end do
 out%par = p
-out%value = f
+out%value = f * fscale
 out%convergence = merge(0, 1, converged)
+contains
+pure function scaled_fn(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+value = fn(x) / fscale
+end function scaled_fn
 end function optim_cg
 
-function optim_sann(fn, par, maxit, reltol, ndeps) result(out)
+function optim_sann(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
 ! Simulated annealing optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps
+real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, tmax
-real(kind=dp) :: f, f_new, best_f, temp, prob, u
-real(kind=dp), allocatable :: p(:), p_new(:), z(:), best_p(:)
+real(kind=dp) :: f, f_new, best_f, temp, prob, u, fscale
+real(kind=dp), allocatable :: p(:), p_new(:), z(:), best_p(:), pscale(:)
 n = size(par)
 max_iter = 10000
 if (present(maxit)) max_iter = maxit
+fscale = 1.0_dp
+if (present(fnscale)) then
+   if (abs(fnscale) > tiny(1.0_dp)) fscale = fnscale
+end if
 tmax = 10
-allocate(p(n), p_new(n), z(n), best_p(n))
+allocate(p(n), p_new(n), z(n), best_p(n), pscale(n))
 p = par
-f = fn(p)
+pscale = 1.0_dp
+if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
+f = scaled_fn(p)
 best_p = p
 best_f = f
 do iter = 1, max_iter
    temp = 10.0_dp / log(real(((iter - 1) / tmax) * tmax, kind=dp) + exp(1.0_dp))
    z = rnorm_vec(n)
-   p_new = p + 0.1_dp * temp * z
-   f_new = fn(p_new)
+   p_new = p + 0.1_dp * temp * z * pscale
+   f_new = scaled_fn(p_new)
    if (f_new < f) then
       p = p_new
       f = f_new
@@ -1574,36 +1604,48 @@ do iter = 1, max_iter
    end if
 end do
 out%par = best_p
-out%value = best_f
+out%value = best_f * fscale
 out%convergence = 0
+contains
+pure function scaled_fn(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+value = fn(x) / fscale
+end function scaled_fn
 end function optim_sann
 
-function optim_nelder_mead(fn, par, maxit, reltol, ndeps) result(out)
+function optim_nelder_mead(fn, par, maxit, reltol, ndeps, fnscale, parscale) result(out)
 ! Nelder-Mead simplex optimizer for vector-valued parameters.
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
-real(kind=dp), intent(in), optional :: reltol, ndeps
+real(kind=dp), intent(in), optional :: reltol, ndeps, fnscale, parscale(:)
 type(optim_result_t) :: out
 integer :: n, max_iter, iter, i, j, best, worst, second
 logical :: converged
-real(kind=dp) :: gtol, step, fr, fe, fc, spread
-real(kind=dp), allocatable :: simplex(:,:), fvals(:), centroid(:), xr(:), xe(:), xc(:)
+real(kind=dp) :: gtol, step, fr, fe, fc, spread, fscale
+real(kind=dp), allocatable :: simplex(:,:), fvals(:), centroid(:), xr(:), xe(:), xc(:), pscale(:)
 n = size(par)
 max_iter = 100
 if (present(maxit)) max_iter = maxit
+fscale = 1.0_dp
+if (present(fnscale)) then
+   if (abs(fnscale) > tiny(1.0_dp)) fscale = fnscale
+end if
 gtol = 1.0e-8_dp
 if (present(reltol)) gtol = reltol
 gtol = max(gtol, sqrt(epsilon(1.0_dp)))
-allocate(simplex(n,n+1), fvals(n+1), centroid(n), xr(n), xe(n), xc(n))
+allocate(simplex(n,n+1), fvals(n+1), centroid(n), xr(n), xe(n), xc(n), pscale(n))
+pscale = 1.0_dp
+if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
 simplex(:,1) = par
 do i = 1, n
    simplex(:,i+1) = par
-   step = 0.05_dp * (abs(par(i)) + 1.0_dp)
+   step = 0.05_dp * (abs(par(i)) + pscale(i))
    simplex(i,i+1) = simplex(i,i+1) + step
 end do
 do j = 1, n + 1
-   fvals(j) = fn(simplex(:,j))
+   fvals(j) = scaled_fn(simplex(:,j))
 end do
 converged = .false.
 do iter = 1, max_iter
@@ -1628,10 +1670,10 @@ do iter = 1, max_iter
    end do
    centroid = centroid / real(n, kind=dp)
    xr = centroid + (centroid - simplex(:,worst))
-   fr = fn(xr)
+   fr = scaled_fn(xr)
    if (fr < fvals(best)) then
       xe = centroid + 2.0_dp * (xr - centroid)
-      fe = fn(xe)
+      fe = scaled_fn(xe)
       if (fe < fr) then
          simplex(:,worst) = xe
          fvals(worst) = fe
@@ -1644,7 +1686,7 @@ do iter = 1, max_iter
       fvals(worst) = fr
    else
       xc = centroid + 0.5_dp * (simplex(:,worst) - centroid)
-      fc = fn(xc)
+      fc = scaled_fn(xc)
       if (fc < fvals(worst)) then
          simplex(:,worst) = xc
          fvals(worst) = fc
@@ -1652,7 +1694,7 @@ do iter = 1, max_iter
          do j = 1, n + 1
             if (j /= best) then
                simplex(:,j) = simplex(:,best) + 0.5_dp * (simplex(:,j) - simplex(:,best))
-               fvals(j) = fn(simplex(:,j))
+               fvals(j) = scaled_fn(simplex(:,j))
             end if
          end do
       end if
@@ -1663,8 +1705,14 @@ do j = 2, n + 1
    if (fvals(j) < fvals(best)) best = j
 end do
 out%par = simplex(:,best)
-out%value = fvals(best)
+out%value = fvals(best) * fscale
 out%convergence = merge(0, 1, converged)
+contains
+pure function scaled_fn(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+value = fn(x) / fscale
+end function scaled_fn
 end function optim_nelder_mead
 
 function constr_optim_bfgs(fn, theta, ui, ci, maxit, reltol, ndeps) result(out)
@@ -1775,16 +1823,21 @@ end if
 end function barrier_obj
 end function constr_optim_nelder_mead
 
-subroutine optim_fd_gradient(fn, p, step_eps, g)
+subroutine optim_fd_gradient(fn, p, step_eps, g, parscale)
 procedure(optim_vec_objective) :: fn
 real(kind=dp), intent(in) :: p(:), step_eps
+real(kind=dp), intent(in), optional :: parscale(:)
 real(kind=dp), intent(out) :: g(:)
 real(kind=dp), allocatable :: p_tmp(:)
-real(kind=dp) :: eps, f_plus, f_minus
+real(kind=dp) :: eps, f_plus, f_minus, scale_i
 integer :: i
 allocate(p_tmp(size(p)))
 do i = 1, size(p)
-   eps = step_eps * (abs(p(i)) + 1.0_dp)
+   scale_i = 1.0_dp
+   if (present(parscale)) then
+      if (i <= size(parscale)) scale_i = max(abs(parscale(i)), tiny(1.0_dp))
+   end if
+   eps = step_eps * (abs(p(i)) + scale_i)
    p_tmp = p
    p_tmp(i) = p_tmp(i) + eps
    f_plus = fn(p_tmp)
