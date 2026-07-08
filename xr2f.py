@@ -23536,6 +23536,18 @@ def _optim_control_kwargs(
     return kwargs
 
 
+def _optim_bound_arg_expr(src: str | None, default: str) -> str:
+    if src is None or not src.strip():
+        return default
+    text = src.strip()
+    lowered = r_expr_to_fortran(text)
+    if _optim_control_value_is_vector(text):
+        return lowered
+    if re.fullmatch(r"[A-Za-z]\w*(?:%[A-Za-z]\w*)?", lowered.strip()):
+        return lowered
+    return f"[{lowered}]"
+
+
 def _named_values_from_call(src: str, call_name: str) -> list[tuple[str, str]] | None:
     c = parse_call_text(src.strip())
     if c is None or c[0].lower() != call_name.lower():
@@ -23805,6 +23817,8 @@ def _emit_optim_bfgs_assignment(
     if objective_first_scalar and not par_f.strip().startswith("["):
         par_f = f"[{par_f}]"
     control_src = kw.get("control", "")
+    lower_f = _optim_bound_arg_expr(kw.get("lower"), "[-huge(1.0_dp)]")
+    upper_f = _optim_bound_arg_expr(kw.get("upper"), "[huge(1.0_dp)]")
     maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
     reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
     ndeps_src = _control_value_from_list(control_src, "ndeps") if control_src else None
@@ -23841,6 +23855,26 @@ def _emit_optim_bfgs_assignment(
         o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{tail})")
         return True
 
+    can_call_runtime_lbfgsb = (
+        method_lit is not None
+        and method == "l-bfgs-b"
+        and not objective_first_scalar
+        and not extra_actuals
+    )
+    if can_call_runtime_lbfgsb:
+        if helper_ctx is not None:
+            nr = helper_ctx.get("need_r_mod")
+            if isinstance(nr, set):
+                nr.update({"optim_result_t", "optim_lbfgsb"})
+        kwargs = _optim_control_kwargs(control_src)
+        tail = ", " + ", ".join(kwargs) if kwargs else ""
+        if comment:
+            cmt = comment.strip()
+            if cmt:
+                o.w(f"! {cmt}")
+        o.w(f"{target} = optim_lbfgsb({fn_name}, {par_f}, {lower_f}, {upper_f}{tail})")
+        return True
+
     can_call_runtime_dispatch = (
         method_lit is None
         and not objective_first_scalar
@@ -23853,6 +23887,7 @@ def _emit_optim_bfgs_assignment(
                 nr.update({
                     "optim_result_t",
                     "optim_bfgs",
+                    "optim_lbfgsb",
                     "optim_cg",
                     "optim_sann",
                     "optim_nelder_mead",
@@ -23869,6 +23904,10 @@ def _emit_optim_bfgs_assignment(
         o.w('case ("BFGS", "bfgs")')
         o.push()
         o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{tail})")
+        o.pop()
+        o.w('case ("L-BFGS-B", "l-bfgs-b")')
+        o.push()
+        o.w(f"{target} = optim_lbfgsb({fn_name}, {par_f}, {lower_f}, {upper_f}{tail})")
         o.pop()
         o.w('case ("CG", "cg")')
         o.push()
@@ -55823,6 +55862,8 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_result_t"})
     if "optim_bfgs(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_bfgs", "optim_result_t"})
+    if "optim_lbfgsb(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_lbfgsb", "optim_result_t"})
     if "optim_cg(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"optim_cg", "optim_result_t"})
     if "optim_sann(" in f90:

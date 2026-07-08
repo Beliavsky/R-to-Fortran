@@ -14,7 +14,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
-   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_cg, optim_sann, optim_nelder_mead, constr_optim_bfgs, constr_optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, set_nlm_method, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
+   & write_table_real_matrix, write_table_real_vector, lm_fit_t, glm_fit_t, prcomp_fit_t, eigen_result_t, optim_result_t, optim_bfgs, optim_lbfgsb, optim_cg, optim_sann, optim_nelder_mead, constr_optim_bfgs, constr_optim_nelder_mead, nlm_result_t, nlm_stub, nlm_optimize_scalar, nlm_optimize_vec, set_nlm_method, print_nlm_result, integrate_result_t, integrate, print_integrate_result, hist_result_t, hist, print_hist, decompose_result_t, ks_test_result_t, lm_fit_general, lm_r_squared_general, lm_predict_general, step_lm, &
    & lm_predict_interval, print_lm_prediction_interval, lm_confint, lm_cooks_distance, print_lm_cooks_top, &
    & lm_coef, print_lm_summary, print_lm_coef_rstyle, print_lm_confint, print_lm_anova, pchisq, normal_cdf, qnorm, ppois, qpois, &
    & dunif, punif, qunif, dexp, pexp, qexp, dgamma, pgamma, qgamma, dbeta, pbeta, qbeta, dchisq, qchisq, &
@@ -1483,6 +1483,134 @@ real(kind=dp) :: value
 value = fn(x) / fscale
 end function scaled_fn
 end function optim_bfgs
+
+function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
+! Bound-constrained optimizer for vector-valued parameter objectives.
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: par(:), lower(:), upper(:)
+integer, intent(in), optional :: maxit
+real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
+type(optim_result_t) :: out
+integer :: n, max_iter, n_iter, i, j, iter
+logical :: converged
+real(kind=dp) :: f, f_new, step_eps, gtol, fscale
+real(kind=dp) :: alpha, slope, sy, rho, shift
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), lb(:), ub(:)
+real(kind=dp), allocatable :: h(:,:), d(:), s(:), y(:), a(:,:), tmp(:,:)
+n = size(par)
+max_iter = 100
+if (present(maxit)) max_iter = maxit
+step_eps = 1.0e-3_dp
+if (present(ndeps)) step_eps = ndeps
+fscale = 1.0_dp
+if (present(fnscale)) then
+   if (abs(fnscale) > tiny(1.0_dp)) fscale = fnscale
+end if
+gtol = 1.0e-8_dp
+if (present(reltol)) gtol = reltol
+gtol = max(gtol, sqrt(epsilon(1.0_dp)))
+allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), lb(n), ub(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
+do i = 1, n
+   lb(i) = lower(min(i, size(lower)))
+   ub(i) = upper(min(i, size(upper)))
+   if (lb(i) > ub(i)) then
+      out%par = par
+      out%value = huge(1.0_dp)
+      out%convergence = 1
+      return
+   end if
+end do
+p = project(par)
+pscale = 1.0_dp
+if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
+h = 0.0_dp
+do i = 1, n
+   h(i,i) = 1.0_dp
+end do
+f = scaled_fn(p)
+call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale, ndeps_vec)
+converged = .false.
+n_iter = 0
+do iter = 1, max_iter
+   n_iter = iter
+   do i = 1, n
+      if ((p(i) <= lb(i) + sqrt(epsilon(1.0_dp)) .and. g(i) > 0.0_dp) .or. &
+         & (p(i) >= ub(i) - sqrt(epsilon(1.0_dp)) .and. g(i) < 0.0_dp)) g(i) = 0.0_dp
+   end do
+   if (sqrt(sum(g**2)) < gtol) then
+      converged = .true.
+      exit
+   end if
+   do i = 1, n
+      d(i) = -sum(h(i,:) * g)
+   end do
+   if (dot_product(g, d) >= 0.0_dp) then
+      h = 0.0_dp
+      do i = 1, n
+         h(i,i) = 1.0_dp
+      end do
+      d = -g
+   end if
+   alpha = 1.0_dp
+   slope = dot_product(g, d)
+   do j = 1, 60
+      p_new = project(p + alpha * d)
+      f_new = scaled_fn(p_new)
+      if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
+      if (alpha < 1.0e-12_dp) exit
+      alpha = 0.5_dp * alpha
+   end do
+   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale, ndeps_vec)
+   s = p_new - p
+   y = g_new - g
+   sy = dot_product(s, y)
+   shift = abs(f - f_new)
+   p = p_new
+   f = f_new
+   g = g_new
+   if (sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
+      rho = 1.0_dp / sy
+      do i = 1, n
+         do j = 1, n
+            a(i,j) = -rho * s(i) * y(j)
+         end do
+         a(i,i) = a(i,i) + 1.0_dp
+      end do
+      do i = 1, n
+         do j = 1, n
+            tmp(i,j) = sum(h(i,:) * a(j,:))
+         end do
+      end do
+      do i = 1, n
+         do j = 1, n
+            h(i,j) = sum(a(i,:) * tmp(:,j)) + rho * s(i) * s(j)
+         end do
+      end do
+   end if
+   if (shift <= gtol * (1.0_dp + abs(f)) .or. sqrt(sum(s**2)) <= gtol * (1.0_dp + sqrt(sum(p**2)))) then
+      converged = .true.
+      exit
+   end if
+end do
+out%par = p
+out%value = f * fscale
+out%convergence = merge(0, 1, converged)
+contains
+pure function project(x) result(px)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: px(size(x))
+integer :: k
+do k = 1, size(x)
+   px(k) = min(max(x(k), lb(k)), ub(k))
+end do
+end function project
+
+pure function scaled_fn(x) result(value)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: value
+value = fn(project(x)) / fscale
+end function scaled_fn
+end function optim_lbfgsb
 
 function optim_cg(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
 ! Nonlinear conjugate-gradient optimizer for vector-valued parameters.
