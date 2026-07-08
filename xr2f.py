@@ -35852,6 +35852,7 @@ def transpile_r_to_fortran(
         o.w("real(kind=dp), allocatable :: par(:)")
         o.w("real(kind=dp) :: value")
         o.w("integer :: convergence")
+        o.w("integer :: counts(2) = 0")
         o.pop()
         o.w("end type optim_result_t")
         o.w("")

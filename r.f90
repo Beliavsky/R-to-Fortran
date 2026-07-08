@@ -266,6 +266,7 @@ type :: optim_result_t
    real(kind=dp), allocatable :: par(:)
    real(kind=dp) :: value
    integer :: convergence
+   integer :: counts(2) = 0
 end type optim_result_t
 
 abstract interface
@@ -1392,7 +1393,7 @@ real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
-integer :: n, max_iter, n_iter, i, j, iter
+integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count
 logical :: converged
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
@@ -1411,6 +1412,8 @@ gtol = 1.0e-8_dp
 if (present(reltol)) gtol = reltol
 gtol = max(gtol, sqrt(epsilon(1.0_dp)))
 allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
+fn_count = 0
+gr_count = 0
 p = par
 pscale = 1.0_dp
 if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
@@ -1419,11 +1422,13 @@ do i = 1, n
    h(i,i) = 1.0_dp
 end do
 f = scaled_fn(p)
+fn_count = fn_count + 1
 call eval_gradient(p, g)
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
    out%convergence = 1
+   out%counts = [fn_count, gr_count]
    return
 end if
 converged = .false.
@@ -1450,6 +1455,7 @@ do iter = 1, max_iter
    do j = 1, 60
       p_new = p + alpha * d
       f_new = scaled_fn(p_new)
+      fn_count = fn_count + 1
       if (ieee_is_finite(f_new) .and. f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
@@ -1492,6 +1498,7 @@ end do
 out%par = p
 out%value = f * fscale
 out%convergence = merge(0, 1, converged)
+out%counts = [fn_count, gr_count]
 contains
 pure function scaled_fn(x) result(value)
 real(kind=dp), intent(in) :: x(:)
@@ -1503,12 +1510,15 @@ subroutine eval_gradient(x, gout)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), intent(out) :: gout(:)
 if (present(gr)) then
+   gr_count = gr_count + 1
    g_raw = gr(x)
    if (size(g_raw) == size(gout)) then
       gout = g_raw / fscale
       return
    end if
 end if
+gr_count = gr_count + 1
+fn_count = fn_count + 2 * size(x)
 call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
 end subroutine eval_gradient
 
@@ -1527,7 +1537,7 @@ real(kind=dp), intent(in) :: par(:), lower(:), upper(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
 type(optim_result_t) :: out
-integer :: n, max_iter, n_iter, i, j, iter
+integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count
 logical :: converged
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
@@ -1546,6 +1556,8 @@ gtol = 1.0e-8_dp
 if (present(reltol)) gtol = reltol
 gtol = max(gtol, sqrt(epsilon(1.0_dp)))
 allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), lb(n), ub(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
+fn_count = 0
+gr_count = 0
 do i = 1, n
    lb(i) = lower(min(i, size(lower)))
    ub(i) = upper(min(i, size(upper)))
@@ -1553,6 +1565,7 @@ do i = 1, n
       out%par = par
       out%value = huge(1.0_dp)
       out%convergence = 1
+      out%counts = [fn_count, gr_count]
       return
    end if
 end do
@@ -1564,11 +1577,13 @@ do i = 1, n
    h(i,i) = 1.0_dp
 end do
 f = scaled_fn(p)
+fn_count = fn_count + 1
 call eval_gradient(p, g)
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
    out%convergence = 1
+   out%counts = [fn_count, gr_count]
    return
 end if
 converged = .false.
@@ -1599,6 +1614,7 @@ do iter = 1, max_iter
    do j = 1, 60
       p_new = project(p + alpha * d)
       f_new = scaled_fn(p_new)
+      fn_count = fn_count + 1
       if (ieee_is_finite(f_new) .and. f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
@@ -1641,6 +1657,7 @@ end do
 out%par = p
 out%value = f * fscale
 out%convergence = merge(0, 1, converged)
+out%counts = [fn_count, gr_count]
 contains
 pure function project(x) result(px)
 real(kind=dp), intent(in) :: x(:)
@@ -1661,12 +1678,15 @@ subroutine eval_gradient(x, gout)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), intent(out) :: gout(:)
 if (present(gr)) then
+   gr_count = gr_count + 1
    g_raw = gr(project(x))
    if (size(g_raw) == size(gout)) then
       gout = g_raw / fscale
       return
    end if
 end if
+gr_count = gr_count + 1
+fn_count = fn_count + 2 * size(x)
 call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
 end subroutine eval_gradient
 
