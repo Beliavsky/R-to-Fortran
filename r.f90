@@ -267,6 +267,8 @@ type :: optim_result_t
    real(kind=dp) :: value
    integer :: convergence
    integer :: counts(2) = 0
+   real(kind=dp), allocatable :: hessian(:,:)
+   character(len=:), allocatable :: message
 end type optim_result_t
 
 abstract interface
@@ -1385,16 +1387,18 @@ end interface r_typeof
 
 contains
 
-function optim_bfgs(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr) result(out)
+function optim_bfgs(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr, hessian) result(out)
 ! Quasi-Newton optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
 procedure(optim_vec_gradient), optional :: gr
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
+logical, intent(in), optional :: hessian
 type(optim_result_t) :: out
-integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count
+integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count, conv_code
 logical :: converged
+character(len=:), allocatable :: msg
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
 real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), g_raw(:)
@@ -1414,6 +1418,8 @@ gtol = max(gtol, sqrt(epsilon(1.0_dp)))
 allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
 fn_count = 0
 gr_count = 0
+conv_code = 1
+msg = "maximum iterations reached"
 p = par
 pscale = 1.0_dp
 if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
@@ -1427,8 +1433,9 @@ call eval_gradient(p, g)
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
-   out%convergence = 1
+   out%convergence = 10
    out%counts = [fn_count, gr_count]
+   out%message = "non-finite initial objective or gradient"
    return
 end if
 converged = .false.
@@ -1437,6 +1444,8 @@ do iter = 1, max_iter
    n_iter = iter
    if (sqrt(sum(g**2)) < gtol) then
       converged = .true.
+      conv_code = 0
+      msg = "converged"
       exit
    end if
    do i = 1, n
@@ -1460,9 +1469,17 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   if (.not. ieee_is_finite(f_new)) exit
+   if (.not. ieee_is_finite(f_new)) then
+      conv_code = 51
+      msg = "line search failed"
+      exit
+   end if
    call eval_gradient(p_new, g_new)
-   if (.not. finite_vec(g_new)) exit
+   if (.not. finite_vec(g_new)) then
+      conv_code = 51
+      msg = "non-finite gradient"
+      exit
+   end if
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1492,13 +1509,22 @@ do iter = 1, max_iter
    end if
    if (shift <= gtol * (1.0_dp + abs(f))) then
       converged = .true.
+      conv_code = 0
+      msg = "converged"
       exit
    end if
 end do
 out%par = p
 out%value = f * fscale
-out%convergence = merge(0, 1, converged)
+out%convergence = merge(0, conv_code, converged)
 out%counts = [fn_count, gr_count]
+out%message = msg
+if (present(hessian)) then
+   if (hessian) then
+      call optim_fd_hessian(scaled_fn, p, step_eps, out%hessian, pscale, ndeps_vec)
+      out%hessian = out%hessian * fscale
+   end if
+end if
 contains
 pure function scaled_fn(x) result(value)
 real(kind=dp), intent(in) :: x(:)
@@ -1529,16 +1555,18 @@ ok = all(ieee_is_finite(x))
 end function finite_vec
 end function optim_bfgs
 
-function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr) result(out)
+function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr, hessian) result(out)
 ! Bound-constrained optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
 procedure(optim_vec_gradient), optional :: gr
 real(kind=dp), intent(in) :: par(:), lower(:), upper(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
+logical, intent(in), optional :: hessian
 type(optim_result_t) :: out
-integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count
+integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count, conv_code
 logical :: converged
+character(len=:), allocatable :: msg
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
 real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), lb(:), ub(:), g_raw(:)
@@ -1558,14 +1586,17 @@ gtol = max(gtol, sqrt(epsilon(1.0_dp)))
 allocate(p(n), p_new(n), g(n), g_new(n), pscale(n), lb(n), ub(n), h(n,n), d(n), s(n), y(n), a(n,n), tmp(n,n))
 fn_count = 0
 gr_count = 0
+conv_code = 1
+msg = "maximum iterations reached"
 do i = 1, n
    lb(i) = lower(min(i, size(lower)))
    ub(i) = upper(min(i, size(upper)))
    if (lb(i) > ub(i)) then
       out%par = par
       out%value = huge(1.0_dp)
-      out%convergence = 1
+      out%convergence = 51
       out%counts = [fn_count, gr_count]
+      out%message = "invalid bounds"
       return
    end if
 end do
@@ -1582,8 +1613,9 @@ call eval_gradient(p, g)
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
-   out%convergence = 1
+   out%convergence = 10
    out%counts = [fn_count, gr_count]
+   out%message = "non-finite initial objective or gradient"
    return
 end if
 converged = .false.
@@ -1596,6 +1628,8 @@ do iter = 1, max_iter
    end do
    if (sqrt(sum(g**2)) < gtol) then
       converged = .true.
+      conv_code = 0
+      msg = "converged"
       exit
    end if
    do i = 1, n
@@ -1619,9 +1653,17 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   if (.not. ieee_is_finite(f_new)) exit
+   if (.not. ieee_is_finite(f_new)) then
+      conv_code = 51
+      msg = "line search failed"
+      exit
+   end if
    call eval_gradient(p_new, g_new)
-   if (.not. finite_vec(g_new)) exit
+   if (.not. finite_vec(g_new)) then
+      conv_code = 51
+      msg = "non-finite gradient"
+      exit
+   end if
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1649,15 +1691,24 @@ do iter = 1, max_iter
          end do
       end do
    end if
-   if (shift <= gtol * (1.0_dp + abs(f)) .or. sqrt(sum(s**2)) <= gtol * (1.0_dp + sqrt(sum(p**2)))) then
-      converged = .true.
-      exit
+   if (shift <= gtol * (1.0_dp + abs(f))) then
+      h = 0.0_dp
+      do i = 1, n
+         h(i,i) = 1.0_dp
+      end do
    end if
 end do
 out%par = p
 out%value = f * fscale
-out%convergence = merge(0, 1, converged)
+out%convergence = merge(0, conv_code, converged)
 out%counts = [fn_count, gr_count]
+out%message = msg
+if (present(hessian)) then
+   if (hessian) then
+      call optim_fd_hessian(scaled_fn, p, step_eps, out%hessian, pscale, ndeps_vec)
+      out%hessian = out%hessian * fscale
+   end if
+end if
 contains
 pure function project(x) result(px)
 real(kind=dp), intent(in) :: x(:)
@@ -1686,9 +1737,66 @@ if (present(gr)) then
    end if
 end if
 gr_count = gr_count + 1
-fn_count = fn_count + 2 * size(x)
-call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
+call bounded_fd_gradient(x, gout)
 end subroutine eval_gradient
+
+subroutine bounded_fd_gradient(x, gout)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(out) :: gout(:)
+real(kind=dp), allocatable :: x0(:), x_plus(:), x_minus(:)
+real(kind=dp) :: eps, step_i, scale_i, f_base, f_plus, f_minus
+integer :: k
+logical :: have_base
+allocate(x0(size(x)), x_plus(size(x)), x_minus(size(x)))
+x0 = project(x)
+have_base = .false.
+f_base = 0.0_dp
+do k = 1, size(x)
+   scale_i = 1.0_dp
+   if (k <= size(pscale)) scale_i = max(abs(pscale(k)), tiny(1.0_dp))
+   step_i = step_eps
+   if (present(ndeps_vec)) then
+      if (k <= size(ndeps_vec)) step_i = ndeps_vec(k)
+   end if
+   eps = step_i * (abs(x0(k)) + scale_i)
+   if (abs(eps) <= tiny(1.0_dp)) eps = step_eps * (abs(x0(k)) + scale_i)
+   if (abs(eps) <= tiny(1.0_dp)) eps = sqrt(epsilon(1.0_dp))
+   if (x0(k) + eps <= ub(k) .and. x0(k) - eps >= lb(k)) then
+      x_plus = x0
+      x_minus = x0
+      x_plus(k) = x0(k) + eps
+      x_minus(k) = x0(k) - eps
+      f_plus = scaled_fn(x_plus)
+      f_minus = scaled_fn(x_minus)
+      fn_count = fn_count + 2
+      gout(k) = (f_plus - f_minus) / (2.0_dp * eps)
+   else if (x0(k) + eps <= ub(k)) then
+      if (.not. have_base) then
+         f_base = scaled_fn(x0)
+         fn_count = fn_count + 1
+         have_base = .true.
+      end if
+      x_plus = x0
+      x_plus(k) = x0(k) + eps
+      f_plus = scaled_fn(x_plus)
+      fn_count = fn_count + 1
+      gout(k) = (f_plus - f_base) / eps
+   else if (x0(k) - eps >= lb(k)) then
+      if (.not. have_base) then
+         f_base = scaled_fn(x0)
+         fn_count = fn_count + 1
+         have_base = .true.
+      end if
+      x_minus = x0
+      x_minus(k) = x0(k) - eps
+      f_minus = scaled_fn(x_minus)
+      fn_count = fn_count + 1
+      gout(k) = (f_base - f_minus) / eps
+   else
+      gout(k) = 0.0_dp
+   end if
+end do
+end subroutine bounded_fd_gradient
 
 pure function finite_vec(x) result(ok)
 real(kind=dp), intent(in) :: x(:)
@@ -1762,6 +1870,11 @@ end do
 out%par = p
 out%value = f * fscale
 out%convergence = merge(0, 1, converged)
+if (converged) then
+   out%message = "converged"
+else
+   out%message = "maximum iterations reached"
+end if
 contains
 pure function scaled_fn(x) result(value)
 real(kind=dp), intent(in) :: x(:)
@@ -1819,6 +1932,7 @@ end do
 out%par = best_p
 out%value = best_f * fscale
 out%convergence = 0
+out%message = "converged"
 contains
 pure function scaled_fn(x) result(value)
 real(kind=dp), intent(in) :: x(:)
@@ -1920,6 +2034,11 @@ end do
 out%par = simplex(:,best)
 out%value = fvals(best) * fscale
 out%convergence = merge(0, 1, converged)
+if (converged) then
+   out%message = "converged"
+else
+   out%message = "maximum iterations reached"
+end if
 contains
 pure function scaled_fn(x) result(value)
 real(kind=dp), intent(in) :: x(:)
@@ -1950,13 +2069,15 @@ slack = matmul(ui, p) - ci
 if (any(slack <= 0.0_dp)) then
    out%par = p
    out%value = huge(1.0_dp)
-   out%convergence = 1
+   out%convergence = 51
+   out%message = "initial value is not feasible"
    return
 end if
 mu = 1.0_dp
 out%par = p
 out%value = fn(p)
 out%convergence = 1
+out%message = "maximum iterations reached"
 do outer = 1, max_outer
    inner = optim_bfgs(barrier_obj, p, maxit=inner_maxit, reltol=tol, ndeps=step_eps)
    p = inner%par
@@ -1965,6 +2086,7 @@ do outer = 1, max_outer
    out%par = p
    out%value = fn(p)
    out%convergence = inner%convergence
+   out%message = inner%message
    if (mu < tol) exit
    mu = 0.2_dp * mu
 end do
@@ -2004,13 +2126,15 @@ slack = matmul(ui, p) - ci
 if (any(slack <= 0.0_dp)) then
    out%par = p
    out%value = huge(1.0_dp)
-   out%convergence = 1
+   out%convergence = 51
+   out%message = "initial value is not feasible"
    return
 end if
 mu = 1.0_dp
 out%par = p
 out%value = fn(p)
 out%convergence = 1
+out%message = "maximum iterations reached"
 do outer = 1, max_outer
    inner = optim_nelder_mead(barrier_obj, p, maxit=inner_maxit, reltol=tol, ndeps=step_eps)
    p = inner%par
@@ -2019,6 +2143,7 @@ do outer = 1, max_outer
    out%par = p
    out%value = fn(p)
    out%convergence = inner%convergence
+   out%message = inner%message
    if (mu < tol) exit
    mu = 0.2_dp * mu
 end do
@@ -2067,6 +2192,64 @@ do i = 1, size(p)
    g(i) = (f_plus - f_minus) / (2.0_dp * eps)
 end do
 end subroutine optim_fd_gradient
+
+subroutine optim_fd_hessian(fn, p, step_eps, hess, parscale, ndeps_vec)
+procedure(optim_vec_objective) :: fn
+real(kind=dp), intent(in) :: p(:), step_eps
+real(kind=dp), intent(in), optional :: parscale(:)
+real(kind=dp), intent(in), optional :: ndeps_vec(:)
+real(kind=dp), allocatable, intent(out) :: hess(:,:)
+real(kind=dp), allocatable :: p_pp(:), p_pm(:), p_mp(:), p_mm(:), step(:)
+real(kind=dp) :: f0, f_plus, f_minus, f_pp, f_pm, f_mp, f_mm, scale_i, step_i
+integer :: i, j, n
+n = size(p)
+allocate(hess(n,n), p_pp(n), p_pm(n), p_mp(n), p_mm(n), step(n))
+do i = 1, n
+   scale_i = 1.0_dp
+   if (present(parscale)) then
+      if (i <= size(parscale)) scale_i = max(abs(parscale(i)), tiny(1.0_dp))
+   end if
+   step_i = step_eps
+   if (present(ndeps_vec)) then
+      if (i <= size(ndeps_vec)) step_i = ndeps_vec(i)
+   end if
+   step(i) = step_i * (abs(p(i)) + scale_i)
+   if (abs(step(i)) <= tiny(1.0_dp)) step(i) = step_eps * (abs(p(i)) + scale_i)
+   if (abs(step(i)) <= tiny(1.0_dp)) step(i) = sqrt(epsilon(1.0_dp))
+end do
+f0 = fn(p)
+do i = 1, n
+   p_pp = p
+   p_mm = p
+   p_pp(i) = p_pp(i) + step(i)
+   p_mm(i) = p_mm(i) - step(i)
+   f_plus = fn(p_pp)
+   f_minus = fn(p_mm)
+   hess(i,i) = (f_plus - 2.0_dp * f0 + f_minus) / (step(i)**2)
+end do
+do i = 1, n
+   do j = i + 1, n
+      p_pp = p
+      p_pm = p
+      p_mp = p
+      p_mm = p
+      p_pp(i) = p_pp(i) + step(i)
+      p_pp(j) = p_pp(j) + step(j)
+      p_pm(i) = p_pm(i) + step(i)
+      p_pm(j) = p_pm(j) - step(j)
+      p_mp(i) = p_mp(i) - step(i)
+      p_mp(j) = p_mp(j) + step(j)
+      p_mm(i) = p_mm(i) - step(i)
+      p_mm(j) = p_mm(j) - step(j)
+      f_pp = fn(p_pp)
+      f_pm = fn(p_pm)
+      f_mp = fn(p_mp)
+      f_mm = fn(p_mm)
+      hess(i,j) = (f_pp - f_pm - f_mp + f_mm) / (4.0_dp * step(i) * step(j))
+      hess(j,i) = hess(i,j)
+   end do
+end do
+end subroutine optim_fd_hessian
 
 function integrate(fn, lower, upper, rel_tol, subdivisions) result(out)
 ! Approximate R integrate() for smooth scalar functions using composite Simpson rules.
