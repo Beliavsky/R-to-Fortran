@@ -23769,6 +23769,18 @@ def _emit_optim_bfgs_assignment(
     method = (method_lit or "BFGS").lower()
     if method_lit is not None and method not in {"bfgs", "l-bfgs-b", "nelder-mead", "cg", "sann"}:
         return False
+    gr_src = kw.get("gr")
+    gr_from_positional = False
+    if gr_src is None and len(pos) >= 3:
+        gr_src = pos[2]
+        gr_from_positional = True
+    gr_name: str | None = None
+    if gr_src is not None and gr_src.strip().lower() not in {"null", "na"}:
+        gr_candidate = gr_src.strip()
+        if not re.match(r"^[A-Za-z]\w*$", gr_candidate):
+            return False
+        nested_gr_name = f"{parent_fn}_{gr_candidate}" if parent_fn else ""
+        gr_name = nested_gr_name if nested_gr_name.lower() in _USER_FUNC_ARG_INDEX else gr_candidate
 
     objective_args = _USER_FUNC_ARG_INDEX.get(fn_name.lower(), {})
     ordered_extra: list[tuple[int, str]] = []
@@ -23800,7 +23812,9 @@ def _emit_optim_bfgs_assignment(
             idx = 1000 + len(ordered_extra)
         explicit_extra_idxs.add(idx)
         ordered_extra.append((idx, actual_f))
-    for i, v in enumerate(pos[2:], start=2):
+    extra_pos = pos[3:] if gr_from_positional else pos[2:]
+    extra_start = 3 if gr_from_positional else 2
+    for i, v in enumerate(extra_pos, start=extra_start):
         explicit_extra_idxs.add(i)
         ordered_extra.append((i, r_expr_to_fortran(v)))
     for formal_l, idx in sorted(objective_args.items(), key=lambda kv: kv[1]):
@@ -23847,6 +23861,8 @@ def _emit_optim_bfgs_assignment(
             if isinstance(nr, set):
                 nr.update({"optim_result_t", "optim_bfgs"})
         kwargs = _optim_control_kwargs(control_src)
+        if gr_name is not None:
+            kwargs.append(f"gr={gr_name}")
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         if comment:
             cmt = comment.strip()
@@ -23867,6 +23883,8 @@ def _emit_optim_bfgs_assignment(
             if isinstance(nr, set):
                 nr.update({"optim_result_t", "optim_lbfgsb"})
         kwargs = _optim_control_kwargs(control_src)
+        if gr_name is not None:
+            kwargs.append(f"gr={gr_name}")
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         if comment:
             cmt = comment.strip()
@@ -23894,6 +23912,10 @@ def _emit_optim_bfgs_assignment(
                 })
         kwargs = _optim_control_kwargs(control_src)
         tail = ", " + ", ".join(kwargs) if kwargs else ""
+        bfgs_kwargs = list(kwargs)
+        if gr_name is not None:
+            bfgs_kwargs.append(f"gr={gr_name}")
+        bfgs_tail = ", " + ", ".join(bfgs_kwargs) if bfgs_kwargs else ""
         method_expr_f = r_expr_to_fortran(method_src)
         if comment:
             cmt = comment.strip()
@@ -23903,11 +23925,11 @@ def _emit_optim_bfgs_assignment(
         o.push()
         o.w('case ("BFGS", "bfgs")')
         o.push()
-        o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{tail})")
+        o.w(f"{target} = optim_bfgs({fn_name}, {par_f}{bfgs_tail})")
         o.pop()
         o.w('case ("L-BFGS-B", "l-bfgs-b")')
         o.push()
-        o.w(f"{target} = optim_lbfgsb({fn_name}, {par_f}, {lower_f}, {upper_f}{tail})")
+        o.w(f"{target} = optim_lbfgsb({fn_name}, {par_f}, {lower_f}, {upper_f}{bfgs_tail})")
         o.pop()
         o.w('case ("CG", "cg")')
         o.push()

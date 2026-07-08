@@ -274,6 +274,11 @@ abstract interface
       real(kind=dp), intent(in) :: par(:)
       real(kind=dp) :: value
    end function optim_vec_objective
+   pure function optim_vec_gradient(par) result(value)
+      import :: dp
+      real(kind=dp), intent(in) :: par(:)
+      real(kind=dp), allocatable :: value(:)
+   end function optim_vec_gradient
 end interface
 
 type :: nlm_result_t
@@ -1379,9 +1384,10 @@ end interface r_typeof
 
 contains
 
-function optim_bfgs(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
+function optim_bfgs(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr) result(out)
 ! Quasi-Newton optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
+procedure(optim_vec_gradient), optional :: gr
 real(kind=dp), intent(in) :: par(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
@@ -1390,7 +1396,7 @@ integer :: n, max_iter, n_iter, i, j, iter
 logical :: converged
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
-real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:)
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), g_raw(:)
 real(kind=dp), allocatable :: h(:,:), d(:), s(:), y(:), a(:,:), tmp(:,:)
 n = size(par)
 max_iter = 100
@@ -1413,7 +1419,7 @@ do i = 1, n
    h(i,i) = 1.0_dp
 end do
 f = scaled_fn(p)
-call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale, ndeps_vec)
+call eval_gradient(p, g)
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1441,7 +1447,7 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale, ndeps_vec)
+   call eval_gradient(p_new, g_new)
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1482,11 +1488,25 @@ real(kind=dp), intent(in) :: x(:)
 real(kind=dp) :: value
 value = fn(x) / fscale
 end function scaled_fn
+
+subroutine eval_gradient(x, gout)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(out) :: gout(:)
+if (present(gr)) then
+   g_raw = gr(x)
+   if (size(g_raw) == size(gout)) then
+      gout = g_raw / fscale
+      return
+   end if
+end if
+call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
+end subroutine eval_gradient
 end function optim_bfgs
 
-function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
+function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr) result(out)
 ! Bound-constrained optimizer for vector-valued parameter objectives.
 procedure(optim_vec_objective) :: fn
+procedure(optim_vec_gradient), optional :: gr
 real(kind=dp), intent(in) :: par(:), lower(:), upper(:)
 integer, intent(in), optional :: maxit
 real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, parscale(:)
@@ -1495,7 +1515,7 @@ integer :: n, max_iter, n_iter, i, j, iter
 logical :: converged
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
-real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), lb(:), ub(:)
+real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), lb(:), ub(:), g_raw(:)
 real(kind=dp), allocatable :: h(:,:), d(:), s(:), y(:), a(:,:), tmp(:,:)
 n = size(par)
 max_iter = 100
@@ -1528,7 +1548,7 @@ do i = 1, n
    h(i,i) = 1.0_dp
 end do
 f = scaled_fn(p)
-call optim_fd_gradient(scaled_fn, p, step_eps, g, pscale, ndeps_vec)
+call eval_gradient(p, g)
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1560,7 +1580,7 @@ do iter = 1, max_iter
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
-   call optim_fd_gradient(scaled_fn, p_new, step_eps, g_new, pscale, ndeps_vec)
+   call eval_gradient(p_new, g_new)
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1610,6 +1630,19 @@ real(kind=dp), intent(in) :: x(:)
 real(kind=dp) :: value
 value = fn(project(x)) / fscale
 end function scaled_fn
+
+subroutine eval_gradient(x, gout)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(out) :: gout(:)
+if (present(gr)) then
+   g_raw = gr(project(x))
+   if (size(g_raw) == size(gout)) then
+      gout = g_raw / fscale
+      return
+   end if
+end if
+call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
+end subroutine eval_gradient
 end function optim_lbfgsb
 
 function optim_cg(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
