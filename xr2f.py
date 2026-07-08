@@ -23845,6 +23845,8 @@ def _emit_optim_bfgs_assignment(
     ndeps_vec_f = r_expr_to_fortran(ndeps_src) if ndeps_is_vector and ndeps_src else ""
     fnscale_f = r_expr_to_fortran(fnscale_src or "1.0")
     parscale_f = r_expr_to_fortran(parscale_src) if parscale_src else ""
+    hessian_src = kw.get("hessian")
+    hessian_f = r_expr_to_fortran(hessian_src) if hessian_src is not None else ""
     prefix = re.sub(r"[^A-Za-z0-9_]", "_", target)
     if not prefix or prefix[0].isdigit():
         prefix = "opt_" + prefix
@@ -23863,6 +23865,8 @@ def _emit_optim_bfgs_assignment(
         kwargs = _optim_control_kwargs(control_src)
         if gr_name is not None:
             kwargs.append(f"gr={gr_name}")
+        if hessian_f:
+            kwargs.append(f"hessian={hessian_f}")
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         if comment:
             cmt = comment.strip()
@@ -23885,6 +23889,8 @@ def _emit_optim_bfgs_assignment(
         kwargs = _optim_control_kwargs(control_src)
         if gr_name is not None:
             kwargs.append(f"gr={gr_name}")
+        if hessian_f:
+            kwargs.append(f"hessian={hessian_f}")
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         if comment:
             cmt = comment.strip()
@@ -23915,6 +23921,8 @@ def _emit_optim_bfgs_assignment(
         bfgs_kwargs = list(kwargs)
         if gr_name is not None:
             bfgs_kwargs.append(f"gr={gr_name}")
+        if hessian_f:
+            bfgs_kwargs.append(f"hessian={hessian_f}")
         bfgs_tail = ", " + ", ".join(bfgs_kwargs) if bfgs_kwargs else ""
         method_expr_f = r_expr_to_fortran(method_src)
         if comment:
@@ -35853,6 +35861,7 @@ def transpile_r_to_fortran(
         o.w("real(kind=dp) :: value")
         o.w("integer :: convergence")
         o.w("integer :: counts(2) = 0")
+        o.w("real(kind=dp), allocatable :: hessian(:,:)")
         o.pop()
         o.w("end type optim_result_t")
         o.w("")
