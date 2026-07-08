@@ -23500,6 +23500,29 @@ def _control_value_from_list(control_src: str, name: str) -> str | None:
     return c[2].get(name)
 
 
+def _optim_control_kwargs(control_src: str, include_scale: bool = True) -> list[str]:
+    if not control_src:
+        return []
+    maxit_src = _control_value_from_list(control_src, "maxit")
+    reltol_src = _control_value_from_list(control_src, "reltol")
+    ndeps_src = _control_value_from_list(control_src, "ndeps")
+    kwargs: list[str] = []
+    if maxit_src is not None:
+        kwargs.append(f"maxit={_int_bound_expr(r_expr_to_fortran(maxit_src))}")
+    if reltol_src is not None:
+        kwargs.append(f"reltol={r_expr_to_fortran(reltol_src)}")
+    if ndeps_src is not None:
+        kwargs.append(f"ndeps={r_expr_to_fortran(ndeps_src)}")
+    if include_scale:
+        fnscale_src = _control_value_from_list(control_src, "fnscale")
+        parscale_src = _control_value_from_list(control_src, "parscale")
+        if fnscale_src is not None:
+            kwargs.append(f"fnscale={r_expr_to_fortran(fnscale_src)}")
+        if parscale_src is not None:
+            kwargs.append(f"parscale={r_expr_to_fortran(parscale_src)}")
+    return kwargs
+
+
 def _named_values_from_call(src: str, call_name: str) -> list[tuple[str, str]] | None:
     c = parse_call_text(src.strip())
     if c is None or c[0].lower() != call_name.lower():
@@ -23685,19 +23708,7 @@ def _emit_optim_bfgs_assignment(
         if method_lit is None or method not in {"bfgs", "nelder-mead"}:
             return False
         control_src = kw.get("control", "")
-        maxit_src = _control_value_from_list(control_src, "maxit") if control_src else None
-        reltol_src = _control_value_from_list(control_src, "reltol") if control_src else None
-        ndeps_src = _control_value_from_list(control_src, "ndeps") if control_src else None
-        maxit_f = _int_bound_expr(r_expr_to_fortran(maxit_src or "100"))
-        gtol_f = r_expr_to_fortran(reltol_src or "1.0e-8")
-        ndeps_f = r_expr_to_fortran(ndeps_src or "1.0e-3")
-        kwargs: list[str] = []
-        if maxit_src is not None:
-            kwargs.append(f"maxit={maxit_f}")
-        if reltol_src is not None:
-            kwargs.append(f"reltol={gtol_f}")
-        if ndeps_src is not None:
-            kwargs.append(f"ndeps={ndeps_f}")
+        kwargs = _optim_control_kwargs(control_src, include_scale=False)
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         helper_name = "constr_optim_bfgs" if method == "bfgs" else "constr_optim_nelder_mead"
         if helper_ctx is not None:
@@ -23802,13 +23813,7 @@ def _emit_optim_bfgs_assignment(
             nr = helper_ctx.get("need_r_mod")
             if isinstance(nr, set):
                 nr.update({"optim_result_t", "optim_bfgs"})
-        kwargs: list[str] = []
-        if maxit_src is not None:
-            kwargs.append(f"maxit={maxit_f}")
-        if reltol_src is not None:
-            kwargs.append(f"reltol={gtol_f}")
-        if ndeps_src is not None:
-            kwargs.append(f"ndeps={ndeps_f}")
+        kwargs = _optim_control_kwargs(control_src)
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         if comment:
             cmt = comment.strip()
@@ -23833,13 +23838,7 @@ def _emit_optim_bfgs_assignment(
                     "optim_sann",
                     "optim_nelder_mead",
                 })
-        kwargs: list[str] = []
-        if maxit_src is not None:
-            kwargs.append(f"maxit={maxit_f}")
-        if reltol_src is not None:
-            kwargs.append(f"reltol={gtol_f}")
-        if ndeps_src is not None:
-            kwargs.append(f"ndeps={ndeps_f}")
+        kwargs = _optim_control_kwargs(control_src)
         tail = ", " + ", ".join(kwargs) if kwargs else ""
         method_expr_f = r_expr_to_fortran(method_src)
         if comment:
