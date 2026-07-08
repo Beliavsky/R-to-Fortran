@@ -1397,8 +1397,8 @@ real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, par
 logical, intent(in), optional :: hessian
 type(optim_result_t) :: out
 integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count, conv_code
-logical :: converged
-character(len=:), allocatable :: msg
+logical :: converged, grad_failed
+character(len=:), allocatable :: msg, grad_msg
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
 real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), g_raw(:)
@@ -1420,6 +1420,8 @@ fn_count = 0
 gr_count = 0
 conv_code = 1
 msg = "maximum iterations reached"
+grad_failed = .false.
+grad_msg = ""
 p = par
 pscale = 1.0_dp
 if (present(parscale)) pscale(1:min(n, size(parscale))) = max(abs(parscale(1:min(n, size(parscale)))), tiny(1.0_dp))
@@ -1430,6 +1432,14 @@ end do
 f = scaled_fn(p)
 fn_count = fn_count + 1
 call eval_gradient(p, g)
+if (grad_failed) then
+   out%par = p
+   out%value = f * fscale
+   out%convergence = 51
+   out%counts = [fn_count, gr_count]
+   out%message = grad_msg
+   return
+end if
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
@@ -1475,6 +1485,11 @@ do iter = 1, max_iter
       exit
    end if
    call eval_gradient(p_new, g_new)
+   if (grad_failed) then
+      conv_code = 51
+      msg = grad_msg
+      exit
+   end if
    if (.not. finite_vec(g_new)) then
       conv_code = 51
       msg = "non-finite gradient"
@@ -1535,13 +1550,25 @@ end function scaled_fn
 subroutine eval_gradient(x, gout)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), intent(out) :: gout(:)
+grad_failed = .false.
+grad_msg = ""
 if (present(gr)) then
    gr_count = gr_count + 1
    g_raw = gr(x)
-   if (size(g_raw) == size(gout)) then
-      gout = g_raw / fscale
+   if (size(g_raw) /= size(gout)) then
+      grad_failed = .true.
+      grad_msg = "analytic gradient has wrong length"
+      gout = ieee_value(0.0_dp, ieee_quiet_nan)
       return
    end if
+   if (.not. finite_vec(g_raw)) then
+      grad_failed = .true.
+      grad_msg = "analytic gradient is non-finite"
+      gout = ieee_value(0.0_dp, ieee_quiet_nan)
+      return
+   end if
+   gout = g_raw / fscale
+   return
 end if
 gr_count = gr_count + 1
 fn_count = fn_count + 2 * size(x)
@@ -1565,8 +1592,8 @@ real(kind=dp), intent(in), optional :: reltol, ndeps, ndeps_vec(:), fnscale, par
 logical, intent(in), optional :: hessian
 type(optim_result_t) :: out
 integer :: n, max_iter, n_iter, i, j, iter, fn_count, gr_count, conv_code
-logical :: converged
-character(len=:), allocatable :: msg
+logical :: converged, grad_failed
+character(len=:), allocatable :: msg, grad_msg
 real(kind=dp) :: f, f_new, step_eps, gtol, fscale
 real(kind=dp) :: alpha, slope, sy, rho, shift
 real(kind=dp), allocatable :: p(:), p_new(:), g(:), g_new(:), pscale(:), lb(:), ub(:), g_raw(:)
@@ -1588,6 +1615,8 @@ fn_count = 0
 gr_count = 0
 conv_code = 1
 msg = "maximum iterations reached"
+grad_failed = .false.
+grad_msg = ""
 do i = 1, n
    lb(i) = lower(min(i, size(lower)))
    ub(i) = upper(min(i, size(upper)))
@@ -1610,6 +1639,14 @@ end do
 f = scaled_fn(p)
 fn_count = fn_count + 1
 call eval_gradient(p, g)
+if (grad_failed) then
+   out%par = p
+   out%value = f * fscale
+   out%convergence = 51
+   out%counts = [fn_count, gr_count]
+   out%message = grad_msg
+   return
+end if
 if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
    out%par = p
    out%value = f * fscale
@@ -1659,6 +1696,11 @@ do iter = 1, max_iter
       exit
    end if
    call eval_gradient(p_new, g_new)
+   if (grad_failed) then
+      conv_code = 51
+      msg = grad_msg
+      exit
+   end if
    if (.not. finite_vec(g_new)) then
       conv_code = 51
       msg = "non-finite gradient"
@@ -1728,13 +1770,25 @@ end function scaled_fn
 subroutine eval_gradient(x, gout)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), intent(out) :: gout(:)
+grad_failed = .false.
+grad_msg = ""
 if (present(gr)) then
    gr_count = gr_count + 1
    g_raw = gr(project(x))
-   if (size(g_raw) == size(gout)) then
-      gout = g_raw / fscale
+   if (size(g_raw) /= size(gout)) then
+      grad_failed = .true.
+      grad_msg = "analytic gradient has wrong length"
+      gout = ieee_value(0.0_dp, ieee_quiet_nan)
       return
    end if
+   if (.not. finite_vec(g_raw)) then
+      grad_failed = .true.
+      grad_msg = "analytic gradient is non-finite"
+      gout = ieee_value(0.0_dp, ieee_quiet_nan)
+      return
+   end if
+   gout = g_raw / fscale
+   return
 end if
 gr_count = gr_count + 1
 call bounded_fd_gradient(x, gout)
