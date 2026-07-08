@@ -35862,6 +35862,7 @@ def transpile_r_to_fortran(
         o.w("integer :: convergence")
         o.w("integer :: counts(2) = 0")
         o.w("real(kind=dp), allocatable :: hessian(:,:)")
+        o.w("character(len=:), allocatable :: message")
         o.pop()
         o.w("end type optim_result_t")
         o.w("")
