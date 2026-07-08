@@ -52630,6 +52630,69 @@ def ensure_present_dummy_optional(lines: list[str]) -> list[str]:
     return out
 
 
+def repair_renamed_null_optional_vector_args_text(f90: str) -> str:
+    """Repair optional NULL vector args renamed after local reassignment."""
+    proc_re = re.compile(
+        r"(?ims)^(\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+([A-Za-z]\w*)\s*\((.*?)\)(.*?)^\s*end\s+function\b[^\n]*\n?)"
+    )
+
+    def repl_proc(m: re.Match[str]) -> str:
+        block = m.group(1)
+        args = [a.strip() for a in split_top_level_commas(m.group(3).replace("&", " ")) if a.strip()]
+        if not args:
+            return block
+        new_args = list(args)
+        new_block = block
+        changed = False
+        for idx, arg in enumerate(args):
+            m_arg = re.fullmatch(r"([A-Za-z]\w*)_2", arg)
+            if m_arg is None:
+                continue
+            base = m_arg.group(1)
+            loc = f"{base}_def"
+            has_base_decl = re.search(
+                rf"(?im)^\s*real\(kind=dp\),\s*intent\(in\),\s*optional\s*::\s*{re.escape(base)}\s*\(:\)\s*$",
+                new_block,
+            ) is not None
+            has_arg_local = re.search(
+                rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*,\s*optional\s*::\s*{re.escape(arg)}\s*\(:\)\s*$",
+                new_block,
+            ) is not None
+            has_def_local = re.search(
+                rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*::\s*{re.escape(loc)}\s*\(:\)\s*$",
+                new_block,
+            ) is not None
+            if not (has_base_decl and has_arg_local and has_def_local):
+                continue
+            new_args[idx] = base
+            new_block = re.sub(
+                rf"(?im)^\s*real\(kind=dp\),\s*allocatable\s*,\s*optional\s*::\s*{re.escape(arg)}\s*\(:\)\s*\r?\n",
+                "",
+                new_block,
+                count=1,
+            )
+            new_block = re.sub(rf"\bpresent\s*\(\s*{re.escape(arg)}\s*\)", f"present({base})", new_block)
+            new_block = re.sub(rf"\b{re.escape(loc)}\s*=\s*{re.escape(arg)}\b", f"{loc} = {base}", new_block)
+            new_block = re.sub(rf"(?m)^\s*{re.escape(arg)}\s*=\s*{re.escape(loc)}\s*\r?\n", "", new_block)
+            new_block = re.sub(rf"\bsize\s*\(\s*{re.escape(base)}\s*(,[^)]*)?\)", rf"size({loc}\1)", new_block)
+            new_block = re.sub(rf"\b{re.escape(arg)}\b", loc, new_block)
+            changed = True
+        if not changed:
+            return block
+
+        def repl_header(hm: re.Match[str]) -> str:
+            return f"{hm.group(1)}({', '.join(new_args)}){hm.group(3)}"
+
+        return re.sub(
+            r"(?is)\b(function\s+[A-Za-z]\w*\s*)\((.*?)\)([^\n]*)",
+            repl_header,
+            new_block,
+            count=1,
+        )
+
+    return proc_re.sub(repl_proc, f90)
+
+
 def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run command with robust text decoding on Windows."""
     try:
@@ -55598,6 +55661,7 @@ def main() -> int:
     f90 = "".join(remove_pure_from_dummy_mutating_procedures(f90.splitlines(True)))
     f90 = "".join(ensure_pure_dummy_intents(f90.splitlines(True)))
     f90 = "".join(ensure_present_dummy_optional(f90.splitlines(True)))
+    f90 = repair_renamed_null_optional_vector_args_text(f90)
     f90 = coerce_named_integer_actuals_from_decls_text(f90)
     f90 = coerce_positional_integer_actuals_from_decls_text(f90)
     f90 = rewrite_invalid_rank2_double_spread_text(f90)
