@@ -1420,6 +1420,12 @@ do i = 1, n
 end do
 f = scaled_fn(p)
 call eval_gradient(p, g)
+if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
+   out%par = p
+   out%value = f * fscale
+   out%convergence = 1
+   return
+end if
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1440,14 +1446,17 @@ do iter = 1, max_iter
    end if
    alpha = 1.0_dp
    slope = dot_product(g, d)
+   f_new = huge(1.0_dp)
    do j = 1, 60
       p_new = p + alpha * d
       f_new = scaled_fn(p_new)
-      if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
+      if (ieee_is_finite(f_new) .and. f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
+   if (.not. ieee_is_finite(f_new)) exit
    call eval_gradient(p_new, g_new)
+   if (.not. finite_vec(g_new)) exit
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1455,7 +1464,8 @@ do iter = 1, max_iter
    p = p_new
    f = f_new
    g = g_new
-   if (sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
+   if (ieee_is_finite(sy) .and. finite_vec(s) .and. finite_vec(y) .and. &
+      & sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
       rho = 1.0_dp / sy
       do i = 1, n
          do j = 1, n
@@ -1501,6 +1511,12 @@ if (present(gr)) then
 end if
 call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
 end subroutine eval_gradient
+
+pure function finite_vec(x) result(ok)
+real(kind=dp), intent(in) :: x(:)
+logical :: ok
+ok = all(ieee_is_finite(x))
+end function finite_vec
 end function optim_bfgs
 
 function optim_lbfgsb(fn, par, lower, upper, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale, gr) result(out)
@@ -1549,6 +1565,12 @@ do i = 1, n
 end do
 f = scaled_fn(p)
 call eval_gradient(p, g)
+if (.not. ieee_is_finite(f) .or. .not. finite_vec(g)) then
+   out%par = p
+   out%value = f * fscale
+   out%convergence = 1
+   return
+end if
 converged = .false.
 n_iter = 0
 do iter = 1, max_iter
@@ -1573,14 +1595,17 @@ do iter = 1, max_iter
    end if
    alpha = 1.0_dp
    slope = dot_product(g, d)
+   f_new = huge(1.0_dp)
    do j = 1, 60
       p_new = project(p + alpha * d)
       f_new = scaled_fn(p_new)
-      if (f_new <= f + 1.0e-4_dp * alpha * slope) exit
+      if (ieee_is_finite(f_new) .and. f_new <= f + 1.0e-4_dp * alpha * slope) exit
       if (alpha < 1.0e-12_dp) exit
       alpha = 0.5_dp * alpha
    end do
+   if (.not. ieee_is_finite(f_new)) exit
    call eval_gradient(p_new, g_new)
+   if (.not. finite_vec(g_new)) exit
    s = p_new - p
    y = g_new - g
    sy = dot_product(s, y)
@@ -1588,7 +1613,8 @@ do iter = 1, max_iter
    p = p_new
    f = f_new
    g = g_new
-   if (sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
+   if (ieee_is_finite(sy) .and. finite_vec(s) .and. finite_vec(y) .and. &
+      & sy > 1.0e-10_dp * sqrt(sum(s**2)) * sqrt(sum(y**2))) then
       rho = 1.0_dp / sy
       do i = 1, n
          do j = 1, n
@@ -1643,6 +1669,12 @@ if (present(gr)) then
 end if
 call optim_fd_gradient(scaled_fn, x, step_eps, gout, pscale, ndeps_vec)
 end subroutine eval_gradient
+
+pure function finite_vec(x) result(ok)
+real(kind=dp), intent(in) :: x(:)
+logical :: ok
+ok = all(ieee_is_finite(x))
+end function finite_vec
 end function optim_lbfgsb
 
 function optim_cg(fn, par, maxit, reltol, ndeps, ndeps_vec, fnscale, parscale) result(out)
