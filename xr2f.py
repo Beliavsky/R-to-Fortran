@@ -10802,6 +10802,9 @@ def r_expr_to_fortran(expr: str) -> str:
     m_uniroot_root0 = re.match(r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$", s, re.IGNORECASE)
     if m_uniroot_root0 is not None:
         return f"uniroot({m_uniroot_root0.group(1).strip()})%root"
+    m_integrate_value0 = re.match(r"^integrate\s*\((.*)\)\s*(?:\$|%)\s*value\s*$", s, re.IGNORECASE)
+    if m_integrate_value0 is not None:
+        return f"{r_expr_to_fortran('integrate(' + m_integrate_value0.group(1).strip() + ')')}%value"
     c_eval0 = parse_call_text(s)
     if c_eval0 is not None and c_eval0[0].lower() == "eval":
         target_eval = c_eval0[1][0].strip() if c_eval0[1] else c_eval0[2].get("expr", "").strip()
@@ -31147,16 +31150,21 @@ def transpile_r_to_fortran(
 
     _collect_nlm_objectives(stmts)
     def _collect_integrate_objectives(ss_int: list[object]) -> None:
+        def _integrate_call_expr(expr_src: str) -> str:
+            expr_s = expr_src.strip()
+            m_val = re.match(r"^(integrate\s*\(.*\))\s*(?:\$|%)\s*value\s*$", expr_s, re.IGNORECASE)
+            return m_val.group(1).strip() if m_val is not None else expr_s
+
         for st_int in ss_int:
             expr_int = ""
             if isinstance(st_int, Assign):
-                expr_int = st_int.expr.strip()
+                expr_int = _integrate_call_expr(st_int.expr)
             elif isinstance(st_int, ExprStmt):
                 asn_int = split_top_level_assignment(st_int.expr.strip())
-                expr_int = (asn_int[1] if asn_int is not None else st_int.expr).strip()
+                expr_int = _integrate_call_expr(asn_int[1] if asn_int is not None else st_int.expr)
             elif isinstance(st_int, PrintStmt):
                 for a_int in st_int.args:
-                    c_pr_int = parse_call_text(a_int.strip())
+                    c_pr_int = parse_call_text(_integrate_call_expr(a_int))
                     if c_pr_int is not None and c_pr_int[0].lower() == "integrate":
                         fn_obj = c_pr_int[1][0].strip() if c_pr_int[1] else c_pr_int[2].get("f", "").strip()
                         if re.fullmatch(r"[A-Za-z]\w*", fn_obj):
@@ -43369,6 +43377,26 @@ def demote_smoother_prediction_point_decls_text(f90: str) -> str:
     for nm in sorted(assigned_from_vector, key=len, reverse=True):
         out = re.sub(rf"\b{re.escape(nm)}\s*\(:\s*,\s*:\)", f"{nm}(:)", out)
     return out
+
+
+def rewrite_integrate_value_function_refs_text(f90: str) -> str:
+    """Fortran cannot select %value directly from integrate(...) function refs."""
+    lines = f90.splitlines()
+    out: list[str] = []
+    pat = re.compile(r"^(\s*)(.+?)\s*=\s*(integrate\s*\(.+\))\s*%\s*value\s*(\s*!.*)?$", re.IGNORECASE)
+    for ln in lines:
+        m = pat.match(ln)
+        if m is None:
+            out.append(ln)
+            continue
+        indent, lhs, call_expr, comment = m.group(1), m.group(2).rstrip(), m.group(3).strip(), m.group(4) or ""
+        inner = indent + "   "
+        out.append(f"{indent}block")
+        out.append(f"{inner}type(integrate_result_t) :: integrate_value_tmp")
+        out.append(f"{inner}integrate_value_tmp = {call_expr}")
+        out.append(f"{inner}{lhs} = integrate_value_tmp%value{comment}")
+        out.append(f"{indent}end block")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def promote_vector_function_results(lines: list[str]) -> list[str]:
@@ -56380,6 +56408,7 @@ def main() -> int:
     f90 = repair_known_scalar_result_fields_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
+    f90 = rewrite_integrate_value_function_refs_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
@@ -56405,6 +56434,8 @@ def main() -> int:
     f90 = repair_arima_fit_list_result_text(f90)
     f90 = "\n".join(restore_renamed_list_result_field_uses(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_vector_function_scalar_prints_text(f90)
+    if "type(integrate_result_t)" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"integrate_result_t"})
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
