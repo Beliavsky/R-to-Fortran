@@ -31312,6 +31312,35 @@ def transpile_r_to_fortran(
                     _INTEGRATE_OBJECTIVE_NAMES.add(fn_obj.lower())
 
     _collect_integrate_objectives(stmts)
+    non_elemental_user_funcs: set[str] = set()
+    func_texts_for_elemental = {
+        f.name.lower(): "\n".join(_collect_stmt_expr_texts(f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body))
+        for f in funcs
+    }
+    for f_ne in funcs:
+        fn_l_ne = f_ne.name.lower()
+        body_txt_ne = func_texts_for_elemental.get(fn_l_ne, "")
+        if fn_l_ne in _SUBROUTINE_FUNCTIONS or re.search(
+            r"\b(?:integrate|optim|lm|read\.csv|read_csv_real_matrix|read\.table|read_table_real_matrix)\s*\(",
+            body_txt_ne,
+            re.IGNORECASE,
+        ):
+            non_elemental_user_funcs.add(fn_l_ne)
+    changed_non_elemental = True
+    while changed_non_elemental:
+        changed_non_elemental = False
+        for f_ne in funcs:
+            fn_l_ne = f_ne.name.lower()
+            if fn_l_ne in non_elemental_user_funcs:
+                continue
+            body_txt_ne = func_texts_for_elemental.get(fn_l_ne, "")
+            if any(
+                re.search(rf"\b{re.escape(callee_ne)}\s*\(", body_txt_ne, re.IGNORECASE)
+                for callee_ne in non_elemental_user_funcs
+            ):
+                non_elemental_user_funcs.add(fn_l_ne)
+                changed_non_elemental = True
+
     for f in funcs:
         _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
     fn_char_args_from_calls: dict[str, set[str]] = {}
@@ -31477,6 +31506,7 @@ def transpile_r_to_fortran(
             and (not _stmt_tree_has_side_effect_ops(f_body_eff))
             and all(arg_rank_f.get(a, 0) == 0 for a in f.args)
             and f.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
+            and f.name.lower() not in non_elemental_user_funcs
         ):
             _USER_FUNC_ELEMENTAL.add(f.name.lower())
         for i, a in enumerate(f.args):
@@ -56776,7 +56806,11 @@ def main() -> int:
     f90 = repair_coef_row_vector_intercept_text(f90)
     f90 = rewrite_integrate_value_function_refs_text(f90)
     f90 = repair_complex_result_exp_real_wrappers_text(f90)
-    f90 = repair_lifted_integrate_closure_refs_text(f90)
+    for _ in range(8):
+        f90_repaired_integrate = repair_lifted_integrate_closure_refs_text(f90)
+        if f90_repaired_integrate == f90:
+            break
+        f90 = f90_repaired_integrate
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
