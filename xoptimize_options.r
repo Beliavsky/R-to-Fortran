@@ -20,7 +20,8 @@
 #
 # Option transaction costs can be modeled with bid/ask implied vols. The default
 # spread model widens vol spreads quadratically in log-moneyness, leaving the
-# stock row unchanged.
+# stock row unchanged. If initial_contracts is nonzero, transaction costs are
+# charged only on trades away from the initial portfolio.
 #
 # The final Optimization objective summary can optionally be written to CSV via
 # write_summary_csv and summary_csv_file.
@@ -83,6 +84,7 @@ stopifnot(length(implied_sigma) == length(base_strikes))
 K <- c(0, base_strikes, base_strikes)
 option_type <- c("call", rep("call", length(base_strikes)), rep("put", length(base_strikes)))
 instrument_implied_sigma <- c(NA, implied_sigma, implied_sigma)
+initial_contracts <- rep(0.0, length(K))
 tol <- 1e-10
 
 par <- ln_params_from_gbm(S0, mu, realized_sigma, T)
@@ -121,6 +123,16 @@ mid_price <- bs_option_price_vec(
 bid_price <- bs_option_price_vec(S0, K, r, q, vol_quotes$bid_vol, T, option_type)
 ask_price <- bs_option_price_vec(S0, K, r, q, vol_quotes$ask_vol, T, option_type)
 option_price <- ask_price
+cat("initial_contracts:\n")
+print(
+  data.frame(
+    type = option_type,
+    strike = K,
+    initial_contracts = initial_contracts
+  ),
+  row.names = FALSE
+)
+cat("\n")
 rf_growth <- exp(r * T)
 payoff_per_dollar <- expected_payoff / option_price
 edge <- payoff_per_dollar - rf_growth
@@ -166,6 +178,7 @@ for (run_idx in seq_len(nrow(objective_runs))) {
         rf_growth = rf_growth,
         gamma = utility_gamma,
         min_terminal_wealth = min_terminal_wealth,
+        initial_contracts = initial_contracts,
         cvar_constraints = cvar_constraints,
         cvar_scenarios = cvar_scenarios,
         max_abs_position_weight = max_invested_weight,
@@ -193,6 +206,7 @@ for (run_idx in seq_len(nrow(objective_runs))) {
         objective = optimization_objective,
         risk_aversion = risk_aversion,
         min_terminal_wealth = min_terminal_wealth,
+        initial_contracts = initial_contracts,
         cvar_constraints = cvar_constraints,
         cvar_scenarios = cvar_scenarios,
         max_abs_position_weight = max_invested_weight,
@@ -264,6 +278,9 @@ for (run_idx in seq_len(nrow(objective_runs))) {
       budget = budget,
       rf_growth = rf_growth,
       gamma = utility_gamma,
+      initial_contracts = initial_contracts,
+      bid_prices = bid_price,
+      ask_prices = ask_price,
       max_weight = max_invested_weight,
       force_full_investment = force_full_investment
     )
@@ -289,6 +306,7 @@ for (run_idx in seq_len(nrow(objective_runs))) {
       min_terminal_wealth = min_terminal_wealth,
       cvar_constraints = cvar_constraints,
       cvar_payoff_scenarios = cvar_payoff_scenarios,
+      initial_contracts = initial_contracts,
       bid_prices = bid_price,
       ask_prices = ask_price,
       tol = 1e-8
@@ -296,7 +314,8 @@ for (run_idx in seq_len(nrow(objective_runs))) {
     weights <- position_exec_prices(contracts, bid_price, ask_price) * contracts / budget
   }
   invested_weight <- sum(weights)
-  trade_cost <- executable_trade_cost(contracts, bid_price, ask_price)
+  trade_contracts <- rebalance_trade_contracts(contracts, initial_contracts)
+  trade_cost <- executable_trade_cost(trade_contracts, bid_price, ask_price)
   cash_weight <- budget - trade_cost
   expected_terminal_wealth <- cash_weight * rf_growth + sum(expected_payoff * contracts)
   terminal_variance <- as.numeric(t(contracts) %*% cov_payoff %*% contracts)
@@ -343,11 +362,12 @@ for (run_idx in seq_len(nrow(objective_runs))) {
       rf_growth = rf_growth,
       contracts = contracts,
       gamma = utility_gamma,
+      initial_contracts = initial_contracts,
       bid_prices = bid_price,
       ask_prices = ask_price
     )
   }
-  exec_price <- position_exec_prices(contracts, bid_price, ask_price)
+  exec_price <- position_exec_prices(trade_contracts, bid_price, ask_price)
   display_payoff_per_dollar <- expected_payoff / exec_price
   display_edge <- display_payoff_per_dollar - rf_growth
   display_sd_per_dollar <- payoff_stats$sd / exec_price
@@ -372,6 +392,8 @@ for (run_idx in seq_len(nrow(objective_runs))) {
     sharpe = round(display_sharpe, 3),
     adj_sharpe = round(display_adj_sharpe, 3),
     port_corr = round(portfolio_corr, 3),
+    initial_contracts = initial_contracts,
+    trade_contracts = trade_contracts,
     weight = weights,
     contracts = contracts
   )
@@ -380,6 +402,8 @@ for (run_idx in seq_len(nrow(objective_runs))) {
     print_out <- out[abs(out$weight) > zero_weight_tol, , drop = FALSE]
   }
   print_out$weight <- sprintf("%.4f", print_out$weight)
+  print_out$initial_contracts <- sprintf("%.4f", print_out$initial_contracts)
+  print_out$trade_contracts <- sprintf("%.4f", print_out$trade_contracts)
   print_out$contracts <- sprintf("%.4f", print_out$contracts)
 
   cat("Option solution\n")
@@ -391,6 +415,7 @@ for (run_idx in seq_len(nrow(objective_runs))) {
   cat("rf_growth:", round(rf_growth, 6), "\n")
   print(print_out, row.names = FALSE)
   cat("\ninvested_weight:", round(invested_weight, 6), "\n")
+  cat("trade_cost:", round(trade_cost, 6), "\n")
   cat("cash_weight:", round(cash_weight, 6), "\n")
   cat("cash_fraction:", round(cash_weight / budget, 6), "\n")
   cat("mean_wealth:", round(expected_terminal_wealth, 6), "\n")
@@ -420,6 +445,7 @@ for (run_idx in seq_len(nrow(objective_runs))) {
       obj_value = reported_objective,
       mean_variance_objective = old_obj,
       invested_weight = invested_weight,
+      trade_cost = trade_cost,
       cash_weight = cash_weight,
       cash_fraction = cash_weight / budget,
       mean_wealth = expected_terminal_wealth,
