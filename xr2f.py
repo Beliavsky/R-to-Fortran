@@ -42,6 +42,11 @@ _RAW_FORTRAN_TAG = "xr2f_raw_fortran"
 _USER_FUNC_ARG_KIND: dict[str, list[str]] = {}
 _USER_FUNC_ARG_INDEX: dict[str, dict[str, int]] = {}
 _USER_FUNC_ARG_RANK: dict[str, dict[str, int]] = {}
+_INFER_ARG_RANK_CACHE: dict[tuple[int, str, int, int], int] = {}
+_INFER_FUNCTION_INTEGER_NAMES_CACHE: dict[tuple[int, int, int, int], frozenset[str]] = {}
+_INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE: dict[tuple[int, int, int, int], frozenset[str]] = {}
+_INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE: dict[tuple[int, int, int, int, int], frozenset[str]] = {}
+_INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE: dict[tuple[int, int, int, int, int], frozenset[str]] = {}
 _USER_FUNC_RETURN_RANK: dict[str, int] = {}
 _USER_FUNC_RETURN_KIND: dict[str, str] = {}
 _USER_FUNC_ELEMENTAL: set[str] = set()
@@ -6496,6 +6501,11 @@ def classify_vars(
 
 def infer_arg_rank(fn: FuncDef, arg: str) -> int:
     forced_rank = _FORCED_FUNC_ARG_RANKS.get(fn.name.lower(), {}).get(arg.lower())
+    cache_key = (id(fn), arg.lower(), id(fn.body), len(_USER_FUNC_ARG_RANK))
+    if forced_rank is None:
+        cached_rank = _INFER_ARG_RANK_CACHE.get(cache_key)
+        if cached_rank is not None:
+            return cached_rank
     if fn.name.lower() == "print_mat" and arg == "x":
         return 2
     if fn.name.lower() == "print_vec" and arg == "x":
@@ -6779,6 +6789,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         rank_out = 0
     if forced_rank is not None:
         rank_out = max(rank_out, forced_rank)
+    else:
+        _INFER_ARG_RANK_CACHE[cache_key] = rank_out
     return rank_out
 
 
@@ -27272,6 +27284,10 @@ def emit_function(
 
 def infer_function_integer_names(fn: FuncDef) -> set[str]:
     """Infer names that are likely integer-typed within one function scope."""
+    cache_key = (id(fn), id(fn.body), len(_USER_FUNC_ARG_RANK), len(_FORCED_FUNC_ARG_RANKS))
+    cached = _INFER_FUNCTION_INTEGER_NAMES_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
     ints: set[str] = set()
     for a in fn.args:
         dflt = fn.defaults.get(a, "").strip()
@@ -27312,6 +27328,7 @@ def infer_function_integer_names(fn: FuncDef) -> set[str]:
                 if is_int_rhs and st.name not in ints:
                     ints.add(st.name)
                     changed = True
+    _INFER_FUNCTION_INTEGER_NAMES_CACHE[cache_key] = frozenset(ints)
     return ints
 
 
@@ -27430,6 +27447,10 @@ def infer_function_callback_args(fn: FuncDef) -> set[str]:
 
 def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
     """Infer local names that are likely integer arrays within one function scope."""
+    cache_key = (id(fn), id(fn.body), len(_USER_FUNC_ARG_RANK), len(_FORCED_FUNC_ARG_RANKS))
+    cached = _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
     int_arrays: set[str] = set()
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     if body_no_ret:
@@ -27445,6 +27466,7 @@ def infer_function_integer_array_names(fn: FuncDef) -> set[str]:
 
         _walk_assignments_recursive(body_no_ret, seed_static_integer)
         _propagate_simple_alias_names(body_no_ret, int_arrays)
+    _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE[cache_key] = frozenset(int_arrays)
     return int_arrays
 
 
@@ -27524,6 +27546,16 @@ def infer_function_logical_array_names(fn: FuncDef) -> set[str]:
 
 def infer_function_real_array_names(fn: FuncDef) -> set[str]:
     """Infer local names that are likely real arrays within one function scope."""
+    cache_key = (
+        id(fn),
+        id(fn.body),
+        len(_USER_FUNC_ARG_RANK),
+        len(_FORCED_FUNC_ARG_RANKS),
+        len(_USER_FUNC_RETURN_RANK),
+    )
+    cached = _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
     real_arrays: set[str] = set()
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     if body_no_ret:
@@ -27551,14 +27583,34 @@ def infer_function_real_array_names(fn: FuncDef) -> set[str]:
             body_no_ret, infer_assigned_names(body_no_ret), known_arrays=known_arrays
         )
         real_arrays.update(nm for nm in b_real_arrays if nm not in scalar_user_call_assignees)
+    _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE[cache_key] = frozenset(real_arrays)
     return real_arrays
 
 
 def infer_function_real_matrix_names(fn: FuncDef) -> set[str]:
     """Infer local names that are likely rank-2 real arrays within one function scope."""
+    cache_key = (
+        id(fn),
+        id(fn.body),
+        len(_USER_FUNC_ARG_RANK),
+        len(_FORCED_FUNC_ARG_RANKS),
+        len(_USER_FUNC_RETURN_RANK),
+    )
+    cached = _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE.get(cache_key)
+    if cached is not None:
+        return set(cached)
     mats: set[str] = set()
     body_no_ret = (fn.body[:-1] if isinstance(fn.body[-1], ExprStmt) else fn.body) if fn.body else []
     if body_no_ret:
+        body_text = "\n".join(_stmt_texts_for_rank_scan(body_no_ret))
+        if not re.search(
+            r"%\*%|\[[^\]\n]*,[^\]\n]*\]|\b(?:matrix|array|cbind|cbind2|rbind|as\.matrix|read\.csv|read\.table|"
+            r"crossprod|tcrossprod|chol|chol2inv|solve|qr\.solve|qr_solve|diag|outer|sweep)\s*\(",
+            body_text,
+            re.IGNORECASE,
+        ):
+            _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE[cache_key] = frozenset(mats)
+            return mats
         known_arrays = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
         _b_ints, _b_real_scalars, _b_int_arrays, b_real_arrays, _b_params = classify_vars(
             body_no_ret, infer_assigned_names(body_no_ret), known_arrays=known_arrays
@@ -27573,6 +27625,7 @@ def infer_function_real_matrix_names(fn: FuncDef) -> set[str]:
                 mats.add(st_seed.name)
 
         _walk_assignments_recursive(body_no_ret, seed_matrix_assignment)
+    _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE[cache_key] = frozenset(mats)
     return mats
 
 
@@ -30519,7 +30572,7 @@ def transpile_r_to_fortran(
     obfuscate: bool = False,
     source_path: str | None = None,
 ) -> str:
-    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -31264,6 +31317,11 @@ def transpile_r_to_fortran(
     _USER_FUNC_ARG_KIND = {}
     _USER_FUNC_ARG_INDEX = {}
     _USER_FUNC_ARG_RANK = {}
+    _INFER_ARG_RANK_CACHE = {}
+    _INFER_FUNCTION_INTEGER_NAMES_CACHE = {}
+    _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE = {}
+    _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE = {}
+    _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE = {}
     _USER_FUNC_ELEMENTAL = set()
     _FUNC_DEFS_BY_NAME = {f.name.lower(): f for f in funcs}
     _NLM_OBJECTIVE_NAMES = set()
@@ -36029,10 +36087,13 @@ def transpile_r_to_fortran(
         re.search(r"\bint64\b|_int64\b", mod_text_now, re.IGNORECASE)
         or re.search(r"\bint64\b|_int64\b", mod_decl_text, re.IGNORECASE)
     )
+    mod_call_names = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(", mod_text_now)}
+    main_call_names = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(", main_text_now)}
     for hn in helper_names:
-        if re.search(rf"\b{re.escape(hn)}\s*\(", mod_text_now):
+        hn_l = hn.lower()
+        if hn_l in mod_call_names:
             mod_needed.add(hn)
-        if re.search(rf"\b{re.escape(hn)}\s*\(", main_text_now):
+        if hn_l in main_call_names:
             main_needed.add(hn)
     if "r_sd" in mod_needed:
         mod_needed.discard("sd")
@@ -36050,54 +36111,26 @@ def transpile_r_to_fortran(
             main_needed.discard("print_matrix_rstyle")
     mod_needed = {nm for nm in mod_needed if nm.lower() not in user_func_names_l}
     main_needed = {nm for nm in main_needed if nm.lower() not in user_func_names_l}
-    if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("lm_fit_t")
-    if re.search(r"\btype\s*\(\s*lm_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("lm_fit_t")
-    if re.search(r"\btype\s*\(\s*glm_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("glm_fit_t")
-    if re.search(r"\btype\s*\(\s*glm_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("glm_fit_t")
-    if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("prcomp_fit_t")
-    if re.search(r"\btype\s*\(\s*prcomp_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("prcomp_fit_t")
-    if re.search(r"\btype\s*\(\s*eigen_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("eigen_result_t")
-    if re.search(r"\btype\s*\(\s*eigen_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("eigen_result_t")
-    if re.search(r"\btype\s*\(\s*ar_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("ar_fit_t")
-    if re.search(r"\btype\s*\(\s*ar_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("ar_fit_t")
-    if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("arima_fit_t")
-    if re.search(r"\btype\s*\(\s*arima_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("arima_fit_t")
-    if re.search(r"\btype\s*\(\s*arima_predict_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("arima_predict_result_t")
-    if re.search(r"\btype\s*\(\s*arima_predict_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("arima_predict_result_t")
-    if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("qr_fit_t")
-    if re.search(r"\btype\s*\(\s*qr_fit_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("qr_fit_t")
-    if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("optim_result_t")
-    if re.search(r"\btype\s*\(\s*optim_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("optim_result_t")
-    if re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("nlm_result_t")
-    if re.search(r"\btype\s*\(\s*nlm_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("nlm_result_t")
-    if re.search(r"\btype\s*\(\s*integrate_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("integrate_result_t")
-    if re.search(r"\btype\s*\(\s*integrate_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("integrate_result_t")
-    if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now, re.IGNORECASE):
-        mod_needed.add("hclust_result_t")
-    if re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", main_text_now, re.IGNORECASE):
-        main_needed.add("hclust_result_t")
+    mod_type_names = {m.group(1).lower() for m in re.finditer(r"\btype\s*\(\s*([A-Za-z]\w*)\s*\)", mod_text_now, re.IGNORECASE)}
+    main_type_names = {m.group(1).lower() for m in re.finditer(r"\btype\s*\(\s*([A-Za-z]\w*)\s*\)", main_text_now, re.IGNORECASE)}
+    for type_name in (
+        "lm_fit_t",
+        "glm_fit_t",
+        "prcomp_fit_t",
+        "eigen_result_t",
+        "ar_fit_t",
+        "arima_fit_t",
+        "arima_predict_result_t",
+        "qr_fit_t",
+        "optim_result_t",
+        "nlm_result_t",
+        "integrate_result_t",
+        "hclust_result_t",
+    ):
+        if type_name in mod_type_names:
+            mod_needed.add(type_name)
+        if type_name in main_type_names:
+            main_needed.add(type_name)
 
     module_iface_lines: list[str] = []
     if emit_local_typeof:
@@ -36218,9 +36251,7 @@ def transpile_r_to_fortran(
         o.pop()
         o.w("end type nlm_result_t")
         o.w("")
-    need_hclust_result = bool(
-        re.search(r"\btype\s*\(\s*hclust_result_t\s*\)", mod_text_now + "\n" + main_text_now, re.IGNORECASE)
-    )
+    need_hclust_result = "hclust_result_t" in mod_type_names or "hclust_result_t" in main_type_names
     if need_hclust_result and ("r_mod" not in helper_modules):
         o.w("")
         o.w("type :: hclust_result_t")
@@ -55126,6 +55157,249 @@ def _print_summary_table(rows: list[dict[str, object]]) -> None:
     print(f"Totals: {n} files, {n_pass} pass, {n - n_pass} fail")
 
 
+def _report_output_paths(report_arg: str | None, out_path: Path) -> tuple[Path, Path]:
+    if report_arg:
+        base = Path(report_arg)
+        if not base.is_absolute():
+            base = base.resolve()
+        suffix = base.suffix.lower()
+        if suffix == ".json":
+            json_path = base
+            md_path = base.with_suffix(".md")
+        elif suffix in {".md", ".markdown"}:
+            md_path = base
+            json_path = base.with_suffix(".json")
+        else:
+            json_path = base.with_suffix(".json")
+            md_path = base.with_suffix(".md")
+    else:
+        json_path = out_path.with_name(f"{out_path.stem}.xr2f_report.json")
+        md_path = out_path.with_name(f"{out_path.stem}.xr2f_report.md")
+    return json_path.resolve(), md_path.resolve()
+
+
+def _collect_report_functions(src: str) -> list[dict[str, object]]:
+    comment_lookup = build_r_comment_lookup(src)
+    try:
+        lines = _combine_switch_lines(preprocess_r_lines(src))
+        stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+        if i != len(lines):
+            return []
+        stmts = lower_switch_statements(stmts)
+        stmts = _normalize_dotted_function_names(stmts)
+        stmts = _rename_duplicate_function_defs(stmts)
+        stmts = _lift_nested_functions(stmts)
+    except Exception:
+        return []
+    funcs = [st for st in stmts if isinstance(st, FuncDef)]
+    line_by_name: dict[str, int] = {}
+    for i_line, raw in enumerate(src.splitlines(), start=1):
+        m = re.search(rf"\b({_R_IDENT_RE})\s*(?:<-|=)\s*function\s*\(", raw)
+        if m is not None:
+            line_by_name.setdefault(_sanitize_r_var_name(m.group(1)).lower(), i_line)
+    out: list[dict[str, object]] = []
+    for fn in funcs:
+        fn_l = fn.name.lower()
+        arg_ranks = _USER_FUNC_ARG_RANK.get(fn_l, {})
+        arg_kinds = _USER_FUNC_ARG_KIND.get(fn_l, [])
+        args: list[dict[str, object]] = []
+        for idx, arg in enumerate(fn.args):
+            args.append(
+                {
+                    "name": arg,
+                    "rank": int(arg_ranks.get(arg.lower(), 0)),
+                    "kind": arg_kinds[idx] if idx < len(arg_kinds) else "unknown",
+                    "default": fn.defaults.get(arg),
+                }
+            )
+        out.append(
+            {
+                "name": fn.name,
+                "source_line": line_by_name.get(fn_l),
+                "args": args,
+                "return": {
+                    "rank": _USER_FUNC_RETURN_RANK.get(fn_l),
+                    "kind": _USER_FUNC_RETURN_KIND.get(fn_l, "unknown"),
+                },
+            }
+        )
+    return out
+
+
+def _collect_report_generated_helpers(f90: str) -> list[str]:
+    helpers: set[str] = set()
+    for m in re.finditer(r"\b(?:function|subroutine)\s+([A-Za-z]\w*)", f90, re.IGNORECASE):
+        nm = m.group(1)
+        if "xr2f" in nm.lower() or "_xric_" in nm.lower():
+            helpers.add(nm)
+    for m in re.finditer(r"\b([A-Za-z]\w*(?:xr2f|_xric_)[A-Za-z0-9_]*)\b", f90, re.IGNORECASE):
+        helpers.add(m.group(1))
+    return sorted(helpers, key=str.lower)
+
+
+def _collect_report_r_mod_imports(f90: str) -> list[str]:
+    imports: set[str] = set()
+    lines = f90.splitlines()
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if re.match(r"^\s*use\s+r_mod\s*,\s*only\s*:", ln, re.IGNORECASE):
+            parts = [ln.split(":", 1)[1]]
+            i += 1
+            while i < len(lines) and re.match(r"^\s*&", lines[i]):
+                parts.append(re.sub(r"^\s*&", "", lines[i]))
+                i += 1
+            for item in ",".join(parts).split(","):
+                item = item.strip().strip("&").strip()
+                if item:
+                    imports.add(item)
+            continue
+        i += 1
+    return sorted(imports, key=str.lower)
+
+
+def _collect_report_derived_types(f90: str) -> list[str]:
+    return sorted(
+        {m.group(1) for m in re.finditer(r"(?im)^\s*type\s*(?:::)?\s+([A-Za-z]\w*)\b", f90)},
+        key=str.lower,
+    )
+
+
+def _collect_report_fortran_procedures(f90: str) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for i, ln in enumerate(f90.splitlines(), start=1):
+        m = re.match(r"^\s*(?:pure\s+|recursive\s+|elemental\s+)*((?:subroutine|function))\s+([A-Za-z]\w*)", ln, re.IGNORECASE)
+        if m is not None:
+            out.append({"name": m.group(2), "kind": m.group(1).lower(), "fortran_line": i})
+    return out
+
+
+def _build_translation_report(
+    *,
+    src: str,
+    f90: str,
+    in_path: Path,
+    out_path: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+    build_info: dict[str, object] | None = None,
+    run_info: dict[str, object] | None = None,
+) -> dict[str, object]:
+    approximations = [
+        {"line": line_no, **dict(meta)}
+        for line_no, meta in _find_approximate_r_function_calls(src)
+    ]
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "command": sys.argv,
+        "source": str(in_path.resolve()),
+        "output": str(out_path.resolve()),
+        "options": {
+            "compile": bool(args.compile),
+            "run": bool(args.run),
+            "run_both": bool(args.run_both),
+            "run_diff": bool(args.run_diff),
+            "partial": bool(args.partial),
+            "partial_main": bool(args.partial_main),
+            "split_module": bool(args.split_module),
+            "self_contained": bool(args.self_contained),
+            "compiler": str(args.compiler),
+            "nlm_method": str(args.nlm_method),
+        },
+        "metrics": {
+            "source": dict(zip(("loc", "tokens", "chars"), _text_metrics(src, "#"))),
+            "fortran": dict(zip(("loc", "tokens", "chars"), _text_metrics(f90, "!"))),
+        },
+        "timings": {k: round(float(v), 6) for k, v in timings.items()},
+        "functions": _collect_report_functions(src),
+        "approximations": approximations,
+        "generated_helpers": _collect_report_generated_helpers(f90),
+        "derived_types": _collect_report_derived_types(f90),
+        "r_mod_imports": _collect_report_r_mod_imports(f90),
+        "fortran_procedures": _collect_report_fortran_procedures(f90),
+        "build": build_info or {},
+        "run": run_info or {},
+    }
+    return report
+
+
+def _render_translation_report_markdown(report: dict[str, object]) -> str:
+    lines: list[str] = []
+    lines.append(f"# xr2f Translation Report")
+    lines.append("")
+    lines.append(f"- Source: `{report.get('source', '')}`")
+    lines.append(f"- Output: `{report.get('output', '')}`")
+    lines.append(f"- Created: `{report.get('created_at', '')}`")
+    build = report.get("build") if isinstance(report.get("build"), dict) else {}
+    run = report.get("run") if isinstance(report.get("run"), dict) else {}
+    if build:
+        lines.append(f"- Build: `{build.get('status', '')}` exit `{build.get('returncode', '')}`")
+    if run:
+        lines.append(f"- Run: `{run.get('status', '')}` exit `{run.get('returncode', '')}`")
+    lines.append("")
+    lines.append("## Metrics")
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    for name in ("source", "fortran"):
+        vals = metrics.get(name) if isinstance(metrics.get(name), dict) else {}
+        lines.append(f"- {name}: {vals.get('loc', '')} LOC, {vals.get('tokens', '')} tokens, {vals.get('chars', '')} chars")
+    timings = report.get("timings") if isinstance(report.get("timings"), dict) else {}
+    if timings:
+        lines.append("")
+        lines.append("## Timings")
+        for k, v in timings.items():
+            lines.append(f"- {k}: {v}")
+    funcs = report.get("functions") if isinstance(report.get("functions"), list) else []
+    lines.append("")
+    lines.append("## R Functions")
+    if not funcs:
+        lines.append("- none detected")
+    for fn in funcs:
+        if not isinstance(fn, dict):
+            continue
+        ret = fn.get("return") if isinstance(fn.get("return"), dict) else {}
+        lines.append(f"- `{fn.get('name')}` line `{fn.get('source_line')}` returns kind `{ret.get('kind')}` rank `{ret.get('rank')}`")
+        args = fn.get("args") if isinstance(fn.get("args"), list) else []
+        for arg in args:
+            if isinstance(arg, dict):
+                default = arg.get("default")
+                default_txt = f", default `{default}`" if default is not None else ""
+                lines.append(f"  - arg `{arg.get('name')}` kind `{arg.get('kind')}` rank `{arg.get('rank')}`{default_txt}")
+    approximations = report.get("approximations") if isinstance(report.get("approximations"), list) else []
+    lines.append("")
+    lines.append("## Approximations")
+    if not approximations:
+        lines.append("- none detected")
+    for item in approximations:
+        if isinstance(item, dict):
+            lines.append(f"- line `{item.get('line')}` `{item.get('name')}` ({item.get('category')}): {item.get('reason')}")
+    for title, key in (
+        ("Generated Helpers", "generated_helpers"),
+        ("Derived Types", "derived_types"),
+        ("r_mod Imports", "r_mod_imports"),
+    ):
+        vals = report.get(key) if isinstance(report.get(key), list) else []
+        lines.append("")
+        lines.append(f"## {title}")
+        if not vals:
+            lines.append("- none")
+        else:
+            for val in vals[:200]:
+                lines.append(f"- `{val}`")
+            if len(vals) > 200:
+                lines.append(f"- ... {len(vals) - 200} more")
+    return "\n".join(lines) + "\n"
+
+
+def _write_translation_report(report: dict[str, object], json_path: Path, md_path: Path) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    md_path.write_text(_render_translation_report_markdown(report), encoding="utf-8")
+    print(f"wrote {json_path}")
+    print(f"wrote {md_path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial R-to-Fortran transpiler")
     ap.add_argument("input_r", help="input .R/.r source file")
@@ -55135,6 +55409,13 @@ def main() -> int:
         help="optional helper Fortran source files (modules); a leading non-existent .f90 path is treated as positional output",
     )
     ap.add_argument("--out", help="output .f90 path (default: <input>_r.f90)")
+    ap.add_argument(
+        "--report",
+        nargs="?",
+        const="",
+        metavar="OUT",
+        help="write LLM-friendly translation reports as JSON and Markdown; default: <output>.xr2f_report.{json,md}",
+    )
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
     ap.add_argument(
         "--split-module",
@@ -55567,6 +55848,10 @@ def main() -> int:
     artifact_dir = Path(args.out_dir).resolve() if args.out_dir else out_path.parent.resolve()
     run_cwd = Path.cwd().resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    report_json_path: Path | None = None
+    report_md_path: Path | None = None
+    if args.report is not None:
+        report_json_path, report_md_path = _report_output_paths(args.report, out_path)
     annotate_r_path: Path | None = None
     annotate_r_args_only = False
     integerize_r_path: Path | None = None
@@ -55613,6 +55898,25 @@ def main() -> int:
     timings: dict[str, float] = {}
     r_run = None
     fortran_round_digits = args.round if args.round is not None else args.round_both
+    final_f90_for_report = ""
+
+    def _maybe_write_report(
+        build_info: dict[str, object] | None = None,
+        run_info: dict[str, object] | None = None,
+    ) -> None:
+        if report_json_path is None or report_md_path is None or not final_f90_for_report:
+            return
+        report = _build_translation_report(
+            src=src,
+            f90=final_f90_for_report,
+            in_path=in_path,
+            out_path=out_path,
+            args=args,
+            timings=timings,
+            build_info=build_info,
+            run_info=run_info,
+        )
+        _write_translation_report(report, report_json_path, report_md_path)
 
     if args.time_both or args.run_both:
         if args.run_diff:
@@ -56507,22 +56811,24 @@ def main() -> int:
         lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(1)}({m.group(2)}, :) {'/=' if m.group(3) == '!=' else m.group(3)} {m.group(4)})",
         f90,
     )
-    f90 = re.sub(
-        r"\b([A-Za-z]\w*)\(\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*,\s*:\s*\)",
-        lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(2).strip()})"
-        if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
-        else m.group(0),
-        f90,
-        flags=re.IGNORECASE,
-    )
-    f90 = re.sub(
-        r"\b([A-Za-z]\w*)\(\s*:\s*,\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*\)",
-        lambda m: f"r_matrix_col_filter({m.group(1)}, {m.group(2).strip()})"
-        if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
-        else m.group(0),
-        f90,
-        flags=re.IGNORECASE,
-    )
+    f90_l = f90.lower()
+    if ".and." in f90_l or ".or." in f90_l:
+        f90 = re.sub(
+            r"\b([A-Za-z]\w*)\(\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*,\s*:\s*\)",
+            lambda m: f"r_matrix_row_filter({m.group(1)}, {m.group(2).strip()})"
+            if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
+            else m.group(0),
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\b([A-Za-z]\w*)\(\s*:\s*,\s*((?:\1\(:,\s*[^()]+\)|\1\(\s*[^(),]+\s*,\s*:\s*\)|[A-Za-z]\w+|[0-9_.+\-]+|[<>=/!]+|\s|\.and\.|\.or\.)+)\s*\)",
+            lambda m: f"r_matrix_col_filter({m.group(1)}, {m.group(2).strip()})"
+            if ".and." in m.group(2).lower() or ".or." in m.group(2).lower()
+            else m.group(0),
+            f90,
+            flags=re.IGNORECASE,
+        )
     f90 = re.sub(
         r"\b([A-Za-z]\w*)\s*\[\s*,\s*,\s*shape\(\s*\1\s*\)\s*\[\s*3\s*\]\s*\]",
         r"\1(:, :, size(\1, 3))",
@@ -57336,6 +57642,7 @@ def main() -> int:
     f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
     f90 = repair_complex_intrinsic_real_wrappers_text(f90)
+    final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
@@ -57357,6 +57664,8 @@ def main() -> int:
     if split_module_path is not None:
         print(f"wrote {split_module_path}")
     print(f"wrote {out_path}")
+    if not (args.compile or args.run):
+        _maybe_write_report()
 
     if args.tee_both:
         print(f"--- original: {in_path} ---")
@@ -57665,8 +57974,24 @@ def main() -> int:
             _print_captured(cp)
             if not args.no_diagnostics:
                 _explain_compile_failure(cp, out_path, src)
+            _maybe_write_report(
+                {
+                    "status": "FAIL",
+                    "returncode": int(cp.returncode),
+                    "command": cmd,
+                    "stdout": cp.stdout or "",
+                    "stderr": cp.stderr or "",
+                }
+            )
             return cp.returncode
         print("Build: PASS")
+        build_info_ok = {
+            "status": "PASS",
+            "returncode": int(cp.returncode),
+            "command": cmd,
+            "stdout": cp.stdout or "",
+            "stderr": cp.stderr or "",
+        }
 
         if args.run:
             t0 = time.perf_counter()
@@ -57693,6 +58018,15 @@ def main() -> int:
                     strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
                 )
+                _maybe_write_report(
+                    build_info_ok,
+                    {
+                        "status": "FAIL",
+                        "returncode": int(failed_frun.returncode),
+                        "stdout": failed_frun.stdout or "",
+                        "stderr": failed_frun.stderr or "",
+                    },
+                )
                 return failed_frun.returncode
             print("Run: PASS")
             if args.run_repeat != 1:
@@ -57711,6 +58045,15 @@ def main() -> int:
                     strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
                 )
+            _maybe_write_report(
+                build_info_ok,
+                {
+                    "status": "PASS",
+                    "returncode": int(frun.returncode),
+                    "stdout": frun.stdout or "",
+                    "stderr": frun.stderr or "",
+                },
+            )
 
             if args.run_diff and r_run is not None:
                 r_blob = (r_run.stdout or "") + (("\n" + r_run.stderr) if r_run.stderr else "")
@@ -57770,6 +58113,8 @@ def main() -> int:
                         print(dl)
                         if dl.startswith("@@"):
                             break
+        elif args.compile:
+            _maybe_write_report(build_info_ok)
 
     if args.time:
         base = timings.get("r_run", 0.0)
