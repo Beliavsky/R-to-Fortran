@@ -548,7 +548,57 @@ def _lift_nested_functions(stmts: list[object]) -> list[object]:
                     leading_comments=nf.leading_comments,
                 )
             )
-        out.extend(_lift_nested_functions(lifted))
+        rewritten_lifted: list[object] = []
+        for lf in lifted:
+            if not isinstance(lf, FuncDef):
+                rewritten_lifted.append(lf)
+                continue
+            old_name = next(
+                (
+                    old
+                    for old, (new_name_for_old, _captures_for_old) in call_map.items()
+                    if new_name_for_old.lower() == lf.name.lower()
+                ),
+                None,
+            )
+            body_call_map = {
+                old: spec
+                for old, spec in call_map.items()
+                if spec[0].lower() != lf.name.lower()
+            }
+            rewritten_body = [rewrite_stmt(b, body_call_map) for b in lf.body]
+            lifted_args = list(lf.args)
+            if old_name is not None:
+                free_after_rewrite: set[str] = set()
+                tmp_free_fn = FuncDef(
+                    name=lf.name,
+                    args=lifted_args,
+                    defaults=dict(lf.defaults),
+                    body=rewritten_body,
+                    leading_comments=lf.leading_comments,
+                )
+                free_after_rewrite = _infer_function_free_names(tmp_free_fn)
+                extra_captures: list[str] = []
+                for free_nm_l, parent_nm in parent_by_lower.items():
+                    if free_nm_l not in free_after_rewrite or free_nm_l in nested_names:
+                        continue
+                    san_nm = _sanitize_fortran_kwarg_name(parent_nm)
+                    if not any(arg.lower() == san_nm.lower() for arg in lifted_args + extra_captures):
+                        extra_captures.append(san_nm)
+                if extra_captures:
+                    lifted_args.extend(extra_captures)
+                    new_name, captures = call_map[old_name]
+                    call_map[old_name] = (new_name, captures + extra_captures)
+            rewritten_lifted.append(
+                FuncDef(
+                    name=lf.name,
+                    args=lifted_args,
+                    defaults=dict(lf.defaults),
+                    body=rewritten_body,
+                    leading_comments=lf.leading_comments,
+                )
+            )
+        out.extend(_lift_nested_functions(rewritten_lifted))
         out.append(
             FuncDef(
                 name=st.name,
@@ -10711,6 +10761,11 @@ def _register_nlm_closure(expr: str) -> str | None:
 
 
 def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src: str, actual_f: str, wanted_kind: str) -> str:
+    if wanted_kind == "complex":
+        af = actual_f.strip()
+        if _is_complex_expr_source(actual_src) or _expr_mentions_known_complex(actual_src) or _expr_mentions_known_complex(af):
+            return actual_f
+        return f"cmplx(real({actual_f}, kind=dp), 0.0_dp, kind=dp)"
     if wanted_kind != "real":
         return actual_f
     af = actual_f.strip()
@@ -12875,9 +12930,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 af = r_expr_to_fortran(a)
                 if key_u == "print_matrix" and i == 1 and _looks_vector_actual_for_matrix_arg(a, af):
                     af = f"reshape({af}, [size({af}), 1])"
-                if i < len(kinds) and kinds[i] == "real":
+                if i < len(kinds) and kinds[i] in {"real", "complex"}:
                     formal_i = inv_idx_map.get(i, f"arg{i + 1}")
-                    af = _coerce_user_actual_for_declared_kind(nm_u, formal_i, a, af, "real")
+                    af = _coerce_user_actual_for_declared_kind(nm_u, formal_i, a, af, kinds[i])
                 pos_out.append(af)
             kw_out: list[str] = []
             for k, v in kw_u.items():
@@ -12890,8 +12945,8 @@ def r_expr_to_fortran(expr: str) -> str:
                 idx_k = idx_map.get(k_l, -1)
                 if key_u == "print_matrix" and k_l == "x" and _looks_vector_actual_for_matrix_arg(v, vf):
                     vf = f"reshape({vf}, [size({vf}), 1])"
-                if idx_k >= 0 and idx_k < len(kinds) and kinds[idx_k] == "real":
-                    vf = _coerce_user_actual_for_declared_kind(nm_u, k_call, v, vf, "real")
+                if idx_k >= 0 and idx_k < len(kinds) and kinds[idx_k] in {"real", "complex"}:
+                    vf = _coerce_user_actual_for_declared_kind(nm_u, k_call, v, vf, kinds[idx_k])
                 kw_out.append(f"{_sanitize_fortran_kwarg_name(k_call)}={vf}")
             args_txt = ", ".join(pos_out + kw_out)
             return f"{nm_u}({args_txt})"
@@ -23370,8 +23425,10 @@ def _expr_kind_simple(expr: str) -> str:
     if c is not None:
         nm, pos, kw = c
         key = nm.lower()
-        if key in {"real", "as.numeric", "as.double"}:
+        if key in {"real", "as.numeric", "as.double", "re", "im", "mod", "arg", "abs"}:
             return "real"
+        if key in {"complex", "as.complex", "cmplx", "conjg"}:
+            return "complex"
         if key in {"int", "as.integer"}:
             return "int"
         if key in {"which.max", "which.min", "maxloc", "minloc"}:
@@ -23400,6 +23457,8 @@ def _expr_kind_simple(expr: str) -> str:
             return "real"
         if key == "sign":
             return "real"
+    if _contains_r_complex_literal(t):
+        return "complex"
     if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*isdir\s*$", t, re.IGNORECASE):
         return "logical"
     if re.match(r"^[A-Za-z]\w*\s*(?:\$|%)\s*(?:size|mode|mtime|ctime|atime)\s*$", t, re.IGNORECASE):
@@ -23412,6 +23471,18 @@ def _expr_kind_simple(expr: str) -> str:
         return "logical"
     if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
         return "logical"
+    for op in ["%*%", "^", "**", "*", "/", "+", "-"]:
+        mm = _split_top_level_token(t, op, from_right=True)
+        if mm is not None:
+            k1 = _expr_kind_simple(mm[0])
+            k2 = _expr_kind_simple(mm[1])
+            if "complex" in {k1, k2}:
+                return "complex"
+            if "real" in {k1, k2}:
+                return "real"
+            if "logical" in {k1, k2}:
+                return "logical"
+            return "int" if k1 == "int" and k2 == "int" else "real"
     return "real"
 
 
@@ -24808,6 +24879,8 @@ def emit_function(
         can_be_pure = False
     if any(re.search(r"\boptim\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
         can_be_pure = False
+    if any(re.search(r"\bintegrate\s*\(", txt, re.IGNORECASE) for txt in purity_texts):
+        can_be_pure = False
     for txt_pure in purity_texts:
         if re.search(r"\b(?:rowSums|colSums)\s*\(", txt_pure, re.IGNORECASE) and re.search(
             r"[\+\-\*/]", txt_pure
@@ -25039,15 +25112,21 @@ def emit_function(
             rdecl = "integer"
         elif ret_rank == 0 and fn_return_kind_hint == "logical":
             rdecl = "logical"
+        elif ret_rank == 0 and fn_return_kind_hint == "complex":
+            rdecl = "complex(kind=dp)"
         elif ret_rank == 0 and rk == "int":
             rdecl = "integer"
         elif ret_rank == 0 and rk == "logical":
             rdecl = "logical"
+        elif ret_rank == 0 and rk == "complex":
+            rdecl = "complex(kind=dp)"
         elif ret_rank >= 1 and "allocatable" not in rdecl:
             if fn_return_kind_hint in {"int", "integer"} or rk == "int":
                 rdecl = "integer, allocatable"
             elif fn_return_kind_hint == "logical" or rk == "logical":
                 rdecl = "logical, allocatable"
+            elif fn_return_kind_hint == "complex" or rk == "complex":
+                rdecl = "complex(kind=dp), allocatable"
             else:
                 rdecl = "real(kind=dp), allocatable"
     else:
@@ -25267,6 +25346,12 @@ def emit_function(
             continue
         ar = arg_rank.get(a, 0)
         dflt_s = dflt.strip()
+        declared_arg_kinds = _USER_FUNC_ARG_KIND.get(fn.name.lower(), [])
+        declared_arg_kind = declared_arg_kinds[f_args.index(a)] if f_args.index(a) < len(declared_arg_kinds) else "real"
+        if ar == 0 and declared_arg_kind == "complex":
+            o.w(f"complex(kind=dp), intent({intent}){opt}{scalar_value_attr} :: {a}")
+            arg_type[a] = "complex"
+            continue
         if (
             dflt_s
             and _is_real_literal(dflt_s)
@@ -25676,6 +25761,18 @@ def emit_function(
             ints.discard(la)
             real_scalars.discard(la)
             params.pop(la, None)
+        complex_scalars_loc, complex_arrays_loc, complex_matrices_loc = infer_main_complex_vars(
+            body_use,
+            known_matrices=set(real_arrays) | set(int_arrays),
+        )
+        for cx_nm in set(complex_scalars_loc) | set(complex_arrays_loc) | set(complex_matrices_loc):
+            ints.discard(cx_nm)
+            int_arrays.discard(cx_nm)
+            real_arrays.discard(cx_nm)
+            real_scalars.discard(cx_nm)
+            logical_arrays.discard(cx_nm)
+            logical_scalars.discard(cx_nm)
+            params.pop(cx_nm, None)
 
         def _force_local_int_array(nm_local: str) -> None:
             int_arrays.add(nm_local)
@@ -26938,6 +27035,20 @@ def emit_function(
             o.w("logical, allocatable :: " + ", ".join(decls_l))
         if logical_scalars:
             o.w("logical :: " + ", ".join(sorted(logical_scalars)))
+        if complex_arrays_loc:
+            decls_cx_v: list[str] = []
+            for x in sorted(complex_arrays_loc):
+                rk_x = max(1, local_ranks.get(x, _infer_local_array_rank(body_use, x)))
+                decls_cx_v.append(f"{x}(" + ":," * (rk_x - 1) + ":)")
+            o.w("complex(kind=dp), allocatable :: " + ", ".join(decls_cx_v))
+        if complex_matrices_loc:
+            decls_cx_m: list[str] = []
+            for x in sorted(complex_matrices_loc):
+                rk_x = max(2, local_ranks.get(x, _infer_local_array_rank(body_use, x)))
+                decls_cx_m.append(f"{x}(" + ":," * (rk_x - 1) + ":)")
+            o.w("complex(kind=dp), allocatable :: " + ", ".join(decls_cx_m))
+        if complex_scalars_loc:
+            o.w("complex(kind=dp) :: " + ", ".join(sorted(complex_scalars_loc)))
         if real_scalars:
             o.w("real(kind=dp) :: " + ", ".join(sorted(real_scalars)))
         char_scalars_loc.difference_update(char_arrays_loc)
@@ -31030,6 +31141,10 @@ def transpile_r_to_fortran(
 
             ret_kind_values: list[str] = []
             self_call_only = True
+            local_complex_names_for_ret = {
+                nm.lower()
+                for nm in set().union(*infer_main_complex_vars(f_rank_ret.body if f_rank_ret.body else []))
+            }
             for ret_kind_src in ret_kind_exprs:
                 ret_kind_one = _return_call_arg(ret_kind_src) or ret_kind_src
                 ret_kind_one = ret_kind_one.strip()
@@ -31040,10 +31155,17 @@ def transpile_r_to_fortran(
                 self_call_only = False
                 if _is_known_integer_expr_for_return(ret_kind_one):
                     ret_kind_values.append("int")
+                elif local_complex_names_for_ret and (
+                    {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", ret_kind_one)}
+                    & local_complex_names_for_ret
+                ):
+                    ret_kind_values.append("complex")
                 else:
                     ret_kind_values.append(_expr_kind_simple(ret_kind_one))
             if ret_kind_values and all(k in {"int", "self"} for k in ret_kind_values) and not self_call_only:
                 ret_kind = "int"
+            elif ret_kind_values and any(k == "complex" for k in ret_kind_values) and not self_call_only:
+                ret_kind = "complex"
             else:
                 ret_kind = _expr_kind_simple(ret_kind_expr)
             if f_rank_ret.name.lower() in _USER_FUNC_RETURN_KIND:
@@ -31051,7 +31173,7 @@ def transpile_r_to_fortran(
             elif ret_kind in {"integer", "int"}:
                 _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = "int"
                 _USER_FUNC_RETURN_RANK[f_rank_ret.name.lower()] = 0
-            elif ret_kind in {"logical", "real"}:
+            elif ret_kind in {"logical", "real", "complex"}:
                 _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = ret_kind
         rr = _function_tail_rank(f_rank_ret)
         if (rr is None or rr <= 0) and f_rank_ret.name.lower() == "normalize" and f_rank_ret.args:
@@ -31193,6 +31315,7 @@ def transpile_r_to_fortran(
     for f in funcs:
         _USER_FUNC_ARG_INDEX[f.name.lower()] = {a.lower(): i for i, a in enumerate(f.args)}
     fn_char_args_from_calls: dict[str, set[str]] = {}
+    fn_complex_args_from_calls: dict[str, set[str]] = {}
 
     def _register_string_literal_user_call(expr_user_call: str) -> None:
         c_user_call = parse_call_text(expr_user_call.strip())
@@ -31216,28 +31339,57 @@ def transpile_r_to_fortran(
             if _dequote_string_literal(actual.strip()) is not None:
                 out_args.add(fn_def.args[k_idx])
 
+    def _register_complex_actual_user_call(expr_user_call: str) -> None:
+        c_user_call = parse_call_text(expr_user_call.strip())
+        if c_user_call is None:
+            return
+        callee_l = c_user_call[0].lower()
+        arg_index = _USER_FUNC_ARG_INDEX.get(callee_l)
+        fn_def = _FUNC_DEFS_BY_NAME.get(callee_l)
+        if arg_index is None or fn_def is None:
+            return
+        out_args = fn_complex_args_from_calls.setdefault(callee_l, set())
+        for i_actual, actual in enumerate(c_user_call[1]):
+            if i_actual >= len(fn_def.args):
+                continue
+            if _is_complex_expr_source(actual.strip()):
+                out_args.add(fn_def.args[i_actual])
+        for k_actual, actual in c_user_call[2].items():
+            k_idx = arg_index.get(k_actual.lower())
+            if k_idx is None or k_idx >= len(fn_def.args):
+                continue
+            if _is_complex_expr_source(actual.strip()):
+                out_args.add(fn_def.args[k_idx])
+
     def _walk_register_string_literal_user_calls(ss_user_call: list[object]) -> None:
         for st_user_call in ss_user_call:
             if isinstance(st_user_call, CallStmt):
                 _register_string_literal_user_call(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
+                _register_complex_actual_user_call(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
             elif isinstance(st_user_call, Assign):
                 _register_string_literal_user_call(st_user_call.expr)
+                _register_complex_actual_user_call(st_user_call.expr)
             elif isinstance(st_user_call, ExprStmt):
                 expr_user_call = st_user_call.expr.strip()
                 asn_user_call = split_top_level_assignment(expr_user_call)
                 _register_string_literal_user_call(asn_user_call[1] if asn_user_call is not None else expr_user_call)
+                _register_complex_actual_user_call(asn_user_call[1] if asn_user_call is not None else expr_user_call)
             elif isinstance(st_user_call, PrintStmt):
                 for arg_user_call in st_user_call.args:
                     _register_string_literal_user_call(arg_user_call)
+                    _register_complex_actual_user_call(arg_user_call)
             elif isinstance(st_user_call, IfStmt):
                 _register_string_literal_user_call(st_user_call.cond)
+                _register_complex_actual_user_call(st_user_call.cond)
                 _walk_register_string_literal_user_calls(st_user_call.then_body)
                 _walk_register_string_literal_user_calls(st_user_call.else_body)
             elif isinstance(st_user_call, ForStmt):
                 _register_string_literal_user_call(st_user_call.iter_expr)
+                _register_complex_actual_user_call(st_user_call.iter_expr)
                 _walk_register_string_literal_user_calls(st_user_call.body)
             elif isinstance(st_user_call, WhileStmt):
                 _register_string_literal_user_call(st_user_call.cond)
+                _register_complex_actual_user_call(st_user_call.cond)
                 _walk_register_string_literal_user_calls(st_user_call.body)
             elif isinstance(st_user_call, RepeatStmt):
                 _walk_register_string_literal_user_calls(st_user_call.body)
@@ -31302,7 +31454,7 @@ def transpile_r_to_fortran(
             m_ret_kind_sym = re.fullmatch(r"[A-Za-z]\w*", ret_kind_sym_expr)
             if m_ret_kind_sym is not None:
                 ret_sym_info = fn_tail_symbol_info.get(f_rank_ret.name.lower(), {}).get(m_ret_kind_sym.group(0).lower())
-                if ret_sym_info is not None and ret_sym_info.kind in {"real", "integer", "logical"}:
+                if ret_sym_info is not None and ret_sym_info.kind in {"real", "integer", "logical", "complex"}:
                     _USER_FUNC_RETURN_KIND[f_rank_ret.name.lower()] = (
                         "int" if ret_sym_info.kind == "integer" and _USER_FUNC_RETURN_RANK.get(f_rank_ret.name.lower(), 0) <= 0 else ret_sym_info.kind
                     )
@@ -31316,6 +31468,7 @@ def transpile_r_to_fortran(
         idx = _USER_FUNC_ARG_INDEX.get(f.name.lower(), {})
         arg_rank_f = {a: _USER_FUNC_ARG_RANK.get(f.name.lower(), {}).get(a.lower(), infer_arg_rank(f, a)) for a in f.args}
         fn_chars = set(fn_char_scalars.get(f.name, set())) | fn_char_args_from_calls.get(f.name.lower(), set())
+        fn_complex_args = fn_complex_args_from_calls.get(f.name.lower(), set())
         f_body_eff = f.body[:-1] if (f.body and isinstance(f.body[-1], ExprStmt)) else f.body
         if (
             f.name.lower() not in _SUBROUTINE_FUNCTIONS
@@ -31330,6 +31483,9 @@ def transpile_r_to_fortran(
             kinds.append(
                 "character"
                 if a in fn_chars or (a == "name" and f.name.lower().startswith("print_") and f.name.lower() != "print_matrix")
+                else
+                "complex"
+                if a in fn_complex_args
                 else
                 "real"
                 if a in fn_declared_double_args
@@ -43397,6 +43553,216 @@ def rewrite_integrate_value_function_refs_text(f90: str) -> str:
         out.append(f"{inner}{lhs} = integrate_value_tmp%value{comment}")
         out.append(f"{indent}end block")
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_complex_result_exp_real_wrappers_text(f90: str) -> str:
+    """Avoid losing imaginary parts in complex-return helpers."""
+    lines = f90.splitlines()
+    out = list(lines)
+    func_pat = re.compile(
+        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+([A-Za-z]\w*)\s*\([^)]*\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    i = 0
+    while i < len(out):
+        m = func_pat.match(out[i])
+        if m is None:
+            i += 1
+            continue
+        result_name = m.group(2)
+        end = next((j for j in range(i + 1, len(out)) if end_pat.match(out[j])), len(out) - 1)
+        block = "\n".join(out[i + 1 : end])
+        if re.search(rf"(?im)^\s*complex\(kind=dp\)\s*::\s*{re.escape(result_name)}\s*$", block) is None:
+            i = end + 1
+            continue
+        for j in range(i + 1, end):
+            lhs_pat = rf"^(\s*{re.escape(result_name)}\s*=\s*)exp\s*\(\s*real\s*\((.*),\s*kind\s*=\s*dp\s*\)\s*\)(\s*!.*)?$"
+            m_assign = re.match(lhs_pat, out[j], re.IGNORECASE)
+            if m_assign is not None:
+                out[j] = f"{m_assign.group(1)}exp({m_assign.group(2).strip()}){m_assign.group(3) or ''}"
+        i = end + 1
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
+    """Wrap lifted nested integrate objectives so integrate() receives a one-arg procedure."""
+    if "integrate(" not in f90 or "\ncontains\n" not in f90:
+        return f90
+    lines = f90.splitlines()
+    contains_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*contains\s*$", ln, re.IGNORECASE)), -1)
+    end_mod_idx = next(
+        (i for i, ln in enumerate(lines) if i > contains_idx and re.match(r"^\s*end\s+module\b", ln, re.IGNORECASE)),
+        -1,
+    )
+    if contains_idx < 0 or end_mod_idx < 0:
+        return f90
+
+    func_pat = re.compile(
+        r"^(\s*)((?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?)function\s+([A-Za-z]\w*)\s*\(([^)]*)\)\s+result\s*\(\s*([A-Za-z]\w*)\s*\)",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    funcs: dict[str, dict[str, object]] = {}
+    i = contains_idx + 1
+    while i < end_mod_idx:
+        m = func_pat.match(lines[i])
+        if m is None:
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, end_mod_idx) if end_pat.match(lines[j])), i)
+        args = [a.strip() for a in split_top_level_commas(m.group(4)) if a.strip()]
+        decls: dict[str, str] = {}
+        for ln in lines[i + 1 : end]:
+            m_decl = re.match(
+                r"^\s*((?:real|complex)\(kind=dp\)|integer|logical)(?:\s*,[^:]*)?::\s*(.+)$",
+                ln,
+                re.IGNORECASE,
+            )
+            if m_decl is None:
+                continue
+            dtype = m_decl.group(1)
+            for part in split_top_level_commas(m_decl.group(2)):
+                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", nm):
+                    decls[nm.lower()] = dtype
+        funcs[m.group(3).lower()] = {
+            "name": m.group(3),
+            "result": m.group(5),
+            "start": i,
+            "end": end,
+            "args": args,
+            "decls": decls,
+        }
+        i = end + 1
+
+    wrappers: list[str] = []
+    globals_to_add: list[str] = []
+    changed = False
+
+    def _set_decl_type(start: int, end: int, var: str, dtype: str) -> None:
+        var_l = var.lower()
+        insert_at = start + 1
+        for j in range(start + 1, end):
+            m_decl = re.match(
+                r"^(\s*)((?:real|complex)\(kind=dp\)|integer|logical)(\s*,[^:]*)?::\s*(.+)$",
+                lines[j],
+                re.IGNORECASE,
+            )
+            if m_decl is None:
+                continue
+            insert_at = j + 1
+            parts = split_top_level_commas(m_decl.group(4))
+            kept: list[str] = []
+            found = False
+            for part in parts:
+                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                if nm.lower() == var_l:
+                    found = True
+                else:
+                    kept.append(part.strip())
+            if not found:
+                continue
+            if m_decl.group(2).lower() == dtype.lower():
+                return
+            if kept:
+                lines[j] = f"{m_decl.group(1)}{m_decl.group(2)}{m_decl.group(3) or ''} :: {', '.join(kept)}"
+            else:
+                lines[j] = ""
+            lines.insert(insert_at, f"{m_decl.group(1)}{dtype}{m_decl.group(3) or ''} :: {var}")
+            return
+
+    for parent_l, parent in list(funcs.items()):
+        parent_name = str(parent["name"])
+        parent_start = int(parent["start"])
+        parent_end = int(parent["end"])
+        parent_decls = dict(parent["decls"])  # type: ignore[arg-type]
+        for j in range(parent_start + 1, parent_end):
+            m_int = re.search(r"\bintegrate\s*\(\s*([A-Za-z]\w*)\s*,", lines[j], re.IGNORECASE)
+            if m_int is None:
+                continue
+            short_name = m_int.group(1)
+            helper_key = f"{parent_name}_{short_name}".lower()
+            helper = funcs.get(helper_key)
+            if helper is None:
+                continue
+            helper_name = str(helper["name"])
+            helper_args = list(helper["args"])  # type: ignore[arg-type]
+            if len(helper_args) <= 1:
+                lines[j] = re.sub(
+                    rf"\bintegrate\s*\(\s*{re.escape(short_name)}\s*,",
+                    f"integrate({helper_name},",
+                    lines[j],
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                changed = True
+                continue
+            captures = helper_args[1:]
+            wrapper = f"{helper_name}_xr2f_integrate_closure"
+            actuals: list[str] = ["u"]
+            assign_lines: list[str] = []
+            for cap in captures:
+                cap_type = parent_decls.get(cap.lower()) or dict(helper["decls"]).get(cap.lower(), "real(kind=dp)")  # type: ignore[arg-type]
+                parent_block_text = "\n".join(lines[parent_start:parent_end])
+                if re.search(rf"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?::[^\n]*\b{re.escape(cap)}\b", parent_block_text):
+                    cap_type = "complex(kind=dp)"
+                m_cap_assign = re.search(
+                    rf"(?im)^\s*{re.escape(cap)}\s*=\s*([A-Za-z]\w*)\s*\(",
+                    parent_block_text,
+                )
+                if m_cap_assign is not None:
+                    callee_info = funcs.get(m_cap_assign.group(1).lower())
+                    if isinstance(callee_info, dict):
+                        result_nm = str(callee_info.get("result", "")).lower()
+                        callee_decls = dict(callee_info.get("decls", {}))
+                        if result_nm and str(callee_decls.get(result_nm, "")).lower().startswith("complex"):
+                            cap_type = "complex(kind=dp)"
+                glob = f"{wrapper}_{cap}"
+                globals_to_add.append(f"{cap_type} :: {glob}")
+                indent_j = re.match(r"^\s*", lines[j]).group(0)
+                assign_lines.append(f"{indent_j}{glob} = {cap}")
+                actuals.append(glob)
+                if cap_type.lower().startswith("complex"):
+                    _set_decl_type(int(helper["start"]), int(helper["end"]), cap, cap_type)
+            lines[j] = re.sub(
+                rf"\bintegrate\s*\(\s*{re.escape(short_name)}\s*,",
+                f"integrate({wrapper},",
+                lines[j],
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            lines[j:j] = assign_lines
+            parent_end += len(assign_lines)
+            end_mod_idx += len(assign_lines)
+            wrappers.extend(
+                [
+                    f"function {wrapper}(u) result({wrapper}_result)",
+                    "real(kind=dp), intent(in) :: u",
+                    f"real(kind=dp) :: {wrapper}_result",
+                    f"{wrapper}_result = {helper_name}({', '.join(actuals)})",
+                    f"end function {wrapper}",
+                    "",
+                ]
+            )
+            changed = True
+    if not changed:
+        return f90
+    unique_globals = []
+    seen_globals: set[str] = set()
+    for decl in globals_to_add:
+        if decl.lower() in seen_globals:
+            continue
+        seen_globals.add(decl.lower())
+        unique_globals.append(decl)
+    insert_head = contains_idx
+    if unique_globals:
+        lines[insert_head:insert_head] = unique_globals
+        contains_idx += len(unique_globals)
+        end_mod_idx += len(unique_globals)
+    if wrappers:
+        lines[end_mod_idx:end_mod_idx] = wrappers
+    return "\n".join(ln for ln in lines if ln != "") + ("\n" if f90.endswith("\n") else "")
 
 
 def promote_vector_function_results(lines: list[str]) -> list[str]:
@@ -56409,6 +56775,8 @@ def main() -> int:
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     f90 = rewrite_integrate_value_function_refs_text(f90)
+    f90 = repair_complex_result_exp_real_wrappers_text(f90)
+    f90 = repair_lifted_integrate_closure_refs_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
