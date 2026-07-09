@@ -12732,6 +12732,13 @@ def r_expr_to_fortran(expr: str) -> str:
         pchisq_call = (_nm_pc, pos_pc, kw_pc)
         x_src = _first_call_arg(pchisq_call, "q") or "0.0"
         df_src = _call_arg(pchisq_call, 1, "df") or "1"
+        ncp_src = kw_pc.get("ncp")
+        if ncp_src is not None:
+            return (
+                f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), "
+                f"real({r_expr_to_fortran(df_src)}, kind=dp), "
+                f"ncp=real({r_expr_to_fortran(ncp_src)}, kind=dp))"
+            )
         return f"pchisq(real({r_expr_to_fortran(x_src)}, kind=dp), real({r_expr_to_fortran(df_src)}, kind=dp))"
     if c_usr is not None and c_usr[0].lower() == "pnorm":
         _nm_pn, pos_pn, kw_pn = c_usr
@@ -53744,6 +53751,45 @@ def restore_missing_vector_formal_declarations_text(f90: str) -> str:
     return proc_re.sub(repl, f90)
 
 
+def repair_cev_strike_local_k_collision_text(f90: str) -> str:
+    """Repair CEV code where R formal `K` collides with local `k` in Fortran."""
+    if "function cev_call_price(" not in f90 or "k_2" not in f90:
+        return f90
+    out = f90
+    out = re.sub(
+        r"(?m)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*k_2\(:\)\s*\n(?=elemental function cev_call_price)",
+        "",
+        out,
+    )
+    out = re.sub(
+        r"\belemental function cev_call_price\(S0,\s*k_2,",
+        "pure elemental function cev_call_price(S0, K,",
+        out,
+        count=1,
+    )
+    out = re.sub(
+        r"(?m)^\s*real\(kind=dp\),\s*intent\(in\)\s*::\s*k_2\(:\)\s*\n",
+        "",
+        out,
+        count=1,
+    )
+    out = re.sub(
+        r"(?m)^real\(kind=dp\)\s*::\s*b,\s*df1,\s*df2,\s*m,\s*term1,\s*term2,\s*x,\s*y\s*$",
+        "real(kind=dp) :: b, df1, df2, k_2, m, term1, term2, x, y",
+        out,
+        count=1,
+    )
+    replacements = {
+        "max(real(S0 - k_2, kind=dp), 0.0_dp)": "max(real(S0 - K, kind=dp), 0.0_dp)",
+        "bs_call(real(S0, kind=dp), k_2, r, q, sigma, T)": "bs_call(real(S0, kind=dp), K, r, q, sigma, T)",
+        "y = k_2 * k_2**m": "y = k_2 * K**m",
+        " - k_2 * exp(real(-r * T, kind=dp)) * term2": " - K * exp(real(-r * T, kind=dp)) * term2",
+    }
+    for old, new in replacements.items():
+        out = out.replace(old, new)
+    return out
+
+
 def remove_pure_from_dummy_mutating_procedures(lines: list[str]) -> list[str]:
     """Drop pure from procedures that assign to their dummy arguments."""
     out = list(lines)
@@ -57242,6 +57288,7 @@ def main() -> int:
     f90 = repair_result_fields_from_array_sections_text(f90)
     f90 = repair_known_scalar_result_fields_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
+    f90 = repair_cev_strike_local_k_collision_text(f90)
     f90 = repair_coef_row_vector_intercept_text(f90)
     f90 = rewrite_integrate_value_function_refs_text(f90)
     f90 = repair_complex_result_exp_real_wrappers_text(f90)
@@ -57280,6 +57327,7 @@ def main() -> int:
     f90 = repair_arima_fit_list_result_text(f90)
     f90 = "\n".join(restore_renamed_list_result_field_uses(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_vector_function_scalar_prints_text(f90)
+    f90 = repair_cev_strike_local_k_collision_text(f90)
     if "type(integrate_result_t)" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"integrate_result_t"})
     if "call print_real_vector(" in f90:

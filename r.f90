@@ -2338,6 +2338,7 @@ else if (abs(lower) > inf_threshold) then
 else
    mode = 0
 end if
+if (mode /= 0) nmax = max(nmax, 16 * nmax)
 n = 2
 prev = simpson_integral_mapped(fn, lower, upper, n, mode)
 do
@@ -2435,17 +2436,23 @@ real(kind=dp), intent(in) :: b
 integer, intent(in) :: n_in
 real(kind=dp) :: out
 integer :: i, n
-real(kind=dp) :: h, x, s
+real(kind=dp) :: h, x, s, y
 n = max(2, n_in)
 if (mod(n, 2) /= 0) n = n + 1
 h = (b - a) / real(n, kind=dp)
-s = fn(a) + fn(b)
+s = 0.0_dp
+y = fn(a)
+if (ieee_is_finite(y)) s = s + y
+y = fn(b)
+if (ieee_is_finite(y)) s = s + y
 do i = 1, n - 1
    x = a + h * real(i, kind=dp)
+   y = fn(x)
+   if (.not. ieee_is_finite(y)) cycle
    if (mod(i, 2) == 0) then
-      s = s + 2.0_dp * fn(x)
+      s = s + 2.0_dp * y
    else
-      s = s + 4.0_dp * fn(x)
+      s = s + 4.0_dp * y
    end if
 end do
 out = s * h / 3.0_dp
@@ -5468,8 +5475,8 @@ integer(kind=int64) :: k
 real(kind=dp) :: r, tol
 character(len=32) :: fmt
 if (present(digits)) then
-   write(fmt, '("(8(f0.",i0,",1x,:))")') max(0, digits)
-   write(*,fmt) x
+   write(fmt, '("(20(f0.",i0,",1x,:))")') max(0, digits)
+   write(*,fmt) (x(i), i = 1, size(x))
    return
 end if
 use_int_like = print_int_like_default
@@ -5498,7 +5505,7 @@ end if
 if (all_int) then
    write(*,"(20(i0,1x,:))") (nint(x(i), kind=int64), i = 1, size(x))
 else
-   write(*,"(8(g0,1x,:))") x
+   write(*,"(20(g0,1x,:))") (x(i), i = 1, size(x))
 end if
 end subroutine print_real_vector
 
@@ -14994,10 +15001,30 @@ z = ((x / df)**(1.0_dp / 3.0_dp) - (1.0_dp - 2.0_dp / (9.0_dp * df))) / &
 p = max(0.0_dp, min(1.0_dp, 1.0_dp - normal_cdf(z)))
 end function chisq_upper_tail_approx
 
-pure function pchisq_scalar(x, df) result(p)
+pure function pchisq_scalar(x, df, ncp) result(p)
 ! Lower-tail chi-square probability.
 real(kind=dp), intent(in) :: x, df
+real(kind=dp), intent(in), optional :: ncp
 real(kind=dp) :: p
+real(kind=dp) :: half_ncp, weight, sumw, term
+integer :: j
+if (present(ncp)) then
+   if (ncp > 0.0_dp) then
+      half_ncp = 0.5_dp * ncp
+      weight = exp(-half_ncp)
+      p = weight * (1.0_dp - chisq_upper_tail_approx(x, df))
+      sumw = weight
+      do j = 1, 10000
+         weight = weight * half_ncp / real(j, kind=dp)
+         term = weight * (1.0_dp - chisq_upper_tail_approx(x, df + 2.0_dp * real(j, kind=dp)))
+         p = p + term
+         sumw = sumw + weight
+         if (abs(term) <= 1.0e-13_dp * max(1.0_dp, abs(p)) .and. abs(1.0_dp - sumw) <= 1.0e-12_dp) exit
+      end do
+      p = max(0.0_dp, min(1.0_dp, p))
+      return
+   end if
+end if
 p = 1.0_dp - chisq_upper_tail_approx(x, df)
 p = max(0.0_dp, min(1.0_dp, p))
 end function pchisq_scalar
@@ -15384,12 +15411,21 @@ real(kind=dp), allocatable :: out(:)
 out = dgamma(x, 0.5_dp * df, rate=0.5_dp, log_=log_)
 end function dchisq_vec
 
-pure function pchisq_vec(x, df) result(out)
+pure function pchisq_vec(x, df, ncp) result(out)
 ! Evaluate distribution helper pchisq_vec.
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: df ! degrees of freedom
+real(kind=dp), intent(in), optional :: ncp
 real(kind=dp), allocatable :: out(:)
-out = pgamma(x, 0.5_dp * df, rate=0.5_dp)
+integer :: i
+allocate(out(size(x)))
+do i = 1, size(x)
+   if (present(ncp)) then
+      out(i) = pchisq_scalar(x(i), df, ncp=ncp)
+   else
+      out(i) = pchisq_scalar(x(i), df)
+   end if
+end do
 end function pchisq_vec
 
 pure function qchisq_vec(p, df) result(out)
