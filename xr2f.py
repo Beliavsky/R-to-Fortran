@@ -10781,6 +10781,24 @@ def r_expr_to_fortran(expr: str) -> str:
         if rest_unary and not rest_unary[0].isdigit() and rest_unary[0] != ".":
             rest_f = r_expr_to_fortran(rest_unary)
             return rest_f if s[0] == "+" else f"-{rest_f}"
+    for op_paren in ("*", "/"):
+        mm_paren = _split_top_level_token(s, op_paren, from_right=True)
+        if mm_paren is None:
+            continue
+        lhs_paren_src = mm_paren[0].strip()
+        rhs_paren_src = mm_paren[1].strip()
+
+        def _fmt_grouped_product_operand(src: str) -> tuple[str, bool]:
+            if src.startswith("(") and src.endswith(")"):
+                inner = fscan.strip_redundant_outer_parens_expr(src)
+                if any(_split_top_level_token(inner, op_inner, from_right=True) is not None for op_inner in ["+", "-"]):
+                    return f"({r_expr_to_fortran(inner)})", True
+            return r_expr_to_fortran(src), False
+
+        lhs_paren_f, lhs_grouped = _fmt_grouped_product_operand(lhs_paren_src)
+        rhs_paren_f, rhs_grouped = _fmt_grouped_product_operand(rhs_paren_src)
+        if lhs_grouped or rhs_grouped:
+            return f"{lhs_paren_f} {op_paren} {rhs_paren_f}"
     m_uniroot_root0 = re.match(r"^uniroot\s*\((.*)\)\s*(?:\$|%)\s*root\s*$", s, re.IGNORECASE)
     if m_uniroot_root0 is not None:
         return f"uniroot({m_uniroot_root0.group(1).strip()})%root"
@@ -12004,6 +12022,14 @@ def r_expr_to_fortran(expr: str) -> str:
             a_vec = (_looks_vector_expr_for_recycle(a_probe) if a_probe else False) or a_rank == 1
             b_vec = (_looks_vector_expr_for_recycle(b_probe) if b_probe else False) or b_rank == 1
             if a_rank >= 2 or b_rank >= 2:
+                if op in {"*", "/"} and b_txt.startswith("(") and b_txt.endswith(")"):
+                    b_inner = fscan.strip_redundant_outer_parens_expr(b_txt)
+                    if any(_split_top_level_token(b_inner, op_inner, from_right=True) is not None for op_inner in ["+", "-"]):
+                        return f"{_paren_operand(r_expr_to_fortran(a_txt))} {op} ({r_expr_to_fortran(b_inner)})"
+                if op in {"*", "/"} and a_txt.startswith("(") and a_txt.endswith(")"):
+                    a_inner = fscan.strip_redundant_outer_parens_expr(a_txt)
+                    if any(_split_top_level_token(a_inner, op_inner, from_right=True) is not None for op_inner in ["+", "-"]):
+                        return f"({r_expr_to_fortran(a_inner)}) {op} {_paren_operand(r_expr_to_fortran(b_txt))}"
                 if a_txt and b_txt and ((a_rank >= 2 and b_vec) or (b_rank >= 2 and a_vec)):
                     a_f = r_expr_to_fortran(a_txt)
                     b_f = r_expr_to_fortran(b_txt)
@@ -39267,6 +39293,8 @@ def demote_rank2_reals_from_vector_rhs_text(f90: str) -> str:
 
     def rhs_is_vector(rhs: str) -> bool:
         rhs_s = rhs.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", rhs_s) and rhs_s in rank1:
+            return True
         m_diag_name = re.search(r"\bdiag\s*\(\s*([A-Za-z]\w*)\s*\)", rhs_s, re.IGNORECASE)
         if m_diag_name is not None and m_diag_name.group(1) in rank2:
             return True
@@ -43247,6 +43275,102 @@ def promote_size_dim2_dummy_arguments(lines: list[str]) -> list[str]:
     return out
 
 
+def demote_spread_vector_dummy_arguments(lines: list[str]) -> list[str]:
+    """Undo rank-2 dummy promotion for vector STATS-style spread arguments."""
+    out = list(lines)
+    scope_start_pat = re.compile(r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\b", re.IGNORECASE)
+    scope_end_pat = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+
+    def dummy_names_from_signature(start_idx: int) -> tuple[set[str], int]:
+        sig = out[start_idx]
+        j = start_idx
+        while ")" not in sig and j + 1 < len(out):
+            j += 1
+            sig += " " + out[j].strip().lstrip("&").strip()
+        m_sig = re.match(
+            r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?(?:function|subroutine)\s+[A-Za-z]\w*\s*\(([^)]*)\)",
+            sig,
+            re.IGNORECASE,
+        )
+        if m_sig is None:
+            return set(), j
+        return {a.strip() for a in split_top_level_commas(m_sig.group(1)) if re.fullmatch(r"[A-Za-z]\w*", a.strip())}, j
+
+    def has_true_matrix_use(body: str, name: str) -> bool:
+        body = "\n".join(
+            ln
+            for ln in body.splitlines()
+            if "::" not in ln and not re.match(r"^\s*(?:function|subroutine|end\s+(?:function|subroutine))\b", ln, re.IGNORECASE)
+        )
+        nm = re.escape(name)
+        matrix_patterns = [
+            rf"\bsize\s*\(\s*{nm}\s*,\s*2\s*\)",
+            rf"\bncol\s*\(\s*{nm}\s*\)",
+            rf"\bshape\s*\(\s*{nm}\s*\)",
+            rf"\b(?:r_matmul|matmul|chol|det_real|solve_real)\s*\(\s*{nm}\b",
+            rf"\b{nm}\s*\([^()\n,]+,\s*[^()\n]+\)",
+        ]
+        return any(re.search(pat, body, re.IGNORECASE) for pat in matrix_patterns)
+
+    i = 0
+    while i < len(out):
+        if scope_start_pat.match(out[i]) is None:
+            i += 1
+            continue
+        start = i
+        dummies, sig_end = dummy_names_from_signature(start)
+        end = sig_end + 1
+        while end < len(out) and scope_end_pat.match(out[end]) is None:
+            end += 1
+        body = "\n".join(out[start : min(end + 1, len(out))])
+        demote: set[str] = set()
+        for nm in dummies:
+            if re.search(rf"\bspread\s*\(\s*{re.escape(nm)}\s*,\s*dim\s*=\s*1\b", body, re.IGNORECASE) and not has_true_matrix_use(body, nm):
+                demote.add(nm)
+        if demote:
+            for j in range(sig_end + 1, min(end + 1, len(out))):
+                m_decl = re.match(r"^(\s*)real\(kind=dp\)([^:]*)::\s*(.+)$", out[j], re.IGNORECASE)
+                if m_decl is None or "intent" not in m_decl.group(2).lower():
+                    continue
+                parts = [p.strip() for p in split_top_level_commas(m_decl.group(3))]
+                changed = False
+                new_parts: list[str] = []
+                for part in parts:
+                    m_part = re.match(r"^([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", part)
+                    if m_part is not None and m_part.group(1) in demote:
+                        new_parts.append(f"{m_part.group(1)}(:)")
+                        changed = True
+                    else:
+                        new_parts.append(part)
+                if changed:
+                    out[j] = f"{m_decl.group(1)}real(kind=dp){m_decl.group(2)}:: {', '.join(new_parts)}"
+        i = end + 1
+    return out
+
+
+def demote_smoother_prediction_point_decls_text(f90: str) -> str:
+    point_names: set[str] = set()
+    for m in re.finditer(r"\b(?:x_points|x_points_)\s*=\s*([A-Za-z]\w*)\b", f90, re.IGNORECASE):
+        point_names.add(m.group(1))
+    for m in re.finditer(r"\bpredict_(?:loess|smooth_spline)\s*\(([^)]*)\)", f90, re.IGNORECASE):
+        args = split_top_level_commas(m.group(1))
+        if len(args) >= 2 and re.fullmatch(r"\s*[A-Za-z]\w*\s*", args[1]):
+            point_names.add(args[1].strip())
+    if not point_names:
+        return f90
+    assigned_from_vector = {
+        lhs
+        for lhs, rhs in re.findall(r"(?m)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$", f90)
+        if lhs in point_names
+    }
+    if not assigned_from_vector:
+        return f90
+    out = f90
+    for nm in sorted(assigned_from_vector, key=len, reverse=True):
+        out = re.sub(rf"\b{re.escape(nm)}\s*\(:\s*,\s*:\)", f"{nm}(:)", out)
+    return out
+
+
 def promote_vector_function_results(lines: list[str]) -> list[str]:
     out = list(lines)
     scope_start_pat = re.compile(
@@ -43319,6 +43443,7 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
         while end < len(out) and scope_end_pat.match(out[end]) is None:
             end += 1
         rank1_names: set[str] = set()
+        rank2_names: set[str] = set()
         result_decl_idx: int | None = None
         for j in range(i + 1, min(end + 1, len(out))):
             m_decl = re.match(r"^\s*real\(kind=dp\)([^:]*)::\s*(.+)$", out[j], re.IGNORECASE)
@@ -43328,17 +43453,32 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
                 m_rank1 = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", part)
                 if m_rank1 is not None:
                     rank1_names.add(m_rank1.group(1))
+                m_rank2 = re.match(r"\s*([A-Za-z]\w*)\s*\(:\s*,\s*:\)\s*$", part)
+                if m_rank2 is not None:
+                    rank2_names.add(m_rank2.group(1))
                 m_scalar_result = re.match(rf"\s*{re.escape(result_name)}\s*$", part, re.IGNORECASE)
                 if m_scalar_result is not None and "allocatable" not in m_decl.group(1).lower():
                     result_decl_idx = j
         promote = False
-        if result_decl_idx is not None and rank1_names:
+        if result_decl_idx is not None and (rank1_names or rank2_names):
             for j in range(i + 1, min(end + 1, len(out))):
                 m_asn = re.match(rf"^\s*{re.escape(result_name)}\s*=\s*(.+)$", out[j], re.IGNORECASE)
                 if m_asn is None:
                     continue
                 rhs = m_asn.group(1)
                 rhs_for_vector_check = strip_scalar_reducer_calls(rhs)
+                for nm2 in rank2_names:
+                    if re.search(
+                        rf"\b{re.escape(nm2)}\s*\(\s*(?:[^,()]+,\s*:|:\s*,\s*[^,()]+)\s*\)",
+                        rhs_for_vector_check,
+                        re.IGNORECASE,
+                    ):
+                        promote = True
+                        break
+                if promote:
+                    break
+                if not rank1_names:
+                    continue
                 if not _array_refs_outside_scalar_reductions(rhs, rank1_names):
                     continue
                 if not _array_refs_outside_scalar_reductions(rhs_for_vector_check, rank1_names):
@@ -44307,7 +44447,7 @@ def promote_dcc_fit_result_declarations(lines: list[str]) -> list[str]:
 
 def promote_matrix_copy_assignments(lines: list[str]) -> list[str]:
     rank2: set[str] = set()
-    decl_pat = re.compile(r"^\s*real\(kind=dp\)(?:\s*,\s*allocatable)?\s*::\s*(.+)$", re.IGNORECASE)
+    decl_pat = re.compile(r"^\s*real\(kind=dp\)(?:\s*,\s*[^:]*)?::\s*(.+)$", re.IGNORECASE)
     for ln in lines:
         m_decl = decl_pat.match(ln)
         if m_decl is None:
@@ -46221,6 +46361,15 @@ def promote_real_matrix_decls_from_matrix_usage_text(f90: str) -> str:
     """Promote real allocatable locals to rank-2 when matrix construction is explicit."""
     lines = f90.splitlines()
     matrix_names: set[str] = set()
+
+    def _rhs_has_matrix_section(rhs: str) -> bool:
+        for m_sec in re.finditer(r"\b[A-Za-z]\w*(?:%[A-Za-z]\w*)?\s*\(([^()\n]*)\)", rhs):
+            inner = m_sec.group(1)
+            dims = [part.strip() for part in split_top_level_commas(inner)]
+            if len(dims) >= 2 and sum(1 for dim in dims if ":" in dim) >= 2:
+                return True
+        return False
+
     for ln in lines:
         m_matrix_assign = re.match(
             r"^\s*([A-Za-z]\w*)\s*=\s*(?:matrix|cbind|cbind2|rbind)\s*\(",
@@ -46235,6 +46384,10 @@ def promote_real_matrix_decls_from_matrix_usage_text(f90: str) -> str:
             )
         if m_matrix_assign is not None:
             matrix_names.add(m_matrix_assign.group(1).lower())
+            continue
+        m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", ln)
+        if m_assign is not None and _rhs_has_matrix_section(m_assign.group(2)):
+            matrix_names.add(m_assign.group(1).lower())
     if not matrix_names:
         return f90
 
@@ -51495,9 +51648,23 @@ def rewrite_vector_function_scalar_prints_text(f90: str) -> str:
         comment = m.group(4) or ""
         return f"{m.group(1)}call print_real_vector({fn_name}({args})){comment}"
 
-    return re.sub(
+    f90 = re.sub(
         r"(?m)^(\s*)call\s+print_real_scalar\s*\(\s*([A-Za-z]\w*)\s*\((.*)\)\s*\)\s*(\s*!.*)?$",
         repl,
+        f90,
+    )
+
+    def repl_write(m: re.Match[str]) -> str:
+        fn_name = m.group(2)
+        args = m.group(3)
+        if fn_name.lower() not in vector_result_funcs:
+            return m.group(0)
+        comment = m.group(4) or ""
+        return f'{m.group(1)}write(*,"(1000(g0,1x,:))") {fn_name}({args}){comment}'
+
+    return re.sub(
+        r'(?m)^(\s*)write\(\*,"\(g0\)"\)\s+([A-Za-z]\w*)\s*\((.*)\)\s*(\s*!.*)?$',
+        repl_write,
         f90,
     )
 
@@ -54927,6 +55094,7 @@ def main() -> int:
     f90_lines = ensure_module_cummax_import(f90_lines)
     f90_lines = demote_scalar_component_assignments(f90_lines)
     f90_lines = promote_size_dim2_dummy_arguments(f90_lines)
+    f90_lines = demote_spread_vector_dummy_arguments(f90_lines)
     f90_lines = promote_rank3_dummy_arguments(f90_lines)
     f90_lines = promote_rank3_result_assignments(f90_lines)
     f90_lines = promote_rank3_slice_matrix_assignments(f90_lines)
@@ -55009,6 +55177,7 @@ def main() -> int:
     f90_lines = rewrite_dcc_coef_print_calls(f90_lines)
     f90_lines = rewrite_optim_maxit_defaults(f90_lines)
     f90_lines = promote_size_dim2_dummy_arguments(f90_lines)
+    f90_lines = demote_spread_vector_dummy_arguments(f90_lines)
     f90_lines = _strip_raw_fortran_tags(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = re.sub(
@@ -55969,6 +56138,9 @@ def main() -> int:
     f90 = demote_rank2_reals_from_vector_rhs_text(f90)
     f90 = demote_rank2_reals_from_scalar_rhs_text(f90)
     f90 = promote_real_matrix_decls_from_matrix_usage_text(f90)
+    f90 = "\n".join(promote_matrix_copy_assignments(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = "\n".join(promote_vector_function_results(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = "\n".join(demote_spread_vector_dummy_arguments(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_rank1_print_matrix_calls_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = demote_type_fields_from_rank1_local_assignments_text(f90)
@@ -56049,6 +56221,7 @@ def main() -> int:
     f90 = promote_diff_function_from_matrix_calls_text(f90)
     f90 = specialize_matrix_diff_function_generics_text(f90)
     f90 = flatten_rank2_assignments_to_vector_results_text(f90)
+    f90 = "\n".join(demote_spread_vector_dummy_arguments(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_indexed_matrix_function_results_text(f90)
     f90 = rewrite_integer_literal_diag_actuals_text(f90)
     if "matrix_elem(" in f90:
@@ -56136,6 +56309,7 @@ def main() -> int:
     f90_lines = rewrite_print_mat_vector_actuals(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = demote_rank2_reals_from_vector_rhs_text(f90)
+    f90 = "\n".join(promote_matrix_copy_assignments(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_rank1_component_matrix_prints_text(f90)
     f90 = lower_selected_derived_list_field_copies_text(f90)
     f90 = repair_embedded_mixed_declaration_fragments_text(f90)
@@ -56170,6 +56344,8 @@ def main() -> int:
     f90 = normalize_one_variable_declarations_text(f90)
     f90 = repair_real_matrix_reader_target_decls_text(f90)
     f90 = promote_real_array_decls_from_assignments_text(f90)
+    f90 = demote_rank2_reals_from_vector_rhs_text(f90)
+    f90 = "\n".join(promote_matrix_copy_assignments(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = promote_integer_maxval_locals_text(f90)
     f90 = demote_scalar_character_local_decls_text(f90)
     f90 = repair_integer_vector_function_result_decls_text(f90)
@@ -56223,10 +56399,12 @@ def main() -> int:
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = promote_real_matrix_initializer_decls_text(f90)
+    f90 = demote_smoother_prediction_point_decls_text(f90)
     f90 = rewrite_scalar_table_extract_decls_text(f90)
     f90 = coalesce_final_declarations_text(f90, max_len=132)
     f90 = repair_arima_fit_list_result_text(f90)
     f90 = "\n".join(restore_renamed_list_result_field_uses(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    f90 = rewrite_vector_function_scalar_prints_text(f90)
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
