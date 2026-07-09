@@ -43950,8 +43950,8 @@ def repair_lifted_integrate_optional_upper_bounds_text(f90: str) -> str:
     """Restore optional upper/rel.tol variables lost while lifting integrate closures."""
     if "integrate(" not in f90 or "upper_def" not in f90:
         return f90
-    func_pat = re.compile(
-        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+[A-Za-z]\w*\s*\([^)]*\)\s+result\s*\(",
+    func_start_pat = re.compile(
+        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+[A-Za-z]\w*\b",
         re.IGNORECASE,
     )
     end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
@@ -43960,7 +43960,16 @@ def repair_lifted_integrate_optional_upper_bounds_text(f90: str) -> str:
     i = 0
     changed = False
     while i < len(lines):
-        if not func_pat.match(lines[i]):
+        if not func_start_pat.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        header = lines[i]
+        h = i
+        while "result" not in header.lower() and h + 1 < len(lines) and "&" in lines[h]:
+            h += 1
+            header += " " + lines[h]
+        if "result" not in header.lower():
             out.append(lines[i])
             i += 1
             continue
@@ -43972,13 +43981,13 @@ def repair_lifted_integrate_optional_upper_bounds_text(f90: str) -> str:
             and re.search(r"\bintegrate\s*\(", block, re.IGNORECASE)
         ):
             block_new = re.sub(
-                r"upper\s*=\s*real\s*\(\s*1\.0_dp\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)",
+                r"upper\s*=\s*real\s*\(\s*1(?:\.0)?(?:_dp)?\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)",
                 "upper=upper_def, rel_tol=rel_tol_def",
                 block,
                 flags=re.IGNORECASE,
             )
             block_new = re.sub(
-                r"upper\s*=\s*real\s*\(\s*1(?:\.0)?\s*,\s*kind\s*=\s*dp\s*\)",
+                r"upper\s*=\s*real\s*\(\s*1(?:\.0)?(?:_dp)?\s*,\s*kind\s*=\s*dp\s*\)",
                 "upper=upper_def, rel_tol=rel_tol_def",
                 block_new,
                 flags=re.IGNORECASE,
@@ -44087,6 +44096,36 @@ def repair_complex_intrinsic_real_wrappers_text(f90: str) -> str:
     out = out.replace(
         "exp(real(delta * T * (gamma0 - sqrt(alpha**2 - (beta + iu)**2)))",
         "exp(delta * T * (gamma0 - sqrt(alpha**2 - (beta + iu)**2)))",
+    )
+    out = re.sub(
+        r"r_log\s*\(\s*real\s*\(\s*\(\s*1\s*-\s*g\s*\*\s*exp\s*\(\s*real\s*\(\s*-d\s*\*\s*T\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)\s*\)\s*\)\s*/\s*\(\s*1\s*-\s*g\s*\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+        "log((1 - g * exp(-d * T)) / (1 - g))",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"r_log\s*\(\s*real\s*\(\s*\(\s*1\s*-\s*g\s*\*\s*exp\s*\(\s*real\s*\(\s*-d\s*\*\s*T\s*,\s*kind\s*=\s*dp\s*\)\s*\)\s*\)\s*/\s*\(\s*1\s*-\s*g\s*\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+        "log((1 - g * exp(-d * T)) / (1 - g))",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"exp\s*\(\s*real\s*\(\s*-d\s*\*\s*T\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)\s*\)",
+        "exp(-d * T)",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"exp\s*\(\s*real\s*\(\s*-d\s*\*\s*T\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+        "exp(-d * T)",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"exp\s*\(\s*real\s*\(\s*iu\s*\*\s*muj\s*-\s*0\.5_dp\s*\*\s*sigmaj\*\*2\s*\*\s*u\*\*2\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+        "exp(iu * muj - 0.5_dp * sigmaj**2 * u**2)",
+        out,
+        flags=re.IGNORECASE,
     )
     return out
 
