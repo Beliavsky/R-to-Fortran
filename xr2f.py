@@ -43686,14 +43686,54 @@ def repair_complex_result_exp_real_wrappers_text(f90: str) -> str:
         result_name = m.group(2)
         end = next((j for j in range(i + 1, len(out)) if end_pat.match(out[j])), len(out) - 1)
         block = "\n".join(out[i + 1 : end])
-        if re.search(rf"(?im)^\s*complex\(kind=dp\)\s*::\s*{re.escape(result_name)}\s*$", block) is None:
+        if re.search(rf"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::[^\n]*\b{re.escape(result_name)}\b", block) is None:
             i = end + 1
             continue
+        complex_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::\s*([^\n]+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", nm):
+                    complex_names.add(nm.lower())
         for j in range(i + 1, end):
             lhs_pat = rf"^(\s*{re.escape(result_name)}\s*=\s*)exp\s*\(\s*real\s*\((.*),\s*kind\s*=\s*dp\s*\)\s*\)(\s*!.*)?$"
             m_assign = re.match(lhs_pat, out[j], re.IGNORECASE)
             if m_assign is not None:
                 out[j] = f"{m_assign.group(1)}exp({m_assign.group(2).strip()}){m_assign.group(3) or ''}"
+                continue
+            if "exp(real(" not in out[j]:
+                continue
+            def repl_exp_real(m_exp: re.Match[str]) -> str:
+                inner = m_exp.group(1).strip()
+                names = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", inner)}
+                if names & complex_names:
+                    return f"exp({inner})"
+                return m_exp.group(0)
+            out[j] = re.sub(
+                r"exp\s*\(\s*real\s*\((.*?),\s*kind\s*=\s*dp\s*\)\s*\)",
+                repl_exp_real,
+                out[j],
+                flags=re.IGNORECASE,
+            )
+        block_after = "\n".join(out[i + 1 : end])
+        def repl_wrapped_exp_real(m_exp: re.Match[str]) -> str:
+            inner = re.sub(r"\s*&\s*\n\s*&\s*", " ", m_exp.group(1).strip())
+            names = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", inner)}
+            if names & complex_names:
+                return f"exp({inner})"
+            return m_exp.group(0)
+        block_new = re.sub(
+            r"exp\s*\(\s*real\s*\((.*?),\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)\s*\)",
+            repl_wrapped_exp_real,
+            block_after,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if block_new != block_after:
+            out[i + 1 : end] = block_new.splitlines()
+            end = i + 1 + len(block_new.splitlines())
         i = end + 1
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
@@ -43947,7 +43987,7 @@ def repair_complex_dummy_real_rewraps_text(f90: str) -> str:
         block = "\n".join(lines[i : end + 1])
         complex_names: set[str] = set()
         for m_decl in re.finditer(
-            r"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?::\s*([^\n]+)$",
+            r"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::\s*([^\n]+)$",
             block,
         ):
             for part in split_top_level_commas(m_decl.group(1)):
@@ -43976,6 +44016,104 @@ def repair_complex_dummy_real_rewraps_text(f90: str) -> str:
     if not changed:
         return f90
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_declared_names_to_complex_text(f90: str, names: set[str]) -> str:
+    if not names:
+        return f90
+    names_l = {n.lower() for n in names}
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    changed = False
+    while i < len(lines):
+        ln = lines[i]
+        if "::" not in ln or re.match(r"^\s*real\(kind=dp\)", ln, re.IGNORECASE) is None:
+            out.append(ln)
+            i += 1
+            continue
+        stmt_lines = [ln]
+        j = i
+        while stmt_lines[-1].rstrip().endswith("&") and j + 1 < len(lines):
+            j += 1
+            stmt_lines.append(lines[j])
+        stmt = "\n".join(stmt_lines)
+        one = re.sub(r"\s*&\s*\n\s*&?\s*", " ", stmt)
+        m_decl = re.match(r"^(\s*)real\(kind=dp\)(\s*,[^:]*)?\s*::\s*(.+)$", one, re.IGNORECASE)
+        if m_decl is None:
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        indent = m_decl.group(1)
+        attrs = m_decl.group(2) or ""
+        parts = [p.strip() for p in split_top_level_commas(m_decl.group(3)) if p.strip()]
+        keep: list[str] = []
+        move: list[str] = []
+        for part in parts:
+            nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+            if nm.lower() in names_l:
+                move.append(part)
+            else:
+                keep.append(part)
+        if not move:
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        changed = True
+        if keep:
+            out.append(f"{indent}real(kind=dp){attrs} :: {', '.join(keep)}")
+        out.append(f"{indent}complex(kind=dp){attrs} :: {', '.join(move)}")
+        i = j + 1
+    if not changed:
+        return f90
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_complex_integrate_closure_captures_text(f90: str) -> str:
+    if "_xr2f_integrate_closure_" not in f90 or "complex(kind=dp)" not in f90:
+        return f90
+    func_pat = re.compile(
+        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+([A-Za-z]\w*)\s*\(([^)]*)\)\s+result\s*\(",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    lines = f90.splitlines()
+    func_args: dict[str, list[str]] = {}
+    complex_names: set[str] = set()
+    function_blocks: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(lines):
+        m_func = func_pat.match(lines[i])
+        if m_func is None:
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), i)
+        fname = m_func.group(1)
+        func_args[fname.lower()] = [a.strip() for a in split_top_level_commas(m_func.group(2)) if a.strip()]
+        block = "\n".join(lines[i : end + 1])
+        function_blocks.append((i, end, fname))
+        for m_decl in re.finditer(r"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::\s*([^\n]+)$", block):
+            for part in split_top_level_commas(m_decl.group(1)):
+                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", nm):
+                    complex_names.add(nm)
+        i = end + 1
+
+    promote: set[str] = set()
+    for start, end, _fname in function_blocks:
+        block = "\n".join(lines[start : end + 1])
+        local_complex = {n.lower() for n in complex_names if re.search(rf"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::[^\n]*\b{re.escape(n)}\b", block)}
+        for m_asn in re.finditer(
+            r"(?im)^\s*([A-Za-z]\w*_xr2f_integrate_closure_[A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$",
+            block,
+        ):
+            if m_asn.group(2).lower() in local_complex:
+                promote.add(m_asn.group(1))
+                promote.add(m_asn.group(1).rsplit("_xr2f_integrate_closure_", 1)[1])
+
+    if promote:
+        f90 = promote_declared_names_to_complex_text(f90, promote)
+    return f90
 
 
 def promote_vector_function_results(lines: list[str]) -> list[str]:
@@ -56994,7 +57132,9 @@ def main() -> int:
         if f90_repaired_integrate == f90:
             break
         f90 = f90_repaired_integrate
+    f90 = normalize_one_variable_declarations_text(f90)
     f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
+    f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
@@ -57026,6 +57166,7 @@ def main() -> int:
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
+    f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
