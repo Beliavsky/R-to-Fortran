@@ -35,6 +35,7 @@ import fortran_scan as fscan
 
 _HAS_R_MOD = False
 _FORTRAN_COMMENTS = True
+_FORTRAN_MAX_IDENTIFIER_LEN = 63
 EMIT_PRIVATE_MODULE_PUBLICS = True
 COALESCE_FINAL_DECLARATIONS = True
 _RAW_FORTRAN_TAG = "xr2f_raw_fortran"
@@ -1796,6 +1797,33 @@ def _sanitize_fortran_kwarg_name(name: str) -> str:
     if nm and nm[0].isdigit():
         nm = "_" + nm
     return nm
+
+
+def _shorten_fortran_identifier(name: str, max_len: int = _FORTRAN_MAX_IDENTIFIER_LEN) -> str:
+    """Return a stable Fortran identifier no longer than the standard limit."""
+    if len(name) <= max_len:
+        return name
+    if max_len <= 9:
+        return name[:max_len]
+    digest = hashlib.sha1(name.encode("utf-8", errors="replace")).hexdigest()[:8]
+    stem_len = max_len - len(digest) - 1
+    stem = name[:stem_len].rstrip("_") or name[:stem_len]
+    return f"{stem}_{digest}"
+
+
+def _integrate_closure_wrapper_name(helper_name: str, captures: list[str]) -> str:
+    """Name a lifted integrate() closure while keeping wrapper captures legal."""
+    wrapper_base = f"{helper_name}_xr2f_integrate_closure"
+    wrapper_max = _FORTRAN_MAX_IDENTIFIER_LEN - len("_result")
+    if len(wrapper_base) <= wrapper_max and all(
+        len(f"{wrapper_base}_{cap}") <= _FORTRAN_MAX_IDENTIFIER_LEN for cap in captures
+    ):
+        return wrapper_base
+    cap_room = 0 if not captures else 1 + max(len(cap) for cap in captures)
+    return _shorten_fortran_identifier(
+        f"{helper_name}_xric",
+        max(1, min(wrapper_max, _FORTRAN_MAX_IDENTIFIER_LEN - cap_room)),
+    )
 
 
 def _sanitize_r_var_name(name: str) -> str:
@@ -43852,7 +43880,7 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
                 changed = True
                 continue
             captures = helper_args[1:]
-            wrapper = f"{helper_name}_xr2f_integrate_closure"
+            wrapper = _integrate_closure_wrapper_name(helper_name, captures)
             actuals: list[str] = ["u"]
             assign_lines: list[str] = []
             for cap in captures:
@@ -43871,7 +43899,7 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
                         callee_decls = dict(callee_info.get("decls", {}))
                         if result_nm and str(callee_decls.get(result_nm, "")).lower().startswith("complex"):
                             cap_type = "complex(kind=dp)"
-                glob = f"{wrapper}_{cap}"
+                glob = _shorten_fortran_identifier(f"{wrapper}_{cap}")
                 globals_to_add.append(f"{cap_type} :: {glob}")
                 indent_j = re.match(r"^\s*", lines[j]).group(0)
                 assign_lines.append(f"{indent_j}{glob} = {cap}")
@@ -44018,6 +44046,51 @@ def repair_complex_dummy_real_rewraps_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def repair_complex_intrinsic_real_wrappers_text(f90: str) -> str:
+    """Clean residual real(..., kind=dp) wrappers around complex intrinsics."""
+    if "kind=dp" not in f90:
+        return f90
+    out = f90
+
+    out = re.sub(
+        r"exp\s*\(\s*(iu\s*\*\s*\(x\s*\+\s*\(r\s*-\s*q\s*\+\s*omega\)\s*\*\s*T\))\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)\)",
+        lambda m: f"exp({m.group(1).strip()})",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    def repl_sqrt_real(m: re.Match[str]) -> str:
+        inner = re.sub(r"\s*&\s*\n\s*&\s*", " ", m.group(1).strip())
+        names = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", inner)}
+        if names & {"iu"}:
+            return f"sqrt({inner})"
+        return m.group(0)
+
+    out = re.sub(
+        r"sqrt\s*\(\s*real\s*\(\s*real\s*\((.+?),\s*kind\s*=\s*dp\s*\)\s*,\s*kind\s*=\s*dp\s*\)\s*\)",
+        repl_sqrt_real,
+        out,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    out = re.sub(
+        r"sqrt\s*\(\s*real\s*\((.+?),\s*kind\s*=\s*dp\s*\)\s*\)",
+        repl_sqrt_real,
+        out,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    out = re.sub(
+        r"exp\s*\(\s*real\s*\(([^()\n]*(?:\([^()\n]*(?:\([^()\n]*\)[^()\n]*)*\)[^()\n]*)*sqrt\([^()\n]*iu[^()\n]*\)[^()\n]*)\)\s*\)",
+        lambda m: f"exp({m.group(1).strip()})",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = out.replace(
+        "exp(real(delta * T * (gamma0 - sqrt(alpha**2 - (beta + iu)**2)))",
+        "exp(delta * T * (gamma0 - sqrt(alpha**2 - (beta + iu)**2)))",
+    )
+    return out
+
+
 def promote_declared_names_to_complex_text(f90: str, names: set[str]) -> str:
     if not names:
         return f90
@@ -44070,7 +44143,10 @@ def promote_declared_names_to_complex_text(f90: str, names: set[str]) -> str:
 
 
 def repair_complex_integrate_closure_captures_text(f90: str) -> str:
-    if "_xr2f_integrate_closure_" not in f90 or "complex(kind=dp)" not in f90:
+    if (
+        "_xr2f_integrate_closure_" not in f90
+        and "_xric_" not in f90
+    ) or "complex(kind=dp)" not in f90:
         return f90
     func_pat = re.compile(
         r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+([A-Za-z]\w*)\s*\(([^)]*)\)\s+result\s*\(",
@@ -44104,12 +44180,15 @@ def repair_complex_integrate_closure_captures_text(f90: str) -> str:
         block = "\n".join(lines[start : end + 1])
         local_complex = {n.lower() for n in complex_names if re.search(rf"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?\s*::[^\n]*\b{re.escape(n)}\b", block)}
         for m_asn in re.finditer(
-            r"(?im)^\s*([A-Za-z]\w*_xr2f_integrate_closure_[A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$",
+            r"(?im)^\s*([A-Za-z]\w*(?:_xr2f_integrate_closure_|_xric_)[A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*$",
             block,
         ):
             if m_asn.group(2).lower() in local_complex:
-                promote.add(m_asn.group(1))
-                promote.add(m_asn.group(1).rsplit("_xr2f_integrate_closure_", 1)[1])
+                closure_name = m_asn.group(1)
+                promote.add(closure_name)
+                split_cap = re.split(r"_xr2f_integrate_closure_|_xric_", closure_name, maxsplit=1)
+                if len(split_cap) == 2 and re.fullmatch(r"[A-Za-z]\w*", split_cap[1]):
+                    promote.add(split_cap[1])
 
     if promote:
         f90 = promote_declared_names_to_complex_text(f90, promote)
@@ -57136,6 +57215,7 @@ def main() -> int:
     f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
     f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
+    f90 = repair_complex_intrinsic_real_wrappers_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
@@ -57168,6 +57248,7 @@ def main() -> int:
     f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
     f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
+    f90 = repair_complex_intrinsic_real_wrappers_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
