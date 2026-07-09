@@ -52242,6 +52242,59 @@ def rewrite_unassigned_renamed_alias_uses_text(f90: str) -> str:
     return proc_re.sub(repl_proc, f90)
 
 
+def repair_outer_block_renamed_lhs_text(f90: str) -> str:
+    """Keep generated outer() fill blocks consistent after stale-alias rewrites."""
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if not re.match(r"^\s*block\s*$", lines[i], re.IGNORECASE):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        depth = 1
+        block_lines = [lines[i]]
+        while j < len(lines):
+            block_lines.append(lines[j])
+            if re.match(r"^\s*block\s*$", lines[j], re.IGNORECASE):
+                depth += 1
+            elif re.match(r"^\s*end\s+block\s*$", lines[j], re.IGNORECASE):
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        block = "\n".join(block_lines)
+        m_alloc = re.search(
+            r"(?im)^\s*allocate\s*\(\s*([A-Za-z]\w*)\s*\(\s*size\s*\(\s*ox\s*\)\s*,\s*size\s*\(\s*oy\s*\)\s*\)\s*\)\s*$",
+            block,
+        )
+        if (
+            m_alloc is not None
+            and re.search(r"(?im)^\s*integer\s*::\s*i_out\s*,\s*j_out\s*$", block) is not None
+            and re.search(r"(?im)^\s*do\s+i_out\s*=\s*1\s*,\s*size\s*\(", block) is not None
+            and re.search(r"(?im)^\s*do\s+j_out\s*=\s*1\s*,\s*size\s*\(", block) is not None
+        ):
+            target = m_alloc.group(1)
+
+            def repl_lhs(ma: re.Match[str]) -> str:
+                lhs = ma.group(2)
+                if lhs.lower() == target.lower():
+                    return ma.group(0)
+                return f"{ma.group(1)}{target}(i_out, j_out) ="
+
+            block = re.sub(
+                r"(?im)^(\s*)([A-Za-z]\w*)\s*\(\s*i_out\s*,\s*j_out\s*\)\s*=",
+                repl_lhs,
+                block,
+            )
+            block_lines = block.splitlines()
+        out.extend(block_lines)
+        i = j
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def repair_turnover_obfuscated_dataframe_text(f90: str) -> str:
     """Repair obfuscated turnover example dataframe append and xtabs lowering."""
     if (
@@ -55006,6 +55059,7 @@ def main() -> int:
     f90 = rewrite_vector_function_scalar_prints_text(f90)
     f90 = rewrite_vector_elemental_write_calls_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
+    f90 = repair_outer_block_renamed_lhs_text(f90)
     f90 = keyword_print_helper_actuals_after_named_text(f90)
     f90 = re.sub(
         r"\b([A-Za-z]\w*)\s*\[\s*which\s*\(\s*([A-Za-z]\w*)\s*\)\s*\[\s*1\s*\]\s*\]",
@@ -56013,6 +56067,7 @@ def main() -> int:
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = add_missing_derived_type_fields_from_assignments_text(f90)
     f90 = rewrite_unassigned_renamed_alias_uses_text(f90)
+    f90 = repair_outer_block_renamed_lhs_text(f90)
     if args.special_repairs:
         f90 = repair_turnover_obfuscated_dataframe_text(f90)
     f90 = repair_filtered_renamed_argument_decls_text(f90)
