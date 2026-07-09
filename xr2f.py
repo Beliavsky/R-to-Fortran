@@ -31390,35 +31390,78 @@ def transpile_r_to_fortran(
             if _is_complex_expr_source(actual.strip()):
                 out_args.add(fn_def.args[k_idx])
 
+    def _iter_call_texts_in_expr(expr_call_walk: str) -> list[str]:
+        out_call_walk: list[str] = []
+        src_call_walk = expr_call_walk.strip()
+        i_call_walk = 0
+        while i_call_walk < len(src_call_walk):
+            m_call_walk = re.search(r"\b([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(", src_call_walk[i_call_walk:])
+            if m_call_walk is None:
+                break
+            name_start = i_call_walk + m_call_walk.start()
+            open_idx = i_call_walk + m_call_walk.end() - 1
+            depth = 0
+            quote: str | None = None
+            esc = False
+            close_idx = -1
+            for j_call_walk in range(open_idx, len(src_call_walk)):
+                ch = src_call_walk[j_call_walk]
+                if quote is not None:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == quote:
+                        quote = None
+                    continue
+                if ch in {"'", '"'}:
+                    quote = ch
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = j_call_walk
+                        break
+            if close_idx < 0:
+                break
+            call_src = src_call_walk[name_start : close_idx + 1]
+            out_call_walk.append(call_src)
+            c_nested = parse_call_text(call_src)
+            if c_nested is not None:
+                for nested_arg in list(c_nested[1]) + list(c_nested[2].values()):
+                    out_call_walk.extend(_iter_call_texts_in_expr(nested_arg))
+            i_call_walk = close_idx + 1
+        return out_call_walk
+
+    def _register_user_calls_in_expr(expr_user_call: str) -> None:
+        for call_src_user in _iter_call_texts_in_expr(expr_user_call):
+            _register_string_literal_user_call(call_src_user)
+            _register_complex_actual_user_call(call_src_user)
+
     def _walk_register_string_literal_user_calls(ss_user_call: list[object]) -> None:
         for st_user_call in ss_user_call:
             if isinstance(st_user_call, CallStmt):
-                _register_string_literal_user_call(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
-                _register_complex_actual_user_call(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
+                _register_user_calls_in_expr(st_user_call.name + "(" + ", ".join(st_user_call.args) + ")")
             elif isinstance(st_user_call, Assign):
-                _register_string_literal_user_call(st_user_call.expr)
-                _register_complex_actual_user_call(st_user_call.expr)
+                _register_user_calls_in_expr(st_user_call.expr)
             elif isinstance(st_user_call, ExprStmt):
                 expr_user_call = st_user_call.expr.strip()
                 asn_user_call = split_top_level_assignment(expr_user_call)
-                _register_string_literal_user_call(asn_user_call[1] if asn_user_call is not None else expr_user_call)
-                _register_complex_actual_user_call(asn_user_call[1] if asn_user_call is not None else expr_user_call)
+                _register_user_calls_in_expr(asn_user_call[1] if asn_user_call is not None else expr_user_call)
             elif isinstance(st_user_call, PrintStmt):
                 for arg_user_call in st_user_call.args:
-                    _register_string_literal_user_call(arg_user_call)
-                    _register_complex_actual_user_call(arg_user_call)
+                    _register_user_calls_in_expr(arg_user_call)
             elif isinstance(st_user_call, IfStmt):
-                _register_string_literal_user_call(st_user_call.cond)
-                _register_complex_actual_user_call(st_user_call.cond)
+                _register_user_calls_in_expr(st_user_call.cond)
                 _walk_register_string_literal_user_calls(st_user_call.then_body)
                 _walk_register_string_literal_user_calls(st_user_call.else_body)
             elif isinstance(st_user_call, ForStmt):
-                _register_string_literal_user_call(st_user_call.iter_expr)
-                _register_complex_actual_user_call(st_user_call.iter_expr)
+                _register_user_calls_in_expr(st_user_call.iter_expr)
                 _walk_register_string_literal_user_calls(st_user_call.body)
             elif isinstance(st_user_call, WhileStmt):
-                _register_string_literal_user_call(st_user_call.cond)
-                _register_complex_actual_user_call(st_user_call.cond)
+                _register_user_calls_in_expr(st_user_call.cond)
                 _walk_register_string_literal_user_calls(st_user_call.body)
             elif isinstance(st_user_call, RepeatStmt):
                 _walk_register_string_literal_user_calls(st_user_call.body)
@@ -31426,6 +31469,46 @@ def transpile_r_to_fortran(
                 _walk_register_string_literal_user_calls(st_user_call.body)
 
     _walk_register_string_literal_user_calls(stmts)
+
+    def _expr_is_complex_with_formals(expr_complex_actual: str, complex_formals: set[str]) -> bool:
+        if _is_complex_expr_source(expr_complex_actual):
+            return True
+        toks_complex_actual = {tok.lower() for tok in re.findall(r"\b[A-Za-z]\w*\b", expr_complex_actual)}
+        return bool(toks_complex_actual & complex_formals)
+
+    for _ in range(4):
+        changed_complex_args = False
+        for caller_fn in funcs:
+            caller_complex = {a.lower() for a in fn_complex_args_from_calls.get(caller_fn.name.lower(), set())}
+            for txt_complex_call in _collect_stmt_expr_texts(caller_fn.body):
+                for call_src_complex in _iter_call_texts_in_expr(txt_complex_call):
+                    c_complex = parse_call_text(call_src_complex)
+                    if c_complex is None:
+                        continue
+                    callee_l_complex = c_complex[0].lower()
+                    arg_index_complex = _USER_FUNC_ARG_INDEX.get(callee_l_complex)
+                    fn_def_complex = _FUNC_DEFS_BY_NAME.get(callee_l_complex)
+                    if arg_index_complex is None or fn_def_complex is None:
+                        continue
+                    out_complex = fn_complex_args_from_calls.setdefault(callee_l_complex, set())
+                    for i_actual_complex, actual_complex in enumerate(c_complex[1]):
+                        if i_actual_complex >= len(fn_def_complex.args):
+                            continue
+                        formal_complex = fn_def_complex.args[i_actual_complex]
+                        if formal_complex not in out_complex and _expr_is_complex_with_formals(actual_complex, caller_complex):
+                            out_complex.add(formal_complex)
+                            changed_complex_args = True
+                    for k_actual_complex, actual_complex in c_complex[2].items():
+                        k_idx_complex = arg_index_complex.get(k_actual_complex.lower())
+                        if k_idx_complex is None or k_idx_complex >= len(fn_def_complex.args):
+                            continue
+                        formal_complex = fn_def_complex.args[k_idx_complex]
+                        if formal_complex not in out_complex and _expr_is_complex_with_formals(actual_complex, caller_complex):
+                            out_complex.add(formal_complex)
+                            changed_complex_args = True
+        if not changed_complex_args:
+            break
+
     _USER_FUNC_ARG_RANK = {
         f.name.lower(): {a.lower(): infer_arg_rank(f, a) for a in f.args}
         for f in funcs
@@ -43793,6 +43876,106 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
     if wrappers:
         lines[end_mod_idx:end_mod_idx] = wrappers
     return "\n".join(ln for ln in lines if ln != "") + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_lifted_integrate_optional_upper_bounds_text(f90: str) -> str:
+    """Restore optional upper/rel.tol variables lost while lifting integrate closures."""
+    if "integrate(" not in f90 or "upper_def" not in f90:
+        return f90
+    func_pat = re.compile(
+        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+[A-Za-z]\w*\s*\([^)]*\)\s+result\s*\(",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    lines = f90.splitlines()
+    out: list[str] = []
+    i = 0
+    changed = False
+    while i < len(lines):
+        if not func_pat.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), len(lines) - 1)
+        block = "\n".join(lines[i : end + 1])
+        if (
+            "upper_def" in block
+            and "rel_tol_def" in block
+            and re.search(r"\bintegrate\s*\(", block, re.IGNORECASE)
+        ):
+            block_new = re.sub(
+                r"upper\s*=\s*real\s*\(\s*1\.0_dp\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)",
+                "upper=upper_def, rel_tol=rel_tol_def",
+                block,
+                flags=re.IGNORECASE,
+            )
+            block_new = re.sub(
+                r"upper\s*=\s*real\s*\(\s*1(?:\.0)?\s*,\s*kind\s*=\s*dp\s*\)",
+                "upper=upper_def, rel_tol=rel_tol_def",
+                block_new,
+                flags=re.IGNORECASE,
+            )
+            if block_new != block:
+                changed = True
+                block = block_new
+        out.extend(block.splitlines())
+        i = end + 1
+    if not changed:
+        return f90
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def repair_complex_dummy_real_rewraps_text(f90: str) -> str:
+    """Do not erase imaginary parts when a complex dummy is passed to a complex formal."""
+    if "cmplx(real(" not in f90 or "complex(kind=dp)" not in f90:
+        return f90
+    func_pat = re.compile(
+        r"^\s*(?:pure\s+)?(?:elemental\s+)?(?:recursive\s+)?function\s+[A-Za-z]\w*\s*\([^)]*\)\s+result\s*\(",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    lines = f90.splitlines()
+    out: list[str] = []
+    changed = False
+    i = 0
+    while i < len(lines):
+        if not func_pat.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), len(lines) - 1)
+        block = "\n".join(lines[i : end + 1])
+        complex_names: set[str] = set()
+        for m_decl in re.finditer(
+            r"(?im)^\s*complex\(kind=dp\)(?:\s*,[^:]*)?::\s*([^\n]+)$",
+            block,
+        ):
+            for part in split_top_level_commas(m_decl.group(1)):
+                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", nm):
+                    complex_names.add(nm)
+        block_new = block
+        for nm in sorted(complex_names, key=len, reverse=True):
+            block_new = re.sub(
+                rf"cmplx\s*\(\s*real\s*\(\s*{re.escape(nm)}\s*,\s*&\s*\n\s*&\s*kind\s*=\s*dp\s*\)\s*,\s*0\.0_dp\s*,\s*kind\s*=\s*dp\s*\)",
+                nm,
+                block_new,
+                flags=re.IGNORECASE,
+            )
+            block_new = re.sub(
+                rf"cmplx\s*\(\s*real\s*\(\s*{re.escape(nm)}\s*,\s*kind\s*=\s*dp\s*\)\s*,\s*0\.0_dp\s*,\s*kind\s*=\s*dp\s*\)",
+                nm,
+                block_new,
+                flags=re.IGNORECASE,
+            )
+        if block_new != block:
+            changed = True
+            block = block_new
+        out.extend(block.splitlines())
+        i = end + 1
+    if not changed:
+        return f90
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
 def promote_vector_function_results(lines: list[str]) -> list[str]:
@@ -56811,6 +56994,8 @@ def main() -> int:
         if f90_repaired_integrate == f90:
             break
         f90 = f90_repaired_integrate
+    f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
+    f90 = repair_complex_dummy_real_rewraps_text(f90)
     f90 = remove_duplicate_local_declarations_text(f90)
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90_had_trailing_newline = f90.endswith("\n")
@@ -56840,6 +57025,8 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"integrate_result_t"})
     if "call print_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
+    f90 = repair_lifted_integrate_optional_upper_bounds_text(f90)
+    f90 = repair_complex_dummy_real_rewraps_text(f90)
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
