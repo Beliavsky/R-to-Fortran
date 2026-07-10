@@ -161,6 +161,9 @@ _INTEGER_ARGUMENT_NONINTEGER_WARNINGS: set[str] = set()
 _SUPPRESS_WARNINGS = False
 _NO_RECYCLE = False
 _STRICT_R_NUMERIC_LITERALS = False
+_IGNORE_XR2F_DIRECTIVES = False
+_XR2F_FORCE_KIND: dict[str, str] = {}
+_XR2F_FORCE_RANK: dict[str, int] = {}
 _R_SD_CALL_NAME = "sd"
 _COMMAND_ARGS_FILE_ARG: str | None = None
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -6515,6 +6518,7 @@ def classify_vars(
         real_arrays.discard(nm)
         known_arrays.add(nm)
         params.pop(nm, None)
+    _apply_main_directives_to_varsets(assign_counts, ints, real_scalars, int_arrays, real_arrays, params, known_arrays)
     # move params out of scalar var declarations
     for p in params:
         ints.discard(p)
@@ -30421,6 +30425,318 @@ def annotate_r_source_with_declares(src: str, stem: str, args_only: bool = False
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _directive_kind(kind: str) -> str:
+    if kind == "double":
+        return "real"
+    return kind
+
+
+_XR2F_DIRECTIVE_NAME_RE = r"[A-Za-z.]\w*(?:\.[A-Za-z]\w*)*"
+_XR2F_DIRECTIVE_KINDS = {"integer", "real", "double", "complex", "logical", "character"}
+
+
+def _normalize_directive_target(name: str) -> str:
+    parts = [p.strip() for p in name.strip().split(".") if p.strip()]
+    return ".".join(parts).lower()
+
+
+def _directive_target_var_name(target: str) -> str:
+    return _sanitize_r_var_name(target)
+
+
+def _normalize_directive_kind(kind: str) -> str:
+    kind_l = kind.strip().lower()
+    if kind_l == "double":
+        return "real"
+    if kind_l not in _XR2F_DIRECTIVE_KINDS:
+        raise NotImplementedError(f"unsupported directive kind `{kind}`")
+    return kind_l
+
+
+def parse_xr2f_directives(src: str, *, ignore: bool = False) -> tuple[dict[str, str], dict[str, int]]:
+    if ignore:
+        return {}, {}
+    force_kind: dict[str, str] = {}
+    force_rank: dict[str, int] = {}
+    kind_re = re.compile(
+        rf"^\s*#\s*xr2f:\s*force_kind\s*\(\s*({_XR2F_DIRECTIVE_NAME_RE})\s*\)\s*=\s*([A-Za-z]+)\s*$",
+        re.IGNORECASE,
+    )
+    rank_re = re.compile(
+        rf"^\s*#\s*xr2f:\s*force_rank\s*\(\s*({_XR2F_DIRECTIVE_NAME_RE})\s*\)\s*=\s*([0-7])\s*$",
+        re.IGNORECASE,
+    )
+    passthrough_re = re.compile(
+        rf"^\s*#\s*xr2f:\s*(?:scope\b.*|examples\b.*|no\s+force_kind/force_rank\b.*|"
+        rf"skip_function\s*\(\s*{_XR2F_DIRECTIVE_NAME_RE}\s*\)|"
+        rf"external_fortran\s*\(\s*{_XR2F_DIRECTIVE_NAME_RE}\s*\))\s*$",
+        re.IGNORECASE,
+    )
+    for line_no, raw in enumerate(src.splitlines(), start=1):
+        if not re.match(r"^\s*#\s*xr2f:", raw, re.IGNORECASE):
+            continue
+        m_kind = kind_re.match(raw)
+        if m_kind is not None:
+            target = _normalize_directive_target(m_kind.group(1))
+            kind = _normalize_directive_kind(m_kind.group(2))
+            old = force_kind.get(target)
+            if old is not None and old != kind:
+                raise NotImplementedError(
+                    f"conflicting xr2f force_kind directives for `{target}` at line {line_no}: {old} vs {kind}"
+                )
+            force_kind[target] = kind
+            continue
+        m_rank = rank_re.match(raw)
+        if m_rank is not None:
+            target = _normalize_directive_target(m_rank.group(1))
+            rank = int(m_rank.group(2))
+            old_rank = force_rank.get(target)
+            if old_rank is not None and old_rank != rank:
+                raise NotImplementedError(
+                    f"conflicting xr2f force_rank directives for `{target}` at line {line_no}: {old_rank} vs {rank}"
+                )
+            force_rank[target] = rank
+            continue
+        if passthrough_re.match(raw):
+            continue
+        raise NotImplementedError(f"unsupported xr2f directive at line {line_no}: {raw.strip()}")
+    return force_kind, force_rank
+
+
+def _parse_declare_dim_rank(dim_text: str) -> int:
+    dim = dim_text.strip()
+    if not dim or dim == "1":
+        return 0
+    return len(split_top_commas(dim))
+
+
+def _collect_declare_type_metadata(src: str) -> dict[str, tuple[str, int, int]]:
+    out: dict[str, tuple[str, int, int]] = {}
+    lines = src.splitlines()
+    current_fn: str | None = None
+    fn_depth = 0
+    in_decl = False
+    decl_scope: str | None = None
+    decl_line = 0
+    decl_re = re.compile(
+        rf"\b({_XR2F_DIRECTIVE_NAME_RE})\s*=\s*(integer|double|real|complex|logical|character)\s*\(([^)]*)\)",
+        re.IGNORECASE,
+    )
+    fn_re = re.compile(rf"^\s*({_XR2F_DIRECTIVE_NAME_RE})\s*<-\s*function\s*\(", re.IGNORECASE)
+
+    for line_no, raw in enumerate(lines, start=1):
+        code, _comment = split_r_code_comment(raw)
+        m_fn = fn_re.match(code)
+        if m_fn is not None and current_fn is None:
+            current_fn = _normalize_directive_target(m_fn.group(1))
+            fn_depth = 0
+        if re.search(r"\bdeclare\s*\(\s*type\s*\(", code, re.IGNORECASE):
+            in_decl = True
+            decl_scope = current_fn
+            decl_line = line_no
+        if in_decl:
+            for m_decl in decl_re.finditer(code):
+                raw_name = _normalize_directive_target(m_decl.group(1))
+                kind = _normalize_directive_kind(m_decl.group(2))
+                rank = _parse_declare_dim_rank(m_decl.group(3))
+                key = f"{decl_scope}.{raw_name}" if decl_scope else raw_name
+                out[key] = (kind, rank, line_no)
+            if "))" in code:
+                in_decl = False
+                decl_scope = None
+                decl_line = 0
+        if current_fn is not None:
+            fn_depth += code.count("{") - code.count("}")
+            if fn_depth <= 0 and "}" in code and line_no != decl_line:
+                current_fn = None
+                fn_depth = 0
+    return out
+
+
+def check_xr2f_directive_declare_conflicts(src: str, force_kind: dict[str, str], force_rank: dict[str, int]) -> None:
+    if not force_kind and not force_rank:
+        return
+    declares = _collect_declare_type_metadata(src)
+    for target, kind in force_kind.items():
+        declared = declares.get(target)
+        if declared is not None and declared[0] != kind:
+            raise NotImplementedError(
+                f"conflicting xr2f directive for `{target}`: declare(type(...)) says {declared[0]} "
+                f"at line {declared[2]}, but force_kind says {kind}"
+            )
+    for target, rank in force_rank.items():
+        declared = declares.get(target)
+        if declared is not None and declared[1] != rank:
+            raise NotImplementedError(
+                f"conflicting xr2f directive for `{target}`: declare(type(...)) says rank {declared[1]} "
+                f"at line {declared[2]}, but force_rank says rank {rank}"
+            )
+
+
+def _apply_main_directives_to_varsets(
+    assign_counts: dict[str, int],
+    ints: set[str],
+    real_scalars: set[str],
+    int_arrays: set[str],
+    real_arrays: set[str],
+    params: dict[str, str],
+    known_arrays: set[str],
+) -> None:
+    def reset_name(nm: str) -> None:
+        ints.discard(nm)
+        real_scalars.discard(nm)
+        int_arrays.discard(nm)
+        real_arrays.discard(nm)
+        params.pop(nm, None)
+
+    main_by_var: dict[str, str] = {}
+    for target in set(_XR2F_FORCE_KIND) | set(_XR2F_FORCE_RANK):
+        nm_target = _directive_target_var_name(target)
+        if nm_target in assign_counts:
+            main_by_var[nm_target] = target
+    for nm, target in sorted(main_by_var.items()):
+        kind = _XR2F_FORCE_KIND.get(target)
+        rank = _XR2F_FORCE_RANK.get(target)
+        if kind is None:
+            if nm in ints or nm in int_arrays or nm in params:
+                kind = "integer"
+            elif nm in real_scalars or nm in real_arrays:
+                kind = "real"
+            else:
+                kind = "real"
+        if rank is None:
+            rank = 1 if (nm in int_arrays or nm in real_arrays or nm in known_arrays) else 0
+        reset_name(nm)
+        if rank > 0:
+            known_arrays.add(nm)
+            if kind == "integer":
+                int_arrays.add(nm)
+            else:
+                real_arrays.add(nm)
+        else:
+            known_arrays.discard(nm)
+            if kind == "integer":
+                ints.add(nm)
+            else:
+                real_scalars.add(nm)
+
+
+def _apply_directives_to_user_func_tables(funcs: list[FuncDef]) -> None:
+    for fn in funcs:
+        fn_l = fn.name.lower()
+        for i, arg in enumerate(fn.args):
+            arg_key = f"{fn_l}.{arg.lower()}"
+            raw_key = _normalize_directive_target(f"{fn.name}.{arg}")
+            target_keys = {arg_key, raw_key}
+            kind = next((_XR2F_FORCE_KIND[k] for k in target_keys if k in _XR2F_FORCE_KIND), None)
+            rank = next((_XR2F_FORCE_RANK[k] for k in target_keys if k in _XR2F_FORCE_RANK), None)
+            if rank is not None:
+                ranks = _USER_FUNC_ARG_RANK.setdefault(fn_l, {})
+                if rank > 0:
+                    ranks[arg.lower()] = rank
+                else:
+                    ranks.pop(arg.lower(), None)
+            if kind is not None:
+                kinds = _USER_FUNC_ARG_KIND.setdefault(fn_l, ["real"] * len(fn.args))
+                if len(kinds) < len(fn.args):
+                    kinds.extend(["real"] * (len(fn.args) - len(kinds)))
+                kinds[i] = kind
+
+
+def _format_xr2f_directive_header(entries: list[tuple[str, str, int]]) -> list[str]:
+    lines = [
+        "# xr2f directives generated by xr2f.py.",
+        "# Review these suggestions before relying on them.",
+        "# xr2f.py consumes force_kind/force_rank comments by default; review before relying on them.",
+    ]
+    if not entries:
+        lines.append("# xr2f: no force_kind/force_rank suggestions inferred")
+        return lines
+    last_scope = None
+    for name, kind, rank in entries:
+        scope = name.rsplit(".", 1)[0] if "." in name else "main"
+        if scope != last_scope:
+            lines.append(f"# xr2f: scope {scope}")
+            last_scope = scope
+        lines.append(f"# xr2f: force_kind({name})={_directive_kind(kind)}")
+        lines.append(f"# xr2f: force_rank({name})={rank}")
+    lines.extend(
+        [
+            "# xr2f: examples of manual-only directives:",
+            "# xr2f: skip_function(function_name)",
+            "# xr2f: external_fortran(function_name)",
+        ]
+    )
+    return lines
+
+
+def write_directives_r_source(src: str, stem: str) -> str:
+    comment_lookup = build_r_comment_lookup(src)
+    lines = preprocess_r_lines(src)
+    lines = _combine_switch_lines(lines)
+    stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
+    if i != len(lines):
+        raise NotImplementedError("could not parse full source for xr2f directive suggestions")
+    stmts = lower_switch_statements(stmts)
+    stmts = _lower_dim_assignments(stmts)
+    stmts = attach_function_adjacent_comments(stmts)
+    stmts = _rename_duplicate_function_defs(stmts)
+    stmts = rename_conflicting_loop_vars(stmts)
+    stmts = rename_conflicting_reused_vars(stmts)
+    stmts = rename_case_conflicting_names(stmts)
+    funcs = [s for s in stmts if isinstance(s, FuncDef)]
+    main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+    raw_name = _raw_r_name_map_from_source(src)
+
+    entries: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+
+    def add_entry(name: str, kind: str, rank: int) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        entries.append((name, kind, rank))
+
+    for fn in funcs:
+        kinds = _annotation_kind_maps_for_function(fn)
+        ranks = _annotation_rank_maps_for_function(fn)
+        for nm, kind in sorted(kinds.items()):
+            raw_nm = raw_name.get(nm, nm)
+            add_entry(f"{fn.name}.{raw_nm}", kind, ranks.get(nm, 0))
+
+    assign_counts = infer_assigned_names(main_stmts)
+    ints, real_scalars, int_arrays, real_arrays, params = classify_vars(main_stmts, assign_counts)
+    array_params = infer_main_array_params(main_stmts, assign_counts)
+    pi_trig_args = _collect_pi_trig_array_args(main_stmts)
+    array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
+    char_scalars = infer_main_character_scalars(main_stmts)
+    char_arrays = infer_main_character_arrays(main_stmts)
+    logical_scalars = infer_main_logical_scalars(main_stmts)
+    logical_arrays = infer_main_logical_arrays(main_stmts, set(int_arrays) | set(real_arrays) | set(array_params))
+
+    main_kinds: dict[str, str] = {}
+    main_ranks: dict[str, int] = {}
+    for nm in sorted(set(params) | ints | int_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind == "integer"}):
+        main_kinds[nm] = "integer"
+    for nm in sorted(real_scalars | real_arrays | {k for k, (kind, _n, _expr) in array_params.items() if kind != "integer"}):
+        main_kinds.setdefault(nm, "double")
+    for nm in sorted(char_scalars | char_arrays):
+        main_kinds.setdefault(nm, "character")
+    for nm in sorted(logical_scalars | logical_arrays):
+        main_kinds.setdefault(nm, "logical")
+    for nm in sorted(int_arrays | real_arrays | char_arrays | logical_arrays):
+        main_ranks[nm] = 1
+    for nm, (_kind, _n, _expr) in array_params.items():
+        main_ranks[nm] = 1
+
+    for nm, kind in sorted(main_kinds.items()):
+        add_entry(raw_name.get(nm, nm), kind, main_ranks.get(nm, 0))
+
+    header = _format_xr2f_directive_header(entries)
+    body = src.lstrip("\ufeff")
+    return "\n".join(header) + "\n\n" + body
+
+
 def integerize_r_source(src: str) -> str:
     """Rewrite safe integer-context numeric literal assignments as R integer literals."""
     int_context_names: set[str] = set()
@@ -30632,6 +30948,7 @@ def transpile_r_to_fortran(
     obfuscate: bool = False,
     source_path: str | None = None,
     strict_r_numeric_literals: bool = False,
+    ignore_directives: bool = False,
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
@@ -30640,13 +30957,16 @@ def transpile_r_to_fortran(
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
-    global _NO_RECYCLE, _STRICT_R_NUMERIC_LITERALS, _MIXED_CHARACTER_COERCION_WARNINGS
+    global _NO_RECYCLE, _STRICT_R_NUMERIC_LITERALS, _IGNORE_XR2F_DIRECTIVES, _XR2F_FORCE_KIND, _XR2F_FORCE_RANK, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     global _CALL_COERCION_WARNINGS
     global _WARNING_SOURCE_TEXT, _CURRENT_WARNING_STMT_TEXT
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
     _STRICT_R_NUMERIC_LITERALS = bool(strict_r_numeric_literals)
+    _IGNORE_XR2F_DIRECTIVES = bool(ignore_directives)
+    _XR2F_FORCE_KIND, _XR2F_FORCE_RANK = parse_xr2f_directives(src, ignore=_IGNORE_XR2F_DIRECTIVES)
+    check_xr2f_directive_declare_conflicts(src, _XR2F_FORCE_KIND, _XR2F_FORCE_RANK)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
@@ -31774,6 +32094,7 @@ def transpile_r_to_fortran(
                 else "real"
             )
         _USER_FUNC_ARG_KIND[f.name.lower()] = kinds
+    _apply_directives_to_user_func_tables(funcs)
     for f_vec_ret in funcs:
         fn_l_vec_ret = f_vec_ret.name.lower()
         if _USER_FUNC_RETURN_KIND.get(fn_l_vec_ret) in {"int", "integer", "logical"}:
@@ -32673,6 +32994,7 @@ def transpile_r_to_fortran(
                 if re.search(r"(?:\+|-|\*|/|\^)", expr_vec_ret):
                     _USER_FUNC_RETURN_RANK[fn_l_vec_ret] = rank_vec_ret
                     break
+    _apply_directives_to_user_func_tables(funcs)
     rle_vars: dict[str, str] = {}
     for st_rle in main_stmts:
         if not isinstance(st_rle, Assign):
@@ -55288,8 +55610,14 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--integerize-r")
         if args.integerize_r:
             cmd.append(args.integerize_r)
+    if getattr(args, "write_directives", None) is not None:
+        cmd.append("--write-directives")
+        if args.write_directives:
+            cmd.append(args.write_directives)
     if getattr(args, "r_numeric_literals", False):
         cmd.append("--r-numeric-literals")
+    if getattr(args, "ignore_directives", False):
+        cmd.append("--ignore-directives")
     if args.if_const_aggressive:
         cmd.append("--if-const-aggressive")
     if args.no_format_print:
@@ -56183,12 +56511,24 @@ def main() -> int:
         help="write an R copy with safe integer-context numeric literal assignments rewritten with L suffixes; default: <input>_integerized.r",
     )
     ap.add_argument(
+        "--write-directives",
+        nargs="?",
+        const="",
+        metavar="OUT.r",
+        help="write a new R copy with suggested # xr2f: directive comments prepended; default: <input>_directed.r",
+    )
+    ap.add_argument(
         "--r-numeric-literals",
         action="store_true",
         help=(
             "treat bare R numeric literals such as 100 as double when they are not used in integer contexts; "
             "useful as a lint/strictness mode"
         ),
+    )
+    ap.add_argument(
+        "--ignore-directives",
+        action="store_true",
+        help="ignore # xr2f: directive comments in the R source",
     )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
@@ -56593,6 +56933,7 @@ def main() -> int:
     annotate_r_path: Path | None = None
     annotate_r_args_only = False
     integerize_r_path: Path | None = None
+    directives_r_path: Path | None = None
     if args.annotate_r is not None:
         if args.annotate_r:
             ann_cand = Path(args.annotate_r)
@@ -56621,6 +56962,15 @@ def main() -> int:
                 integerize_r_path = int_cand.resolve()
         else:
             integerize_r_path = (artifact_dir / f"{in_path.stem}_integerized.r").resolve()
+    if getattr(args, "write_directives", None) is not None:
+        if args.write_directives:
+            dir_cand = Path(args.write_directives)
+            if args.out_dir and not dir_cand.is_absolute():
+                directives_r_path = (Path(args.out_dir) / dir_cand).resolve()
+            else:
+                directives_r_path = dir_cand.resolve()
+        else:
+            directives_r_path = (artifact_dir / f"{in_path.stem}_directed.r").resolve()
     py_out_path: Path | None = None
     if args.via_python:
         if args.out_python:
@@ -56703,6 +57053,15 @@ def main() -> int:
 
     t0 = time.perf_counter()
     src = in_path.read_text(encoding="utf-8-sig")
+    if directives_r_path is not None:
+        try:
+            directed_src = write_directives_r_source(src, in_path.stem)
+        except NotImplementedError as e:
+            print(f"Write directives: FAIL ({e})")
+            return 1
+        directives_r_path.parent.mkdir(parents=True, exist_ok=True)
+        directives_r_path.write_text(directed_src, encoding="utf-8")
+        print(f"wrote {directives_r_path}")
     if integerize_r_path is not None:
         try:
             src = integerize_r_source(src)
@@ -57005,6 +57364,7 @@ def main() -> int:
                 obfuscate=(args.obfuscate and not source_already_obfuscated),
                 source_path=str(out_path.resolve()),
                 strict_r_numeric_literals=args.r_numeric_literals,
+                ignore_directives=args.ignore_directives,
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
