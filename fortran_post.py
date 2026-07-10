@@ -43,7 +43,7 @@ def collapse_single_stmt_if_blocks(lines: List[str]) -> List[str]:
 
 
 def ensure_blank_line_between_module_procedures(lines: List[str]) -> List[str]:
-    """Ensure at least one blank line between consecutive module procedures."""
+    """Ensure exactly one blank line around procedures in module CONTAINS blocks."""
     out: List[str] = []
     module_start_re = re.compile(r"^\s*module\b(?!\s+procedure\b)", re.IGNORECASE)
     module_end_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
@@ -64,7 +64,9 @@ def ensure_blank_line_between_module_procedures(lines: List[str]) -> List[str]:
     def _is_blank(ln: str) -> bool:
         return not ln.strip()
 
-    for i, ln in enumerate(lines):
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
         code = _code_only(ln)
         low = code.lower()
 
@@ -77,29 +79,26 @@ def ensure_blank_line_between_module_procedures(lines: List[str]) -> List[str]:
             in_module = False
             in_contains = False
 
+        if in_module and in_contains and proc_hdr_re.match(code):
+            while out and _is_blank(out[-1]):
+                out.pop()
+            if out:
+                out.append(blank_line)
+
         out.append(ln)
 
-        if not (in_module and in_contains and proc_end_re.match(code)):
+        if in_module and in_contains and proc_end_re.match(code):
+            j = i + 1
+            while j < len(lines) and _is_blank(lines[j]):
+                j += 1
+            if j < len(lines):
+                next_code = _code_only(lines[j])
+                if proc_hdr_re.match(next_code) or module_end_re.match(next_code):
+                    out.append(blank_line)
+            i = j
             continue
 
-        # Check whether the next procedure header appears without any blank
-        # separating lines (comments-only lines do not count as blank).
-        j = i + 1
-        saw_blank = False
-        while j < len(lines):
-            code_j = _code_only(lines[j])
-            if _is_blank(lines[j]):
-                saw_blank = True
-                j += 1
-                continue
-            if not code_j:
-                j += 1
-                continue
-            break
-        if j < len(lines):
-            code_j = _code_only(lines[j])
-            if proc_hdr_re.match(code_j) and not saw_blank:
-                out.append(blank_line)
+        i += 1
 
     return out
 

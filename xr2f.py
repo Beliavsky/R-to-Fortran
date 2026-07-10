@@ -58310,6 +58310,9 @@ def main() -> int:
     f90 = repair_complex_intrinsic_real_wrappers_text(f90)
     f90 = remove_pure_from_impure_call_graph_text(f90)
     f90 = rewrite_scalar_where_assignments_text(f90)
+    f90_lines = fpost.ensure_blank_line_between_module_procedures(f90.splitlines())
+    f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
+    f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     f90 = validate_no_expression_component_refs_text(f90)
     final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
