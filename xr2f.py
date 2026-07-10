@@ -43716,21 +43716,322 @@ def demote_smoother_prediction_point_decls_text(f90: str) -> str:
 
 def rewrite_integrate_value_function_refs_text(f90: str) -> str:
     """Fortran cannot select %value directly from integrate(...) function refs."""
+    known_calls: dict[str, dict[str, str]] = {
+        "integrate": {"value": "integrate_result_t"},
+        "file_info": {
+            "size": "file_info_t",
+            "isdir": "file_info_t",
+            "mode": "file_info_t",
+            "mtime": "file_info_t",
+            "ctime": "file_info_t",
+            "atime": "file_info_t",
+        },
+    }
+
+    def split_comment(line: str) -> tuple[str, str]:
+        quote: str | None = None
+        esc = False
+        for i, ch in enumerate(line):
+            if quote is not None:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                continue
+            if ch == "!":
+                return line[:i].rstrip(), line[i:]
+        return line.rstrip(), ""
+
+    def flatten_continued_statement(lines: list[str], start: int) -> tuple[str, int, str]:
+        first = lines[start]
+        indent = re.match(r"^(\s*)", first).group(1)
+        chunks: list[str] = []
+        i = start
+        while i < len(lines):
+            part, _comment = split_comment(lines[i])
+            stripped = part.rstrip()
+            continued = stripped.endswith("&")
+            if continued:
+                stripped = stripped[:-1].rstrip()
+            if i != start:
+                stripped = re.sub(r"^\s*&\s*", "", stripped)
+            chunks.append(stripped.strip() if i != start else stripped.strip())
+            i += 1
+            if not continued:
+                break
+        return " ".join(ch for ch in chunks if ch), i, indent
+
+    def matching_close(src: str, open_i: int) -> int:
+        depth = 0
+        quote: str | None = None
+        esc = False
+        for i in range(open_i, len(src)):
+            ch = src[i]
+            if quote is not None:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    def lower_known_component_calls(rhs: str) -> tuple[str, list[tuple[str, str, str]]]:
+        out: list[str] = []
+        temps: list[tuple[str, str, str]] = []
+        i = 0
+        tmp_index = 1
+        while i < len(rhs):
+            m = re.match(r"[A-Za-z]\w*", rhs[i:])
+            if m is None:
+                out.append(rhs[i])
+                i += 1
+                continue
+            name = m.group(0)
+            call_start = i + len(name)
+            j = call_start
+            while j < len(rhs) and rhs[j].isspace():
+                j += 1
+            if j >= len(rhs) or rhs[j] != "(" or name.lower() not in known_calls:
+                out.append(name)
+                i = call_start
+                continue
+            close_i = matching_close(rhs, j)
+            if close_i < 0:
+                out.append(name)
+                i = call_start
+                continue
+            k = close_i + 1
+            while k < len(rhs) and rhs[k].isspace():
+                k += 1
+            if k >= len(rhs) or rhs[k] != "%":
+                out.append(rhs[i : close_i + 1])
+                i = close_i + 1
+                continue
+            field_start = k + 1
+            field_m = re.match(r"[A-Za-z]\w*", rhs[field_start:])
+            if field_m is None:
+                out.append(rhs[i : close_i + 1])
+                i = close_i + 1
+                continue
+            field = field_m.group(0)
+            type_name = known_calls[name.lower()].get(field.lower())
+            if type_name is None:
+                out.append(rhs[i : field_start + len(field)])
+                i = field_start + len(field)
+                continue
+            tmp_name = f"xr2f_{name.lower()}_{field.lower()}_tmp"
+            if any(tmp_name == t[0] for t in temps):
+                tmp_index += 1
+                tmp_name = f"xr2f_{name.lower()}_{field.lower()}_tmp_{tmp_index}"
+            call_expr = rhs[i : close_i + 1].strip()
+            temps.append((tmp_name, type_name, call_expr))
+            out.append(f"{tmp_name}%{field}")
+            i = field_start + len(field)
+        return "".join(out), temps
+
     lines = f90.splitlines()
     out: list[str] = []
-    pat = re.compile(r"^(\s*)(.+?)\s*=\s*(integrate\s*\(.+\))\s*%\s*value\s*(\s*!.*)?$", re.IGNORECASE)
-    for ln in lines:
-        m = pat.match(ln)
-        if m is None:
-            out.append(ln)
+    i = 0
+    while i < len(lines):
+        flat, next_i, indent = flatten_continued_statement(lines, i)
+        if next_i == i + 1:
+            code, comment = split_comment(lines[i])
+        else:
+            code, comment = flat, ""
+        m = re.match(r"^\s*(.+?)\s*=\s*(.+?)\s*$", code, re.IGNORECASE)
+        if m is None or not any(f"{name}(" in code.lower() for name in known_calls):
+            out.extend(lines[i:next_i])
+            i = next_i
             continue
-        indent, lhs, call_expr, comment = m.group(1), m.group(2).rstrip(), m.group(3).strip(), m.group(4) or ""
+        lhs, rhs = m.group(1).rstrip(), m.group(2).strip()
+        rhs_new, temps = lower_known_component_calls(rhs)
+        if not temps:
+            out.extend(lines[i:next_i])
+            i = next_i
+            continue
         inner = indent + "   "
         out.append(f"{indent}block")
-        out.append(f"{inner}type(integrate_result_t) :: integrate_value_tmp")
-        out.append(f"{inner}integrate_value_tmp = {call_expr}")
-        out.append(f"{inner}{lhs} = integrate_value_tmp%value{comment}")
+        for tmp_name, type_name, _call_expr in temps:
+            out.append(f"{inner}type({type_name}) :: {tmp_name}")
+        for tmp_name, _type_name, call_expr in temps:
+            out.append(f"{inner}{tmp_name} = {call_expr}")
+        out.append(f"{inner}{lhs} = {rhs_new}{(' ' + comment) if comment else ''}")
         out.append(f"{indent}end block")
+        i = next_i
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def validate_no_expression_component_refs_text(f90: str) -> str:
+    """Fail early if generated Fortran still contains expression%field."""
+    def matching_open(src: str, close_i: int) -> int:
+        depth = 0
+        quote: str | None = None
+        esc = False
+        for i in range(close_i, -1, -1):
+            ch = src[i]
+            if quote is not None:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                continue
+            if ch == ")":
+                depth += 1
+            elif ch == "(":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    def previous_nonspace(src: str, idx: int) -> str:
+        j = idx - 1
+        while j >= 0 and src[j].isspace():
+            j -= 1
+        return src[j] if j >= 0 else ""
+
+    logical_lines: list[tuple[int, str]] = []
+    lines = f90.splitlines()
+    i = 0
+    while i < len(lines):
+        start = i + 1
+        chunks: list[str] = []
+        while i < len(lines):
+            part = re.sub(r"!.*$", "", lines[i]).rstrip()
+            continued = part.endswith("&")
+            if continued:
+                part = part[:-1].rstrip()
+            if chunks:
+                part = re.sub(r"^\s*&\s*", "", part)
+            chunks.append(part.strip())
+            i += 1
+            if not continued:
+                break
+        logical_lines.append((start, " ".join(ch for ch in chunks if ch)))
+    for line_no, line in logical_lines:
+        for m in re.finditer(r"\)\s*%\s*([A-Za-z]\w*)", line):
+            close_i = m.start()
+            open_i = matching_open(line, close_i)
+            if open_i < 0:
+                continue
+            prev = previous_nonspace(line, open_i)
+            if prev.isalnum() or prev == "_":
+                continue
+            raise NotImplementedError(
+                "generated invalid Fortran component selection from an expression "
+                f"near output line {line_no}: {line.strip()}"
+            )
+    return f90
+
+
+def remove_pure_from_impure_call_graph_text(f90: str) -> str:
+    """Remove PURE from functions that call integrate() directly or transitively."""
+    if "pure function" not in f90.lower() or "integrate(" not in f90.lower():
+        return f90
+    lines = f90.splitlines()
+    func_pat = re.compile(
+        r"^(\s*)((?:(?:pure|elemental|recursive)\s+)*)function\s+([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    funcs: dict[str, dict[str, object]] = {}
+    i = 0
+    while i < len(lines):
+        m = func_pat.match(lines[i])
+        if m is None:
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), i)
+        block = "\n".join(lines[i : end + 1])
+        funcs[m.group(3).lower()] = {"start": i, "block": block}
+        i = end + 1
+    if not funcs:
+        return f90
+    impure = {
+        name
+        for name, info in funcs.items()
+        if re.search(r"\bintegrate\s*\(", str(info["block"]), re.IGNORECASE)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, info in funcs.items():
+            if name in impure:
+                continue
+            block_l = str(info["block"]).lower()
+            if any(re.search(rf"\b{re.escape(callee)}\s*\(", block_l) for callee in impure):
+                impure.add(name)
+                changed = True
+    if not impure:
+        return f90
+    changed_lines = False
+    for name in impure:
+        start = int(funcs[name]["start"])
+        if re.search(r"\bpure\b", lines[start], re.IGNORECASE):
+            lines[start] = re.sub(r"\bpure\s+", "", lines[start], count=1, flags=re.IGNORECASE)
+            changed_lines = True
+    if not changed_lines:
+        return f90
+    return "\n".join(lines) + ("\n" if f90.endswith("\n") else "")
+
+
+def rewrite_scalar_where_assignments_text(f90: str) -> str:
+    """Rewrite single-line WHERE assignments when the target is scalar."""
+    if "where (" not in f90.lower():
+        return f90
+    scalar_names: set[str] = set()
+    array_names: set[str] = set()
+    decl_pat = re.compile(
+        r"^\s*(?:real\s*\([^)]*\)|integer|logical|complex\s*\([^)]*\))\s*(?:,\s*[^:]*)?::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    for line in f90.splitlines():
+        m_decl = decl_pat.match(line)
+        if m_decl is None:
+            continue
+        for part in split_top_level_commas(m_decl.group(1)):
+            part_s = part.strip()
+            nm_m = re.match(r"([A-Za-z]\w*)", part_s)
+            if nm_m is None:
+                continue
+            nm = nm_m.group(1)
+            if "(" in part_s or "allocatable" in line.lower():
+                array_names.add(nm.lower())
+            else:
+                scalar_names.add(nm.lower())
+    if not scalar_names:
+        return f90
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_where = re.match(r"^(\s*)where\s*\((.*)\)\s*([A-Za-z]\w*)\s*=\s*(.+)$", line, re.IGNORECASE)
+        if m_where is None:
+            out.append(line)
+            continue
+        target_l = m_where.group(3).lower()
+        if target_l in scalar_names and target_l not in array_names:
+            out.append(f"{m_where.group(1)}if ({m_where.group(2)}) {m_where.group(3)} = {m_where.group(4)}")
+        else:
+            out.append(line)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
@@ -43832,6 +44133,7 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
         end = next((j for j in range(i + 1, end_mod_idx) if end_pat.match(lines[j])), i)
         args = [a.strip() for a in split_top_level_commas(m.group(4)) if a.strip()]
         decls: dict[str, str] = {}
+        ranks: dict[str, int] = {}
         for ln in lines[i + 1 : end]:
             m_decl = re.match(
                 r"^\s*((?:real|complex)\(kind=dp\)|integer|logical)(?:\s*,[^:]*)?::\s*(.+)$",
@@ -43842,9 +44144,12 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
                 continue
             dtype = m_decl.group(1)
             for part in split_top_level_commas(m_decl.group(2)):
-                nm = re.sub(r"\(.*\)", "", part.strip()).strip()
+                part_s = part.strip()
+                nm = re.sub(r"\(.*\)", "", part_s).strip()
                 if re.fullmatch(r"[A-Za-z]\w*", nm):
                     decls[nm.lower()] = dtype
+                    dims_m = re.search(r"\((.*)\)", part_s)
+                    ranks[nm.lower()] = dims_m.group(1).count(":") if dims_m is not None else 0
         funcs[m.group(3).lower()] = {
             "name": m.group(3),
             "result": m.group(5),
@@ -43852,6 +44157,7 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
             "end": end,
             "args": args,
             "decls": decls,
+            "ranks": ranks,
         }
         i = end + 1
 
@@ -43907,7 +44213,37 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
                 continue
             helper_name = str(helper["name"])
             helper_args = list(helper["args"])  # type: ignore[arg-type]
+            helper_ranks = dict(helper.get("ranks", {}))
+            helper_result = str(helper.get("result", "")).lower()
+            vectorized_helper = (
+                bool(helper_args)
+                and int(helper_ranks.get(str(helper_args[0]).lower(), 0)) == 1
+                and int(helper_ranks.get(helper_result, 0)) == 1
+            )
             if len(helper_args) <= 1:
+                if vectorized_helper:
+                    wrapper = _integrate_closure_wrapper_name(helper_name, [])
+                    lines[j] = re.sub(
+                        rf"\bintegrate\s*\(\s*{re.escape(short_name)}\s*,",
+                        f"integrate({wrapper},",
+                        lines[j],
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                    wrappers.extend(
+                        [
+                            f"function {wrapper}(u) result({wrapper}_result)",
+                            "real(kind=dp), intent(in) :: u",
+                            f"real(kind=dp) :: {wrapper}_result",
+                            f"real(kind=dp), allocatable :: {wrapper}_values(:)",
+                            f"{wrapper}_values = {helper_name}([u])",
+                            f"{wrapper}_result = {wrapper}_values(1)",
+                            f"end function {wrapper}",
+                            "",
+                        ]
+                    )
+                    changed = True
+                    continue
                 lines[j] = re.sub(
                     rf"\bintegrate\s*\(\s*{re.escape(short_name)}\s*,",
                     f"integrate({helper_name},",
@@ -43959,7 +44295,15 @@ def repair_lifted_integrate_closure_refs_text(f90: str) -> str:
                     f"function {wrapper}(u) result({wrapper}_result)",
                     "real(kind=dp), intent(in) :: u",
                     f"real(kind=dp) :: {wrapper}_result",
-                    f"{wrapper}_result = {helper_name}({', '.join(actuals)})",
+                    *(
+                        [
+                            f"real(kind=dp), allocatable :: {wrapper}_values(:)",
+                            f"{wrapper}_values = {helper_name}({', '.join(['[u]'] + actuals[1:])})",
+                            f"{wrapper}_result = {wrapper}_values(1)",
+                        ]
+                        if vectorized_helper
+                        else [f"{wrapper}_result = {helper_name}({', '.join(actuals)})"]
+                    ),
                     f"end function {wrapper}",
                     "",
                 ]
@@ -48178,6 +48522,43 @@ def promote_logical_comparison_result_decls_text(f90: str) -> str:
             out.append(f"{m_decl.group(1)}logical, allocatable :: " + ", ".join(logical_parts))
             if real_parts:
                 out.append(f"{m_decl.group(1)}real(kind=dp), allocatable :: " + ", ".join(real_parts))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_logical_mask_assignment_decls_text(f90: str) -> str:
+    """Promote logical masks assigned from vectorized finite/NA predicates."""
+    normalized = re.sub(r"&\s*\n\s*&\s*", " ", f90)
+    names = {
+        m.group(1)
+        for m in re.finditer(
+            r"(?im)^\s*([A-Za-z]\w*)\s*=\s*(?:\(\s*)?(?:\.not\.\s*)?(?:ieee_is_finite|is_na)\s*\(",
+            normalized,
+        )
+    }
+    if not names:
+        return f90
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_decl = re.match(r"^(\s*)logical\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None:
+            out.append(line)
+            continue
+        scalar_parts: list[str] = []
+        mask_parts: list[str] = []
+        for part in split_top_level_commas(m_decl.group(2)):
+            part_s = part.strip()
+            base = re.sub(r"\s*=.*$", "", part_s).strip()
+            base = re.sub(r"\s*\(.*\)\s*$", "", base).strip()
+            if base in names:
+                mask_parts.append(f"{base}(:)")
+            elif part_s:
+                scalar_parts.append(part_s)
+        if mask_parts:
+            out.append(f"{m_decl.group(1)}logical, allocatable :: " + ", ".join(mask_parts))
+            if scalar_parts:
+                out.append(f"{m_decl.group(1)}logical :: " + ", ".join(scalar_parts))
         else:
             out.append(line)
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
@@ -55274,6 +55655,232 @@ def _collect_report_fortran_procedures(f90: str) -> list[dict[str, object]]:
     return out
 
 
+def _collect_report_fortran_procedure_blocks(f90: str) -> dict[str, dict[str, object]]:
+    lines = f90.splitlines()
+    start_pat = re.compile(
+        r"^\s*((?:(?:pure|elemental|recursive)\s+)*)((?:subroutine|function))\s+([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    end_pat = re.compile(r"^\s*end\s+(?:subroutine|function)\b", re.IGNORECASE)
+    out: dict[str, dict[str, object]] = {}
+    i = 0
+    while i < len(lines):
+        m = start_pat.match(lines[i])
+        if m is None:
+            i += 1
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), i)
+        qualifiers = sorted({q.lower() for q in m.group(1).split()})
+        name = m.group(3)
+        out[name.lower()] = {
+            "name": name,
+            "kind": m.group(2).lower(),
+            "qualifiers": qualifiers,
+            "start_line": i + 1,
+            "end_line": end + 1,
+            "body": "\n".join(lines[i : end + 1]),
+        }
+        i = end + 1
+    return out
+
+
+def _decl_rank_from_part(part: str) -> int:
+    m = re.search(r"\((.*)\)", part)
+    if m is None:
+        return 0
+    return m.group(1).count(":")
+
+
+def _collect_report_variable_declarations(f90: str) -> dict[str, list[dict[str, object]]]:
+    blocks = _collect_report_fortran_procedure_blocks(f90)
+    lines = f90.splitlines()
+    proc_ranges = [
+        (int(info["start_line"]), int(info["end_line"]))
+        for info in blocks.values()
+    ]
+
+    def scope_at(line_no: int) -> str:
+        for info in blocks.values():
+            if int(info["start_line"]) <= line_no <= int(info["end_line"]):
+                return str(info["name"])
+        return "module_or_program"
+
+    decl_pat = re.compile(
+        r"^\s*((?:type\s*\(\s*([A-Za-z]\w*)\s*\))|(?:real\s*\([^)]*\))|integer|logical|complex\s*\([^)]*\)|character\s*\([^)]*\))\s*(,[^:]*)?::\s*(.+)$",
+        re.IGNORECASE,
+    )
+    out: dict[str, list[dict[str, object]]] = {}
+    for i, line in enumerate(lines, start=1):
+        m = decl_pat.match(line)
+        if m is None:
+            continue
+        base = re.sub(r"\s+", " ", m.group(1).strip())
+        derived_type = m.group(2)
+        attrs = [a.strip().lower() for a in (m.group(3) or "").split(",") if a.strip()]
+        scope = scope_at(i)
+        for part in split_top_level_commas(m.group(4)):
+            part_s = part.strip()
+            nm_m = re.match(r"([A-Za-z]\w*)", part_s)
+            if nm_m is None:
+                continue
+            out.setdefault(scope, []).append(
+                {
+                    "name": nm_m.group(1),
+                    "base_type": base,
+                    "derived_type": derived_type,
+                    "rank": _decl_rank_from_part(part_s),
+                    "attrs": attrs,
+                    "line": i,
+                }
+            )
+    return out
+
+
+def _collect_report_call_graph(f90: str) -> list[dict[str, object]]:
+    blocks = _collect_report_fortran_procedure_blocks(f90)
+    names = {str(info["name"]).lower(): str(info["name"]) for info in blocks.values()}
+    out: list[dict[str, object]] = []
+    for key, info in sorted(blocks.items(), key=lambda kv: str(kv[1]["name"]).lower()):
+        body = str(info["body"])
+        callees: set[str] = set()
+        for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(", body):
+            callee_l = m.group(1).lower()
+            if callee_l == key:
+                continue
+            if callee_l in names:
+                callees.add(names[callee_l])
+        out.append(
+            {
+                "name": info["name"],
+                "kind": info["kind"],
+                "qualifiers": info["qualifiers"],
+                "fortran_line": info["start_line"],
+                "calls": sorted(callees, key=str.lower),
+            }
+        )
+    return out
+
+
+def _collect_report_r_constructs(src: str) -> list[dict[str, object]]:
+    constructs: list[dict[str, object]] = []
+    patterns: list[tuple[str, str, str]] = [
+        ("closure", r"\bfunction\s*\(", "Nested or anonymous functions may require lifted helpers and captured state."),
+        ("integrate", r"\bintegrate\s*\(", "Numerical integration uses r.f90 integrate approximation and may need tolerance checks."),
+        ("optim", r"\boptim\s*\(", "Optimization uses runtime approximations; compare convergence/value fields."),
+        ("data_frame", r"\bdata\.frame\s*\(", "Data frames may be expanded into columns or derived types."),
+        ("list", r"\blist\s*\(", "R lists may become derived types with fixed fields."),
+        ("apply", r"\b(?:apply|lapply|sapply|mapply)\s*\(", "Apply-family calls may be lowered to loops/helpers."),
+        ("drop_false", r"drop\s*=\s*FALSE", "drop=FALSE affects rank preservation."),
+        ("dollar_access", r"\$[A-Za-z.]\w*", "R field access becomes Fortran derived-type component access."),
+        ("recycling", r"\b(?:rep|rep\.int)\s*\(", "Vector recycling/repetition should be checked against R semantics."),
+    ]
+    for line_no, line in enumerate(src.splitlines(), start=1):
+        for name, pat, reason in patterns:
+            if re.search(pat, line, re.IGNORECASE):
+                constructs.append({"line": line_no, "kind": name, "text": line.strip(), "note": reason})
+    return constructs
+
+
+def _collect_report_risk_notes(
+    *,
+    src: str,
+    f90: str,
+    approximations: list[dict[str, object]],
+    r_mod_imports: list[str],
+    generated_helpers: list[str],
+) -> list[dict[str, object]]:
+    notes: list[dict[str, object]] = []
+    if approximations:
+        notes.append(
+            {
+                "severity": "medium",
+                "kind": "approximation",
+                "message": f"{len(approximations)} approximate R call(s) detected; inspect approximations for numerical drift.",
+            }
+        )
+    if "integrate" in {x.lower() for x in r_mod_imports}:
+        notes.append(
+            {
+                "severity": "medium",
+                "kind": "integrate",
+                "message": "Uses r.f90 integrate(); verify improper bounds, subdivisions, rel.tol, and vectorized callback behavior.",
+            }
+        )
+    if any("xr2f_integrate_closure" in h.lower() or "_xric_" in h.lower() for h in generated_helpers):
+        notes.append(
+            {
+                "severity": "medium",
+                "kind": "lifted_closure",
+                "message": "Generated lifted integrate closures; verify captured variables and callback scalar/vector ranks.",
+            }
+        )
+    if re.search(r"\boptim_(?:bfgs|lbfgsb|cg|sann|nelder_mead)\s*\(", f90, re.IGNORECASE):
+        notes.append(
+            {
+                "severity": "medium",
+                "kind": "optim",
+                "message": "Uses runtime optim helper; compare par/value/convergence/counts with R.",
+            }
+        )
+    if re.search(r"\bwhere\s*\(", f90, re.IGNORECASE):
+        notes.append(
+            {
+                "severity": "low",
+                "kind": "vector_mask",
+                "message": "Generated WHERE masks; verify scalar versus vector mask semantics.",
+            }
+        )
+    if re.search(r"\btype\s*::", f90, re.IGNORECASE):
+        notes.append(
+            {
+                "severity": "low",
+                "kind": "derived_types",
+                "message": "Generated derived types; field ranks and component names are available in variable_declarations/derived_types.",
+            }
+        )
+    if re.search(r"\$[A-Za-z.]\w*", src):
+        notes.append(
+            {
+                "severity": "low",
+                "kind": "field_access",
+                "message": "R `$` field access was present; check generated `%` component accesses and list/data-frame layouts.",
+            }
+        )
+    return notes
+
+
+def _build_llm_handoff(
+    *,
+    src: str,
+    f90: str,
+    approximations: list[dict[str, object]],
+    generated_helpers: list[str],
+    r_mod_imports: list[str],
+) -> dict[str, object]:
+    call_graph = _collect_report_call_graph(f90)
+    variable_declarations = _collect_report_variable_declarations(f90)
+    return {
+        "purpose": "Context for an LLM or human to audit, repair, or complete the generated Fortran translation.",
+        "r_constructs": _collect_report_r_constructs(src),
+        "call_graph": call_graph,
+        "variable_declarations": variable_declarations,
+        "risk_notes": _collect_report_risk_notes(
+            src=src,
+            f90=f90,
+            approximations=approximations,
+            r_mod_imports=r_mod_imports,
+            generated_helpers=generated_helpers,
+        ),
+        "suggested_checks": [
+            "Compile generated Fortran with the target compiler and warnings enabled.",
+            "Run R and Fortran side by side on deterministic inputs.",
+            "Compare printed outputs with rounding only after inspecting raw differences.",
+            "For numerical helpers such as integrate(), optim(), besselK(), and smoothers, verify tolerances against R.",
+            "Inspect variable_declarations for rank/kind mismatches at failing compiler lines.",
+        ],
+    }
+
+
 def _build_translation_report(
     *,
     src: str,
@@ -55289,8 +55896,10 @@ def _build_translation_report(
         {"line": line_no, **dict(meta)}
         for line_no, meta in _find_approximate_r_function_calls(src)
     ]
+    generated_helpers = _collect_report_generated_helpers(f90)
+    r_mod_imports = _collect_report_r_mod_imports(f90)
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "command": sys.argv,
         "source": str(in_path.resolve()),
@@ -55314,10 +55923,17 @@ def _build_translation_report(
         "timings": {k: round(float(v), 6) for k, v in timings.items()},
         "functions": _collect_report_functions(src),
         "approximations": approximations,
-        "generated_helpers": _collect_report_generated_helpers(f90),
+        "generated_helpers": generated_helpers,
         "derived_types": _collect_report_derived_types(f90),
-        "r_mod_imports": _collect_report_r_mod_imports(f90),
+        "r_mod_imports": r_mod_imports,
         "fortran_procedures": _collect_report_fortran_procedures(f90),
+        "llm_handoff": _build_llm_handoff(
+            src=src,
+            f90=f90,
+            approximations=approximations,
+            generated_helpers=generated_helpers,
+            r_mod_imports=r_mod_imports,
+        ),
         "build": build_info or {},
         "run": run_info or {},
     }
@@ -55373,6 +55989,55 @@ def _render_translation_report_markdown(report: dict[str, object]) -> str:
     for item in approximations:
         if isinstance(item, dict):
             lines.append(f"- line `{item.get('line')}` `{item.get('name')}` ({item.get('category')}): {item.get('reason')}")
+    handoff = report.get("llm_handoff") if isinstance(report.get("llm_handoff"), dict) else {}
+    risk_notes = handoff.get("risk_notes") if isinstance(handoff.get("risk_notes"), list) else []
+    lines.append("")
+    lines.append("## LLM Handoff Risk Notes")
+    if not risk_notes:
+        lines.append("- none")
+    for note in risk_notes:
+        if isinstance(note, dict):
+            lines.append(f"- `{note.get('severity')}` `{note.get('kind')}`: {note.get('message')}")
+    r_constructs = handoff.get("r_constructs") if isinstance(handoff.get("r_constructs"), list) else []
+    lines.append("")
+    lines.append("## R Constructs")
+    if not r_constructs:
+        lines.append("- none detected")
+    for item in r_constructs[:80]:
+        if isinstance(item, dict):
+            lines.append(f"- line `{item.get('line')}` `{item.get('kind')}`: `{item.get('text')}`")
+    if len(r_constructs) > 80:
+        lines.append(f"- ... {len(r_constructs) - 80} more")
+    call_graph = handoff.get("call_graph") if isinstance(handoff.get("call_graph"), list) else []
+    lines.append("")
+    lines.append("## Call Graph")
+    if not call_graph:
+        lines.append("- none detected")
+    for item in call_graph[:120]:
+        if isinstance(item, dict):
+            calls = item.get("calls") if isinstance(item.get("calls"), list) else []
+            calls_txt = ", ".join(f"`{c}`" for c in calls) if calls else "none"
+            quals = item.get("qualifiers") if isinstance(item.get("qualifiers"), list) else []
+            qual_txt = " ".join(str(q) for q in quals)
+            lines.append(f"- `{item.get('name')}` {qual_txt} calls: {calls_txt}")
+    if len(call_graph) > 120:
+        lines.append(f"- ... {len(call_graph) - 120} more")
+    variable_decls = handoff.get("variable_declarations") if isinstance(handoff.get("variable_declarations"), dict) else {}
+    lines.append("")
+    lines.append("## Variable Declarations")
+    if not variable_decls:
+        lines.append("- none detected")
+    for scope, decls in list(variable_decls.items())[:60]:
+        if not isinstance(decls, list):
+            continue
+        lines.append(f"- `{scope}`: {len(decls)} declaration(s)")
+        for decl in decls[:20]:
+            if isinstance(decl, dict):
+                lines.append(
+                    f"  - `{decl.get('name')}` `{decl.get('base_type')}` rank `{decl.get('rank')}` line `{decl.get('line')}`"
+                )
+        if len(decls) > 20:
+            lines.append(f"  - ... {len(decls) - 20} more")
     for title, key in (
         ("Generated Helpers", "generated_helpers"),
         ("Derived Types", "derived_types"),
@@ -57121,6 +57786,7 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, set(extra_use_names))
     f90 = promote_logical_pack_result_decls_text(f90)
     f90 = promote_logical_comparison_result_decls_text(f90)
+    f90 = promote_logical_mask_assignment_decls_text(f90)
     f90 = promote_integer_sequence_result_decls_text(f90)
     f90 = promote_integer_index_result_decls_text(f90)
     f90 = promote_vectorized_assignment_result_decls_text(f90)
@@ -57642,6 +58308,9 @@ def main() -> int:
     f90 = repair_complex_integrate_closure_captures_text(f90)
     f90 = repair_complex_dummy_real_rewraps_text(f90)
     f90 = repair_complex_intrinsic_real_wrappers_text(f90)
+    f90 = remove_pure_from_impure_call_graph_text(f90)
+    f90 = rewrite_scalar_where_assignments_text(f90)
+    f90 = validate_no_expression_component_refs_text(f90)
     final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
