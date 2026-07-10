@@ -9102,24 +9102,100 @@ if (abs(sin(acos(-1.0_dp) * nuf)) < 1.0e-8_dp) nuf = nuf + eps
 out = (besselJ_core(x, nuf) * cos(acos(-1.0_dp) * nuf) - besselJ_core(x, -nuf)) / sin(acos(-1.0_dp) * nuf)
 end function besselY_core
 
+pure function besselK0_core(x, scaled) result(out)
+! Approximate K_0(x), optionally returning exp(x) * K_0(x).
+real(kind=dp), intent(in) :: x
+logical, intent(in) :: scaled
+real(kind=dp) :: out, y, poly
+if (x <= 0.0_dp) then
+   out = huge(1.0_dp)
+   return
+end if
+if (x <= 2.0_dp) then
+   y = 0.25_dp * x * x
+   poly = -0.57721566_dp + y * (0.42278420_dp + y * (0.23069756_dp + y * (0.03488590_dp + &
+      y * (0.00262698_dp + y * (0.00010750_dp + y * 0.00000740_dp)))))
+   out = -log(0.5_dp * x) * besselI_core(x, 0.0_dp, .false.) + poly
+   if (scaled) out = out * exp(x)
+else
+   y = 2.0_dp / x
+   poly = 1.25331414_dp + y * (-0.07832358_dp + y * (0.02189568_dp + y * (-0.01062446_dp + &
+      y * (0.00587872_dp + y * (-0.00251540_dp + y * 0.00053208_dp)))))
+   out = poly / sqrt(x)
+   if (.not. scaled) out = out * exp(-x)
+end if
+end function besselK0_core
+
+pure function besselK1_core(x, scaled) result(out)
+! Approximate K_1(x), optionally returning exp(x) * K_1(x).
+real(kind=dp), intent(in) :: x
+logical, intent(in) :: scaled
+real(kind=dp) :: out, y, poly
+if (x <= 0.0_dp) then
+   out = huge(1.0_dp)
+   return
+end if
+if (x <= 2.0_dp) then
+   y = 0.25_dp * x * x
+   poly = 1.0_dp + y * (0.15443144_dp + y * (-0.67278579_dp + y * (-0.18156897_dp + &
+      y * (-0.01919402_dp + y * (-0.00110404_dp + y * (-0.00004686_dp))))))
+   out = log(0.5_dp * x) * besselI_core(x, 1.0_dp, .false.) + poly / x
+   if (scaled) out = out * exp(x)
+else
+   y = 2.0_dp / x
+   poly = 1.25331414_dp + y * (0.23498619_dp + y * (-0.03655620_dp + y * (0.01504268_dp + &
+      y * (-0.00780353_dp + y * (0.00325614_dp + y * (-0.00068245_dp))))))
+   out = poly / sqrt(x)
+   if (.not. scaled) out = out * exp(-x)
+end if
+end function besselK1_core
+
 pure function besselK_core(x, nu, scaled) result(out)
 ! Evaluate the besselK core Bessel helper.
 real(kind=dp), intent(in) :: x ! input values
 real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in) :: scaled
-real(kind=dp) :: out, nuf, s
+real(kind=dp) :: out, nuf, s, km1, kcur, kp1
+integer :: i, n
 if (x <= 0.0_dp) then
    out = huge(1.0_dp)
    return
 end if
 nuf = abs(nu)
+if (abs(nuf - real(nint(nuf), kind=dp)) <= 100.0_dp * epsilon(1.0_dp)) then
+   n = nint(nuf)
+   select case (n)
+   case (0)
+      out = besselK0_core(x, scaled)
+      return
+   case (1)
+      out = besselK1_core(x, scaled)
+      return
+   case default
+      km1 = besselK0_core(x, scaled)
+      kcur = besselK1_core(x, scaled)
+      do i = 1, n - 1
+         kp1 = km1 + (2.0_dp * real(i, kind=dp) / x) * kcur
+         km1 = kcur
+         kcur = kp1
+      end do
+      out = kcur
+      return
+   end select
+end if
+if (abs(nuf - 0.5_dp) <= 100.0_dp * epsilon(1.0_dp)) then
+   out = sqrt(0.5_dp * acos(-1.0_dp) / x)
+   if (.not. scaled) out = out * exp(-x)
+   return
+end if
 if (abs(sin(acos(-1.0_dp) * nuf)) > 1.0e-7_dp .and. x <= 20.0_dp) then
    out = 0.5_dp * acos(-1.0_dp) * (besselI_core(x, -nuf, .false.) - besselI_core(x, nuf, .false.)) / sin(acos(-1.0_dp) * nuf)
 else
    s = sqrt(0.5_dp * acos(-1.0_dp) / x)
-   out = s * exp(-x) * (1.0_dp + (4.0_dp * nuf * nuf - 1.0_dp) / (8.0_dp * max(x, 1.0e-6_dp)))
+   out = s * (1.0_dp + (4.0_dp * nuf * nuf - 1.0_dp) / (8.0_dp * max(x, 1.0e-6_dp)))
+   if (.not. scaled) out = out * exp(-x)
 end if
-if (scaled) out = out * exp(x)
+if (scaled .and. abs(sin(acos(-1.0_dp) * nuf)) > 1.0e-7_dp .and. x <= 20.0_dp) out = out * exp(x)
 end function besselK_core
 
 pure function besselJ_scalar_i(x, nu) result(out)
