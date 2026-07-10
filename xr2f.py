@@ -55598,6 +55598,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--via-python")
     if args.out_python:
         cmd.extend(["--out-python", args.out_python])
+    if getattr(args, "llm_bundle", None):
+        cmd.extend(["--llm-bundle", args.llm_bundle])
     if args.annotate_r is not None:
         cmd.append("--annotate-r")
         if args.annotate_r:
@@ -56457,6 +56459,165 @@ def _write_translation_report(report: dict[str, object], json_path: Path, md_pat
     print(f"wrote {md_path}")
 
 
+def _write_llm_prompt(
+    *,
+    in_path: Path,
+    full_f90_path: Path,
+    partial_f90_path: Path,
+    report_md_path: Path,
+    directives_path: Path,
+    runtime_api_path: Path,
+) -> str:
+    return "\n".join(
+        [
+            "# LLM Translation Task",
+            "",
+            f"Source R file: `{in_path.name}`",
+            f"Full xr2f translation: `{full_f90_path.name}`",
+            f"Partial module translation: `{partial_f90_path.name}`",
+            f"Translation report: `{report_md_path.name}`",
+            f"Directive copy: `{directives_path.name}`",
+            f"Runtime API guide: `{runtime_api_path.name}`",
+            "",
+            "## Instructions",
+            "",
+            "1. Treat the R source as the semantic reference.",
+            "2. Use the full xr2f translation as the first compile target.",
+            "3. Use the partial module translation for reusable procedure implementations when it is cleaner than the full program.",
+            "4. Prefer helpers and derived types from `r_mod` when they already represent R behavior.",
+            "5. Fix compile errors before changing numerical algorithms.",
+            "6. Compare R and Fortran output on deterministic inputs before simplifying code.",
+            "7. Keep any reviewed `# xr2f:` directives in the R source when they encode facts the transpiler cannot infer reliably.",
+            "",
+            "## First Checks",
+            "",
+            "- Read the report's approximations, risk notes, generated helpers, and variable declarations.",
+            "- Inspect compile errors against the generated Fortran line and mapped R source line.",
+            "- If results differ numerically, check RNG mode, integration tolerances, optimizer approximations, and complex arithmetic first.",
+            "",
+        ]
+    )
+
+
+def _write_llm_bundle(
+    *,
+    bundle_dir: Path,
+    src: str,
+    f90: str,
+    in_path: Path,
+    out_path: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+    helper_modules: set[str],
+    fortran_comments: bool,
+) -> None:
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    stem = in_path.stem
+    source_copy_path = bundle_dir / in_path.name
+    full_f90_path = bundle_dir / f"{stem}_r.f90"
+    partial_f90_path = bundle_dir / f"{stem}_partial.f90"
+    partial_log_path = bundle_dir / f"{stem}_partial.log"
+    report_json_path = bundle_dir / f"{stem}_report.json"
+    report_md_path = bundle_dir / f"{stem}_report.md"
+    directives_path = bundle_dir / f"{stem}_directed.r"
+    runtime_api_path = bundle_dir / "xr2f_runtime_api.md"
+    compile_log_path = bundle_dir / "compile_log.txt"
+    prompt_path = bundle_dir / "llm_prompt.md"
+
+    source_copy_path.write_text(src, encoding="utf-8")
+    print(f"wrote {source_copy_path}")
+    full_f90_path.write_text(f90, encoding="utf-8")
+    print(f"wrote {full_f90_path}")
+
+    try:
+        directed_src = write_directives_r_source(src, stem)
+        directives_path.write_text(directed_src, encoding="utf-8")
+        print(f"wrote {directives_path}")
+    except NotImplementedError as exc:
+        directives_path.write_text(
+            "# xr2f directive generation failed.\n"
+            f"# reason: {exc}\n\n"
+            + src.lstrip("\ufeff"),
+            encoding="utf-8",
+        )
+        print(f"wrote {directives_path}")
+
+    report = _build_translation_report(
+        src=src,
+        f90=f90,
+        in_path=in_path,
+        out_path=full_f90_path,
+        args=args,
+        timings=timings,
+    )
+    _write_translation_report(report, report_json_path, report_md_path)
+
+    try:
+        partial_f90, translated_names, skipped_items = transpile_r_partial_to_fortran_module(
+            src,
+            stem,
+            helper_modules=helper_modules,
+            fortran_comments=fortran_comments,
+        )
+        partial_f90_path.write_text(partial_f90, encoding="utf-8")
+        partial_log_path.write_text(
+            "Partial translation: PASS\n"
+            + "translated: "
+            + (", ".join(translated_names) if translated_names else "<none>")
+            + "\n"
+            + "skipped: "
+            + (", ".join(f"{name} ({reason})" for name, reason in skipped_items) if skipped_items else "<none>")
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        partial_f90_path.write_text(
+            "! Partial translation failed.\n"
+            f"! reason: {_partial_skip_reason(exc)}\n",
+            encoding="utf-8",
+        )
+        partial_log_path.write_text(f"Partial translation: FAIL\nreason: {_partial_skip_reason(exc)}\n", encoding="utf-8")
+    print(f"wrote {partial_f90_path}")
+    print(f"wrote {partial_log_path}")
+
+    runtime_src = Path(__file__).resolve().with_name("xr2f_runtime_api.md")
+    if runtime_src.exists():
+        runtime_api_path.write_text(runtime_src.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        runtime_api_path.write_text("# xr2f Runtime API\n\nNo runtime API guide was found next to xr2f.py.\n", encoding="utf-8")
+    print(f"wrote {runtime_api_path}")
+
+    compile_lines = [
+        "xr2f LLM bundle compile notes",
+        "",
+        f"normal_output: {out_path}",
+        f"bundle_output: {full_f90_path}",
+        f"compiler: {args.compiler}",
+        f"compile_requested: {bool(args.compile)}",
+        f"run_requested: {bool(args.run)}",
+        "",
+        "Suggested direct build command uses the normal xr2f output path, not the bundle copy:",
+        f"python {Path(__file__).name} {in_path} --out {out_path} --compile",
+        "",
+        "If compiling the bundle copy manually, include r.f90 or the cached runtime module include path as appropriate.",
+    ]
+    compile_log_path.write_text("\n".join(compile_lines) + "\n", encoding="utf-8")
+    print(f"wrote {compile_log_path}")
+
+    prompt_path.write_text(
+        _write_llm_prompt(
+            in_path=source_copy_path,
+            full_f90_path=full_f90_path,
+            partial_f90_path=partial_f90_path,
+            report_md_path=report_md_path,
+            directives_path=directives_path,
+            runtime_api_path=runtime_api_path,
+        ),
+        encoding="utf-8",
+    )
+    print(f"wrote {prompt_path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial R-to-Fortran transpiler")
     ap.add_argument("input_r", help="input .R/.r source file")
@@ -56472,6 +56633,11 @@ def main() -> int:
         const="",
         metavar="OUT",
         help="write LLM-friendly translation reports as JSON and Markdown; default: <output>.xr2f_report.{json,md}",
+    )
+    ap.add_argument(
+        "--llm-bundle",
+        metavar="DIR",
+        help="write an LLM handoff bundle containing full/partial Fortran, reports, directives, runtime API guide, and prompt",
     )
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
     ap.add_argument(
@@ -56831,6 +56997,9 @@ def main() -> int:
             if args.out:
                 print("When input uses globbing with multiple matches, --out is not supported.")
                 return 1
+            if getattr(args, "llm_bundle", None):
+                print("When input uses globbing with multiple matches, --llm-bundle is not supported.")
+                return 1
             if args.annotate_r:
                 print("When input uses globbing with multiple matches, explicit --annotate-r OUT.r is not supported.")
                 return 1
@@ -56926,6 +57095,7 @@ def main() -> int:
     artifact_dir = Path(args.out_dir).resolve() if args.out_dir else out_path.parent.resolve()
     run_cwd = Path.cwd().resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    llm_bundle_dir: Path | None = Path(args.llm_bundle).resolve() if getattr(args, "llm_bundle", None) else None
     report_json_path: Path | None = None
     report_md_path: Path | None = None
     if args.report is not None:
@@ -58770,6 +58940,18 @@ def main() -> int:
     if split_module_path is not None:
         print(f"wrote {split_module_path}")
     print(f"wrote {out_path}")
+    if llm_bundle_dir is not None:
+        _write_llm_bundle(
+            bundle_dir=llm_bundle_dir,
+            src=src,
+            f90=f90,
+            in_path=in_path,
+            out_path=out_path,
+            args=args,
+            timings=timings,
+            helper_modules=helper_modules,
+            fortran_comments=(not args.no_fortran_comments),
+        )
     if not (args.compile or args.run):
         _maybe_write_report()
 
