@@ -160,6 +160,7 @@ _COMPLEX_LENGTH_NONINTEGER_WARNINGS: set[str] = set()
 _INTEGER_ARGUMENT_NONINTEGER_WARNINGS: set[str] = set()
 _SUPPRESS_WARNINGS = False
 _NO_RECYCLE = False
+_STRICT_R_NUMERIC_LITERALS = False
 _R_SD_CALL_NAME = "sd"
 _COMMAND_ARGS_FILE_ARG: str | None = None
 _R_COMMENT_SENTINEL = "__XR2F_COMMENT__:"
@@ -4415,6 +4416,11 @@ def _is_int_literal(txt: str) -> bool:
     return re.match(r"^[+-]?\d+[lL]?(?:_[A-Za-z]\w*)?$", t) is not None
 
 
+def _is_explicit_r_int_literal(txt: str) -> bool:
+    t = txt.strip()
+    return re.match(r"^[+-]?\d+[lL](?:_[A-Za-z]\w*)?$", t) is not None
+
+
 def _normalize_r_int_literal(txt: str) -> str:
     """Convert R integer literal form (e.g., 1000L) to Fortran integer literal."""
     t = txt.strip()
@@ -4643,6 +4649,8 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
             return
         nm, pos, kw = c
         key = nm.lower()
+        for arg in [*pos, *kw.values()]:
+            mark_call_args(arg)
 
         def pos_arg(i: int) -> str | None:
             return pos[i] if len(pos) > i else None
@@ -4678,10 +4686,29 @@ def infer_integer_context_names(stmts: list[object]) -> set[str]:
             src = kw.get("size") or pos_arg(1)
             if src is not None:
                 mark_expr(src)
-        elif key in {"runif", "rnorm", "numeric", "integer", "double", "logical", "character", "raw"}:
+        elif key in {
+            "runif", "rnorm", "rgamma", "rbeta", "rchisq", "rf", "rlogis", "rlnorm",
+            "rweibull", "rcauchy", "rgeom", "rnbinom", "rhyper", "rwilcox",
+            "rsignrank", "rpois", "rbinom", "numeric", "integer", "double",
+            "logical", "character", "raw",
+        }:
             src = kw.get("n") or pos_arg(0)
             if src is not None:
                 mark_expr(src)
+        elif key in _USER_FUNC_ARG_KIND:
+            arg_kinds = _USER_FUNC_ARG_KIND.get(key, [])
+            arg_index = _USER_FUNC_ARG_INDEX.get(key, {})
+            for i, kind in enumerate(arg_kinds):
+                if kind not in {"int", "integer"}:
+                    continue
+                src = pos_arg(i)
+                if src is None:
+                    for arg_nm, idx in arg_index.items():
+                        if idx == i:
+                            src = kw.get(arg_nm)
+                            break
+                if src is not None:
+                    mark_expr(src)
         elif key == "kmeans":
             for src in [kw.get("centers"), kw.get("nstart")]:
                 if src is not None:
@@ -5308,6 +5335,8 @@ def classify_vars(
     real_arrays: set[str] = set()
     params: dict[str, str] = {}
     known_arrays = set(known_arrays or set())
+    assigned_names_ctx = set(assign_counts.keys())
+    integer_context_names = infer_integer_context_names(stmts) & assigned_names_ctx
     find_char_arrays = {x.lower() for x in infer_main_character_arrays(stmts)}
 
     def seed_sequence_assignments(ss: list[object]) -> None:
@@ -6175,8 +6204,19 @@ def classify_vars(
                     int_arrays.discard(st.name)
                     real_arrays.discard(st.name)
                 elif _is_int_literal(rhs):
+                    if (
+                        _STRICT_R_NUMERIC_LITERALS
+                        and not _is_explicit_r_int_literal(rhs)
+                        and st.name not in integer_context_names
+                    ):
+                        real_scalars.add(st.name)
+                        params.pop(st.name, None)
+                        ints.discard(st.name)
+                        known_arrays.discard(st.name)
+                        int_arrays.discard(st.name)
+                        real_arrays.discard(st.name)
                     # Do not force integer typing for variables already inferred real.
-                    if st.name in real_scalars or st.name in real_arrays:
+                    elif st.name in real_scalars or st.name in real_arrays:
                         pass
                     elif assign_counts.get(st.name, 0) == 1:
                         params[st.name] = _normalize_r_int_literal(rhs)
@@ -6309,9 +6349,6 @@ def classify_vars(
         real_arrays.discard(nm)
         known_arrays.add(nm)
         params.pop(nm, None)
-    assigned_names_ctx = set(assign_counts.keys())
-    integer_context_names = infer_integer_context_names(stmts) & assigned_names_ctx
-
     def assigned_from_scalar_int_index(target: str, ss: list[object]) -> bool:
         for st in ss:
             if isinstance(st, Assign):
@@ -19080,6 +19117,20 @@ def emit_stmts(
             _wstmt(f"call print_real_vector({scale_f})", "")
             need_r_mod.add("print_real_vector")
 
+    def _assignment_rhs_for_target(name: str, src: str, lowered: str) -> str:
+        txt = src.strip()
+        if (
+            _STRICT_R_NUMERIC_LITERALS
+            and _is_int_literal(txt)
+            and not _is_explicit_r_int_literal(txt)
+            and name not in int_scalar_vars
+            and name not in int_vector_vars
+            and name not in matrix_vars
+            and name not in vector_vars
+        ):
+            return f"{_normalize_r_int_literal(txt)}.0_dp"
+        return lowered
+
     for st in stmts:
         _CURRENT_WARNING_STMT_TEXT = _warning_stmt_source_text(st)
         if isinstance(st, CommentStmt):
@@ -20585,7 +20636,7 @@ def emit_stmts(
                     o.w(f"call rnorm_vec({_int_bound_expr(n)}, {st.name})")
                     need_rnorm["used"] = True
             else:
-                _wstmt(f"{st.name} = {rhs_f}", st.comment)
+                _wstmt(f"{st.name} = {_assignment_rhs_for_target(st.name, rhs, rhs_f)}", st.comment)
         elif isinstance(st, PrintStmt):
             if st.args:
                 print_args: list[str] = []
@@ -27781,6 +27832,7 @@ def infer_main_real_params(stmts: list[object], assign_counts: dict[str, int]) -
     """Find conservative top-level real scalar named constants."""
     out: dict[str, str] = {}
     subscript_mutated: set[str] = set()
+    integer_context_names = infer_integer_context_names(stmts) if _STRICT_R_NUMERIC_LITERALS else set()
     for txt in _stmt_texts_for_rank_scan(stmts):
         asn = split_top_level_assignment(txt.strip())
         if asn is None:
@@ -27797,9 +27849,17 @@ def infer_main_real_params(stmts: list[object], assign_counts: dict[str, int]) -
         if assign_counts.get(st.name, 0) != 1:
             continue
         rhs = st.expr.strip()
-        if not _is_real_literal(rhs):
+        if _is_real_literal(rhs):
+            out[st.name] = r_expr_to_fortran(rhs)
             continue
-        out[st.name] = r_expr_to_fortran(rhs)
+        if not (
+            _STRICT_R_NUMERIC_LITERALS
+            and _is_int_literal(rhs)
+            and not _is_explicit_r_int_literal(rhs)
+            and st.name not in integer_context_names
+        ):
+            continue
+        out[st.name] = f"{_normalize_r_int_literal(rhs)}.0_dp"
     return out
 
 
@@ -30571,6 +30631,7 @@ def transpile_r_to_fortran(
     fortran_comments: bool = True,
     obfuscate: bool = False,
     source_path: str | None = None,
+    strict_r_numeric_literals: bool = False,
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS
@@ -30579,12 +30640,13 @@ def transpile_r_to_fortran(
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
     global _EXPANDED_DATA_FRAME_FIELDS, _EXPANDED_DATA_FRAME_ALIASES, _CSV_HEADER_SOURCES, _SCALE_SOURCE_BY_RESULT, _SCALE_ATTRS_BY_RESULT
-    global _NO_RECYCLE, _MIXED_CHARACTER_COERCION_WARNINGS
+    global _NO_RECYCLE, _STRICT_R_NUMERIC_LITERALS, _MIXED_CHARACTER_COERCION_WARNINGS
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     global _CALL_COERCION_WARNINGS
     global _WARNING_SOURCE_TEXT, _CURRENT_WARNING_STMT_TEXT
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
+    _STRICT_R_NUMERIC_LITERALS = bool(strict_r_numeric_literals)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
@@ -55226,6 +55288,8 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
         cmd.append("--integerize-r")
         if args.integerize_r:
             cmd.append(args.integerize_r)
+    if getattr(args, "r_numeric_literals", False):
+        cmd.append("--r-numeric-literals")
     if args.if_const_aggressive:
         cmd.append("--if-const-aggressive")
     if args.no_format_print:
@@ -56118,6 +56182,14 @@ def main() -> int:
         metavar="OUT.r",
         help="write an R copy with safe integer-context numeric literal assignments rewritten with L suffixes; default: <input>_integerized.r",
     )
+    ap.add_argument(
+        "--r-numeric-literals",
+        action="store_true",
+        help=(
+            "treat bare R numeric literals such as 100 as double when they are not used in integer contexts; "
+            "useful as a lint/strictness mode"
+        ),
+    )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
     ap.add_argument(
@@ -56324,8 +56396,9 @@ def main() -> int:
     args = ap.parse_args()
     if args.check_obfuscated_r:
         args.obfuscate = True
-    global _SUPPRESS_WARNINGS
+    global _SUPPRESS_WARNINGS, _STRICT_R_NUMERIC_LITERALS
     _SUPPRESS_WARNINGS = bool(args.no_warn)
+    _STRICT_R_NUMERIC_LITERALS = bool(args.r_numeric_literals)
     if args.run_repeat < 1:
         print("Error: --run-repeat must be positive.")
         return 2
@@ -56931,6 +57004,7 @@ def main() -> int:
                 fortran_comments=(not args.no_fortran_comments),
                 obfuscate=(args.obfuscate and not source_already_obfuscated),
                 source_path=str(out_path.resolve()),
+                strict_r_numeric_literals=args.r_numeric_literals,
             )
         except NotImplementedError as e:
             print(f"Transpile: FAIL ({e})")
