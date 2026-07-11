@@ -48380,6 +48380,32 @@ def _real_dp_cast_operand_is_already_real(expr: str, real_vars: set[str]) -> boo
     return False
 
 
+def rewrite_named_real_row_prints_text(f90: str) -> str:
+    """Print named matrix row sections as aligned one-row tables."""
+    if "print_named_real_vector" not in f90:
+        return f90
+
+    def is_matrix_row_section(expr: str) -> bool:
+        expr = expr.strip()
+        m = re.match(r"^([A-Za-z]\w*)\s*\((.*)\)$", expr, re.DOTALL)
+        if m is None:
+            return False
+        parts = split_top_level_commas(m.group(2))
+        return len(parts) == 2 and parts[1].strip() == ":" and parts[0].strip() not in {"", ":"}
+
+    return _replace_balanced_func_calls(
+        f90,
+        "print_named_real_vector",
+        lambda inner: (
+            f"print_named_real_row({inner})"
+            if (parts := split_top_level_commas(inner))
+            and len(parts) >= 2
+            and is_matrix_row_section(parts[0])
+            else f"print_named_real_vector({inner})"
+        ),
+    )
+
+
 def add_missing_r_mod_uses_per_scope_text(f90: str, names: set[str]) -> str:
     """Add late-discovered r_mod imports only to scopes that do not already import them."""
     if not names:
@@ -54411,6 +54437,7 @@ def keyword_print_helper_actuals_after_named_text(f90: str) -> str:
     specs = {
         "print_matrix_rstyle_named": ["names", "int_cols", "row_names", "digits"],
         "print_named_real_vector": ["names", "digits"],
+        "print_named_real_row": ["names", "digits", "row_name"],
     }
 
     def _has_named_actual(txt: str) -> bool:
@@ -58849,6 +58876,7 @@ def main() -> int:
     f90 = promote_vector_function_call_local_decls_text(f90)
     f90 = promote_complex_constructor_vector_decls_text(f90)
     f90 = rewrite_integerish_real_seq_subscripts_text(f90)
+    f90 = rewrite_named_real_row_prints_text(f90)
     extra_use_names: list[str] = []
     if "type(decompose_result_t)" in f90 or "decompose(" in f90:
         extra_use_names.extend(["decompose", "decompose_result_t"])
@@ -58884,6 +58912,8 @@ def main() -> int:
         extra_use_names.append("print_factanal")
     if "call print_named_real_vector(" in f90:
         extra_use_names.append("print_named_real_vector")
+    if "call print_named_real_row(" in f90:
+        extra_use_names.append("print_named_real_row")
     if "call print_real_vector(" in f90:
         extra_use_names.append("print_real_vector")
     if "call print_complex_vector(" in f90:
@@ -59289,6 +59319,8 @@ def main() -> int:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_real_vector"})
     if "call print_named_real_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_vector"})
+    if "call print_named_real_row(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
     if "call print_char_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_char_vector"})
     if "call print_integer_vector(" in f90:
@@ -59387,8 +59419,11 @@ def main() -> int:
     f90 = repair_late_matrix_print_labels_text(f90)
     f90 = repair_rank1_recycling_matrix_refs_text(f90)
     f90 = repair_known_scalar_result_fields_text(f90)
+    f90 = rewrite_named_real_row_prints_text(f90)
     if "call print_matrix(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_matrix => print_matrix_rstyle"})
+    if "call print_named_real_row(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
     if "call print_table2(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_table2"})
     if "date_to_char_vec(" in f90:
@@ -59456,6 +59491,9 @@ def main() -> int:
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90.splitlines())
     f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    f90 = rewrite_named_real_row_prints_text(f90)
+    if "call print_named_real_row(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
     f90 = validate_no_expression_component_refs_text(f90)
     final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
