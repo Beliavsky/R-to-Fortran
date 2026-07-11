@@ -3266,10 +3266,11 @@ def preprocess_r_lines(src: str) -> list[str]:
             seen_code = True
         elif tcmt and seen_code:
             lines0.append(_R_COMMENT_SENTINEL + tcmt)
-    # Join multiline statements by balanced parentheses.
+    # Join multiline statements by balanced parentheses and subscripts.
     joined: list[str] = []
     cur = ""
-    depth = 0
+    paren_depth = 0
+    bracket_depth = 0
     in_single = False
     in_double = False
     pending_comments: list[str] = []
@@ -3297,11 +3298,21 @@ def preprocess_r_lines(src: str) -> list[str]:
                 in_double = not in_double
             elif not in_single and not in_double:
                 if ch == "(":
-                    depth += 1
-                elif ch == ")" and depth > 0:
-                    depth -= 1
+                    paren_depth += 1
+                elif ch == ")" and paren_depth > 0:
+                    paren_depth -= 1
+                elif ch == "[":
+                    bracket_depth += 1
+                elif ch == "]" and bracket_depth > 0:
+                    bracket_depth -= 1
             i += 1
-        if depth == 0 and not in_single and not in_double and not _r_statement_continues(cur):
+        if (
+            paren_depth == 0
+            and bracket_depth == 0
+            and not in_single
+            and not in_double
+            and not _r_statement_continues(cur)
+        ):
             joined.append(cur)
             cur = ""
             if pending_comments:
