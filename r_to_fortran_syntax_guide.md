@@ -38,6 +38,14 @@ real(kind=dp), parameter :: x = 1.5_dp
 
 R's bare numeric literal `100` is a double in R, while `100L` is integer.  `xr2f.py` defaults to pragmatic integer inference in integer contexts, and `--r-numeric-literals` can be used as a stricter lint mode.
 
+R numeric values are double precision.  Fortran default `real` is usually single precision, so generated code uses `real(kind=dp)` where `dp` is an alias for `real64`, and real literals use the `_dp` suffix:
+
+```fortran
+use, intrinsic :: iso_fortran_env, only: dp => real64
+real(kind=dp) :: x
+x = 1.5_dp
+```
+
 ## Assignment
 
 R commonly uses `<-`:
