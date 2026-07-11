@@ -169,6 +169,39 @@ Subroutines are also commonly used in hand-written Fortran to return multiple va
 
 Because Fortran procedure interfaces are static, R functions that return different types or ranks on different paths are hard to translate safely.
 
+## Optional Arguments
+
+R function arguments can have defaults:
+
+```r
+scale_shift <- function(x, scale = 1.0, shift = 0.0) {
+  scale * x + shift
+}
+
+y <- scale_shift(x, shift = 2.0)
+```
+
+Fortran supports optional dummy arguments with the `optional` attribute and tests them with `present()`:
+
+```fortran
+function scale_shift(x, scale, shift) result(y)
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp), intent(in), optional :: scale
+real(kind=dp), intent(in), optional :: shift
+real(kind=dp), allocatable :: y(:)
+real(kind=dp) :: scale_def, shift_def
+
+scale_def = 1.0_dp
+if (present(scale)) scale_def = scale
+shift_def = 0.0_dp
+if (present(shift)) shift_def = shift
+
+y = scale_def * x + shift_def
+end function scale_shift
+```
+
+`xr2f.py` generally lowers R defaults this way: each optional argument gets a local default variable such as `scale_def`, and calls can pass only the arguments that are present in the R call.
+
 ## Vectors, Matrices, And Arrays
 
 R uses square brackets for subscripting:
@@ -303,7 +336,7 @@ sum(m, dim=1)  ! column sums: one result per column
 
 The `dim` number is the dimension being reduced.  For a matrix `m(row, col)`, `sum(m, dim=1)` collapses rows and returns one value per column.
 
-Fortran has intrinsic reducers such as:
+Fortran has intrinsic reducers such as
 
 ```fortran
 sum(x)
