@@ -30,7 +30,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
    & print_real_vector, print_complex_vector, print_integer_vector, print_char_vector, &
-   & print_named_real_vector, print_table1, print_table2, print_summary, set_print_int_like, &
+   & print_named_real_vector, print_named_real_row, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, findInterval, cut, outer, &
@@ -5552,6 +5552,49 @@ integer, intent(in), optional :: digits ! digits after decimal point for display
 call print_char_vector(names)
 call print_real_vector(x, digits=digits)
 end subroutine print_named_real_vector
+
+subroutine print_named_real_row(x, names, digits, row_name)
+! Print a named real vector as a one-row table with aligned labels.
+real(kind=dp), intent(in) :: x(:) ! input vector
+character(len=*), intent(in) :: names(:) ! column names
+integer, intent(in), optional :: digits ! number of digits after decimal
+character(len=*), intent(in), optional :: row_name ! optional row name
+integer :: j, row_w, col_w, digits_use
+character(len=32) :: row_fmt, col_fmt, real_fmt
+digits_use = 4
+if (present(digits)) digits_use = max(0, min(15, digits))
+row_w = 12
+if (present(row_name)) row_w = max(row_w, len_trim(row_name))
+col_w = max(12, digits_use + 8)
+do j = 1, size(names)
+   col_w = max(col_w, len_trim(names(j)))
+end do
+write(row_fmt, '("(a", i0, ",1x)")') row_w
+write(col_fmt, '("(a", i0, ",1x)")') col_w
+write(real_fmt, '("(f", i0, ".", i0, ",1x)")') col_w, digits_use
+write(*,'(a)', advance='no') repeat(" ", row_w + 1)
+do j = 1, size(x)
+   if (j <= size(names)) then
+      write(*,col_fmt, advance='no') trim(names(j))
+   else
+      write(*,'(i0,1x)', advance='no') j
+   end if
+end do
+write(*,*)
+if (present(row_name)) then
+   write(*,row_fmt, advance='no') trim(row_name)
+else
+   write(*,row_fmt, advance='no') ""
+end if
+do j = 1, size(x)
+   if (ieee_is_finite(x(j))) then
+      write(*,real_fmt, advance='no') x(j)
+   else
+      write(*,col_fmt, advance='no') "NA"
+   end if
+end do
+write(*,*)
+end subroutine print_named_real_row
 
 pure function nlm_stub(p, hessian) result(out)
 ! Support nlm-style optimization for stub.
