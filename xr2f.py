@@ -40617,7 +40617,7 @@ def coalesce_final_declarations_text(f90: str, max_len: int = 132) -> str:
     current_results: set[str] = set()
     in_derived_type = False
     decl_re = re.compile(
-        r"^(\s*)([^:][^:]*)\s*::\s*(.+?)\s*$",
+        r"^(\s*)(.*?)\s*::\s*(.+?)\s*$",
         re.IGNORECASE,
     )
 
@@ -40644,16 +40644,21 @@ def coalesce_final_declarations_text(f90: str, max_len: int = 132) -> str:
         if len(merged) <= max_len:
             out.append(f"{merged}{eol}")
         else:
-            first = f"{indent}{spec} :: {names[0]}, &"
-            if len(first) <= max_len:
-                out.append(f"{first}{eol}")
-                start_idx = 1
-            else:
-                out.append(f"{indent}{spec} :: &{eol}")
-                start_idx = 0
-            for idx in range(start_idx, len(names)):
-                tail = "" if idx == len(names) - 1 else ", &"
-                out.append(f"{indent}   & {names[idx]}{tail}{eol}")
+            prefix = f"{indent}{spec} :: "
+            cont_prefix = f"{indent}   & "
+            idx = 0
+            current = prefix
+            while idx < len(names):
+                name = names[idx]
+                sep = "" if current in {prefix, cont_prefix} else ", "
+                candidate = f"{current}{sep}{name}"
+                if len(candidate) <= max_len or current in {prefix, cont_prefix}:
+                    current = candidate
+                    idx += 1
+                    continue
+                out.append(f"{current}, &{eol}")
+                current = cont_prefix
+            out.append(f"{current}{eol}")
         pending = []
 
     for line in lines:
@@ -40695,6 +40700,10 @@ def coalesce_final_declarations_text(f90: str, max_len: int = 132) -> str:
         indent, spec, entity = m_decl.groups()
         spec = spec.strip()
         entity = entity.strip()
+        if not spec:
+            emit_pending()
+            out.append(line)
+            continue
         if ("=" in entity and "parameter" not in spec.lower()) or entity_name(entity) in current_results:
             emit_pending()
             out.append(line)
@@ -48217,7 +48226,6 @@ def simplify_real_dp_casts_text(f90: str) -> str:
     """Remove redundant real(..., kind=dp) casts when the operand is already real(dp)."""
     if "real(" not in f90:
         return f90
-    real_vars: set[str] = set()
     real_dp_funcs: set[str] = {"r_round"}
     current_fn: str | None = None
     current_result: str | None = None
@@ -48237,6 +48245,61 @@ def simplify_real_dp_casts_text(f90: str) -> str:
         elif re.match(r"\s*end\s+function\b", line, re.IGNORECASE):
             current_fn = None
             current_result = None
+        if (
+            current_fn is not None
+            and current_result is not None
+            and re.match(r"\s*real\s*\(\s*kind\s*=\s*dp\s*\)", line, re.IGNORECASE)
+            and "::" in line
+        ):
+            rhs = line.split("::", 1)[1]
+            for part in split_top_level_commas(rhs):
+                name = part.split("=", 1)[0].strip()
+                name = re.sub(r"\(.*\)$", "", name).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", name) and name.lower() == current_result.lower():
+                    real_dp_funcs.add(current_fn.lower())
+
+    lines = f90.splitlines(True)
+    out: list[str] = []
+    scope_lines: list[str] = []
+    scope_stack: list[tuple[str, str]] = []
+    start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|recursive)\s+)*"
+        r"(?:(?:real|integer|logical|complex|character)\s*(?:\([^)]*\))?\s+)?"
+        r"(program|function|subroutine)\s+([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    end_re = re.compile(r"^\s*end\s*(program|function|subroutine)\b", re.IGNORECASE)
+
+    def flush_scope() -> None:
+        nonlocal scope_lines
+        if scope_lines:
+            out.append(_simplify_real_dp_casts_in_scope_text("".join(scope_lines), real_dp_funcs))
+            scope_lines = []
+
+    for line in lines:
+        code = line.rstrip("\r\n")
+        m_start = start_re.match(code)
+        if m_start is not None:
+            flush_scope()
+            scope_stack.append((m_start.group(1).lower(), m_start.group(2).lower()))
+            scope_lines.append(line)
+            continue
+        if scope_stack:
+            scope_lines.append(line)
+            m_end = end_re.match(code)
+            if m_end is not None and m_end.group(1).lower() == scope_stack[-1][0]:
+                scope_stack.pop()
+                flush_scope()
+            continue
+        scope_lines.append(line)
+    flush_scope()
+    return "".join(out)
+
+
+def _simplify_real_dp_casts_in_scope_text(f90: str, real_dp_funcs: set[str]) -> str:
+    """Remove redundant real(dp) casts using declarations from one Fortran scope."""
+    real_vars: set[str] = set()
+    for line in f90.splitlines():
         if not re.match(r"\s*real\s*\(\s*kind\s*=\s*dp\s*\)", line, re.IGNORECASE):
             continue
         if "::" not in line:
@@ -48247,8 +48310,6 @@ def simplify_real_dp_casts_text(f90: str) -> str:
             name = re.sub(r"\(.*\)$", "", name).strip()
             if re.fullmatch(r"[A-Za-z]\w*", name):
                 real_vars.add(name.lower())
-                if current_fn is not None and current_result is not None and name.lower() == current_result.lower():
-                    real_dp_funcs.add(current_fn.lower())
 
     if real_vars:
         f90 = re.sub(
@@ -48286,6 +48347,18 @@ def simplify_real_dp_casts_text(f90: str) -> str:
             parts[0].strip()
             if (parts := split_top_level_commas(inner))
             and len(parts) == 2
+            and _real_dp_cast_operand_is_already_real(parts[0].strip(), real_vars)
+            and re.fullmatch(r"(?i)kind\s*=\s*dp", parts[1].strip())
+            else f"real({inner})"
+        ),
+    )
+    f90 = _replace_balanced_func_calls(
+        f90,
+        "real",
+        lambda inner: (
+            parts[0].strip()
+            if (parts := split_top_level_commas(inner))
+            and len(parts) == 2
             and (m_call := re.match(r"^\s*([A-Za-z]\w*)\s*\(", parts[0].strip()))
             and m_call.group(1).lower() in real_dp_funcs
             and re.fullmatch(r"(?i)kind\s*=\s*dp", parts[1].strip())
@@ -48293,6 +48366,18 @@ def simplify_real_dp_casts_text(f90: str) -> str:
         ),
     )
     return f90
+
+
+def _real_dp_cast_operand_is_already_real(expr: str, real_vars: set[str]) -> bool:
+    """True when real(expr, kind=dp) is redundant from local declarations."""
+    expr = expr.strip()
+    m_name = re.fullmatch(r"([A-Za-z]\w*)", expr)
+    if m_name is not None and m_name.group(1).lower() in real_vars:
+        return True
+    m_section = re.match(r"^([A-Za-z]\w*)\s*\(", expr)
+    if m_section is not None and ":" in expr and m_section.group(1).lower() in real_vars:
+        return True
+    return False
 
 
 def add_missing_r_mod_uses_per_scope_text(f90: str, names: set[str]) -> str:
@@ -56499,6 +56584,457 @@ def _write_llm_prompt(
     )
 
 
+def _render_llm_bundle_diagnostics(
+    *,
+    src: str,
+    out_path: Path,
+    build_command: list[str] | None = None,
+    build_cp: subprocess.CompletedProcess[str] | None = None,
+    run_cp: subprocess.CompletedProcess[str] | None = None,
+    r_run: subprocess.CompletedProcess[str] | None = None,
+    run_diff_status: str | None = None,
+    run_diff_first: int | None = None,
+) -> str:
+    lines: list[str] = [
+        "xr2f LLM bundle compile/run diagnostics",
+        "",
+        f"normal_output: {out_path}",
+    ]
+    if build_command is None:
+        lines.extend(
+            [
+                "build_status: NOT_RUN",
+                "",
+                "Suggested direct build command uses the normal xr2f output path, not the bundle copy:",
+                f"python {Path(__file__).name} <input.r> --out {out_path} --compile",
+                "",
+                "If compiling the bundle copy manually, include r.f90 or the cached runtime module include path as appropriate.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+    lines.extend(["", "Build", "-----", "command: " + " ".join(str(x) for x in build_command)])
+    if build_cp is None:
+        lines.append("status: UNKNOWN")
+    else:
+        status = "PASS" if build_cp.returncode == 0 else "FAIL"
+        lines.append(f"status: {status}")
+        lines.append(f"returncode: {build_cp.returncode}")
+        if build_cp.stdout:
+            lines.extend(["", "stdout:", build_cp.stdout.rstrip()])
+        if build_cp.stderr:
+            lines.extend(["", "stderr:", build_cp.stderr.rstrip()])
+        if build_cp.returncode != 0:
+            compile_text = (build_cp.stdout or "") + (build_cp.stderr or "")
+            err_line, err_msg = _first_fortran_compile_error_line(compile_text, out_path)
+            lines.extend(["", "first_error:"])
+            lines.append(f"fortran_line: {err_line if err_line is not None else ''}")
+            lines.append(f"message: {err_msg}")
+            if err_line is not None:
+                try:
+                    f_lines = out_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if 1 <= err_line <= len(f_lines):
+                        f_line = f_lines[err_line - 1]
+                        lines.append(f"fortran_text: {f_line.strip()}")
+                        matches = _find_likely_r_source_lines(src, f_line, err_msg)
+                        if matches:
+                            lines.append("likely_r_source:")
+                            for r_line, r_text, reason in matches:
+                                lines.append(f"  - line {r_line}: {r_text} [{reason}]")
+                except OSError:
+                    pass
+    if r_run is not None:
+        lines.extend(["", "R run", "-----"])
+        lines.append(f"returncode: {r_run.returncode}")
+        if r_run.stdout:
+            lines.extend(["stdout:", r_run.stdout.rstrip()])
+        if r_run.stderr:
+            lines.extend(["stderr:", r_run.stderr.rstrip()])
+    if run_cp is not None:
+        lines.extend(["", "Fortran run", "-----------"])
+        lines.append(f"returncode: {run_cp.returncode}")
+        if run_cp.stdout:
+            lines.extend(["stdout:", run_cp.stdout.rstrip()])
+        if run_cp.stderr:
+            lines.extend(["stderr:", run_cp.stderr.rstrip()])
+    if run_diff_status is not None:
+        lines.extend(["", "Run diff", "--------"])
+        lines.append(f"status: {run_diff_status}")
+        if run_diff_first is not None:
+            lines.append(f"first_mismatch_line: {run_diff_first + 1}")
+    return "\n".join(lines) + "\n"
+
+
+def _compile_failure_target(
+    *,
+    src: str,
+    out_path: Path,
+    build_cp: subprocess.CompletedProcess[str] | None,
+) -> dict[str, object] | None:
+    if build_cp is None or build_cp.returncode == 0:
+        return None
+    compile_text = (build_cp.stdout or "") + (build_cp.stderr or "")
+    err_line, err_msg = _first_fortran_compile_error_line(compile_text, out_path)
+    target: dict[str, object] = {
+        "fortran_line": err_line,
+        "message": err_msg,
+        "fortran_text": "",
+        "procedure": "",
+        "likely_r_source": [],
+    }
+    if err_line is None:
+        return target
+    try:
+        f_lines = out_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        f_lines = []
+    if 1 <= err_line <= len(f_lines):
+        f_line = f_lines[err_line - 1]
+        target["fortran_text"] = f_line.strip()
+        target["procedure"] = _enclosing_fortran_procedure_at_line("\n".join(f_lines), err_line) or ""
+        target["likely_r_source"] = [
+            {"line": r_line, "text": r_text, "reason": reason}
+            for r_line, r_text, reason in _find_likely_r_source_lines(src, f_line, err_msg)
+        ]
+    return target
+
+
+def _identifier_candidates_from_fortran_line(line: str) -> list[str]:
+    skip = {
+        "real", "kind", "dp", "int", "size", "shape", "call", "if", "then", "else",
+        "true", "false", "max", "min", "sum", "mean", "sqrt", "log", "exp",
+    }
+    out: list[str] = []
+    for nm in re.findall(r"\b[A-Za-z]\w*\b", line):
+        if nm.lower() in skip:
+            continue
+        if nm not in out:
+            out.append(nm)
+    return out
+
+
+def _directive_name_for_fortran_symbol(name: str, procedure: str | None = None) -> str:
+    nm = name.strip()
+    if procedure and re.match(r"^[A-Za-z]\w*$", procedure):
+        return f"{procedure}.{nm}"
+    return nm
+
+
+def _directive_suggestions_for_compile_target(compile_target: dict[str, object] | None) -> list[dict[str, str]]:
+    if compile_target is None:
+        return []
+    msg = str(compile_target.get("message") or "")
+    msg_l = msg.lower()
+    ftxt = str(compile_target.get("fortran_text") or "")
+    proc = str(compile_target.get("procedure") or "")
+    out: list[dict[str, str]] = []
+
+    def add(comment: str, why: str) -> None:
+        if comment and not any(x["comment"] == comment for x in out):
+            out.append({"comment": comment, "why": why})
+
+    m_assign = re.match(r"\s*([A-Za-z]\w*)\s*=", ftxt)
+    lhs = m_assign.group(1) if m_assign is not None else ""
+    if "incompatible ranks" in msg_l:
+        m_rank = re.search(r"incompatible ranks\s+(\d+)\s+and\s+(\d+)", msg_l)
+        rhs_rank = m_rank.group(2) if m_rank is not None else "1"
+        lhs_rank = m_rank.group(1) if m_rank is not None else rhs_rank
+        if lhs:
+            add(
+                f"# xr2f: force_rank({_directive_name_for_fortran_symbol(lhs, proc)})={rhs_rank}",
+                "assignment rank mismatch; try matching the assigned expression rank",
+            )
+            add(
+                f"# xr2f: force_rank({_directive_name_for_fortran_symbol(lhs, proc)})={lhs_rank}",
+                "if the LHS declaration rank is semantically correct, force it explicitly",
+            )
+    if "rank mismatch in argument" in msg_l:
+        m_call = re.search(r"\b([A-Za-z]\w*)\s*\(", ftxt)
+        m_arg = re.search(r"argument ['`]?([A-Za-z]\w*)['`]?", msg, re.IGNORECASE)
+        if m_call is not None and m_arg is not None:
+            add(
+                f"# xr2f: force_rank({m_call.group(1)}.{m_arg.group(1)})=1",
+                "argument rank mismatch; review whether the formal should be a vector",
+            )
+            add(
+                f"# xr2f: force_rank({m_call.group(1)}.{m_arg.group(1)})=2",
+                "argument rank mismatch; review whether the formal should be a matrix",
+            )
+    if "type mismatch in argument" in msg_l:
+        m_call = re.search(r"\b([A-Za-z]\w*)\s*\(", ftxt)
+        m_arg = re.search(r"argument ['`]?([A-Za-z]\w*)['`]?", msg, re.IGNORECASE)
+        if m_call is not None and m_arg is not None:
+            if "complex" in msg_l:
+                add(
+                    f"# xr2f: force_kind({m_call.group(1)}.{m_arg.group(1)})=complex",
+                    "compiler reports a complex/real argument mismatch",
+                )
+            if "real" in msg_l:
+                add(
+                    f"# xr2f: force_kind({m_call.group(1)}.{m_arg.group(1)})=real",
+                    "compiler reports a real/integer or real/complex argument mismatch",
+                )
+    if "unexpected '%'" in msg_l or "nonderived-type" in msg_l or "nonderived type" in msg_l:
+        m_field = re.search(r"\b([A-Za-z]\w*)\s*%", ftxt)
+        if m_field is not None:
+            add(
+                f"# xr2f: force_rank({_directive_name_for_fortran_symbol(m_field.group(1), proc)})=0",
+                "component access failed; verify the R object is a list/data-frame result, not a scalar/vector",
+            )
+    if "impure function" in msg_l and "pure procedure" in msg_l:
+        add(
+            "# xr2f: review purity/non-pure caller around integrate/optim/random/file calls",
+            "Fortran PURE procedure called an impure helper; this usually needs non-pure lowering rather than a rank directive",
+        )
+    if "has no implicit type" in msg_l or "no implicit type" in msg_l:
+        names = _identifier_candidates_from_fortran_line(ftxt)
+        for nm in names[:3]:
+            add(
+                f"# xr2f: force_kind({_directive_name_for_fortran_symbol(nm, proc)})=real",
+                "undeclared symbol near failure; review whether this name should be a real variable",
+            )
+    return out
+
+
+def _render_llm_fix_targets(
+    *,
+    report: dict[str, object],
+    src: str,
+    out_path: Path,
+    build_cp: subprocess.CompletedProcess[str] | None = None,
+    run_cp: subprocess.CompletedProcess[str] | None = None,
+    r_run: subprocess.CompletedProcess[str] | None = None,
+    run_diff_status: str | None = None,
+    run_diff_first: int | None = None,
+) -> str:
+    lines: list[str] = ["# xr2f LLM Fix Targets", ""]
+    compile_target = _compile_failure_target(src=src, out_path=out_path, build_cp=build_cp)
+    lines.append("## 1. Compile Target")
+    if compile_target is None:
+        if build_cp is None:
+            lines.append("- No build was run yet. Compile the generated Fortran first.")
+        else:
+            lines.append("- Build passed. Do not change code solely to satisfy the compiler.")
+    else:
+        lines.append(f"- Fortran line: `{compile_target.get('fortran_line') or ''}`")
+        proc_name = str(compile_target.get("procedure") or "")
+        if proc_name:
+            lines.append(f"- Procedure: `{proc_name}`")
+        lines.append(f"- Compiler message: {compile_target.get('message') or ''}")
+        ftxt = str(compile_target.get("fortran_text") or "")
+        if ftxt:
+            lines.append(f"- Fortran text: `{ftxt}`")
+        likely = compile_target.get("likely_r_source") if isinstance(compile_target.get("likely_r_source"), list) else []
+        if likely:
+            lines.append("- Likely R source:")
+            for item in likely[:8]:
+                if isinstance(item, dict):
+                    lines.append(f"  - line `{item.get('line')}`: `{item.get('text')}` ({item.get('reason')})")
+        else:
+            lines.append("- No likely R source mapping was found.")
+
+    lines.append("")
+    lines.append("## 2. Runtime / Diff Target")
+    if run_diff_status is not None:
+        lines.append(f"- Run diff: `{run_diff_status}`")
+        if run_diff_first is not None:
+            lines.append(f"- First mismatch line: `{run_diff_first + 1}`")
+    elif run_cp is not None:
+        status = "PASS" if run_cp.returncode == 0 else "FAIL"
+        lines.append(f"- Fortran run: `{status}` exit `{run_cp.returncode}`")
+    elif r_run is not None:
+        lines.append("- R output is available; Fortran run has not been compared yet.")
+    else:
+        lines.append("- No run comparison was captured yet. After compile passes, run R and Fortran side by side.")
+
+    handoff = report.get("llm_handoff") if isinstance(report.get("llm_handoff"), dict) else {}
+    risk_notes = handoff.get("risk_notes") if isinstance(handoff.get("risk_notes"), list) else []
+    approximations = report.get("approximations") if isinstance(report.get("approximations"), list) else []
+    generated_helpers = report.get("generated_helpers") if isinstance(report.get("generated_helpers"), list) else []
+    r_constructs = handoff.get("r_constructs") if isinstance(handoff.get("r_constructs"), list) else []
+    variable_decls = handoff.get("variable_declarations") if isinstance(handoff.get("variable_declarations"), dict) else {}
+
+    lines.append("")
+    lines.append("## 3. High-Risk Translation Regions")
+    if not risk_notes and not approximations and not generated_helpers:
+        lines.append("- No high-risk regions were identified by the report.")
+    for note in risk_notes[:12]:
+        if isinstance(note, dict):
+            lines.append(f"- `{note.get('severity')}` `{note.get('kind')}`: {note.get('message')}")
+    for item in approximations[:12]:
+        if isinstance(item, dict):
+            lines.append(f"- Approximation line `{item.get('line')}` `{item.get('name')}`: {item.get('reason')}")
+    helper_hotspots = [str(h) for h in generated_helpers if "integrate" in str(h).lower() or "xr2f" in str(h).lower() or "_xric_" in str(h).lower()]
+    if helper_hotspots:
+        lines.append("- Generated helper hotspots: " + ", ".join(f"`{h}`" for h in helper_hotspots[:20]))
+
+    lines.append("")
+    lines.append("## 4. Directive Candidates")
+    directive_suggestions = _directive_suggestions_for_compile_target(compile_target)
+    if directive_suggestions:
+        lines.append("- Concrete candidates to review:")
+        for item in directive_suggestions[:10]:
+            lines.append(f"  - `{item['comment']}`")
+            lines.append(f"    - {item['why']}")
+    if compile_target is not None and compile_target.get("fortran_text"):
+        names = sorted(
+            {
+                nm
+                for nm in re.findall(r"\b[A-Za-z]\w*\b", str(compile_target.get("fortran_text")))
+                if nm.lower() not in {"real", "kind", "dp", "int", "size", "shape", "call"}
+            },
+            key=str.lower,
+        )
+        if names:
+            lines.append("- Review kind/rank for: " + ", ".join(f"`{nm}`" for nm in names[:12]))
+            if not directive_suggestions:
+                lines.append("- If R semantics are known, add reviewed comments such as `# xr2f: force_kind(name)=real` or `# xr2f: force_rank(name)=1`.")
+        else:
+            lines.append("- No obvious variable names found at the compile failure line.")
+    else:
+        directive_constructs = [c for c in r_constructs if isinstance(c, dict) and c.get("kind") in {"drop_false", "dollar_access", "apply", "closure"}]
+        if directive_constructs:
+            lines.append("- Review directives around these R constructs:")
+            for item in directive_constructs[:8]:
+                lines.append(f"  - line `{item.get('line')}` `{item.get('kind')}`: `{item.get('text')}`")
+        else:
+            lines.append("- No immediate directive candidates. Use `<stem>_directed.r` as the starting point if inference is wrong.")
+
+    lines.append("")
+    lines.append("## 5. Declaration Context")
+    if not variable_decls:
+        lines.append("- No declaration context available.")
+    else:
+        shown = 0
+        for scope, decls in variable_decls.items():
+            if not isinstance(decls, list) or shown >= 6:
+                continue
+            lines.append(f"- `{scope}`: {len(decls)} declaration(s)")
+            for decl in decls[:8]:
+                if isinstance(decl, dict):
+                    lines.append(f"  - `{decl.get('name')}` `{decl.get('base_type')}` rank `{decl.get('rank')}` line `{decl.get('line')}`")
+            shown += 1
+
+    lines.append("")
+    lines.append("## 6. Validation Plan")
+    lines.extend(
+        [
+            "- First make the generated Fortran compile without broad rewrites.",
+            "- Run the original R and Fortran outputs side by side.",
+            "- For numerical drift, inspect approximations before changing data layout.",
+            "- For rank/kind failures, prefer reviewed `# xr2f:` directives over post-hoc Fortran-only fixes when the R source fact is stable.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _write_llm_fix_targets_file(
+    *,
+    bundle_dir: Path | None,
+    report: dict[str, object],
+    src: str,
+    out_path: Path,
+    build_cp: subprocess.CompletedProcess[str] | None = None,
+    run_cp: subprocess.CompletedProcess[str] | None = None,
+    r_run: subprocess.CompletedProcess[str] | None = None,
+    run_diff_status: str | None = None,
+    run_diff_first: int | None = None,
+) -> None:
+    if bundle_dir is None:
+        return
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "fix_targets.md").write_text(
+        _render_llm_fix_targets(
+            report=report,
+            src=src,
+            out_path=out_path,
+            build_cp=build_cp,
+            run_cp=run_cp,
+            r_run=r_run,
+            run_diff_status=run_diff_status,
+            run_diff_first=run_diff_first,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_llm_bundle_diagnostics_file(
+    *,
+    bundle_dir: Path | None,
+    src: str,
+    in_path: Path,
+    out_path: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+    build_command: list[str] | None = None,
+    build_cp: subprocess.CompletedProcess[str] | None = None,
+    run_cp: subprocess.CompletedProcess[str] | None = None,
+    r_run: subprocess.CompletedProcess[str] | None = None,
+    run_diff_status: str | None = None,
+    run_diff_first: int | None = None,
+) -> None:
+    if bundle_dir is None:
+        return
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    path = bundle_dir / "compile_log.txt"
+    path.write_text(
+        _render_llm_bundle_diagnostics(
+            src=src,
+            out_path=out_path,
+            build_command=build_command,
+            build_cp=build_cp,
+            run_cp=run_cp,
+            r_run=r_run,
+            run_diff_status=run_diff_status,
+            run_diff_first=run_diff_first,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        f90_for_report = out_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        f90_for_report = ""
+    report = _build_translation_report(
+        src=src,
+        f90=f90_for_report,
+        in_path=in_path,
+        out_path=out_path,
+        args=args,
+        timings=timings,
+        build_info=(
+            {
+                "status": "PASS" if build_cp is not None and build_cp.returncode == 0 else "FAIL",
+                "returncode": int(build_cp.returncode),
+                "command": build_command or [],
+                "stdout": build_cp.stdout or "",
+                "stderr": build_cp.stderr or "",
+            }
+            if build_cp is not None
+            else None
+        ),
+        run_info=(
+            {
+                "status": "PASS" if run_cp.returncode == 0 else "FAIL",
+                "returncode": int(run_cp.returncode),
+                "stdout": run_cp.stdout or "",
+                "stderr": run_cp.stderr or "",
+            }
+            if run_cp is not None
+            else None
+        ),
+    )
+    _write_llm_fix_targets_file(
+        bundle_dir=bundle_dir,
+        report=report,
+        src=src,
+        out_path=out_path,
+        build_cp=build_cp,
+        run_cp=run_cp,
+        r_run=r_run,
+        run_diff_status=run_diff_status,
+        run_diff_first=run_diff_first,
+    )
+
+
 def _write_llm_bundle(
     *,
     bundle_dir: Path,
@@ -56522,6 +57058,7 @@ def _write_llm_bundle(
     directives_path = bundle_dir / f"{stem}_directed.r"
     runtime_api_path = bundle_dir / "xr2f_runtime_api.md"
     compile_log_path = bundle_dir / "compile_log.txt"
+    fix_targets_path = bundle_dir / "fix_targets.md"
     prompt_path = bundle_dir / "llm_prompt.md"
 
     source_copy_path.write_text(src, encoding="utf-8")
@@ -56587,22 +57124,13 @@ def _write_llm_bundle(
         runtime_api_path.write_text("# xr2f Runtime API\n\nNo runtime API guide was found next to xr2f.py.\n", encoding="utf-8")
     print(f"wrote {runtime_api_path}")
 
-    compile_lines = [
-        "xr2f LLM bundle compile notes",
-        "",
-        f"normal_output: {out_path}",
-        f"bundle_output: {full_f90_path}",
-        f"compiler: {args.compiler}",
-        f"compile_requested: {bool(args.compile)}",
-        f"run_requested: {bool(args.run)}",
-        "",
-        "Suggested direct build command uses the normal xr2f output path, not the bundle copy:",
-        f"python {Path(__file__).name} {in_path} --out {out_path} --compile",
-        "",
-        "If compiling the bundle copy manually, include r.f90 or the cached runtime module include path as appropriate.",
-    ]
-    compile_log_path.write_text("\n".join(compile_lines) + "\n", encoding="utf-8")
+    compile_log_path.write_text(_render_llm_bundle_diagnostics(src=src, out_path=out_path), encoding="utf-8")
     print(f"wrote {compile_log_path}")
+    fix_targets_path.write_text(
+        _render_llm_fix_targets(report=report, src=src, out_path=out_path),
+        encoding="utf-8",
+    )
+    print(f"wrote {fix_targets_path}")
 
     prompt_path.write_text(
         _write_llm_prompt(
@@ -56695,6 +57223,13 @@ def main() -> int:
         "--ignore-directives",
         action="store_true",
         help="ignore # xr2f: directive comments in the R source",
+    )
+    ap.add_argument(
+        "--decl-line-length",
+        type=int,
+        default=100,
+        metavar="N",
+        help="maximum line length for coalesced declaration lines, 60..132 (default: 100)",
     )
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled Fortran")
@@ -56908,6 +57443,9 @@ def main() -> int:
     if args.run_repeat < 1:
         print("Error: --run-repeat must be positive.")
         return 2
+    if not 60 <= args.decl_line_length <= 132:
+        print("Option error: --decl-line-length must be between 60 and 132.")
+        return 1
     compiler_explicit = any(a == "--compiler" or a.startswith("--compiler=") for a in sys.argv[1:])
     _maybe_adopt_positional_out(args)
     if args.round is not None and args.round < 0:
@@ -58899,7 +59437,7 @@ def main() -> int:
     f90 = promote_real_matrix_initializer_decls_text(f90)
     f90 = demote_smoother_prediction_point_decls_text(f90)
     f90 = rewrite_scalar_table_extract_decls_text(f90)
-    f90 = coalesce_final_declarations_text(f90, max_len=132)
+    f90 = coalesce_final_declarations_text(f90, max_len=args.decl_line_length)
     f90 = repair_arima_fit_list_result_text(f90)
     f90 = "\n".join(restore_renamed_list_result_field_uses(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = rewrite_vector_function_scalar_prints_text(f90)
@@ -58914,6 +59452,7 @@ def main() -> int:
     f90 = repair_complex_intrinsic_real_wrappers_text(f90)
     f90 = remove_pure_from_impure_call_graph_text(f90)
     f90 = rewrite_scalar_where_assignments_text(f90)
+    f90 = simplify_real_dp_casts_text(f90)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90.splitlines())
     f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
@@ -59262,6 +59801,17 @@ def main() -> int:
             _print_captured(cp)
             if not args.no_diagnostics:
                 _explain_compile_failure(cp, out_path, src)
+            _write_llm_bundle_diagnostics_file(
+                bundle_dir=llm_bundle_dir,
+                src=src,
+                in_path=in_path,
+                out_path=out_path,
+                args=args,
+                timings=timings,
+                build_command=cmd,
+                build_cp=cp,
+                r_run=r_run,
+            )
             _maybe_write_report(
                 {
                     "status": "FAIL",
@@ -59280,6 +59830,17 @@ def main() -> int:
             "stdout": cp.stdout or "",
             "stderr": cp.stderr or "",
         }
+        _write_llm_bundle_diagnostics_file(
+            bundle_dir=llm_bundle_dir,
+            src=src,
+            in_path=in_path,
+            out_path=out_path,
+            args=args,
+            timings=timings,
+            build_command=cmd,
+            build_cp=cp,
+            r_run=r_run,
+        )
 
         if args.run:
             t0 = time.perf_counter()
@@ -59305,6 +59866,18 @@ def main() -> int:
                     strip_quotes=args.strip_quotes,
                     strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
+                )
+                _write_llm_bundle_diagnostics_file(
+                    bundle_dir=llm_bundle_dir,
+                    src=src,
+                    in_path=in_path,
+                    out_path=out_path,
+                    args=args,
+                    timings=timings,
+                    build_command=cmd,
+                    build_cp=cp,
+                    run_cp=failed_frun,
+                    r_run=r_run,
                 )
                 _maybe_write_report(
                     build_info_ok,
@@ -59333,6 +59906,18 @@ def main() -> int:
                     strip_r_indices=args.pretty,
                     wrap_out=args.wrap_out,
                 )
+            _write_llm_bundle_diagnostics_file(
+                bundle_dir=llm_bundle_dir,
+                src=src,
+                in_path=in_path,
+                out_path=out_path,
+                args=args,
+                timings=timings,
+                build_command=cmd,
+                build_cp=cp,
+                run_cp=frun,
+                r_run=r_run,
+            )
             _maybe_write_report(
                 build_info_ok,
                 {
@@ -59371,10 +59956,37 @@ def main() -> int:
                 diff_match, first = _diff_output_matches(r_lines, f_lines)
                 if diff_match:
                     print("Run diff: MATCH")
+                    _write_llm_bundle_diagnostics_file(
+                        bundle_dir=llm_bundle_dir,
+                        src=src,
+                        in_path=in_path,
+                        out_path=out_path,
+                        args=args,
+                        timings=timings,
+                        build_command=cmd,
+                        build_cp=cp,
+                        run_cp=frun,
+                        r_run=r_run,
+                        run_diff_status="MATCH",
+                    )
                 else:
                     print("Run diff: DIFF")
                     if first is None:
                         first = min(len(r_lines), len(f_lines))
+                    _write_llm_bundle_diagnostics_file(
+                        bundle_dir=llm_bundle_dir,
+                        src=src,
+                        in_path=in_path,
+                        out_path=out_path,
+                        args=args,
+                        timings=timings,
+                        build_command=cmd,
+                        build_cp=cp,
+                        run_cp=frun,
+                        r_run=r_run,
+                        run_diff_status="DIFF",
+                        run_diff_first=first,
+                    )
                     print(f"  first mismatch line: {first + 1}")
                     if first < len(r_lines):
                         print(f"  r      : {r_lines[first]}")
