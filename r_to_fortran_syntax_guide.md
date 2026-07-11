@@ -15,7 +15,7 @@ flag <- TRUE
 name <- "SPY"
 ```
 
-Fortran variables are declared before use:
+Modern Fortran uses `implicit none` and explicit declarations:
 
 ```fortran
 real(kind=dp) :: x
@@ -29,7 +29,7 @@ flag = .true.
 name = "SPY"
 ```
 
-When a value is compile-time constant, generated Fortran may use a parameter:
+When a value is a compile-time constant, generated Fortran may use a parameter:
 
 ```fortran
 integer, parameter :: n = 10
@@ -114,6 +114,22 @@ Fortran also supports `do while`:
 ```fortran
 do while (err > tol)
    ...
+end do
+```
+
+R's `repeat` loop maps to an unbounded Fortran `do` with an explicit `exit`:
+
+```r
+repeat {
+  x <- update(x)
+  if (converged(x)) break
+}
+```
+
+```fortran
+do
+   x = update(x)
+   if (converged(x)) exit
 end do
 ```
 
@@ -424,4 +440,3 @@ The most reliable translations are scripts where:
 - list fields are fixed;
 - dynamic dispatch, environments, package-specific objects, and arbitrary data-frame programming are avoided;
 - R and Fortran outputs can be compared with `--run-both` or `--run-diff`.
-
