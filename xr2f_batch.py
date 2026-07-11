@@ -66,6 +66,7 @@ _STAGE_RE = re.compile(
 _WROTE_F90_RE = re.compile(r"^\s*wrote\s+(.+?\.f90)\s*$", flags=re.IGNORECASE | re.MULTILINE)
 _TRANSPILE_FAIL_RE = re.compile(r"^\s*(?:Transpile|Transpile \(R->Python\)):\s*FAIL\s*(?:\((.*)\))?\s*$", flags=re.IGNORECASE)
 _PROCESSED_LINE_RE = re.compile(r"^\s*\[\d+/\d+\]\s+(.+?)\s*$")
+_CASE_FAIL_RE = re.compile(r"^\s*(?:FAIL|.*\bFAIL\b)", flags=re.IGNORECASE)
 _R_FUNCTION_DEF_RE = re.compile(
     r"(?:<-|=)\s*function\s*\(",
     flags=re.IGNORECASE,
@@ -171,6 +172,21 @@ def _processed_from_log(log_path: Path) -> set[str]:
         if m:
             out.add(_path_key(Path(m.group(1).strip())))
     return out
+
+
+def _first_failure_from_log(log_path: Path) -> str | None:
+    current: str | None = None
+    text = log_path.read_text(encoding="utf-8", errors="ignore")
+    for ln in text.splitlines():
+        if ln.strip() == "Summary:":
+            break
+        m = _PROCESSED_LINE_RE.match(ln)
+        if m:
+            current = m.group(1).strip()
+            continue
+        if current is not None and _CASE_FAIL_RE.match(ln):
+            return current
+    return None
 
 
 def _resolve_resume_anchor(r_files: list[Path], anchor_raw: str) -> tuple[Path | None, str | None]:
@@ -298,13 +314,19 @@ def _default_tee_path(inputs: list[str]) -> Path:
     prefix = "xr2f_results"
     for item in inputs:
         raw = item[1:] if item.startswith("@") else item
-        name = Path(raw).name
+        raw_path = Path(raw)
+        name = raw_path.name
+        if _has_glob_meta(name):
+            name = raw_path.parent.name
         if name:
             parts = name.split("_")
             if len(parts) >= 2:
                 prefix = "_".join(parts[:2]) + "_results"
             else:
                 prefix = Path(name).stem + "_results"
+            prefix = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", prefix).strip(" ._")
+            if not prefix:
+                prefix = "xr2f_results"
             break
     stamp = datetime.now().strftime("%Y%m%d_%I%M%p").lower()
     return Path(f"{prefix}_{stamp}.txt")
@@ -370,7 +392,7 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=1, help="Run up to this many independent xr2f.py jobs concurrently.")
     ap.add_argument("--timeout", type=float, default=0.0, help="Per-file timeout in seconds (0 = no timeout).")
     ap.add_argument("--status-interval", type=float, default=60.0, help="Seconds between parallel progress reports while waiting.")
-    ap.add_argument("--resume", help="Resume from prior xr2f_batch log by skipping already-processed files.")
+    ap.add_argument("--resume", help="Resume from prior xr2f_batch log, starting with the first failed case in that log.")
     ap.add_argument("--resume-after", help="Start after this R source path in matched ordering.")
     ap.add_argument("--resume-with", help="Start with this R source path in matched ordering.")
     ap.add_argument("--verbose", action="store_true", help="Print full xr2f output for PASS cases too.")
@@ -415,6 +437,9 @@ def main() -> int:
     if args.resume_after and args.resume_with:
         print("Invalid options: --resume-after and --resume-with are mutually exclusive.")
         return 1
+    if args.resume and (args.resume_after or args.resume_with):
+        print("Invalid options: --resume cannot be combined with --resume-after or --resume-with.")
+        return 1
     if args.bridge_skip_no_functions and not args.bridge:
         print("Invalid options: --bridge-skip-no-functions requires --bridge.")
         return 1
@@ -446,10 +471,17 @@ def main() -> int:
         if not resume_path.exists() or not resume_path.is_file():
             print(f"Invalid options: --resume file not found: {resume_path}")
             return 1
-        done_keys = _processed_from_log(resume_path)
-        before = len(r_files)
-        r_files = [p for p in r_files if _path_key(p) not in done_keys]
-        print(f"Resume: skipped {before - len(r_files)} already-processed file(s) from {resume_path}.")
+        first_failure = _first_failure_from_log(resume_path)
+        if first_failure is None:
+            print(f"Resume: no failed case found in {resume_path}; no files to process.")
+            return 0
+        anchor_resolved, err = _resolve_resume_anchor(r_files, first_failure)
+        if anchor_resolved is None:
+            print(f"Invalid options: {err}")
+            return 1
+        idx = [_path_key(p) for p in r_files].index(_path_key(anchor_resolved))
+        r_files = r_files[idx:]
+        print(f"Resume: starting with first failure from {resume_path}: {anchor_resolved}. Remaining: {len(r_files)} file(s).")
         if not r_files:
             print("Resume: no remaining files to process.")
             return 0
