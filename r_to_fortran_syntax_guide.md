@@ -46,6 +46,27 @@ real(kind=dp) :: x
 x = 1.5_dp
 ```
 
+## Complex Numbers
+
+R writes the imaginary unit as `1i`:
+
+```r
+z <- 1 + 2i
+w <- exp(1i * theta)
+```
+
+Fortran complex values are usually written with `cmplx(real_part, imag_part, kind=dp)` or with a named imaginary unit:
+
+```fortran
+complex(kind=dp) :: z, w
+complex(kind=dp), parameter :: iu = cmplx(0.0_dp, 1.0_dp, kind=dp)
+
+z = cmplx(1.0_dp, 2.0_dp, kind=dp)
+w = exp(iu * theta)
+```
+
+R's `Re`, `Im`, `Conj`, `Mod`, and `Arg` correspond to Fortran intrinsics or simple wrappers such as `real`, `aimag`, `conjg`, `abs`, and `atan2`.
+
 ## Assignment
 
 R commonly uses `<-`:
