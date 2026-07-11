@@ -237,6 +237,20 @@ Fortran:
 real(kind=dp), parameter :: x(3) = [1.0_dp, 2.0_dp, 3.0_dp]
 ```
 
+R vectors coerce mixed elements to a common type:
+
+```r
+x <- c(3L, 4.5)          # numeric vector
+s <- c("boy", "girl")    # character vector
+```
+
+Fortran array constructors require compatible element types.  Character constructor elements must also have a consistent length, either by padding shorter strings or by declaring the constructor length:
+
+```fortran
+real(kind=dp), parameter :: x(2) = [3.0_dp, 4.5_dp]
+character(len=4), parameter :: s(2) = [character(len=4) :: "boy", "girl"]
+```
+
 R matrices are column-major, and Fortran arrays are also column-major:
 
 ```r
