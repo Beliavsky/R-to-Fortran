@@ -10003,7 +10003,7 @@ def _looks_integer_fortran_expr(expr: str) -> bool:
         return True
     if re.match(r"^size\s*\(.+\)$", t, re.IGNORECASE):
         return True
-    if re.match(r"^int\s*\(.+\)$", t, re.IGNORECASE):
+    if re.match(r"^(?:int|floor|ceiling|nint)\s*\(.+\)$", t, re.IGNORECASE):
         return True
     return False
 
