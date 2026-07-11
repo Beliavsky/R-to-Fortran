@@ -5339,6 +5339,7 @@ def classify_vars(
     params: dict[str, str] = {}
     known_arrays = set(known_arrays or set())
     assigned_names_ctx = set(assign_counts.keys())
+    loop_mutated_names = {nm for nm in assigned_names_ctx if _name_assigned_inside_loop(stmts, nm)}
     integer_context_names = infer_integer_context_names(stmts) & assigned_names_ctx
     find_char_arrays = {x.lower() for x in infer_main_character_arrays(stmts)}
 
@@ -6221,7 +6222,7 @@ def classify_vars(
                     # Do not force integer typing for variables already inferred real.
                     elif st.name in real_scalars or st.name in real_arrays:
                         pass
-                    elif assign_counts.get(st.name, 0) == 1:
+                    elif assign_counts.get(st.name, 0) == 1 and st.name not in loop_mutated_names:
                         params[st.name] = _normalize_r_int_literal(rhs)
                     else:
                         ints.add(st.name)
@@ -6230,7 +6231,7 @@ def classify_vars(
                 elif _is_integer_arith_expr(rhs):
                     if st.name in real_scalars or st.name in real_arrays:
                         pass
-                    elif assign_counts.get(st.name, 0) == 1:
+                    elif assign_counts.get(st.name, 0) == 1 and st.name not in loop_mutated_names:
                         params[st.name] = r_expr_to_fortran(rhs)
                     else:
                         ints.add(st.name)
@@ -6240,6 +6241,7 @@ def classify_vars(
                         params.pop(st.name, None)
                 elif (
                     assign_counts.get(st.name, 0) == 1
+                    and st.name not in loop_mutated_names
                     and (rhs_names_empty := _integerish_expr_names(rhs)) is not None
                     and not rhs_names_empty
                     and st.name not in real_scalars
@@ -6248,6 +6250,7 @@ def classify_vars(
                     params[st.name] = r_expr_to_fortran(rhs)
                 elif (
                     assign_counts.get(st.name, 0) == 1
+                    and st.name not in loop_mutated_names
                     and (rhs_names := _integerish_expr_names(rhs)) is not None
                     and rhs_names
                     and rhs_names <= set(params)
@@ -7919,6 +7922,12 @@ def _stmt_writes_name(st: object, name: str) -> bool:
         return any(_stmt_writes_name(b, name) for b in st.then_body) or any(
             _stmt_writes_name(b, name) for b in st.else_body
         )
+    if isinstance(st, SwitchStmt):
+        return any(
+            _stmt_writes_name(b, name)
+            for _label, body in st.cases
+            for b in body
+        ) or any(_stmt_writes_name(b, name) for b in st.default_body)
     return False
 
 
@@ -7935,6 +7944,11 @@ def _name_assigned_inside_loop(stmts: list[object], name: str) -> bool:
                 return True
         elif isinstance(st, IfStmt):
             if _name_assigned_inside_loop(st.then_body, name) or _name_assigned_inside_loop(st.else_body, name):
+                return True
+        elif isinstance(st, SwitchStmt):
+            if any(_name_assigned_inside_loop(body, name) for _label, body in st.cases) or _name_assigned_inside_loop(
+                st.default_body, name
+            ):
                 return True
     return False
 
@@ -27820,6 +27834,8 @@ def infer_main_array_params(stmts: list[object], assign_counts: dict[str, int]) 
             continue
         if st.name in subscript_mutated:
             continue
+        if _name_assigned_inside_loop(stmts, st.name):
+            continue
         if assign_counts.get(st.name, 0) != 1:
             continue
         rhs = st.expr.strip()
@@ -27849,6 +27865,8 @@ def infer_main_real_params(stmts: list[object], assign_counts: dict[str, int]) -
         if not isinstance(st, Assign):
             continue
         if st.name in subscript_mutated:
+            continue
+        if _name_assigned_inside_loop(stmts, st.name):
             continue
         if assign_counts.get(st.name, 0) != 1:
             continue
@@ -31015,6 +31033,12 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    source_main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+    source_main_loop_mutated_names = {
+        nm
+        for nm in infer_assigned_names(source_main_stmts)
+        if _name_assigned_inside_loop(source_main_stmts, nm)
+    }
     validate_unsupported_environment_assignment(stmts)
     if obfuscate:
         stmts = obfuscate_user_defined_names(stmts)
@@ -31092,6 +31116,11 @@ def transpile_r_to_fortran(
         )
     }
     main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
+    main_loop_mutated_names = source_main_loop_mutated_names | {
+        nm
+        for nm in infer_assigned_names(main_stmts)
+        if _name_assigned_inside_loop(main_stmts, nm)
+    }
     _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts, {fn.name for fn in funcs})
@@ -32353,6 +32382,22 @@ def transpile_r_to_fortran(
     pi_trig_args = _collect_pi_trig_array_args(main_stmts)
     array_params = {k: v for k, v in array_params.items() if k.lower() not in pi_trig_args}
     real_params = infer_main_real_params(main_stmts, assign_counts)
+    # A loop-mutated source variable is never a named constant.  Preserve
+    # this invariant across lowering/inline passes that may alter assignment
+    # counts before declarations are finalized.
+    for nm_mut in main_loop_mutated_names:
+        if nm_mut in params:
+            params.pop(nm_mut, None)
+            ints.add(nm_mut)
+        if nm_mut in real_params:
+            real_params.pop(nm_mut, None)
+            real_scalars.add(nm_mut)
+        if nm_mut in array_params:
+            kind_mut, _n_mut, _expr_mut = array_params.pop(nm_mut)
+            if kind_mut == "integer":
+                int_arrays.add(nm_mut)
+            else:
+                real_arrays.add(nm_mut)
     for nm_real_param in real_params:
         real_scalars.discard(nm_real_param)
     char_scalars = infer_main_character_scalars(main_stmts)
@@ -47048,6 +47093,8 @@ def hoist_module_used_scalar_parameters_text(f90: str) -> str:
         if re.search(rf"\b{name}\b", module_body) is None:
             continue
         if re.search(rf"(?m)^\s*{re.escape(name)}\s*=", module_body) is not None:
+            continue
+        if len(re.findall(rf"(?m)^\s*{re.escape(name)}\s*=", program_body)) != 1:
             continue
         m_assign = re.search(rf"(?m)^{name}\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:_dp)?)\s*$", program_body)
         if m_assign is None:
