@@ -165,6 +165,8 @@ x = x - mu
 end subroutine center
 ```
 
+Subroutines are also commonly used in hand-written Fortran to return multiple values that do not fit naturally in one array, by giving some dummy arguments `intent(out)` or `intent(inout)`.  `xr2f.py` usually keeps R functions as Fortran functions; when an R function returns a fixed list-like result, the generated function returns a derived type whose fields match the R result fields.
+
 Because Fortran procedure interfaces are static, R functions that return different types or ranks on different paths are hard to translate safely.
 
 ## Vectors, Matrices, And Arrays
