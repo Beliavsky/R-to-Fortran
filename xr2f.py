@@ -6240,6 +6240,18 @@ def classify_vars(
                         real_arrays.discard(st.name)
                         params.pop(st.name, None)
                 elif (
+                    (rhs_integer_names := _integerish_expr_names(rhs)) is not None
+                    and rhs_integer_names
+                    and rhs_integer_names <= (ints | set(params))
+                    and st.name not in real_scalars
+                    and st.name not in real_arrays
+                ):
+                    ints.add(st.name)
+                    params.pop(st.name, None)
+                    known_arrays.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                elif (
                     assign_counts.get(st.name, 0) == 1
                     and st.name not in loop_mutated_names
                     and (rhs_names_empty := _integerish_expr_names(rhs)) is not None
