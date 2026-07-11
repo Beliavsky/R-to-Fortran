@@ -1,7 +1,7 @@
 # xreg_fit.r
 # Read fixed regression data and fit lm(y ~ x1 + x2).
 
-path <- "xreg_data.txt"
+path <- "r_examples/xreg_data.txt"
 
 tab <- read.table(path, header = FALSE)
 

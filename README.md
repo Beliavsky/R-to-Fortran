@@ -1,10 +1,10 @@
 # R-to-Fortran
 
-`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran, written using Codex.  The goal is to translate numeric, array-oriented, statistical, and file-oriented R scripts into readable Fortran that can be compiled with `gfortran` or `ifx`, or run interactively through the `ofort` Fortran interpreter from the REPL.
+`xr2f.py` is an experimental source-to-source transpiler from a practical subset of R to modern Fortran, written using Codex.  The goal is to translate numeric, array-oriented, statistical, time-series, optimization, and file-oriented R scripts into readable Fortran that can be compiled with `gfortran` or `ifx`, or run interactively through the `ofort` Fortran interpreter from the REPL.
 
 This is not a complete R implementation.  It is useful for scripts that mostly use base R syntax, arrays, loops, vector operations, matrix algebra, static data structures, and a growing subset of base R statistical and filesystem workflows.  The project includes substantial Fortran runtime support for common statistics, distributions, smoothing, linear models, time-series helpers, clustering, tests, random-number generation, formatted printing, and file/directory I/O patterns used by the example corpus.
 
-The current workflow is test-driven and pragmatic: translate supported R code, compile it, compare it with R where useful, reduce failures to small reproducers, and reuse generated or hand-edited Fortran modules when that is the better engineering path.
+The current workflow is test-driven and pragmatic: translate supported R code, compile it, compare it with R where useful, reduce failures to small reproducers, and reuse generated or hand-edited Fortran modules when that is the better engineering path.  The project can also be used as an LLM-assisted translation toolkit: `xr2f.py` can emit partial modules, structured translation reports, and runtime helpers that make generated Fortran easier for a human or LLM to inspect and repair.
 
 ## Why Fortran?
 
@@ -13,6 +13,8 @@ Fortran is a practical compilation target for numerical R code.  It is a fast, s
 Fortran also has a long history in statistics and numerical computing.  Many statistical algorithms have reference or production implementations in Fortran, parts of R itself are written in Fortran, and R has an established interface for calling compiled Fortran routines.  Translating suitable R scripts to readable Fortran can therefore produce code that is fast, portable, and close to an ecosystem that R already knows how to call.
 
 As an example of the possible speedup, `r_examples\xgarch_dcc.r` fits univariate GARCH/NAGARCH models and a multivariate DCC-GARCH model in base R.  In one `--time-both` run where the R and Fortran results matched, the R run took 19.61 seconds and the generated Fortran run took 1.14 seconds.  Timings are workload- and machine-dependent, but this illustrates the kind of numerical script where translation can pay off.
+
+For a practical side-by-side overview of R syntax and modern Fortran equivalents, see [R To Fortran Syntax Guide](r_to_fortran_syntax_guide.md).  It covers control flow, functions, array indexing, matrix algebra, logical indexing, printing helpers, and common R-to-Fortran pitfalls such as `x[1:n-1]`.
 
 ## Relationship To quickr
 
@@ -88,6 +90,29 @@ python xr2f.py foo.r --integerize-r
 python xr2f.py foo.r --obfuscate --check-obfuscated-r
 ```
 
+Write LLM-friendly translation reports as JSON and Markdown:
+
+```bat
+python xr2f.py foo.r --report
+python xr2f.py foo.r --report foo_report.json --compile
+```
+
+Use strict R numeric-literal semantics as a lint mode:
+
+```bat
+python xr2f.py foo.r --run-both --r-numeric-literals
+```
+
+By default, `xr2f.py` treats many bare integer-looking literals pragmatically when they are used as lengths, indices, loop bounds, or integer arguments.  With `--r-numeric-literals`, bare literals such as `100` are treated as R numeric/double values when they are not used in an integer context; explicit `100L` remains integer.  Differences between default mode and `--r-numeric-literals` often identify R code that should be clarified with `L`, `as.integer()`, or an explicit numeric conversion.
+
+Control wrapping of coalesced generated Fortran declarations:
+
+```bat
+python xr2f.py foo.r --compile --decl-line-length 100
+```
+
+`--decl-line-length N` controls only merged declaration lines, not general Fortran wrapping.  The default is 100, and accepted values are 60 through 132.
+
 Start the interactive REPL:
 
 ```bat
@@ -153,6 +178,8 @@ end program xr2f_smoke
 - `xr_obfuscate.py`: standalone batch obfuscator for R sources.  It renames user-defined functions and variables, can preserve directory layout under an output directory, can run the generated R with `Rscript`, and can continue through failures with a quiet summary mode.
 - `xr2f_reduce.py`: reducer for R scripts that trigger a reproducible `xr2f.py` Fortran compile failure.  It can infer the first compile-error signature, reduce while preserving that signature, optionally check R validity, and backtrack to the smallest reduced R file that still runs.
 - `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, string, filesystem, and file-I/O helpers.
+- `xr2f_runtime_api.md`: curated guide to the stable `r.f90` helpers for generated Fortran, manual repairs, and LLM-assisted translation.
+- `r2f_llm_runtime.f90`: optional standalone helper module for LLM/manual translations.  It provides named numeric matrices, printable numeric tables, model summaries, linear-model result records, finite/NA-aware statistics, token parsers, index helpers, string conversion helpers, and cumulative-vector helpers without making normal `xr2f.py` output depend on those containers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
 - `xr2p.py`, `xp2f.py`, `xr2r.py`: alternate and normalization pipelines used by selected modes such as `--via-python` and `--via-core-r`.
 - `compare_project_files.py`: helper for comparing selected source files against another checkout.
@@ -180,7 +207,7 @@ The supported subset is intentionally focused on numerical scripts:
 - Ordering and ranking helpers such as `sort`, `order`, and `rank` for selected vectors.
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
 - Optional use of R's RNG through an R-linked shim with `--r-rng`.
-- Printing helpers including `print`, `show`, selected `cat`, `sprintf` with scalar literal formats, `round(..., digits=...)`, compact vector printing, matrix printing, `mode`, and `hist` result printing.
+- Printing helpers including `print`, `show`, selected `cat`, `sprintf` with scalar literal formats, `round(..., digits=...)`, compact vector printing, aligned one-row named-vector printing for table-row matrix sections, matrix/table printing, `mode`, and `hist` result printing.
 - Basic named vectors: construction with names, `names(v)`, `unname(v)`, named printing, positional indexing, literal-name indexing, and name-preserving printed arithmetic.
 - Static R lists with fixed fields for selected cases.  Named fields become Fortran derived-type components; unnamed fields use generated component names `item1`, `item2`, and so on.  Scalar, vector/array, character, logical, and nested static-list components are supported for common `$`, `[[...]]`, indexing, assignment, and printing patterns.
 - Homogeneous positional numeric lists such as `list(c(...), c(...))` or `list(matrix(...), matrix(...))` are kept as numerical array/list-of-matrix structures where the numerical examples expect array semantics.
@@ -273,6 +300,8 @@ python xr2f.py foo.r --r-rng --run-both
 
 On Windows this requires an R installation with headers/libraries available to the C and Fortran compilers.  `xr2f.py` caches compiled runtime objects to reduce repeat compile time where possible.
 
+For direct use of the runtime outside fully generated programs, see [`xr2f_runtime_api.md`](xr2f_runtime_api.md).  It documents the stable `r_mod` helpers for vectors, matrices, printing, distributions, optimization, integration, clustering, models, data frames, files, and common LLM repair patterns.
+
 ## Source Annotation, Integerization, Obfuscation, and Reduction
 
 `xr2f.py` includes source-level tools that are useful when improving the translator or preparing R code for translation.
@@ -332,6 +361,42 @@ python xr2f.py foo.r --partial-main --compile
 ```
 
 It tries to keep only top-level statements that do not depend on skipped functions and then reduces the generated program until it compiles.  This can be slow, and the resulting main program is a pruned approximation of the original script rather than a semantically complete translation.  Prefer `--partial` for normal partial-conversion work.
+
+## LLM-Assisted Translation
+
+`xr2f.py` can be useful even when a script does not fully translate on its own.  A practical LLM-assisted workflow is:
+
+1. Run `xr2f.py foo.r --llm-bundle foo_bundle --compile` or `--run-both`.
+2. Give the LLM `foo_bundle`, which contains the R script, full generated Fortran, partial module output, translation reports, directives, runtime API guide, compile notes, and a prompt.
+3. Ask the LLM to repair the generated Fortran locally rather than rewrite the whole script from scratch.
+4. Validate with `--run-both`, `--run-diff`, or a separate numerical comparison harness.
+
+`--llm-bundle DIR` writes a fixed-layout handoff directory:
+
+- `<stem>_r.f90`: the normal full-program translation.
+- `<stem>_partial.f90`: best-effort module translation of reusable R functions.
+- `<stem>_report.json` and `<stem>_report.md`: structured translation reports.
+- `<stem>_directed.r`: R source with suggested `# xr2f:` directive comments.
+- `xr2f_runtime_api.md`: curated guide to stable `r_mod` helpers.
+- `compile_log.txt` and `llm_prompt.md`: build/run diagnostics and LLM repair instructions.  When `--compile`, `--run`, or `--run-both` is used, `compile_log.txt` records the exact build command, compiler output, run output, run-diff status when available, and first-error/source-line hints for compile failures.
+- `fix_targets.md`: ranked repair checklist with the first compile target, runtime/diff status, high-risk translation regions, concrete directive candidates for recognizable compiler errors, declaration context, and validation plan.
+
+`--report` writes a JSON report and a Markdown companion report.  The report is intended to make translation failures easier to localize by recording source metadata, inferred types, generated symbols, warnings, approximations, and build/run status where available.
+
+`xr2f_repair.py` can run a conservative automated repair pass over an LLM bundle.  It reads directive candidates from `fix_targets.md`, creates trial copies of the R source, reruns `xr2f.py`, and writes `repair_log.json` / `repair_log.md` without modifying the original source:
+
+```bat
+python xr2f_repair.py --bundle foo_bundle --mode compile
+```
+
+For larger scripts, start with:
+
+```bat
+python xr2f.py foo.r --partial --compile --report
+python xr2f.py foo.r --partial-main --compile --report
+```
+
+Use [`xr2f_runtime_api.md`](xr2f_runtime_api.md) as the reference for `r.f90` helpers an LLM should prefer when repairing or extending generated Fortran.  The runtime guide is curated rather than generated: it documents recommended public helpers, result types, examples, approximation notes, and known gaps.
 
 ## Interactive REPL
 
@@ -454,7 +519,7 @@ The repository includes a focused pytest suite and R fixture scripts:
 pytest -q
 ```
 
-The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.  Many tests use scripts from `r_examples/`, `r_stat_examples/`, local root-level regression scripts, and generated one-off R programs in temporary directories.  As of July 4, 2026, pytest collects 373 tests; recent local full-corpus runs have passed with `XR2F_FULL_EXAMPLES=1`.
+The tests compile supported R examples with `gfortran`, so `gfortran` must be on `PATH`.  Many tests use scripts from `r_examples/`, `r_stat_examples/`, local root-level regression scripts, and generated one-off R programs in temporary directories.  The exact test count changes frequently as new reproducers are added; recent local full-corpus runs have been passing with `XR2F_FULL_EXAMPLES=1`.
 
 Run the full example corpus by opting in:
 
@@ -496,7 +561,7 @@ Differences can be legitimate when the R script uses random numbers, platform-de
 
 This project is experimental and test-driven.  The practical strategy is to add support for real scripts one feature at a time while checking that existing translated scripts still compile and run.  Most new behavior starts from a small reproducer script and then becomes either a pytest regression test or part of the full example corpus.
 
-The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, optimization routines, table-formatting helpers, and filesystem helpers used by the example corpus.  It can emit reusable modules, use external Fortran modules, create obfuscated R copies to detect name-specific lowering, integerize selected R literals, and reduce compile failures to reproducers.
+The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, optimization routines, table-formatting helpers, and filesystem helpers used by the example corpus.  It can emit reusable modules, use external Fortran modules, create structured translation reports, create obfuscated R copies to detect name-specific lowering, integerize selected R literals, run strict numeric-literal linting with `--r-numeric-literals`, control declaration wrapping with `--decl-line-length`, and reduce compile failures to reproducers.  The `r.f90` runtime is documented in [`xr2f_runtime_api.md`](xr2f_runtime_api.md) so generated Fortran can also be used as a starting point for manual or LLM-assisted translation.
 
 Coverage is still selective and pragmatic.  The translator favors real regression examples over full language completeness, and it generally prefers explicit unsupported-feature errors over silently generating misleading Fortran.  Some final post-codegen repairs remain intentionally pragmatic; `--no-post-repairs` and `--special-repairs` exist to separate generic translator behavior from corpus-specific compatibility repairs.
 

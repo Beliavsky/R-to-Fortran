@@ -63,6 +63,16 @@ def test_xr2f_batch_reports_missing_at_file(tmp_path: Path) -> None:
     assert "@ file not found:" in proc.stdout
 
 
+def test_xr2f_batch_default_tee_path_sanitizes_glob_name() -> None:
+    import xr2f_batch
+
+    path = xr2f_batch._default_tee_path([r"r_examples\*.r"])
+
+    assert "*" not in path.name
+    assert path.name.startswith("r_examples_results_")
+    assert path.suffix == ".txt"
+
+
 def test_expand_inputs_skip_lines_can_skip_glob_matches(tmp_path: Path) -> None:
     for name in ("01_a.r", "02_b.r", "03_c.r"):
         (tmp_path / name).write_text("print(1)\n", encoding="utf-8")
@@ -149,3 +159,55 @@ def test_xr2f_batch_max_fail_alias_stops(tmp_path: Path) -> None:
     assert proc.returncode == 1
     assert "Stopped at max-fail=1." in proc.stdout
     assert "Totals: 1 files, 0 pass, 1 fail" in proc.stdout
+
+
+def test_xr2f_batch_resume_starts_with_first_failure_from_log(tmp_path: Path) -> None:
+    a_r = tmp_path / "a.r"
+    b_r = tmp_path / "b.r"
+    c_r = tmp_path / "c.r"
+    a_r.write_text("print(1)\n", encoding="utf-8")
+    b_r.write_text("print(2)\n", encoding="utf-8")
+    c_r.write_text("print(3)\n", encoding="utf-8")
+    prior_log = tmp_path / "prior_results.txt"
+    prior_log.write_text(
+        "\n".join(
+            [
+                f"[1/3] {a_r}",
+                "",
+                f"[2/3] {b_r}",
+                "  FAIL (exit 1)",
+                "command: python xr2f.py b.r --compile",
+                "",
+                f"[3/3] {c_r}",
+                "",
+                "Summary:",
+                f"{b_r}  FAIL  build  1  0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XR2F_BATCH_PATH),
+            str(tmp_path / "*.r"),
+            "--resume",
+            str(prior_log),
+            "--limit",
+            "1",
+            "--self-contained",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"Resume: starting with first failure from {prior_log}: {b_r}" in proc.stdout
+    assert "[1/1]" in proc.stdout
+    assert "b.r" in proc.stdout
+    assert "a.r" not in proc.stdout
+    assert "Totals: 1 files, 1 pass, 0 fail" in proc.stdout
