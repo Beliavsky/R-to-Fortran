@@ -65,6 +65,11 @@ _KNOWN_INT_VECTOR_NAMES: set[str] = set()
 _CURRENT_INT_SCALAR_NAMES: set[str] = set()
 _CURRENT_INT_ARRAY_NAMES: set[str] = set()
 _CURRENT_REAL_ARRAY_NAMES: set[str] = set()
+_CURRENT_INT_MATRIX_NAMES: set[str] = set()
+_CURRENT_REAL_MATRIX_NAMES: set[str] = set()
+_CURRENT_VECTOR_NAMES: set[str] = set()
+_CURRENT_MATRIX_NAMES: set[str] = set()
+_CURRENT_RANK_HINTS: dict[str, int] = {}
 _CURRENT_CHAR_SCALAR_NAMES: set[str] = set()
 _KNOWN_INT_CONSTANTS: dict[str, int] = {}
 _KNOWN_MATRIX_NAMES: set[str] = set()
@@ -13471,20 +13476,54 @@ def r_expr_to_fortran(expr: str) -> str:
         y_src = pos_cp[1] if len(pos_cp) >= 2 else kw_cp.get("y")
         if x_src is None:
             raise NotImplementedError("crossprod requires x argument")
-        x_f = r_expr_to_fortran(x_src)
+
+        def _crossprod_operand(src: str) -> str:
+            src_t = src.strip()
+            mul_parts = _split_top_level_token(src_t, "*", from_right=True)
+            if mul_parts is None:
+                return r_expr_to_fortran(src_t)
+            lhs_src, rhs_src = (part.strip() for part in mul_parts)
+            rank_hints = {
+                **_CURRENT_RANK_HINTS,
+                **{name.lower(): 1 for name in (
+                    _KNOWN_VECTOR_NAMES
+                    | _KNOWN_INT_VECTOR_NAMES
+                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                    | (_CURRENT_INT_ARRAY_NAMES - _CURRENT_INT_MATRIX_NAMES)
+                    | (_CURRENT_REAL_ARRAY_NAMES - _CURRENT_REAL_MATRIX_NAMES)
+                    | _CURRENT_VECTOR_NAMES
+                )},
+                **{name.lower(): 2 for name in (
+                    _KNOWN_MATRIX_NAMES
+                    | _KNOWN_LOGICAL_MATRIX_NAMES
+                    | _CURRENT_INT_MATRIX_NAMES
+                    | _CURRENT_REAL_MATRIX_NAMES
+                    | _CURRENT_MATRIX_NAMES
+                )},
+            }
+            for operand_name in re.findall(r"\b[A-Za-z]\w*\b", src_t):
+                operand_l = operand_name.lower()
+                signature_ranks = {
+                    ranks[operand_l]
+                    for ranks in _USER_FUNC_ARG_RANK.values()
+                    if operand_l in ranks and ranks[operand_l] > 0
+                }
+                if len(signature_ranks) == 1:
+                    rank_hints.setdefault(operand_l, signature_ranks.pop())
+            lhs_rank = _infer_assignment_rank_hint(lhs_src, rank_hints)
+            rhs_rank = _infer_assignment_rank_hint(rhs_src, rank_hints)
+            lhs_f = r_expr_to_fortran(lhs_src)
+            rhs_f = r_expr_to_fortran(rhs_src)
+            if lhs_rank >= 2 and rhs_rank == 1:
+                return f"{lhs_f} * spread({rhs_f}, dim=2, ncopies=size({lhs_f},2))"
+            if rhs_rank >= 2 and lhs_rank == 1:
+                return f"spread({lhs_f}, dim=2, ncopies=size({rhs_f},2)) * {rhs_f}"
+            return f"{lhs_f} * {rhs_f}"
+
+        x_f = _crossprod_operand(x_src)
         if y_src is None:
             return f"r_matmul(transpose({x_f}), {x_f})" if _HAS_R_MOD else f"matmul(transpose({x_f}), {x_f})"
-        y_txt = y_src.strip()
-        y_mul = _split_top_level_token(y_txt, "*", from_right=True)
-        if y_mul is not None:
-            yl = y_mul[0].strip()
-            yr = y_mul[1].strip()
-            if re.match(r"^[A-Za-z]\w*$", yl) and re.match(r"^[A-Za-z]\w*$", yr):
-                y_f = f"{r_expr_to_fortran(yl)} * spread({r_expr_to_fortran(yr)}, dim=2, ncopies=size({r_expr_to_fortran(yl)},2))"
-            else:
-                y_f = r_expr_to_fortran(y_src)
-        else:
-            y_f = r_expr_to_fortran(y_src)
+        y_f = _crossprod_operand(y_src)
         return f"r_matmul(transpose({x_f}), {y_f})" if _HAS_R_MOD else f"matmul(transpose({x_f}), {y_f})"
     c_tcp = parse_call_text(s)
     if c_tcp is not None and c_tcp[0].lower() == "tcrossprod":
@@ -16820,7 +16859,10 @@ def emit_stmts(
     alloc_seen: set[str] | None = None,
     helper_ctx: dict[str, object] | None = None,
 ) -> None:
-    global _CURRENT_INT_SCALAR_NAMES, _CURRENT_INT_ARRAY_NAMES, _CURRENT_REAL_ARRAY_NAMES, _CURRENT_CHAR_SCALAR_NAMES
+    global _CURRENT_INT_SCALAR_NAMES, _CURRENT_INT_ARRAY_NAMES, _CURRENT_REAL_ARRAY_NAMES
+    global _CURRENT_INT_MATRIX_NAMES, _CURRENT_REAL_MATRIX_NAMES, _CURRENT_CHAR_SCALAR_NAMES
+    global _CURRENT_VECTOR_NAMES, _CURRENT_MATRIX_NAMES
+    global _CURRENT_RANK_HINTS
     global _CURRENT_WARNING_STMT_TEXT
     if alloc_seen is None:
         alloc_seen = set()
@@ -16996,6 +17038,11 @@ def emit_stmts(
     _CURRENT_INT_SCALAR_NAMES = {n.lower() for n in int_scalar_vars}
     _CURRENT_INT_ARRAY_NAMES = {n.lower() for n in (set(int_vector_vars) | set(int_matrix_vars))}
     _CURRENT_REAL_ARRAY_NAMES = {n.lower() for n in (set(real_vector_vars) | set(real_matrix_vars))}
+    _CURRENT_INT_MATRIX_NAMES = {n.lower() for n in int_matrix_vars}
+    _CURRENT_REAL_MATRIX_NAMES = {n.lower() for n in real_matrix_vars}
+    _CURRENT_VECTOR_NAMES = {n.lower() for n in vector_vars}
+    _CURRENT_MATRIX_NAMES = {n.lower() for n in matrix_vars}
+    _CURRENT_RANK_HINTS = {name.lower(): rank for name, rank in local_ranks_ctx.items()}
     _CURRENT_CHAR_SCALAR_NAMES = {n.lower() for n in char_scalar_vars}
     list_locals: dict[str, dict[str, object]] = {}
     if helper_ctx is not None:
@@ -36886,6 +36933,28 @@ def transpile_r_to_fortran(
         txt_l = txt.lower()
         k_l = k.lower()
 
+        if _expr_kind_simple(txt) == "logical":
+            rank_hints = (
+                {
+                    a.lower(): infer_arg_rank(funcs_by_name[fn_name], a)
+                    for a in funcs_by_name[fn_name].args
+                }
+                if fn_name in funcs_by_name
+                else {}
+            )
+            rank_hints.update({
+                **{name.lower(): 1 for name in (fn_int_arrays | fn_real_arrays | fn_logical_arrays)},
+                **{name.lower(): 2 for name in fn_real_mats},
+            })
+            logical_rank = _infer_assignment_rank_hint(txt, rank_hints)
+            if logical_rank >= 3:
+                return f"logical, allocatable :: {k}(:,:,:)"
+            if logical_rank == 2:
+                return f"logical, allocatable :: {k}(:,:)"
+            if logical_rank == 1:
+                return f"logical, allocatable :: {k}(:)"
+            return f"logical :: {k}"
+
         def _find_alias_assign(ss_alias: list[object], name_alias: str) -> Assign | None:
             for st_alias in ss_alias:
                 if isinstance(st_alias, Assign) and st_alias.name == name_alias:
@@ -49614,7 +49683,7 @@ def demote_elemental_allocatable_result_functions_text(f90: str) -> str:
             if re.match(r"^\s*end\s+function\b", lines[j], re.IGNORECASE):
                 break
             m_decl = re.match(
-                rf"^(\s*)(integer(?:\s*\([^)]*\))?|real\s*\([^)]*\)|logical|character\s*\([^)]*\))\s*,\s*allocatable\s*::\s*{re.escape(result_name)}\s*\(:\)\s*$",
+                rf"^(\s*)(integer(?:\s*\([^)]*\))?|real\s*\([^)]*\)|logical|character\s*\([^)]*\))\s*,\s*allocatable\s*::\s*{re.escape(result_name)}\s*\(\s*:(?:\s*,\s*:)*\s*\)\s*$",
                 lines[j],
                 re.IGNORECASE,
             )
