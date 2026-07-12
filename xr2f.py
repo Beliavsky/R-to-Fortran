@@ -5833,6 +5833,17 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
+                elif (
+                    cinfo is not None
+                    and cinfo[0].lower() == "cut"
+                    and cinfo[2].get("labels", "").strip().upper() in {"FALSE", "F"}
+                ):
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
                 elif re.match(r"^vector\s*\(\s*['\"]list['\"]", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
@@ -33333,7 +33344,11 @@ def transpile_r_to_fortran(
         if not isinstance(st_seq_real, Assign):
             continue
         rhs_seq_real_f = r_expr_to_fortran(st_seq_real.expr.strip())
-        if re.search(r"\br_seq_(?:int|len|int_by|int_length)\s*\(", rhs_seq_real_f, re.IGNORECASE) and re.search(
+        if re.match(
+            r"^\s*(?:real\s*\(\s*)?r_seq_(?:int|len|int_by|int_length)\s*\(",
+            rhs_seq_real_f,
+            re.IGNORECASE,
+        ) and re.search(
             r"(?:_dp\b|\d+\.\d*|\.\d+|real\s*\()", rhs_seq_real_f, re.IGNORECASE
         ):
             real_arrays.add(st_seq_real.name)
