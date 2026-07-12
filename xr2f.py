@@ -6579,6 +6579,15 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         return 1
     arg_aliases: set[str] = set()
 
+    def _without_length_out_use(txt: str, name: str) -> str:
+        """Mask scalar seq/rep length.out uses before vector-rank scans."""
+        return re.sub(
+            rf"\blength(?:\.|_)out\s*=\s*{re.escape(name)}\b",
+            "length.out = 1",
+            txt,
+            flags=re.IGNORECASE,
+        )
+
     def _collect_arg_aliases(ss_alias: list[object]) -> None:
         changed = True
         while changed:
@@ -6610,13 +6619,14 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
     if arg_aliases:
         body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
         for alias_arg in arg_aliases:
-            if re.search(rf"\b{re.escape(alias_arg)}\s*\[[^\]\n]*,[^\]\n]*\]", body_text_all):
+            body_text_rank = _without_length_out_use(body_text_all, alias_arg)
+            if re.search(rf"\b{re.escape(alias_arg)}\s*\[[^\]\n]*,[^\]\n]*\]", body_text_rank):
                 return max(forced_rank or 0, 2)
             if re.search(
                 rf"\b(?:quantile|sort|order|rank|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b",
-                body_text_all,
+                body_text_rank,
                 re.IGNORECASE,
-            ) or re.search(rf"\b{re.escape(alias_arg)}\s*\[", body_text_all):
+            ) or re.search(rf"\b{re.escape(alias_arg)}\s*\[", body_text_rank):
                 return max(forced_rank or 0, 1)
     pats_rank4 = [
         re.compile(rf"\b{re.escape(arg)}\s*\[\[[^\]]+\]\]\s*\[\[", re.IGNORECASE),
@@ -6679,7 +6689,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                 txt = ""
             txt = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', txt)
             for alias_arg in arg_aliases:
-                if re.search(rf"\b(?:quantile|sort|order|rank|pack|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b", txt, re.IGNORECASE):
+                txt_rank = _without_length_out_use(txt, alias_arg)
+                if re.search(rf"\b(?:quantile|sort|order|rank|pack|sum|mean|min|max|sd|var)\s*\([^)]*\b{re.escape(alias_arg)}\b", txt_rank, re.IGNORECASE):
                     rank = max(rank, 1)
             if (
                 re.search(r"\bsum\s*\(", txt, re.IGNORECASE)
