@@ -10759,13 +10759,19 @@ def validate_static_list_field_updates(stmts: list[object]) -> None:
                         if fld in before:
                             merged[fld] = before[fld]
                             continue
-                        if fld in then_fields and fld in else_fields and then_fields[fld] == else_fields[fld]:
-                            merged[fld] = then_fields[fld]
-                        elif fld in then_fields or fld in else_fields:
-                            raise NotImplementedError(
-                                f"dynamic R list field `{base}${fld}` is not supported; "
-                                "fields added in branches must be assigned in both branches with the same kind"
-                            )
+                        then_kind = then_fields.get(fld)
+                        else_kind = else_fields.get(fld)
+                        if then_kind is not None and else_kind is not None:
+                            if then_kind not in {"unknown", else_kind} and else_kind != "unknown":
+                                raise NotImplementedError(
+                                    f"R list field `{base}${fld}` has incompatible branch kinds "
+                                    f"{then_kind} and {else_kind}; dynamic list field types are not supported"
+                                )
+                            merged[fld] = else_kind if then_kind == "unknown" else then_kind
+                        elif then_kind is not None:
+                            merged[fld] = then_kind
+                        elif else_kind is not None:
+                            merged[fld] = else_kind
                     if merged:
                         scope_lists[base] = merged
             elif isinstance(st, ForStmt):
@@ -25917,6 +25923,23 @@ def emit_function(
                         and _parse_list_constructor(st_alias.expr.strip()) is not None
                     ):
                         out_alias.append(Assign(list_alias, st_alias.expr, st_alias.comment))
+                    elif isinstance(st_alias, ExprStmt):
+                        assignment_alias = split_top_level_assignment(st_alias.expr.strip())
+                        if (
+                            assignment_alias is not None
+                            and re.match(
+                                rf"^{re.escape(ret_alias_src)}\s*(?:\$|%)",
+                                assignment_alias[0].strip(),
+                            )
+                        ):
+                            out_alias.append(
+                                ExprStmt(
+                                    _replace_idents(st_alias.expr, {ret_alias_src: list_alias}),
+                                    st_alias.comment,
+                                )
+                            )
+                        else:
+                            out_alias.append(st_alias)
                     elif isinstance(st_alias, IfStmt):
                         out_alias.append(
                             IfStmt(
@@ -29261,7 +29284,9 @@ def collect_model_data_frame_uses(stmts: list[object]) -> set[str]:
     return out
 
 
-def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
+def collect_colname_labels(
+    stmts: list[object], *, include_dataframe_constructors: bool = False
+) -> dict[str, list[str]]:
     labels: dict[str, list[str]] = {}
     string_vectors: dict[str, list[str]] = {}
 
@@ -29318,6 +29343,19 @@ def collect_colname_labels(stmts: list[object]) -> dict[str, list[str]]:
                 if labs is not None:
                     string_vectors[st.name.lower()] = labs
                 cinfo = parse_call_text(st.expr.strip())
+                if (
+                    include_dataframe_constructors
+                    and cinfo is not None
+                    and cinfo[0].lower() == "data.frame"
+                ):
+                    df_labels = [
+                        key
+                        for key in cinfo[2]
+                        if key.lower()
+                        not in {"stringsasfactors", "check_names", "check.names", "row_names", "row.names"}
+                    ]
+                    if df_labels:
+                        labels[st.name.lower()] = df_labels
                 m_alias = re.fullmatch(r"[A-Za-z]\w*", st.expr.strip())
                 if m_alias is not None:
                     src_labs = labels.get(m_alias.group(0).lower())
@@ -31510,7 +31548,10 @@ def transpile_r_to_fortran(
                 changed_dimlabs = True
     list_specs = _list_return_specs(funcs)
     _LIST_FIELD_NAME_ALIASES = _list_field_aliases_from_specs(list_specs)
-    fn_matrix_col_labels = {f.name: collect_colname_labels(f.body) for f in funcs}
+    fn_matrix_col_labels = {
+        f.name: collect_colname_labels(f.body, include_dataframe_constructors=True)
+        for f in funcs
+    }
     source_fn_matrix_col_labels = collect_direct_function_matrix_col_labels_from_source(src)
     source_local_matrix_col_labels = dict(globals().get("_XR2F_FN_LOCAL_MATRIX_COL_LABELS", {}))
     for fn_src_labs, labs_src_labs in source_fn_matrix_col_labels.items():
@@ -48526,6 +48567,46 @@ def simplify_real_dp_casts_text(f90: str) -> str:
     """Remove redundant real(..., kind=dp) casts when the operand is already real(dp)."""
     if "real(" not in f90:
         return f90
+    type_components: dict[str, dict[str, str]] = {}
+    current_type_decl: str | None = None
+    logical_decl_lines: list[str] = []
+    pending_decl = ""
+    for raw_line in f90.splitlines():
+        code = raw_line.split("!", 1)[0].strip()
+        if pending_decl:
+            code = pending_decl + " " + re.sub(r"^\s*&\s*", "", code)
+        if code.rstrip().endswith("&"):
+            pending_decl = code.rstrip()[:-1].strip()
+            continue
+        pending_decl = ""
+        logical_decl_lines.append(code)
+    if pending_decl:
+        logical_decl_lines.append(pending_decl)
+    for code in logical_decl_lines:
+        m_type = re.match(r"^type\s*::\s*([A-Za-z]\w*)\b", code, re.IGNORECASE)
+        if m_type is not None:
+            current_type_decl = m_type.group(1).lower()
+            type_components.setdefault(current_type_decl, {})
+            continue
+        if current_type_decl is not None and re.match(r"^end\s+type\b", code, re.IGNORECASE):
+            current_type_decl = None
+            continue
+        if current_type_decl is None or "::" not in code:
+            continue
+        component_kind: str | None = None
+        if re.match(r"^real\s*\(\s*kind\s*=\s*dp\s*\)", code, re.IGNORECASE):
+            component_kind = "real_dp"
+        else:
+            m_derived = re.match(r"^type\s*\(\s*([A-Za-z]\w*)\s*\)", code, re.IGNORECASE)
+            if m_derived is not None:
+                component_kind = m_derived.group(1).lower()
+        if component_kind is None:
+            continue
+        for part in split_top_level_commas(code.split("::", 1)[1]):
+            name = part.split("=", 1)[0].strip()
+            name = re.sub(r"\(.*\)$", "", name).strip()
+            if re.fullmatch(r"[A-Za-z]\w*", name):
+                type_components[current_type_decl][name.lower()] = component_kind
     real_dp_funcs: set[str] = {"r_round"}
     current_fn: str | None = None
     current_result: str | None = None
@@ -48573,7 +48654,7 @@ def simplify_real_dp_casts_text(f90: str) -> str:
     def flush_scope() -> None:
         nonlocal scope_lines
         if scope_lines:
-            out.append(_simplify_real_dp_casts_in_scope_text("".join(scope_lines), real_dp_funcs))
+            out.append(_simplify_real_dp_casts_in_scope_text("".join(scope_lines), real_dp_funcs, type_components))
             scope_lines = []
 
     for line in lines:
@@ -48596,10 +48677,26 @@ def simplify_real_dp_casts_text(f90: str) -> str:
     return "".join(out)
 
 
-def _simplify_real_dp_casts_in_scope_text(f90: str, real_dp_funcs: set[str]) -> str:
+def _simplify_real_dp_casts_in_scope_text(
+    f90: str,
+    real_dp_funcs: set[str],
+    type_components: dict[str, dict[str, str]],
+) -> str:
     """Remove redundant real(dp) casts using declarations from one Fortran scope."""
     real_vars: set[str] = set()
+    derived_vars: dict[str, str] = {}
     for line in f90.splitlines():
+        m_derived_var = re.match(
+            r"\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_derived_var is not None:
+            for part in split_top_level_commas(m_derived_var.group(2)):
+                name = part.split("=", 1)[0].strip()
+                name = re.sub(r"\(.*\)$", "", name).strip()
+                if re.fullmatch(r"[A-Za-z]\w*", name):
+                    derived_vars[name.lower()] = m_derived_var.group(1).lower()
         if not re.match(r"\s*real\s*\(\s*kind\s*=\s*dp\s*\)", line, re.IGNORECASE):
             continue
         if "::" not in line:
@@ -48647,7 +48744,9 @@ def _simplify_real_dp_casts_in_scope_text(f90: str, real_dp_funcs: set[str]) -> 
             parts[0].strip()
             if (parts := split_top_level_commas(inner))
             and len(parts) == 2
-            and _real_dp_cast_operand_is_already_real(parts[0].strip(), real_vars)
+            and _real_dp_cast_operand_is_already_real(
+                parts[0].strip(), real_vars, derived_vars, type_components
+            )
             and re.fullmatch(r"(?i)kind\s*=\s*dp", parts[1].strip())
             else f"real({inner})"
         ),
@@ -48668,7 +48767,12 @@ def _simplify_real_dp_casts_in_scope_text(f90: str, real_dp_funcs: set[str]) -> 
     return f90
 
 
-def _real_dp_cast_operand_is_already_real(expr: str, real_vars: set[str]) -> bool:
+def _real_dp_cast_operand_is_already_real(
+    expr: str,
+    real_vars: set[str],
+    derived_vars: dict[str, str] | None = None,
+    type_components: dict[str, dict[str, str]] | None = None,
+) -> bool:
     """True when real(expr, kind=dp) is redundant from local declarations."""
     expr = expr.strip()
     m_name = re.fullmatch(r"([A-Za-z]\w*)", expr)
@@ -48677,6 +48781,21 @@ def _real_dp_cast_operand_is_already_real(expr: str, real_vars: set[str]) -> boo
     m_section = re.match(r"^([A-Za-z]\w*)\s*\(", expr)
     if m_section is not None and ":" in expr and m_section.group(1).lower() in real_vars:
         return True
+    component_expr = re.sub(r"\s*\(.*\)\s*$", "", expr).strip()
+    component_path = [part.strip().lower() for part in component_expr.split("%")]
+    if len(component_path) >= 2 and all(re.fullmatch(r"[A-Za-z]\w*", part) for part in component_path):
+        current_type = (derived_vars or {}).get(component_path[0])
+        for field in component_path[1:]:
+            if current_type is None:
+                return False
+            component_kind = (type_components or {}).get(current_type, {}).get(field)
+            if component_kind == "real_dp":
+                current_type = "real_dp"
+            elif component_kind is not None:
+                current_type = component_kind
+            else:
+                return False
+        return current_type == "real_dp"
     return False
 
 
