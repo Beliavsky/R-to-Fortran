@@ -6579,6 +6579,8 @@ def classify_vars(
 
 def infer_arg_rank(fn: FuncDef, arg: str) -> int:
     forced_rank = _FORCED_FUNC_ARG_RANKS.get(fn.name.lower(), {}).get(arg.lower())
+    if fn.defaults.get(arg, "").strip().upper() in {"TRUE", "FALSE", "T", "F"}:
+        return forced_rank or 0
     cache_key = (id(fn), arg.lower(), id(fn.body), len(_USER_FUNC_ARG_RANK))
     if forced_rank is None:
         cached_rank = _INFER_ARG_RANK_CACHE.get(cache_key)
@@ -7337,6 +7339,7 @@ def _replace_idents(expr: str, mapping: dict[str, str]) -> str:
         "as.integer",
         "as.numeric",
         "as.character",
+        "log",
     }
     for old in sorted(mapping.keys(), key=len, reverse=True):
         ident_pat = rf"(?<![A-Za-z0-9_.]){re.escape(old)}(?![A-Za-z0-9_.])"
@@ -25585,6 +25588,10 @@ def emit_function(
         dflt_s = dflt.strip()
         declared_arg_kinds = _USER_FUNC_ARG_KIND.get(fn.name.lower(), [])
         declared_arg_kind = declared_arg_kinds[f_args.index(a)] if f_args.index(a) < len(declared_arg_kinds) else "real"
+        if dflt_s.upper() in {"TRUE", "FALSE", "T", "F"}:
+            o.w(f"logical, intent({intent}){opt}{scalar_value_attr} :: {a}")
+            arg_type[a] = "logical"
+            continue
         if ar == 0 and declared_arg_kind == "complex":
             o.w(f"complex(kind=dp), intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "complex"
@@ -27610,6 +27617,7 @@ def infer_function_callback_args(fn: FuncDef) -> set[str]:
         "as.integer",
         "as.numeric",
         "as.character",
+        "log",
     }
 
     def walk_expr(expr: str) -> None:
