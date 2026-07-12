@@ -13258,7 +13258,12 @@ def r_expr_to_fortran(expr: str) -> str:
             identity_base = True
         elif labels_x is None:
             c_x = parse_call_text(x_t)
-            if c_x is not None and c_x[0].lower() in {"seq_len", "seq.int"} and len(c_x[1]) == 1 and not c_x[2]:
+            if c_x is not None and c_x[0].lower() == "seq_along" and len(c_x[1]) == 1 and not c_x[2]:
+                seq_arg_f = r_expr_to_fortran(c_x[1][0])
+                n_f = f"size({seq_arg_f})"
+                base_f = f"r_seq_len({n_f})"
+                identity_base = True
+            elif c_x is not None and c_x[0].lower() in {"seq_len", "seq.int"} and len(c_x[1]) == 1 and not c_x[2]:
                 n_f = _int_bound_expr(r_expr_to_fortran(c_x[1][0]))
                 base_f = f"r_seq_len({n_f})"
                 identity_base = True
