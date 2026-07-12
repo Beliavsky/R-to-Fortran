@@ -13188,6 +13188,37 @@ def r_expr_to_fortran(expr: str) -> str:
     c_cp = parse_call_text(s)
     if c_cp is not None and c_cp[0].lower() == "ts":
         return r_expr_to_fortran(c_cp[1][0] if c_cp[1] else c_cp[2].get("data", "0.0"))
+    if c_cp is not None and c_cp[0].lower() == "cut":
+        pos_cut, kw_cut = c_cp[1], c_cp[2]
+        x_src_cut = pos_cut[0] if pos_cut else kw_cut.get("x")
+        breaks_src_cut = pos_cut[1] if len(pos_cut) >= 2 else kw_cut.get("breaks")
+        if x_src_cut is None or breaks_src_cut is None:
+            raise NotImplementedError("cut requires x and breaks arguments")
+        x_f_cut = r_expr_to_fortran(x_src_cut)
+        breaks_f_cut = r_expr_to_fortran(breaks_src_cut)
+        optional_cut: list[str] = []
+        include_src_cut = kw_cut.get("include.lowest", kw_cut.get("include_lowest"))
+        labels_src_cut = kw_cut.get("labels")
+        if include_src_cut is not None:
+            optional_cut.append(f"include_lowest={r_expr_to_fortran(include_src_cut)}")
+        if labels_src_cut is not None:
+            optional_cut.append(f"labels={r_expr_to_fortran(labels_src_cut)}")
+        suffix_cut = (", " + ", ".join(optional_cut)) if optional_cut else ""
+        breaks_name_cut = breaks_src_cut.strip().lower()
+        known_vector_breaks_cut = breaks_name_cut in (
+            _KNOWN_VECTOR_NAMES
+            | _KNOWN_INT_VECTOR_NAMES
+            | _CURRENT_INT_ARRAY_NAMES
+            | _CURRENT_REAL_ARRAY_NAMES
+        )
+        scalar_breaks_cut = (
+            _is_int_literal(breaks_src_cut.strip())
+            or _is_real_literal(breaks_src_cut.strip())
+            or (re.fullmatch(r"[A-Za-z]\w*", breaks_src_cut.strip()) is not None and not known_vector_breaks_cut)
+        )
+        if scalar_breaks_cut:
+            return f"cut_n(real({x_f_cut}, kind=dp), int({breaks_f_cut}){suffix_cut})"
+        return f"cut(real({x_f_cut}, kind=dp), real({breaks_f_cut}, kind=dp){suffix_cut})"
     if c_cp is not None and c_cp[0].lower() == "ecdf":
         return c_cp[1][0].strip() if c_cp[1] else c_cp[2].get("x", "").strip()
     if c_cp is not None and c_cp[0].lower() in {"ks.test", "ks_test"}:
@@ -36303,7 +36334,7 @@ def transpile_r_to_fortran(
         "setdiff",
         "setequal",
         "findInterval",
-        "cut",
+        "cut", "cut_n",
         "outer",
         "hclust",
         "hist",
