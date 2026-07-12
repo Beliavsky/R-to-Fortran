@@ -48832,6 +48832,33 @@ def demote_scalar_reduction_local_declarations_text(f90: str) -> str:
             rhs_inner = ma.group(2)
             if not re.search(r"\bdim\s*=", rhs_inner, re.IGNORECASE):
                 scalar_names.add(ma.group(1).lower())
+        for line in block.splitlines():
+            m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*=\s*(.+)$", line)
+            if m_assign is None:
+                continue
+            lhs, rhs = m_assign.groups()
+            div_parts = _split_top_level_token(rhs.strip(), "/", from_right=True)
+            if div_parts is None:
+                continue
+            numerator, denominator = (part.strip() for part in div_parts)
+            reducer_call = parse_call_text(numerator)
+            if reducer_call is not None and reducer_call[0].lower() == "real" and reducer_call[1]:
+                kind_src = reducer_call[2].get("kind", reducer_call[1][1] if len(reducer_call[1]) >= 2 else "")
+                if kind_src.strip().lower() == "dp":
+                    reducer_call = parse_call_text(reducer_call[1][0].strip())
+            if reducer_call is None or not re.fullmatch(reducer_pat, reducer_call[0], re.IGNORECASE):
+                continue
+            if "dim" in {key.lower() for key in reducer_call[2]}:
+                continue
+            denominator_scalar = (
+                re.fullmatch(r"[A-Za-z]\w*", denominator) is not None
+                or re.fullmatch(r"[A-Za-z]\w*\s*\([^,:]+\)", denominator) is not None
+                or re.fullmatch(r"(?:real|int)\s*\(.+\)", denominator, re.IGNORECASE) is not None
+                or _is_int_literal(denominator)
+                or _is_real_literal(denominator)
+            )
+            if denominator_scalar:
+                scalar_names.add(lhs.lower())
         if not scalar_names:
             return block
 
