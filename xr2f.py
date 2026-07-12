@@ -17941,22 +17941,59 @@ def emit_stmts(
         c_tri_rank = parse_call_text(t)
         if c_tri_rank is not None and c_tri_rank[0].lower() in {"lower.tri", "upper.tri"}:
             return 2
-        m_rank3_index = re.match(r"^([A-Za-z]\w*)\s*\[(.*)\]\s*$", t)
-        if m_rank3_index is not None and m_rank3_index.group(1).lower() in _KNOWN_RANK3_NAMES:
-            dims_rank3_all = _split_index_dims(m_rank3_index.group(2).strip())
+        m_array_index = re.match(
+            r"^([A-Za-z]\w*(?:(?:\$|%)[A-Za-z]\w*)*)\s*\[(.*)\]\s*$",
+            t,
+        )
+        if m_array_index is not None:
+            dims_all = _split_index_dims(m_array_index.group(2).strip())
+        else:
+            dims_all = []
+        if m_array_index is not None and len(dims_all) >= 2:
             drop_false = any(
                 re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE)
-                for d in dims_rank3_all
+                for d in dims_all
             )
-            dims_rank3 = [d for d in dims_rank3_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+            dims = [d for d in dims_all if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
+            base_src = m_array_index.group(1).strip()
+            base_rank = _expr_rank_for_print(base_src)
+            if base_rank is None or base_rank < len(dims):
+                base_rank = len(dims)
             if drop_false:
-                return len(dims_rank3)
-            fixed_rank3 = sum(
-                1
-                for d in dims_rank3
-                if d.strip() and d.strip() != ":" and _split_top_level_colon(d.strip()) is None
-            )
-            return max(0, 3 - fixed_rank3)
+                return base_rank
+
+            vector_index_names = {
+                *(name.lower() for name in vector_vars),
+                *_KNOWN_VECTOR_NAMES,
+                *_KNOWN_INT_VECTOR_NAMES,
+                *_KNOWN_LOGICAL_VECTOR_NAMES,
+                *_KNOWN_CHAR_VECTOR_NAMES,
+            }
+
+            def _is_scalar_array_index(index_src: str) -> bool:
+                idx = index_src.strip()
+                idx_l = idx.lower()
+                if not idx or idx == ":" or idx.startswith("-"):
+                    return False
+                if _split_top_level_colon(idx) is not None:
+                    return False
+                if idx_l in {"true", "false", "t", "f", ".true.", ".false."}:
+                    return False
+                if re.fullmatch(r"[+-]?0+[lL]?", idx) is not None:
+                    return False
+                if re.fullmatch(r"[A-Za-z]\w*", idx) is not None and idx_l in vector_index_names:
+                    return False
+                idx_call = parse_call_text(idx)
+                if idx_call is not None and idx_call[0].lower() in {
+                    "c", "seq", "seq.int", "seq_len", "seq_along", "which", "order", "rep",
+                }:
+                    return False
+                if any(op in idx for op in ("==", "!=", "<=", ">=", "<", ">", "&", "|", "%in%")):
+                    return False
+                return True
+
+            scalar_count = sum(_is_scalar_array_index(d) for d in dims)
+            return max(0, base_rank - scalar_count)
         c_rank_print = parse_call_text(t)
         if c_rank_print is not None and c_rank_print[0].lower() in {
             "is.na",
@@ -21265,8 +21302,8 @@ def emit_stmts(
                                         _wstmt(f"call print_matrix_rstyle_named({one_f}, {label_expr})", st.comment)
                                         need_r_mod.add("print_matrix_rstyle_named")
                                 else:
-                                    _wstmt(f"call print_matrix({one_f})", st.comment)
-                                    need_r_mod.add("print_matrix_rstyle")
+                                    _wstmt(f"call display({one_f})", st.comment)
+                                    need_r_mod.add("display")
                         else:
                             o.w("block")
                             o.push()
@@ -21781,8 +21818,8 @@ def emit_stmts(
                         ):
                             _wstmt(f'write(*,"(*(g0,1x))") reshape({one_f}, [size({one_f})])', st.comment)
                         else:
-                            _wstmt(f"call print_real_vector(real(reshape({one_f}, [size({one_f})]), kind=dp))", st.comment)
-                            need_r_mod.add("print_real_vector")
+                            _wstmt(f"call display({one_f})", st.comment)
+                            need_r_mod.add("display")
                         continue
                     if rank_one == 2:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
@@ -22238,8 +22275,8 @@ def emit_stmts(
                             continue
                         if one in real_matrix_vars:
                             if has_r_mod:
-                                _wstmt(f"call print_matrix({one})", st.comment)
-                                need_r_mod.add("print_matrix_rstyle")
+                                _wstmt(f"call display({one})", st.comment)
+                                need_r_mod.add("display")
                             else:
                                 o.w("block")
                                 o.push()
@@ -22262,16 +22299,13 @@ def emit_stmts(
                     )
                     if rank_for_matrix_print == 3 and has_r_mod:
                         one_for_r3_print = r_expr_to_fortran(_rewrite_predict_expr(one))
-                        _wstmt(
-                            f"call print_real_vector(real(reshape({one_for_r3_print}, [size({one_for_r3_print})]), kind=dp))",
-                            st.comment,
-                        )
-                        need_r_mod.add("print_real_vector")
+                        _wstmt(f"call display({one_for_r3_print})", st.comment)
+                        need_r_mod.add("display")
                         continue
                     if rank_for_matrix_print == 2 and has_r_mod and not mentions_rank3_for_print:
                         one_for_matrix_print = r_expr_to_fortran(_rewrite_predict_expr(one))
-                        _wstmt(f"call print_matrix({one_for_matrix_print})", st.comment)
-                        need_r_mod.add("print_matrix_rstyle")
+                        _wstmt(f"call display({one_for_matrix_print})", st.comment)
+                        need_r_mod.add("display")
                         continue
                     m_sum = re.match(r"^summary\s*\((.*)\)\s*$", one, re.IGNORECASE)
                     m_coef_summary_lm = re.match(r"^coef\s*\(\s*summary\s*\(\s*(lm\s*\(.*\))\s*\)\s*\)\s*$", one, re.IGNORECASE)
@@ -23592,8 +23626,8 @@ def emit_stmts(
             rank_expr_print = _expr_rank_for_print(expr_print_src)
             if rank_expr_print == 3:
                 expr_print_f = r_expr_to_fortran(_rewrite_predict_expr(expr_print_src))
-                _wstmt(f"call print_real_vector(real(reshape({expr_print_f}, [size({expr_print_f})]), kind=dp))", st.comment)
-                need_r_mod.add("print_real_vector")
+                _wstmt(f"call display({expr_print_f})", st.comment)
+                need_r_mod.add("display")
                 continue
             if rank_expr_print == 1:
                 def _vector_print_kind_from_expr(src_vpk: str) -> str:
@@ -57032,6 +57066,16 @@ def _identifier_candidates_from_fortran_line(line: str) -> list[str]:
     return out
 
 
+def rewrite_flattened_array_displays_text(f90: str) -> str:
+    """Route already-lowered array prints through rank-generic display."""
+    return re.sub(
+        r"(?m)^(\s*)call\s+print_real_vector\(real\(reshape\((.+),\s*\[size\(\2\)\]\),\s*kind=dp\)\)\s*$",
+        r"\1call display(\2)",
+        f90,
+        flags=re.IGNORECASE,
+    )
+
+
 def _directive_name_for_fortran_symbol(name: str, procedure: str | None = None) -> str:
     nm = name.strip()
     if procedure and re.match(r"^[A-Za-z]\w*$", procedure):
@@ -59706,6 +59750,9 @@ def main() -> int:
     f90 = repair_diff_generic_specializations_text(f90)
     f90 = repair_real_matrix_integer_print_calls_text(f90)
     f90 = repair_integer_duck_diff_calls_from_source_text(f90, src)
+    f90 = rewrite_flattened_array_displays_text(f90)
+    if "call display(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"display"})
     if "call print_integer_vector(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_integer_vector"})
     f90 = repair_matrix_rows_round_prints_text(f90)
