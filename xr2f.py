@@ -11335,7 +11335,17 @@ def r_expr_to_fortran(expr: str) -> str:
                 and col_src_subset
                 and ":" not in col_f_subset
                 and not col_f_subset.startswith("[")
-                and not (re.fullmatch(r"[A-Za-z]\w*", col_src_subset) and col_src_subset.lower() in _KNOWN_VECTOR_NAMES)
+                and not (
+                    re.fullmatch(r"[A-Za-z]\w*", col_src_subset)
+                    and col_src_subset.lower()
+                    in (
+                        _KNOWN_VECTOR_NAMES
+                        | _KNOWN_INT_VECTOR_NAMES
+                        | _KNOWN_LOGICAL_VECTOR_NAMES
+                        | _CURRENT_INT_ARRAY_NAMES
+                        | _CURRENT_REAL_ARRAY_NAMES
+                    )
+                )
                 and not re.match(r"^[A-Za-z]\w*\s*\(", col_f_subset)
             ):
                 col_f_subset = f"{col_f_subset}:{col_f_subset}"
@@ -11346,7 +11356,17 @@ def r_expr_to_fortran(expr: str) -> str:
                 and row_src_subset
                 and ":" not in row_f_subset
                 and not row_f_subset.startswith("[")
-                and not (re.fullmatch(r"[A-Za-z]\w*", row_src_subset) and row_src_subset.lower() in _KNOWN_VECTOR_NAMES)
+                and not (
+                    re.fullmatch(r"[A-Za-z]\w*", row_src_subset)
+                    and row_src_subset.lower()
+                    in (
+                        _KNOWN_VECTOR_NAMES
+                        | _KNOWN_INT_VECTOR_NAMES
+                        | _KNOWN_LOGICAL_VECTOR_NAMES
+                        | _CURRENT_INT_ARRAY_NAMES
+                        | _CURRENT_REAL_ARRAY_NAMES
+                    )
+                )
                 and not re.match(r"^[A-Za-z]\w*\s*\(", row_f_subset)
             ):
                 row_f_subset = f"{row_f_subset}:{row_f_subset}"
@@ -16634,7 +16654,17 @@ def r_expr_to_fortran(expr: str) -> str:
                     if (
                         ":" not in col_f_idx
                         and not col_f_idx.startswith("[")
-                        and not (re.fullmatch(r"[A-Za-z]\w*", col_src_idx) and col_src_idx.lower() in _KNOWN_VECTOR_NAMES)
+                        and not (
+                            re.fullmatch(r"[A-Za-z]\w*", col_src_idx)
+                            and col_src_idx.lower()
+                            in (
+                                _KNOWN_VECTOR_NAMES
+                                | _KNOWN_INT_VECTOR_NAMES
+                                | _KNOWN_LOGICAL_VECTOR_NAMES
+                                | _CURRENT_INT_ARRAY_NAMES
+                                | _CURRENT_REAL_ARRAY_NAMES
+                            )
+                        )
                         and not re.match(r"^[A-Za-z]\w*\s*\(", col_f_idx)
                     ):
                         return f"{base}(:, {col_f_idx}:{col_f_idx})"
@@ -16644,7 +16674,17 @@ def r_expr_to_fortran(expr: str) -> str:
                     if (
                         ":" not in row_f_idx
                         and not row_f_idx.startswith("[")
-                        and not (re.fullmatch(r"[A-Za-z]\w*", row_src_idx) and row_src_idx.lower() in _KNOWN_VECTOR_NAMES)
+                        and not (
+                            re.fullmatch(r"[A-Za-z]\w*", row_src_idx)
+                            and row_src_idx.lower()
+                            in (
+                                _KNOWN_VECTOR_NAMES
+                                | _KNOWN_INT_VECTOR_NAMES
+                                | _KNOWN_LOGICAL_VECTOR_NAMES
+                                | _CURRENT_INT_ARRAY_NAMES
+                                | _CURRENT_REAL_ARRAY_NAMES
+                            )
+                        )
                         and not re.match(r"^[A-Za-z]\w*\s*\(", row_f_idx)
                     ):
                         return f"{base}({row_f_idx}:{row_f_idx}, :)"
