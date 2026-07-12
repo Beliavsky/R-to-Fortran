@@ -5532,7 +5532,18 @@ def classify_vars(
                     ints.discard(st.name)
                     real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
-                elif cinfo is not None and cinfo[0].lower() == "sample" and cinfo[1] and _split_top_level_colon(cinfo[1][0].strip()) is not None:
+                elif (
+                    cinfo is not None
+                    and cinfo[0].lower() == "sample"
+                    and cinfo[1]
+                    and (
+                        _split_top_level_colon(cinfo[1][0].strip()) is not None
+                        or (
+                            (sample_population_call := parse_call_text(cinfo[1][0].strip())) is not None
+                            and sample_population_call[0].lower() in {"seq", "seq.int", "seq_len", "seq_along", "integer"}
+                        )
+                    )
+                ):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -6994,7 +7005,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
     rank1_names: set[str] = set()
     for t_rank1 in texts:
         m_rank1 = re.match(
-            r"^\s*([A-Za-z]\w*)\s*<-\s*(?:colMeans|rowMeans|colSums|rowSums|apply|numeric|double|r_rep_real|r_rep_int|seq|seq_len|seq_along|cut)\s*\(",
+            r"^\s*([A-Za-z]\w*)\s*<-\s*(?:colMeans|rowMeans|colSums|rowSums|apply|numeric|double|r_rep_real|r_rep_int|seq|seq_len|seq_along|sample|sample\.int|cut)\s*\(",
             t_rank1,
             re.IGNORECASE,
         )
@@ -7103,7 +7114,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
             if rr is not None:
                 return rr
         if re.match(
-            rf"^\s*{nm}\s*<-\s*(?:simulate_markov_chain|sample\.int|integer|cut)\s*\(",
+            rf"^\s*{nm}\s*<-\s*(?:simulate_markov_chain|sample|sample\.int|integer|cut)\s*\(",
             t,
             re.IGNORECASE,
         ):
@@ -22070,6 +22081,10 @@ def emit_stmts(
                                 _wstmt(f"call print_integer_vector({one_f})", st.comment)
                                 need_r_mod.add("print_integer_vector")
                                 continue
+                            if re.fullmatch(r"[A-Za-z]\w*\s*(?:\$|%)\s*[A-Za-z]\w*", one.strip()):
+                                _wstmt(f"call display({one_f})", st.comment)
+                                need_r_mod.add("display")
+                                continue
                             if re.fullmatch(r"[A-Za-z]\w*", one_f.strip()) and one_f.strip() in real_vector_vars:
                                 _wstmt(f"call print_real_vector({one_f})", st.comment)
                             else:
@@ -26904,6 +26919,8 @@ def emit_function(
                     changed_scalar = True
         for st_seq_rank in assign_nodes:
             c_var_rank = parse_call_text(st_seq_rank.expr.strip())
+            if c_var_rank is not None and c_var_rank[0].lower() in {"sample", "sample.int"}:
+                local_ranks[st_seq_rank.name] = 1
             if c_var_rank is not None and c_var_rank[0].lower() == "var":
                 var_arg = c_var_rank[1][0].strip() if c_var_rank[1] else c_var_rank[2].get("x", "").strip()
                 var_arg_rank = _infer_assignment_rank_hint(
