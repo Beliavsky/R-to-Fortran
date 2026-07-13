@@ -31834,6 +31834,96 @@ def _rewrite_simple_anonymous_apply_functions(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _rewrite_simple_anonymous_combn_functions(src: str) -> str:
+    """Lift one-expression combn anonymous callbacks into named helpers."""
+    lines = src.splitlines()
+    out: list[str] = []
+    i = 0
+    n_fun = 0
+
+    def next_name() -> str:
+        nonlocal n_fun
+        while True:
+            n_fun += 1
+            candidate = f"xr2f_combn_fun_{n_fun}"
+            if re.search(rf"\b{re.escape(candidate)}\b", src) is None:
+                return candidate
+
+    def split_body_suffix(text: str) -> tuple[str, str]:
+        par = bracket = brace = 0
+        quote = ""
+        for pos, ch in enumerate(text):
+            if quote:
+                if ch == quote and (pos == 0 or text[pos - 1] != "\\"):
+                    quote = ""
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+            elif ch == "(":
+                par += 1
+            elif ch == ")":
+                par -= 1
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket -= 1
+            elif ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace -= 1
+            elif ch == "," and par == 0 and bracket == 0 and brace == 0:
+                return text[:pos].rstrip(), text[pos:]
+        return text.strip(), ""
+
+    while i < len(lines):
+        line = lines[i]
+        m_braced = re.match(
+            r"^(\s*.*?\bcombn\s*\(.*?\bFUN\s*=\s*)function\s*\(([^)]*)\)\s*\{\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_braced is not None and i + 2 < len(lines):
+            body = lines[i + 1].strip()
+            close = lines[i + 2].strip()
+            close_m = re.fullmatch(r"\}\s*(,.*)?\)", close)
+            if body and close_m is not None:
+                fn_name = next_name()
+                out.extend(
+                    [
+                        f"{fn_name} <- function({m_braced.group(2).strip()}) {{",
+                        f"  {body}",
+                        "}",
+                        f"{m_braced.group(1)}{fn_name}{close_m.group(1) or ''})",
+                    ]
+                )
+                i += 3
+                continue
+
+        m_inline = re.match(
+            r"^(\s*.*?\bcombn\s*\(.*?\bFUN\s*=\s*)function\s*\(([^)]*)\)\s*(?!\{)(.+)\)\s*(#.*)?$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_inline is not None:
+            body, suffix = split_body_suffix(m_inline.group(3).strip())
+            if body:
+                fn_name = next_name()
+                out.extend(
+                    [
+                        f"{fn_name} <- function({m_inline.group(2).strip()}) {{",
+                        f"  {body}",
+                        "}",
+                        f"{m_inline.group(1)}{fn_name}{suffix}){m_inline.group(4) or ''}",
+                    ]
+                )
+                i += 1
+                continue
+
+        out.append(line)
+        i += 1
+    return "\n".join(out) + ("\n" if src.endswith("\n") else "")
+
+
 def _rewrite_simple_transposed_sapply_field(src: str) -> str:
     """Lower t(sapply(xs, function(f) { f$field })) into an explicit row loop."""
     lines = src.splitlines()
@@ -31972,6 +32062,7 @@ def transpile_r_to_fortran(
     check_xr2f_directive_declare_conflicts(src, _XR2F_FORCE_KIND, _XR2F_FORCE_RANK)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _rewrite_simple_anonymous_apply_functions(src)
+    src = _rewrite_simple_anonymous_combn_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
     _DOTTED_VAR_RENAMES = {}
     _RAW_R_IDENT_NAMES = _collect_raw_r_ident_names(src)
