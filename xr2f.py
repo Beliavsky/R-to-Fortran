@@ -3258,7 +3258,140 @@ def _lower_trycatch_assignment_blocks(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _lower_replicate_assignment_blocks(src: str) -> str:
+    """Lower `x <- replicate(n, { ... })` to a repeatable helper call."""
+    start_re = re.compile(
+        rf"(?m)^(?P<indent>[ \t]*)(?P<target>{_R_IDENT_RE})\s*(?:<-|=)\s*replicate\s*\(",
+        re.IGNORECASE,
+    )
+
+    def matching_delim(text: str, open_pos: int, open_ch: str, close_ch: str) -> int:
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        i = open_pos
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "#":
+                nl = text.find("\n", i)
+                if nl < 0:
+                    return -1
+                i = nl + 1
+                continue
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def first_top_level_comma(text: str) -> int:
+        par = bracket = brace = 0
+        quote: str | None = None
+        escaped = False
+        for i, ch in enumerate(text):
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+            elif ch == "(":
+                par += 1
+            elif ch == ")":
+                par -= 1
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket -= 1
+            elif ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace -= 1
+            elif ch == "," and par == 0 and bracket == 0 and brace == 0:
+                return i
+        return -1
+
+    out: list[str] = []
+    pos = 0
+    helper_no = 0
+    while True:
+        match = start_re.search(src, pos)
+        if match is None:
+            out.append(src[pos:])
+            break
+        open_paren = src.find("(", match.start(), match.end())
+        close_paren = matching_delim(src, open_paren, "(", ")")
+        if close_paren < 0:
+            out.append(src[pos:])
+            break
+        inner = src[open_paren + 1 : close_paren]
+        comma = first_top_level_comma(inner)
+        if comma < 0:
+            out.append(src[pos : close_paren + 1])
+            pos = close_paren + 1
+            continue
+        count_src = inner[:comma].strip()
+        value_and_opts = inner[comma + 1 :].strip()
+        if not value_and_opts.startswith("{"):
+            out.append(src[pos : close_paren + 1])
+            pos = close_paren + 1
+            continue
+        close_brace = matching_delim(value_and_opts, 0, "{", "}")
+        if close_brace < 0:
+            out.append(src[pos : close_paren + 1])
+            pos = close_paren + 1
+            continue
+        options = value_and_opts[close_brace + 1 :].strip()
+        if options and not re.fullmatch(r",\s*simplify\s*=\s*(?:TRUE|T)\s*", options, re.IGNORECASE):
+            out.append(src[pos : close_paren + 1])
+            pos = close_paren + 1
+            continue
+
+        helper_no += 1
+        helper = f"xr2f_replicate_block_{helper_no}"
+        while re.search(rf"\b{re.escape(helper)}\b", src, re.IGNORECASE):
+            helper_no += 1
+            helper = f"xr2f_replicate_block_{helper_no}"
+        indent = match.group("indent")
+        body = value_and_opts[1:close_brace].strip("\r\n")
+        body_lines = body.splitlines()
+        nonblank = [len(ln) - len(ln.lstrip()) for ln in body_lines if ln.strip()]
+        trim = min(nonblank) if nonblank else 0
+        body = "\n".join(indent + "  " + ln[trim:] if ln.strip() else "" for ln in body_lines)
+        replacement = (
+            f"{indent}{helper} <- function() {{\n"
+            f"{body}\n"
+            f"{indent}}}\n"
+            f"{indent}{match.group('target')} <- xr2f_replicate_block({count_src}, {helper}())"
+        )
+        out.append(src[pos : match.start()])
+        out.append(replacement)
+        pos = close_paren + 1
+    return "".join(out)
+
+
 def preprocess_r_lines(src: str) -> list[str]:
+    src = _lower_replicate_assignment_blocks(src)
     src = _lower_trycatch_assignment_blocks(src)
     lines0: list[str] = []
     seen_code = False
@@ -7041,6 +7174,16 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
     # Rank-2 triggers on matrix-like assignment or 2D indexing use.
     texts = _stmt_texts_for_rank_scan(stmts)
     nm = re.escape(name)
+    for t_rep in texts:
+        m_rep = re.match(rf"^\s*{nm}\s*<-\s*(xr2f_replicate_block\s*\(.*\))\s*$", t_rep, re.IGNORECASE)
+        if m_rep is None:
+            continue
+        c_rep = parse_call_text(m_rep.group(1))
+        value_src = _call_arg(c_rep, 1, "value") if c_rep is not None else ""
+        value_call = parse_call_text(value_src.strip()) if value_src else None
+        if value_call is not None:
+            return min(3, _USER_FUNC_RETURN_RANK.get(value_call[0].lower(), 0) + 1)
+        return 1
     rank1_names: set[str] = set()
     for t_rank1 in texts:
         m_rank1 = re.match(
@@ -8241,8 +8384,7 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
             c_inline_rhs = parse_call_text(st.expr.strip())
             if (
                 c_inline_rhs is not None
-                and c_inline_rhs[0].lower() == "replicate"
-                and c_inline_rhs[2].get("simplify", "TRUE").strip().upper() in {"FALSE", "F"}
+                and c_inline_rhs[0].lower() in {"replicate", "xr2f_replicate_block"}
             ):
                 i += 1
                 continue
@@ -9009,6 +9151,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
         c_call = parse_call_text(expr)
         if c_call is not None:
             fn_name = c_call[0].lower()
+            if fn_name == "xr2f_replicate_block":
+                value_src = _call_arg(c_call, 1, "value")
+                value_call = parse_call_text(value_src.strip()) if value_src else None
+                if value_call is not None:
+                    return min(3, _USER_FUNC_RETURN_RANK.get(value_call[0].lower(), 0) + 1)
+                return 1
             if fn_name in _SCALAR_DISTRIBUTION_FUNCTIONS:
                 arg_src = _first_call_arg(c_call)
                 if not arg_src:
@@ -9050,6 +9198,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             if fn_name == "apply_col_cumsum":
                 return 2
             if fn_name == "apply_col_sd":
+                return 1
+            if fn_name in {"coef", "coefficients", "lm_coef"}:
                 return 1
             if fn_name == "var":
                 arg_src = _first_call_arg(c_call, "x")
@@ -19553,6 +19703,60 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            c_rep_block = parse_call_text(rhs)
+            if c_rep_block is not None and c_rep_block[0].lower() == "xr2f_replicate_block":
+                count_src = _call_arg(c_rep_block, 0, "n")
+                value_src = _call_arg(c_rep_block, 1, "value")
+                value_call = parse_call_text(value_src.strip()) if value_src else None
+                if not count_src or value_call is None:
+                    raise NotImplementedError("replicate block requires a count and generated helper call")
+                value_rank = _USER_FUNC_RETURN_RANK.get(value_call[0].lower(), 0)
+                value_kind = _USER_FUNC_RETURN_KIND.get(value_call[0].lower(), "real")
+                if value_rank > 2:
+                    raise NotImplementedError("replicate block results above rank 2 are not supported")
+                count_f = _int_bound_expr(r_expr_to_fortran(count_src))
+                value_f = r_expr_to_fortran(value_src)
+                tag = re.sub(r"\W+", "_", st.name).strip("_") or "value"
+                idx = f"i_replicate_{tag}"
+                o.w("block")
+                o.push()
+                o.w(f"integer :: {idx}")
+                if value_rank == 0:
+                    o.w(f"allocate({st.name}({count_f}))")
+                    o.w(f"do {idx} = 1, {count_f}")
+                    o.push()
+                    o.w(f"{st.name}({idx}) = {value_f}")
+                    o.pop()
+                    o.w("end do")
+                else:
+                    if value_kind in {"int", "integer"}:
+                        decl = "integer, allocatable"
+                    elif value_kind == "logical":
+                        decl = "logical, allocatable"
+                    elif value_kind in {"char", "character"}:
+                        decl = "character(len=:), allocatable"
+                    else:
+                        decl = "real(kind=dp), allocatable"
+                    dims = ":" if value_rank == 1 else ":,:"
+                    tmp = f"replicate_{tag}_value"
+                    o.w(f"{decl} :: {tmp}({dims})")
+                    o.w(f"{tmp} = {value_f}")
+                    if value_rank == 1:
+                        o.w(f"allocate({st.name}(size({tmp}, 1), {count_f}))")
+                        o.w(f"{st.name}(:, 1) = {tmp}")
+                        target_slice = f"{st.name}(:, {idx})"
+                    else:
+                        o.w(f"allocate({st.name}(size({tmp}, 1), size({tmp}, 2), {count_f}))")
+                        o.w(f"{st.name}(:, :, 1) = {tmp}")
+                        target_slice = f"{st.name}(:, :, {idx})"
+                    o.w(f"do {idx} = 2, {count_f}")
+                    o.push()
+                    o.w(f"{target_slice} = {value_f}")
+                    o.pop()
+                    o.w("end do")
+                o.pop()
+                o.w("end block")
+                continue
             if st.name in object_list_vars:
                 rep_obj = _replicate_object_call_info(rhs, None)
                 if rep_obj is not None:
