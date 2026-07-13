@@ -11201,6 +11201,7 @@ def _coerce_user_actual_for_declared_kind(fn_name: str, formal: str, actual_src:
     actual_l = actual_src.strip().lower()
     is_int_actual = (
         _is_int_literal(af)
+        or _expr_kind_simple(actual_src) == "int"
         or actual_l in _KNOWN_INT_NAMES
         or actual_l in _KNOWN_INT_VECTOR_NAMES
         or actual_l in _CURRENT_INT_ARRAY_NAMES
@@ -11296,6 +11297,12 @@ def r_expr_to_fortran(expr: str) -> str:
             return _R_DERIVATIVE_OBJECTS[target_eval]
         raise NotImplementedError("unsupported eval(): only known D(expression(...), var) derivative objects are currently supported")
     c_expr0 = parse_call_text(s)
+    if c_expr0 is not None and c_expr0[0].lower() == "force":
+        pos_force, kw_force = c_expr0[1], c_expr0[2]
+        force_src = pos_force[0].strip() if pos_force else kw_force.get("x", "").strip()
+        if not force_src or len(pos_force) > 1 or set(kw_force) - {"x"}:
+            raise NotImplementedError("force() requires exactly one argument")
+        return r_expr_to_fortran(force_src)
     if c_expr0 is not None and c_expr0[0].lower() in {"expression", "d"}:
         raise NotImplementedError("unsupported expression/D() object in executable expression; use eval() on a known D() result")
     c_sys0 = parse_call_text(s)
@@ -23480,6 +23487,15 @@ def emit_stmts(
                 o.w("return")
                 continue
             c_expr = parse_call_text(st.expr.strip())
+            if (
+                c_expr is not None
+                and c_expr[0].lower() == "force"
+                and helper_ctx is not None
+                and helper_ctx.get("current_fn_name")
+            ):
+                force_src = c_expr[1][0].strip() if c_expr[1] else c_expr[2].get("x", "").strip()
+                if re.fullmatch(r"[A-Za-z]\w*", force_src):
+                    continue
             if c_expr is not None and c_expr[0].lower() in {"seq", "seq.int", "seq_along", "seq_len"}:
                 _wstmt(f"print *, {r_expr_to_fortran(st.expr.strip())}", st.comment)
                 continue
@@ -27615,6 +27631,8 @@ def emit_function(
             if c_scalar_call is None or _USER_FUNC_RETURN_RANK.get(c_scalar_call[0].lower()) != 0:
                 continue
             nm_scalar_call = st_scalar_call.name
+            if nm_scalar_call in local_list_types or nm_scalar_call in object_list_locals:
+                continue
             real_arrays.discard(nm_scalar_call)
             int_arrays.discard(nm_scalar_call)
             logical_arrays.discard(nm_scalar_call)
@@ -27727,6 +27745,18 @@ def emit_function(
             if c_rng_vec is not None and c_rng_vec[0].lower() in {"rnorm", "rnorm_vec", "runif", "runif_vec"}:
                 _force_local_real_array(st_rng_vec.name)
                 local_ranks[st_rng_vec.name] = 1
+        # Late rank/kind inference must not redeclare a derived-type local as
+        # an intrinsic variable.  These names are scoped to this procedure.
+        for nm in set(local_list_types) | set(object_list_locals):
+            ints.discard(nm)
+            int_arrays.discard(nm)
+            real_arrays.discard(nm)
+            real_scalars.discard(nm)
+            logical_arrays.discard(nm)
+            logical_scalars.discard(nm)
+            char_scalars_loc.discard(nm)
+            char_arrays_loc.discard(nm)
+            params.pop(nm, None)
         real_scalars.difference_update(real_arrays)
         real_arrays.difference_update(ints)
         int_arrays.difference_update(ints)
@@ -39952,21 +39982,48 @@ def promote_derived_result_call_locals_text(f90: str) -> str:
     if not fn_result_types:
         return f90
 
-    target_types: dict[str, str] = {}
+    lines = f90.splitlines()
+    scope_ids: list[int] = []
+    scope_stack: list[int] = [0]
+    next_scope = 1
+    scope_start = re.compile(
+        r"^\s*(?:(?:pure|recursive|elemental|module)\s+)*(?:function|subroutine|program)\b",
+        re.IGNORECASE,
+    )
+    scope_end = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    for line in lines:
+        if scope_start.match(line):
+            scope_stack.append(next_scope)
+            next_scope += 1
+        scope_ids.append(scope_stack[-1])
+        if scope_end.match(line) and len(scope_stack) > 1:
+            scope_stack.pop()
+
+    target_types: dict[tuple[int, str], str] = {}
     fn_alt = "|".join(re.escape(name) for name in sorted(fn_result_types, key=len, reverse=True))
-    for m_assign in re.finditer(rf"(?m)^\s*([A-Za-z]\w*)\s*=\s*({fn_alt})\s*\(", f90):
-        lhs, fn_name = m_assign.groups()
-        target_types[lhs] = fn_result_types[fn_name]
+    assign_pat = re.compile(rf"^\s*([A-Za-z]\w*)\s*=\s*({fn_alt})\s*\(", re.IGNORECASE)
+    for line, scope_id in zip(lines, scope_ids):
+        m_assign = assign_pat.match(line)
+        if m_assign is not None:
+            lhs, fn_name = m_assign.groups()
+            result_type = next(
+                typ for name, typ in fn_result_types.items() if name.lower() == fn_name.lower()
+            )
+            target_types[(scope_id, lhs.lower())] = result_type
     if not target_types:
         return f90
 
-    already_declared = {
-        m.group(2)
-        for m in re.finditer(r"(?im)^\s*type\s*\(\s*([A-Za-z]\w*_result_t)\s*\)\s*::\s*([A-Za-z]\w*)\b", f90)
-    }
-    lines = f90.splitlines()
+    already_declared: set[tuple[int, str]] = set()
+    type_decl_pat = re.compile(
+        r"^\s*type\s*\(\s*([A-Za-z]\w*_result_t)\s*\)\s*::\s*([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    for line, scope_id in zip(lines, scope_ids):
+        m_type_decl = type_decl_pat.match(line)
+        if m_type_decl is not None:
+            already_declared.add((scope_id, m_type_decl.group(2).lower()))
     out: list[str] = []
-    inserted: set[str] = set()
+    inserted: set[tuple[int, str]] = set()
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -39986,12 +40043,13 @@ def promote_derived_result_call_locals_text(f90: str) -> str:
             i += 1
             continue
         indent, prefix, rest = m_decl.groups()
+        scope_id = scope_ids[i - len(block_lines) + 1]
         kept: list[str] = []
         removed: list[str] = []
         for part in split_top_level_commas(rest):
             part_s = part.strip()
             name_m = re.match(r"([A-Za-z]\w*)\b", part_s)
-            if name_m is not None and name_m.group(1) in target_types:
+            if name_m is not None and (scope_id, name_m.group(1).lower()) in target_types:
                 removed.append(name_m.group(1))
             else:
                 kept.append(part_s)
@@ -40000,9 +40058,10 @@ def promote_derived_result_call_locals_text(f90: str) -> str:
             i += 1
             continue
         for name in removed:
-            if name not in already_declared and name not in inserted:
-                out.append(f"{indent}type({target_types[name]}) :: {name}")
-                inserted.add(name)
+            key = (scope_id, name.lower())
+            if key not in already_declared and key not in inserted:
+                out.append(f"{indent}type({target_types[key]}) :: {name}")
+                inserted.add(key)
         if kept:
             text = indent + prefix + ", ".join(kept)
             if len(text) <= 110:
