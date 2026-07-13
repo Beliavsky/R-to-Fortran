@@ -18013,28 +18013,33 @@ def emit_stmts(
 
     def _combn_args(
         cinfo: tuple[str, list[str], dict[str, str]],
-    ) -> tuple[str, str, str | None, str | None]:
+    ) -> tuple[str, str, str | None, str | None, list[str], dict[str, str]]:
         pos = cinfo[1]
         kw_lower = {k.lower(): v for k, v in cinfo[2].items()}
-        unsupported = set(kw_lower) - {"x", "m", "fun", "simplify"}
-        if len(pos) > 4 or unsupported:
-            raise NotImplementedError("combn supports x, m, scalar FUN, and simplify=TRUE")
         x_src = pos[0] if pos else kw_lower.get("x", "")
         m_src = pos[1] if len(pos) >= 2 else kw_lower.get("m", "")
         fun_src = pos[2] if len(pos) >= 3 else kw_lower.get("fun")
         simplify_src = pos[3] if len(pos) >= 4 else kw_lower.get("simplify")
+        extra_pos = list(pos[4:])
+        extra_kw = {
+            k: v
+            for k, v in cinfo[2].items()
+            if k.lower() not in {"x", "m", "fun", "simplify"}
+        }
         if not x_src or not m_src:
             raise NotImplementedError("combn requires x and m")
         if simplify_src is not None and simplify_src.strip().lower() not in {"true", "t"}:
             raise NotImplementedError("combn currently supports FUN only with simplify=TRUE")
-        return x_src, m_src, fun_src, simplify_src
+        if fun_src is None and (extra_pos or extra_kw):
+            raise NotImplementedError("combn extra arguments require FUN")
+        return x_src, m_src, fun_src, simplify_src, extra_pos, extra_kw
 
     def _emit_combn_fun(
         cinfo: tuple[str, list[str], dict[str, str]],
         target: str | None,
         comment: str,
     ) -> bool:
-        x_src, m_src, fun_src, _simplify_src = _combn_args(cinfo)
+        x_src, m_src, fun_src, _simplify_src, extra_pos, extra_kw = _combn_args(cinfo)
         if fun_src is None:
             return False
         fun_name = fun_src.strip()
@@ -18066,8 +18071,12 @@ def emit_stmts(
         slice_f = f"{tmp_nm}(:, {idx_nm})"
 
         if fun_l == "sum":
+            if extra_pos or extra_kw:
+                raise NotImplementedError("combn FUN=sum does not yet support forwarded arguments")
             value_f = f"sum({slice_f})"
         elif fun_l == "prod":
+            if extra_pos or extra_kw:
+                raise NotImplementedError("combn FUN=prod does not yet support forwarded arguments")
             value_f = f"real(product({slice_f}), kind=dp)"
         else:
             fn_obj = _FUNC_DEFS_BY_NAME.get(fun_l)
@@ -18082,7 +18091,48 @@ def emit_stmts(
                 actual_f = f"real({actual_f}, kind=dp)"
             elif wanted in {"int", "integer"} and not x_is_int:
                 actual_f = f"int({actual_f})"
-            value_f = f"{_sanitize_r_var_name(fun_name)}({actual_f})"
+            callback_actuals = [actual_f]
+            bound_formals = {fn_obj.args[0].lower()} if fn_obj.args else set()
+            for i_extra, extra_src in enumerate(extra_pos, start=1):
+                if i_extra >= len(fn_obj.args):
+                    raise NotImplementedError(f"too many forwarded arguments for combn FUN `{fun_name}`")
+                formal = fn_obj.args[i_extra]
+                extra_f = r_expr_to_fortran(extra_src)
+                if i_extra < len(kinds):
+                    extra_f = _coerce_user_actual_for_declared_kind(
+                        fun_name,
+                        formal,
+                        extra_src,
+                        extra_f,
+                        kinds[i_extra],
+                    )
+                callback_actuals.append(extra_f)
+                bound_formals.add(formal.lower())
+            idx_map = _USER_FUNC_ARG_INDEX.get(fun_l, {})
+            for key, extra_src in extra_kw.items():
+                formal_key = _sanitize_fortran_kwarg_name(key)
+                formal_l = formal_key.lower()
+                idx = idx_map.get(formal_l, -1)
+                if idx <= 0:
+                    raise NotImplementedError(
+                        f"combn FUN `{fun_name}` has no forwarded argument named `{key}`"
+                    )
+                if formal_l in bound_formals:
+                    raise NotImplementedError(
+                        f"combn FUN `{fun_name}` receives `{key}` more than once"
+                    )
+                extra_f = r_expr_to_fortran(extra_src)
+                if idx < len(kinds):
+                    extra_f = _coerce_user_actual_for_declared_kind(
+                        fun_name,
+                        formal_key,
+                        extra_src,
+                        extra_f,
+                        kinds[idx],
+                    )
+                callback_actuals.append(f"{formal_key}={extra_f}")
+                bound_formals.add(formal_l)
+            value_f = f"{_sanitize_r_var_name(fun_name)}({', '.join(callback_actuals)})"
 
         result_f = f"[({value_f}, {idx_nm}=1,size({tmp_nm},2))]"
         o.w("block")
@@ -21258,7 +21308,7 @@ def emit_stmts(
                     o.w("end block")
                     continue
             if cinfo is not None and cinfo[0].lower() == "combn":
-                _x_combn, _m_combn, fun_combn, _simplify_combn = _combn_args(cinfo)
+                _x_combn, _m_combn, fun_combn, _simplify_combn, _extra_pos, _extra_kw = _combn_args(cinfo)
                 if fun_combn is not None:
                     _emit_combn_fun(cinfo, st.name, st.comment)
                     continue
@@ -21508,7 +21558,7 @@ def emit_stmts(
                         continue
                     c_combn_print = parse_call_text(one.strip())
                     if c_combn_print is not None and c_combn_print[0].lower() == "combn":
-                        _x_combn, _m_combn, fun_combn, _simplify_combn = _combn_args(c_combn_print)
+                        _x_combn, _m_combn, fun_combn, _simplify_combn, _extra_pos, _extra_kw = _combn_args(c_combn_print)
                         if fun_combn is not None:
                             _emit_combn_fun(c_combn_print, None, st.comment)
                             continue
