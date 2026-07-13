@@ -78,8 +78,10 @@ _KNOWN_INT_CONSTANTS: dict[str, int] = {}
 _KNOWN_MATRIX_NAMES: set[str] = set()
 _KNOWN_LOGICAL_VECTOR_NAMES: set[str] = set()
 _CURRENT_LOGICAL_ARRAY_NAMES: set[str] = set()
+_CURRENT_LOGICAL_SCALAR_NAMES: set[str] = set()
 _KNOWN_LOGICAL_MATRIX_NAMES: set[str] = set()
 _KNOWN_CHAR_VECTOR_NAMES: set[str] = set()
+_KNOWN_CHAR_MATRIX_NAMES: set[str] = set()
 _STATIC_LS_NAMES: list[str] = []
 _STATIC_LS_STR_LINES: list[str] = []
 _STATIC_LS_STR_RUNTIME_SCALARS: dict[str, str] = {}
@@ -8410,7 +8412,7 @@ def _is_inline_temp_rhs(expr: str) -> bool:
         return False
     if re.match(r"^pack\s*\(", t, re.IGNORECASE):
         return False
-    if re.match(r"^(?:Find|Position|Vectorize|rle|sapply|mapply|tapply|ave|aggregate|by|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
+    if re.match(r"^(?:Find|Position|Vectorize|combn|rle|sapply|mapply|tapply|ave|aggregate|by|optim|nlm|integrate)\s*\(", t, re.IGNORECASE):
         return False
     if re.match(r"^(?:acf|pacf|ccf|ar|ar\.yw|ar\.burg|ar\.ols|ar\.mle|arima)\s*\(", t, re.IGNORECASE):
         return False
@@ -9234,6 +9236,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     simple_ctor_rank = _simple_vector_constructor_rank(expr)
     if simple_ctor_rank is not None:
         return simple_ctor_rank
+    if re.match(r"^combn\s*\(", expr_l):
+        return 2
     if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply)\s*\(", expr_l):
         return 1
 
@@ -17032,7 +17036,29 @@ def r_expr_to_fortran(expr: str) -> str:
             bool_token = inner.strip()
             if bool_token.lower() in {"true", "false", ".true.", ".false."} or bool_token in {"T", "F"}:
                 mask_scalar = ".true." if bool_token.lower() in {"true", ".true."} or bool_token == "T" else ".false."
+                if base.lower() not in (
+                    _CURRENT_VECTOR_NAMES
+                    | _CURRENT_MATRIX_NAMES
+                    | _KNOWN_VECTOR_NAMES
+                    | _KNOWN_INT_VECTOR_NAMES
+                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                    | _KNOWN_MATRIX_NAMES
+                    | _KNOWN_LOGICAL_MATRIX_NAMES
+                ):
+                    return f"pack([{base}], [{mask_scalar}])"
                 return f"pack({base}, spread({mask_scalar}, dim=1, ncopies=size({base})))"
+            if il in _CURRENT_LOGICAL_SCALAR_NAMES:
+                if base.lower() in (
+                    _CURRENT_VECTOR_NAMES
+                    | _CURRENT_MATRIX_NAMES
+                    | _KNOWN_VECTOR_NAMES
+                    | _KNOWN_INT_VECTOR_NAMES
+                    | _KNOWN_LOGICAL_VECTOR_NAMES
+                    | _KNOWN_MATRIX_NAMES
+                    | _KNOWN_LOGICAL_MATRIX_NAMES
+                ):
+                    return f"pack({base}, {r_expr_to_fortran(inner)})"
+                return f"pack([{base}], [{r_expr_to_fortran(inner)}])"
             if "ieee_value" in il:
                 return f"r_index_real({base}, {r_expr_to_fortran(inner)})"
             if (
@@ -17207,6 +17233,7 @@ def emit_stmts(
 ) -> None:
     global _CURRENT_INT_SCALAR_NAMES, _CURRENT_INT_ARRAY_NAMES, _CURRENT_REAL_ARRAY_NAMES
     global _CURRENT_INT_MATRIX_NAMES, _CURRENT_REAL_MATRIX_NAMES, _CURRENT_CHAR_SCALAR_NAMES
+    global _CURRENT_LOGICAL_SCALAR_NAMES
     global _CURRENT_VECTOR_NAMES, _CURRENT_MATRIX_NAMES
     global _CURRENT_RANK_HINTS
     global _CURRENT_WARNING_STMT_TEXT
@@ -17233,6 +17260,7 @@ def emit_stmts(
     int_vector_vars: set[str] = set()
     real_vector_vars: set[str] = set()
     logical_vector_vars: set[str] = set()
+    logical_scalar_vars: set[str] = set()
     logical_matrix_vars: set[str] = set()
     matrix_vars: set[str] = set()
     vector_vars: set[str] = set()
@@ -17315,6 +17343,9 @@ def emit_stmts(
         lvv = helper_ctx.get("logical_vector_vars")
         if isinstance(lvv, set):
             logical_vector_vars = lvv
+        lsv = helper_ctx.get("logical_scalar_vars")
+        if isinstance(lsv, set):
+            logical_scalar_vars = lsv
         lmv = helper_ctx.get("logical_matrix_vars")
         if isinstance(lmv, set):
             logical_matrix_vars = lmv
@@ -17390,6 +17421,7 @@ def emit_stmts(
     _CURRENT_MATRIX_NAMES = {n.lower() for n in matrix_vars}
     _CURRENT_RANK_HINTS = {name.lower(): rank for name, rank in local_ranks_ctx.items()}
     _CURRENT_CHAR_SCALAR_NAMES = {n.lower() for n in char_scalar_vars}
+    _CURRENT_LOGICAL_SCALAR_NAMES = {n.lower() for n in logical_scalar_vars}
     list_locals: dict[str, dict[str, object]] = {}
     if helper_ctx is not None:
         ll = helper_ctx.get("list_locals")
@@ -18418,6 +18450,8 @@ def emit_stmts(
             if root in _KNOWN_RANK3_NAMES or root.endswith("_true") or root == "a":
                 return 2
         m_r_ix = re.match(r"^([A-Za-z]\w*)\s*\[([^\[\]]+)\]$", t)
+        if m_r_ix and m_r_ix.group(2).strip().lower() in {n.lower() for n in logical_scalar_vars}:
+            return 1
         if m_r_ix and (m_r_ix.group(1) in int_matrix_vars or m_r_ix.group(1) in real_matrix_vars):
             dims_all = _split_index_dims(m_r_ix.group(2).strip())
             drop_false = any(re.match(r"^drop\s*=\s*(?:FALSE|F|\.false\.)\s*$", d.strip(), re.IGNORECASE) for d in dims_all)
@@ -21124,6 +21158,18 @@ def emit_stmts(
                     o.pop()
                     o.w("end block")
                     continue
+            if cinfo is not None and cinfo[0].lower() == "combn":
+                _nm, pos, kw = cinfo
+                unsupported_kw = {k for k in kw if k.lower() not in {"x", "m"}}
+                if len(pos) > 2 or unsupported_kw:
+                    raise NotImplementedError("combn currently supports only combn(x, m)")
+                has_x = len(pos) >= 1 or any(k.lower() == "x" for k in kw)
+                has_m = len(pos) >= 2 or any(k.lower() == "m" for k in kw)
+                if not has_x or not has_m:
+                    raise NotImplementedError("combn requires x and m")
+                _wstmt(f"{st.name} = {rhs_f}", st.comment)
+                need_r_mod.add("combn")
+                continue
             if cinfo is not None and cinfo[0].lower() == "sample" and st.name in int_vector_vars:
                 _wstmt(f"{st.name} = [{rhs_f}]", st.comment)
                 if "sample_int1(" in rhs_f:
@@ -21365,6 +21411,14 @@ def emit_stmts(
                         continue
                     if _emit_print_array_expr_scalar_subset(one, st.comment):
                         continue
+                    c_combn_print = parse_call_text(one.strip())
+                    if c_combn_print is not None and c_combn_print[0].lower() == "combn":
+                        unsupported_kw = {k for k in c_combn_print[2] if k.lower() not in {"x", "m"}}
+                        if len(c_combn_print[1]) > 2 or unsupported_kw:
+                            raise NotImplementedError("combn currently supports only combn(x, m)")
+                        _wstmt(f"call display({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.update({"combn", "display"})
+                        continue
                     if one in benchmark_vars:
                         _wcomment(f"print({one}) omitted: bench::mark output is not translated")
                         continue
@@ -21395,6 +21449,10 @@ def emit_stmts(
                             _wstmt(f'write(*,"(*(g0,:,1x))") {field_items}', st.comment)
                         else:
                             _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
+                        continue
+                    if has_r_mod and one.lower() in _KNOWN_CHAR_MATRIX_NAMES:
+                        _wstmt(f"call display({r_expr_to_fortran(one)})", st.comment)
+                        need_r_mod.add("display")
                         continue
                     if has_r_mod and one.lower() in _KNOWN_CHAR_VECTOR_NAMES:
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
@@ -27963,6 +28021,20 @@ def emit_function(
         helper_ctx_loc["logical_vector_vars"] = {
             x for x in logical_arrays if local_ranks.get(x, _infer_local_array_rank(body_use, x)) < 2
         }
+        default_logical_args = {
+            name
+            for name, default in fn.defaults.items()
+            if default.strip().upper() in {"TRUE", "FALSE", "T", "F"}
+        }
+        helper_ctx_loc["logical_scalar_vars"] = (
+            set(logical_scalars)
+            | set(fn_logical_scalar_args)
+            | default_logical_args
+            | {
+                arg_local_map.get(name, name)
+                for name in set(fn_logical_scalar_args) | default_logical_args
+            }
+        )
         helper_ctx_loc["local_ranks"] = dict(local_ranks)
         if not emit_as_subroutine:
             helper_ctx_loc["return_var"] = rname
@@ -31722,7 +31794,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS, _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES
@@ -31771,7 +31843,9 @@ def transpile_r_to_fortran(
     _KNOWN_NULL_NAMES = set()
     _KNOWN_NA_VECTOR_NAMES = set()
     _CURRENT_LOGICAL_ARRAY_NAMES = set()
+    _CURRENT_LOGICAL_SCALAR_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
+    _KNOWN_CHAR_MATRIX_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
     _CUSTOM_INFIX_OPS = {}
@@ -33058,16 +33132,16 @@ def transpile_r_to_fortran(
             real_scalars.discard(st_ret.name)
             int_arrays.discard(st_ret.name)
             params.pop(st_ret.name, None)
+    preliminary_array_params = infer_main_array_params(main_stmts, assign_counts)
     changed_main_arrays = True
     while changed_main_arrays:
         changed_main_arrays = False
-        known_main_arrays = set(int_arrays) | set(real_arrays)
+        known_main_arrays = set(int_arrays) | set(real_arrays) | set(preliminary_array_params)
+        known_main_arrays_l = {nm.lower(): nm for nm in known_main_arrays}
         for st_arr in main_stmts:
             if not isinstance(st_arr, Assign):
                 continue
             if st_arr.name in known_main_arrays:
-                continue
-            if st_arr.name in ints or st_arr.name in real_scalars:
                 continue
             rhs_arr = st_arr.expr.strip()
             c_rhs_arr = parse_call_text(rhs_arr)
@@ -33078,6 +33152,35 @@ def transpile_r_to_fortran(
             ):
                 continue
             if re.match(r"^(?:length|size|nrow|ncol)\s*\(", rhs_arr, re.IGNORECASE):
+                continue
+            rhs_array_ref = rhs_arr
+            m_df_col_alias = re.fullmatch(r"([A-Za-z]\w*)\s*\$\s*([A-Za-z][A-Za-z0-9_.]*)", rhs_arr)
+            if m_df_col_alias is not None:
+                expanded_col = _expanded_data_frame_col_expr(m_df_col_alias.group(1), m_df_col_alias.group(2))
+                if expanded_col is not None:
+                    rhs_array_ref = expanded_col
+            rhs_bare = (
+                known_main_arrays_l.get(rhs_array_ref.lower())
+                if re.fullmatch(r"[A-Za-z]\w*", rhs_array_ref)
+                else None
+            )
+            if rhs_bare is not None:
+                source_is_integer = rhs_bare in int_arrays or (
+                    rhs_bare in preliminary_array_params
+                    and preliminary_array_params[rhs_bare][0] == "integer"
+                )
+                if source_is_integer:
+                    int_arrays.add(st_arr.name)
+                    real_arrays.discard(st_arr.name)
+                else:
+                    real_arrays.add(st_arr.name)
+                    int_arrays.discard(st_arr.name)
+                ints.discard(st_arr.name)
+                real_scalars.discard(st_arr.name)
+                params.pop(st_arr.name, None)
+                changed_main_arrays = True
+                continue
+            if st_arr.name in ints or st_arr.name in real_scalars:
                 continue
             if any(re.search(rf"\b{re.escape(nm)}\b", rhs_arr) for nm in known_main_arrays):
                 if re.search(r"\bas\.\s*numeric\s*\(|/|\.\d|[0-9]_dp|_dp|rnorm|runif", rhs_arr, re.IGNORECASE):
@@ -33218,6 +33321,45 @@ def transpile_r_to_fortran(
     logical_scalars = infer_main_logical_scalars(main_stmts)
     int_matrices = infer_main_integer_matrices(main_stmts)
     real_matrices = infer_main_real_matrices(main_stmts, int_matrices)
+    char_matrices: set[str] = set()
+    for st_combn in main_stmts:
+        if not isinstance(st_combn, Assign):
+            continue
+        c_combn = parse_call_text(st_combn.expr.strip())
+        if c_combn is None or c_combn[0].lower() != "combn":
+            continue
+        x_combn = c_combn[1][0].strip() if c_combn[1] else next(
+            (v.strip() for k, v in c_combn[2].items() if k.lower() == "x"),
+            "",
+        )
+        x_combn_l = x_combn.lower()
+        is_char_combn = (
+            _static_character_vector_values(x_combn) is not None
+            or x_combn_l in {nm.lower() for nm in char_arrays}
+        )
+        is_int_combn = (
+            _is_static_integer_vector_expr(x_combn)
+            or _split_top_level_colon(x_combn) is not None
+            or x_combn_l in {nm.lower() for nm in int_arrays}
+            or x_combn_l in {nm.lower() for nm in array_params if array_params[nm][0] == "integer"}
+        )
+        ints.discard(st_combn.name)
+        real_scalars.discard(st_combn.name)
+        int_arrays.discard(st_combn.name)
+        real_arrays.discard(st_combn.name)
+        char_arrays.discard(st_combn.name)
+        params.pop(st_combn.name, None)
+        array_params.pop(st_combn.name, None)
+        if is_char_combn:
+            char_matrices.add(st_combn.name)
+            int_matrices.discard(st_combn.name)
+            real_matrices.discard(st_combn.name)
+        elif is_int_combn:
+            int_matrices.add(st_combn.name)
+            real_matrices.discard(st_combn.name)
+        else:
+            real_matrices.add(st_combn.name)
+            int_matrices.discard(st_combn.name)
     for st_rmultinom_mat in main_stmts:
         if isinstance(st_rmultinom_mat, Assign) and re.match(r"^\s*rmultinom\s*\(", st_rmultinom_mat.expr.strip(), re.IGNORECASE):
             int_matrices.add(st_rmultinom_mat.name)
@@ -33234,7 +33376,11 @@ def transpile_r_to_fortran(
             continue
         if st_rank_final.name in omitted_dim_array_names:
             continue
-        if st_rank_final.name in int_matrices or st_rank_final.name in int_arrays:
+        if (
+            st_rank_final.name in int_matrices
+            or st_rank_final.name in int_arrays
+            or st_rank_final.name in char_matrices
+        ):
             continue
         if _infer_assignment_rank_hint(st_rank_final.expr, matrix_rank_ctx) == 2:
             real_matrices.add(st_rank_final.name)
@@ -33496,10 +33642,14 @@ def transpile_r_to_fortran(
             rhs_na_vec = m_na_vec.group(2)
             if nm_na_vec in _KNOWN_VECTOR_NAMES and re.search(r"\b(?:NA|NA_real_|NaN)\b|ieee_value\s*\(", rhs_na_vec, re.IGNORECASE):
                 _KNOWN_NA_VECTOR_NAMES.add(nm_na_vec)
-    _KNOWN_MATRIX_NAMES = {n.lower() for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices))}
+    _KNOWN_MATRIX_NAMES = {
+        n.lower()
+        for n in (set(int_matrices) | set(real_matrices) | set(complex_matrices) | set(char_matrices))
+    }
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_LOGICAL_MATRIX_NAMES = {n.lower() for n in logical_matrices}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
+    _KNOWN_CHAR_MATRIX_NAMES = {n.lower() for n in char_matrices}
     user_func_by_lower = {f.name.lower(): f for f in funcs}
 
     def _force_user_arg_ranks_from_call(c_call_force: tuple[str, list[str], dict[str, str]]) -> None:
@@ -34002,6 +34152,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["int_vector_vars"] = set(int_arrays) | {k for k, (kk, _, _) in array_params.items() if kk == "integer"}
     helper_ctx_main["real_vector_vars"] = set(real_arrays) | {k for k, (kk, _, _) in array_params.items() if kk != "integer"}
     helper_ctx_main["logical_vector_vars"] = set(logical_arrays)
+    helper_ctx_main["logical_scalar_vars"] = set(logical_scalars)
     helper_ctx_main["logical_matrix_vars"] = set(logical_matrices)
     helper_ctx_main["char_scalar_vars"] = set(char_scalars)
     helper_ctx_main["char_vector_vars"] = set(char_arrays)
@@ -35306,7 +35457,12 @@ def transpile_r_to_fortran(
     for st_rank_final in main_stmts:
         if not isinstance(st_rank_final, Assign):
             continue
-        if st_rank_final.name in int_matrices or st_rank_final.name in int_arrays or st_rank_final.name in int_rank3_arrays:
+        if (
+            st_rank_final.name in int_matrices
+            or st_rank_final.name in int_arrays
+            or st_rank_final.name in int_rank3_arrays
+            or st_rank_final.name in char_matrices
+        ):
             continue
         if _infer_assignment_rank_hint(st_rank_final.expr, matrix_rank_ctx) == 2:
             real_matrices.add(st_rank_final.name)
@@ -35364,6 +35520,8 @@ def transpile_r_to_fortran(
         pbody.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars)))
     if char_arrays:
         pbody.w("character(len=:), allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(char_arrays)))
+    if char_matrices:
+        pbody.w("character(len=:), allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(char_matrices)))
     if logical_arrays:
         pbody.w("logical, allocatable :: " + ", ".join(f"{x}(:)" for x in sorted(logical_arrays)))
     if logical_matrices:
@@ -35489,6 +35647,7 @@ def transpile_r_to_fortran(
         fn_needs_rnorm = emit_function(mprocs, fn, list_specs, helper_ctx=helper_ctx_mod) or fn_needs_rnorm
         mprocs.w("")
     _CURRENT_LOGICAL_ARRAY_NAMES = set()
+    _CURRENT_LOGICAL_SCALAR_NAMES = set()
     for info_wrap in _NLM_CLOSURE_WRAPPERS.values():
         name_wrap = str(info_wrap.get("name", ""))
         fn_wrap = str(info_wrap.get("fn", ""))
@@ -37249,6 +37408,7 @@ def transpile_r_to_fortran(
         "r_beta",
         "r_lbeta",
         "r_choose",
+        "combn",
         "r_lchoose",
         "r_gamma",
         "r_lgamma",
