@@ -55,6 +55,8 @@ _FUNC_DEFS_BY_NAME: dict[str, object] = {}
 _VECTORIZED_ALIASES: dict[str, str] = {}
 _VOID_FUNCTION_LIKE: set[str] = set()
 _SUBROUTINE_FUNCTIONS: set[str] = set()
+_LEXICAL_INOUT_ARGS: dict[str, set[str]] = {}
+_LEXICALLY_MUTATED_LOCALS: dict[str, set[str]] = {}
 _INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
 _R_EXPRESSION_OBJECTS: dict[str, str] = {}
 _R_DERIVATIVE_OBJECTS: dict[str, str] = {}
@@ -448,6 +450,49 @@ def _infer_function_free_names(fn: FuncDef) -> set[str]:
 
 def _lift_nested_functions(stmts: list[object]) -> list[object]:
     """Lift nested R functions to top-level helpers with closure vars as arguments."""
+    global _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
+
+    def lower_lexical_superassignments(
+        body: list[object], parent_by_lower: dict[str, str]
+    ) -> tuple[list[object], set[str]]:
+        mutated: set[str] = set()
+
+        def lower_one(st: object) -> object:
+            if isinstance(st, ExprStmt):
+                m_super = re.fullmatch(r"\s*([A-Za-z]\w*)\s*<<-\s*(.+?)\s*", st.expr, re.DOTALL)
+                if m_super is None:
+                    return st
+                target_src, rhs = m_super.groups()
+                target = parent_by_lower.get(target_src.lower())
+                if target is None:
+                    raise NotImplementedError(
+                        f"unsupported superassignment target `{target_src}`; "
+                        "the target must be a local in the nearest enclosing function"
+                    )
+                mutated.add(target)
+                return Assign(target, rhs.strip(), st.comment)
+            if isinstance(st, IfStmt):
+                return IfStmt(
+                    st.cond,
+                    [lower_one(x) for x in st.then_body],
+                    [lower_one(x) for x in st.else_body],
+                )
+            if isinstance(st, ForStmt):
+                return ForStmt(st.var, st.iter_expr, [lower_one(x) for x in st.body])
+            if isinstance(st, WhileStmt):
+                return WhileStmt(st.cond, [lower_one(x) for x in st.body])
+            if isinstance(st, RepeatStmt):
+                return RepeatStmt([lower_one(x) for x in st.body])
+            if isinstance(st, SwitchStmt):
+                return SwitchStmt(
+                    st.selector,
+                    [(label, [lower_one(x) for x in case]) for label, case in st.cases],
+                    [lower_one(x) for x in st.default_body],
+                    st.selector_kind,
+                )
+            return st
+
+        return [lower_one(st) for st in body], mutated
 
     def split_nested_defs(body: list[object]) -> tuple[list[object], list[FuncDef]]:
         cleaned: list[object] = []
@@ -539,7 +584,9 @@ def _lift_nested_functions(stmts: list[object]) -> list[object]:
         call_map: dict[str, tuple[str, list[str]]] = {}
         lifted: list[object] = []
         for nf in nested:
+            lowered_nf_body, mutated_parent_names = lower_lexical_superassignments(nf.body, parent_by_lower)
             free = _infer_function_free_names(nf)
+            free.update(nm.lower() for nm in mutated_parent_names)
             capture_matches = [
                 (nm_l, parent_by_lower[nm_l])
                 for nm_l in parent_by_lower
@@ -555,12 +602,21 @@ def _lift_nested_functions(stmts: list[object]) -> list[object]:
                     capture_rename[parent_nm] = san
             new_name = f"{st.name}_{nf.name}"
             call_map[nf.name] = (new_name, captures)
+            if mutated_parent_names:
+                _LEXICALLY_MUTATED_LOCALS.setdefault(st.name.lower(), set()).update(mutated_parent_names)
+                _LEXICAL_INOUT_ARGS[new_name.lower()] = {
+                    san
+                    for parent_nm, san in zip(raw_captures, captures)
+                    if parent_nm in mutated_parent_names
+                }
             lifted.append(
                 FuncDef(
                     name=new_name,
                     args=list(nf.args) + captures,
                     defaults=dict(nf.defaults),
-                    body=[_rename_stmt_obj(b, capture_rename) for b in nf.body] if capture_rename else list(nf.body),
+                    body=[_rename_stmt_obj(b, capture_rename) for b in lowered_nf_body]
+                    if capture_rename
+                    else list(lowered_nf_body),
                     leading_comments=nf.leading_comments,
                 )
             )
@@ -3067,9 +3123,11 @@ def _expr_has_assign_call(expr: str) -> bool:
     return found
 
 
-def validate_unsupported_environment_assignment(stmts: list[object]) -> None:
+def validate_unsupported_environment_assignment(
+    stmts: list[object], *, allow_superassignment: bool = False
+) -> None:
     def check_expr(expr: str) -> None:
-        if _contains_superassignment(expr):
+        if not allow_superassignment and _contains_superassignment(expr):
             raise NotImplementedError("unsupported superassignment <<-; R environment mutation is not supported")
         if _expr_has_assign_call(expr):
             raise NotImplementedError("unsupported assign(): dynamic/environment assignment is not supported")
@@ -9284,6 +9342,15 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                 return 1
             if fn_name == "cut":
                 return 1
+            if fn_name in {
+                "factorial", "lfactorial", "beta", "lbeta", "choose", "lchoose",
+                "gamma", "lgamma", "psigamma", "digamma", "trigamma",
+            }:
+                arg_ranks = [
+                    _infer_assignment_rank_hint(a.strip(), inferred_ranks)
+                    for a in list(c_call[1]) + list(c_call[2].values())
+                ]
+                return max(arg_ranks) if arg_ranks else 0
             if fn_name in _USER_FUNC_ELEMENTAL:
                 arg_ranks = [_infer_assignment_rank_hint(a.strip(), inferred_ranks) for a in list(c_call[1]) + list(c_call[2].values())]
                 return max(arg_ranks) if arg_ranks else 0
@@ -9639,17 +9706,6 @@ def _simple_vector_constructor_rank(expr: str) -> int | None:
         "seq_len",
         "seq_along",
         "ls",
-        "factorial",
-        "lfactorial",
-        "beta",
-        "lbeta",
-        "choose",
-        "lchoose",
-        "gamma",
-        "lgamma",
-        "psigamma",
-        "digamma",
-        "trigamma",
         "armaacf",
     }:
         return 1
@@ -10234,7 +10290,9 @@ def _function_has_void_return(fn: FuncDef) -> bool:
 
 
 def _function_should_emit_subroutine(fn: FuncDef) -> bool:
-    return _stmt_tree_has_output_ops(fn.body) and _function_has_void_return(fn)
+    return fn.name.lower() in _LEXICAL_INOUT_ARGS or (
+        _stmt_tree_has_output_ops(fn.body) and _function_has_void_return(fn)
+    )
 
 
 def _cond_identifiers(expr: str) -> set[str]:
@@ -25355,8 +25413,9 @@ def emit_function(
                 ]
             )
     f_args = [a for a in fn.args if a != "..."]
-    emit_as_subroutine = _stmt_tree_has_output_ops(fn_body) and _function_has_void_return(
-        FuncDef(name=fn.name, args=f_args, defaults=fn.defaults, body=fn_body)
+    emit_as_subroutine = fn.name.lower() in _LEXICAL_INOUT_ARGS or (
+        _stmt_tree_has_output_ops(fn_body)
+        and _function_has_void_return(FuncDef(name=fn.name, args=f_args, defaults=fn.defaults, body=fn_body))
     )
     def _lower_local_scalar_closures(
         body_in: list[object],
@@ -25746,7 +25805,7 @@ def emit_function(
             and _USER_FUNC_RETURN_RANK.get(fn.name.lower(), 0) > 0
         )
         or re.search(
-            r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul)\s*\(",
+            r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul|factorial|lfactorial|beta|lbeta|choose|lchoose|gamma|lgamma|psigamma|digamma|trigamma)\s*\(",
             ret_expr_src,
             re.IGNORECASE,
         )
@@ -25995,6 +26054,9 @@ def emit_function(
     fn_logical_scalar_args = infer_function_logical_scalar_arg_names(fn)
     fn_logical_arr_args = infer_function_logical_array_arg_names(fn)
     fn_proc_args = infer_function_callback_args(fn)
+    lexical_inout_args = {
+        nm.lower() for nm in _LEXICAL_INOUT_ARGS.get(fn.name.lower(), set())
+    }
 
     def _arg_list_result_type(arg_name: str) -> str | None:
         used_fields: set[str] = set()
@@ -26012,9 +26074,9 @@ def emit_function(
 
     for a in f_args:
         dflt = fn.defaults.get(a, "")
-        intent = "in"
+        intent = "inout" if a.lower() in lexical_inout_args else "in"
         opt = ", optional" if dflt.strip() else ""
-        scalar_value_attr = ", value" if a in written_args and not opt else ""
+        scalar_value_attr = ", value" if a in written_args and not opt and intent == "in" else ""
         if s3_receiver_type is not None and a == f_args[0]:
             o.w(f"type({s3_receiver_type}), intent(in){opt} :: {a}")
             arg_type[a] = "s3_object"
@@ -26090,7 +26152,7 @@ def emit_function(
             or a.endswith("_order")
             or a in fn_int_args
         ):
-            o.w(f"integer, intent(in){opt}{scalar_value_attr} :: {a}")
+            o.w(f"integer, intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "integer"
             continue
         if dflt.startswith("c("):
@@ -26100,10 +26162,10 @@ def emit_function(
             o.w(f"character(len=*), intent({intent}){opt} :: {a}")
             arg_type[a] = "char"
         elif dflt.strip().upper() == "NULL":
-            o.w(f"integer, intent(in){opt} :: {a}")
+            o.w(f"integer, intent({intent}){opt} :: {a}")
             arg_type[a] = "integer"
         elif _is_int_literal(dflt):
-            o.w(f"integer, intent(in){opt}{scalar_value_attr} :: {a}")
+            o.w(f"integer, intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "integer"
         elif dflt in {"TRUE", "FALSE"}:
             o.w(f"logical, intent(in){opt}{scalar_value_attr} :: {a}")
@@ -26188,6 +26250,8 @@ def emit_function(
 
     for a in f_args:
         if a not in written_args:
+            continue
+        if a.lower() in lexical_inout_args:
             continue
         if a in arg_local_map:
             continue
@@ -26473,6 +26537,35 @@ def emit_function(
         logical_scalars = infer_local_logical_scalars(body_use)
         logical_scalars.discard(rname)
         logical_scalars.difference_update(logical_arrays)
+        lexical_mutated_locals = _LEXICALLY_MUTATED_LOCALS.get(fn.name.lower(), set())
+        for nm_mutated in lexical_mutated_locals:
+            params.pop(nm_mutated, None)
+            if nm_mutated in (
+                int_arrays
+                | real_arrays
+                | logical_arrays
+                | char_scalars_loc
+                | char_arrays_loc
+            ):
+                continue
+            init_expr = next(
+                (
+                    st_mut.expr.strip()
+                    for st_mut in body_use
+                    if isinstance(st_mut, Assign) and st_mut.name == nm_mutated
+                ),
+                "",
+            )
+            if re.fullmatch(r"[+-]?\d+[Ll]", init_expr):
+                ints.add(nm_mutated)
+                real_scalars.discard(nm_mutated)
+            elif init_expr.upper() in {"TRUE", "FALSE"}:
+                logical_scalars.add(nm_mutated)
+                ints.discard(nm_mutated)
+                real_scalars.discard(nm_mutated)
+            else:
+                real_scalars.add(nm_mutated)
+                ints.discard(nm_mutated)
         for la_known in logical_arrays:
             _KNOWN_LOGICAL_VECTOR_NAMES.add(la_known.lower())
             _KNOWN_LOGICAL_VECTOR_NAMES.add(r_expr_to_fortran(la_known).lower())
@@ -31628,7 +31721,7 @@ def transpile_r_to_fortran(
     ignore_directives: bool = False,
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
-    global _SUBROUTINE_FUNCTIONS
+    global _SUBROUTINE_FUNCTIONS, _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
@@ -31640,6 +31733,8 @@ def transpile_r_to_fortran(
     global _WARNING_SOURCE_TEXT, _CURRENT_WARNING_STMT_TEXT
     global _DOTTED_VAR_RENAMES, _RAW_R_IDENT_NAMES, _SANITIZED_R_NAME_BY_RAW
     _FORTRAN_COMMENTS = bool(fortran_comments)
+    _LEXICAL_INOUT_ARGS = {}
+    _LEXICALLY_MUTATED_LOCALS = {}
     _STRICT_R_NUMERIC_LITERALS = bool(strict_r_numeric_literals)
     _IGNORE_XR2F_DIRECTIVES = bool(ignore_directives)
     _XR2F_FORCE_KIND, _XR2F_FORCE_RANK = parse_xr2f_directives(src, ignore=_IGNORE_XR2F_DIRECTIVES)
@@ -31698,7 +31793,7 @@ def transpile_r_to_fortran(
         for nm in infer_assigned_names(source_main_stmts)
         if _name_assigned_inside_loop(source_main_stmts, nm)
     }
-    validate_unsupported_environment_assignment(stmts)
+    validate_unsupported_environment_assignment(stmts, allow_superassignment=True)
     if obfuscate:
         stmts = obfuscate_user_defined_names(stmts)
     stmts = lower_switch_statements(stmts)
@@ -31721,6 +31816,7 @@ def transpile_r_to_fortran(
     _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS = _collect_symbolic_derivatives(stmts)
     stmts = _drop_symbolic_object_assignments(stmts)
     stmts = _lift_nested_functions(stmts)
+    validate_unsupported_environment_assignment(stmts)
     reused_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_reused_vars(stmts, warnings=reused_shadow_warnings, src=src)
     stmts = rename_case_conflicting_names(stmts)
@@ -32752,6 +32848,7 @@ def transpile_r_to_fortran(
             f.name.lower() not in _SUBROUTINE_FUNCTIONS
             and
             f.name.lower() not in fn_return_array_kind
+            and _USER_FUNC_RETURN_RANK.get(f.name.lower(), 0) == 0
             and (not _stmt_tree_has_side_effect_ops(f_body_eff))
             and all(arg_rank_f.get(a, 0) == 0 for a in f.args)
             and f.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
@@ -37459,6 +37556,7 @@ def transpile_r_to_fortran(
         fn_real_mats = fn_real_matrix_names.get(fn_name, set())
         fn_logical_arrays = fn_logical_array_names.get(fn_name, set())
         fn_char_arrays = infer_function_character_array_names(funcs_by_name[fn_name]) if fn_name in funcs_by_name else set()
+        fn_char_scalar_names = fn_char_scalars.get(fn_name, set())
         fn_lms = fn_lm_names.get(fn_name, set())
         txt_l = txt.lower()
         k_l = k.lower()
@@ -37556,6 +37654,8 @@ def transpile_r_to_fortran(
         ):
             return f"integer :: {k}"
         if re.match(r"^[A-Za-z]\w*$", txt):
+            if txt.lower() in {x.lower() for x in fn_char_scalar_names}:
+                return f"character(len=:), allocatable :: {k}"
             local_matrix_labels_src = source_local_matrix_col_labels.get(fn_name.lower(), {})
             if txt.lower() in local_matrix_labels_src:
                 return f"real(kind=dp), allocatable :: {k}(:,:)"
@@ -44036,6 +44136,72 @@ def rewrite_raw_derived_function_writes_text(f90: str) -> str:
         out.append(f90[pos:m.start()])
         out.append("\n".join(repl_lines))
         pos = i
+    f90 = "".join(out)
+
+    # A list-returning R call may initially be classified as a real scalar by
+    # the print emitter.  Materialize the derived result and print its fields,
+    # just as for the raw WRITE form handled above.
+    out = []
+    pos = 0
+    pat = re.compile(
+        r"(?m)^(\s*)call\s+(?:print_real_scalar|display)\s*\(\s*([A-Za-z]\w*)\s*\("
+    )
+    while True:
+        m = pat.search(f90, pos)
+        if m is None:
+            out.append(f90[pos:])
+            break
+        fn_name = m.group(2)
+        type_name = result_type_by_fn.get(fn_name.lower())
+        fields = type_fields.get(type_name or "", [])
+        if not fields:
+            out.append(f90[pos:m.end()])
+            pos = m.end()
+            continue
+        open_idx = m.end() - 1
+        i = open_idx + 1
+        depth = 1
+        quote: str | None = None
+        while i < len(f90) and depth > 0:
+            ch = f90[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+            elif ch in {"'", '"'}:
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            out.append(f90[pos:m.end()])
+            pos = m.end()
+            continue
+        wrapper_end = i
+        while wrapper_end < len(f90) and f90[wrapper_end] in " \t":
+            wrapper_end += 1
+        if wrapper_end >= len(f90) or f90[wrapper_end] != ")":
+            out.append(f90[pos:m.end()])
+            pos = m.end()
+            continue
+        wrapper_end += 1
+        rhs = f90[m.start(2):i]
+        indent = m.group(1)
+        tmp = "xr2f_print_tmp"
+        repl_lines = [f"{indent}block", f"{indent}   type({type_name}) :: {tmp}", f"{indent}   {tmp} = {rhs}"]
+        for fld, rank in fields:
+            repl_lines.append(f'{indent}   write(*,"(a)") "{fld}"')
+            if rank >= 2:
+                repl_lines.append(f"{indent}   call print_matrix({tmp}%{fld})")
+            elif rank == 1:
+                repl_lines.append(f"{indent}   call print_real_vector({tmp}%{fld})")
+            else:
+                repl_lines.append(f'{indent}   write(*,"(g0)") {tmp}%{fld}')
+        repl_lines.append(f"{indent}end block")
+        out.append(f90[pos:m.start()])
+        out.append("\n".join(repl_lines))
+        pos = wrapper_end
     return "".join(out)
 
 
@@ -55963,13 +56129,13 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.Complete
         }
         retry_count = 0
         while (
-            retry_count < 2
+            retry_count < 5
             and cp.returncode in transient_windows_startup_failures
             and not (cp.stdout or cp.stderr)
             and ("gfortran" in compiler_name or "ifx" in compiler_name)
         ):
             retry_count += 1
-            time.sleep(0.25 * retry_count)
+            time.sleep(0.5 * retry_count)
             cp = subprocess.run(
                 cmd,
                 capture_output=True,
