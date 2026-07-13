@@ -8199,6 +8199,14 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
             if "$" in st.expr:
                 i += 1
                 continue
+            c_inline_rhs = parse_call_text(st.expr.strip())
+            if (
+                c_inline_rhs is not None
+                and c_inline_rhs[0].lower() == "replicate"
+                and c_inline_rhs[2].get("simplify", "TRUE").strip().upper() in {"FALSE", "F"}
+            ):
+                i += 1
+                continue
             if name.lower() in df_alias_sources:
                 i += 1
                 continue
@@ -19506,6 +19514,20 @@ def emit_stmts(
                 # Already emitted as named constant parameter.
                 continue
             rhs = st.expr.strip()
+            if st.name in object_list_vars:
+                rep_obj = _replicate_object_call_info(rhs, None)
+                if rep_obj is not None:
+                    count_f = _int_bound_expr(r_expr_to_fortran(rep_obj[0]))
+                    value_f = r_expr_to_fortran(rep_obj[1])
+                    _wstmt(
+                        f"{st.name} = spread({value_f}, dim=1, ncopies={count_f})",
+                        st.comment,
+                    )
+                    continue
+            field_apply = _scalar_field_apply_info(rhs)
+            if field_apply is not None and field_apply[0] in object_list_vars:
+                _wstmt(f"{st.name} = {field_apply[0]}%{field_apply[1]}", st.comment)
+                continue
             m_obj_list_extract_rhs = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+)\s*\]\]$", rhs)
             if m_obj_list_extract_rhs is not None and m_obj_list_extract_rhs.group(1) in object_list_vars:
                 idx_obj_rhs = _int_bound_expr(r_expr_to_fortran(m_obj_list_extract_rhs.group(2).strip()))
@@ -26383,7 +26405,11 @@ def emit_function(
         _collect_vector_list_names(body_use)
         def _collect_object_list_locals(ss_ol: list[object]) -> None:
             for st_ol in ss_ol:
-                if isinstance(st_ol, ExprStmt):
+                if isinstance(st_ol, Assign):
+                    rep_ol = _replicate_object_call_info(st_ol.expr.strip(), list_specs)
+                    if rep_ol is not None:
+                        object_list_locals[st_ol.name] = rep_ol[2]
+                elif isinstance(st_ol, ExprStmt):
                     asn_ol = split_top_level_assignment(st_ol.expr.strip())
                     if asn_ol is not None:
                         m_ol = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*.+\s*\]\]$", asn_ol[0].strip())
@@ -26424,6 +26450,23 @@ def emit_function(
                 elif isinstance(st_olea, RepeatStmt):
                     _collect_object_list_extract_aliases(st_olea.body)
         _collect_object_list_extract_aliases(body_use)
+        for st_apply in body_use:
+            if not isinstance(st_apply, Assign):
+                continue
+            apply_info = _scalar_field_apply_info(st_apply.expr)
+            if apply_info is None or apply_info[0] not in object_list_locals:
+                continue
+            ints.discard(st_apply.name)
+            real_scalars.discard(st_apply.name)
+            int_arrays.discard(st_apply.name)
+            real_arrays.discard(st_apply.name)
+            logical_arrays.discard(st_apply.name)
+            if apply_info[2] == "integer":
+                int_arrays.add(st_apply.name)
+            elif apply_info[2] == "logical":
+                logical_arrays.add(st_apply.name)
+            else:
+                real_arrays.add(st_apply.name)
         for a in fn.args:
             ints.discard(a)
             real_scalars.discard(a)
@@ -33660,6 +33703,9 @@ def transpile_r_to_fortran(
             c_fit_primary_src = _trycatch_primary_expr(st.expr.strip())
             if c_fit_primary_src is not None:
                 c_fit_main = parse_call_text(c_fit_primary_src)
+            rep_main = _replicate_object_call_info(st.expr.strip(), list_specs)
+            if rep_main is not None:
+                main_object_list_vars[st.name] = rep_main[2]
             if c_fit_main is not None and c_fit_main[0].lower() in {"lm", "aov"}:
                 lm_vars.add(st.name)
                 helper_ctx_main["need_lm"] = True
@@ -33818,6 +33864,26 @@ def transpile_r_to_fortran(
                 _collect_main_object_list_assigns(st_obj.body)
 
     _collect_main_object_list_assigns(main_stmts)
+    for st_apply_main in main_stmts:
+        if not isinstance(st_apply_main, Assign):
+            continue
+        apply_info_main = _scalar_field_apply_info(st_apply_main.expr)
+        if apply_info_main is None or apply_info_main[0] not in main_object_list_vars:
+            continue
+        ints.discard(st_apply_main.name)
+        real_scalars.discard(st_apply_main.name)
+        int_arrays.discard(st_apply_main.name)
+        real_arrays.discard(st_apply_main.name)
+        logical_arrays.discard(st_apply_main.name)
+        params.pop(st_apply_main.name, None)
+        real_params.pop(st_apply_main.name, None)
+        array_params.pop(st_apply_main.name, None)
+        if apply_info_main[2] == "integer":
+            int_arrays.add(st_apply_main.name)
+        elif apply_info_main[2] == "logical":
+            logical_arrays.add(st_apply_main.name)
+        else:
+            real_arrays.add(st_apply_main.name)
     for nm in lm_vars:
         ints.discard(nm)
         real_scalars.discard(nm)
@@ -34799,6 +34865,27 @@ def transpile_r_to_fortran(
             real_arrays.discard(st_rank_final.name)
             real_scalars.discard(st_rank_final.name)
             matrix_rank_ctx[st_rank_final.name.lower()] = 2
+    # Scalar-field vapply/sapply over an object array always returns a vector.
+    for st_apply_main in main_stmts:
+        if not isinstance(st_apply_main, Assign):
+            continue
+        apply_info_main = _scalar_field_apply_info(st_apply_main.expr)
+        if apply_info_main is None or apply_info_main[0] not in main_object_list_vars:
+            continue
+        ints.discard(st_apply_main.name)
+        real_scalars.discard(st_apply_main.name)
+        int_arrays.discard(st_apply_main.name)
+        real_arrays.discard(st_apply_main.name)
+        logical_arrays.discard(st_apply_main.name)
+        params.pop(st_apply_main.name, None)
+        real_params.pop(st_apply_main.name, None)
+        array_params.pop(st_apply_main.name, None)
+        if apply_info_main[2] == "integer":
+            int_arrays.add(st_apply_main.name)
+        elif apply_info_main[2] == "logical":
+            logical_arrays.add(st_apply_main.name)
+        else:
+            real_arrays.add(st_apply_main.name)
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
     if int_arrays:
@@ -40013,6 +40100,48 @@ def rewrite_guarded_index_merge_assignments_text(f90: str) -> str:
             ]
         )
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def _scalar_field_apply_info(expr: str) -> tuple[str, str, str] | None:
+    """Return (source, field, kind) for vapply/sapply scalar field extraction."""
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() not in {"vapply", "sapply"}:
+        return None
+    pos, kw = cinfo[1], {k.lower().replace(".", "_"): v for k, v in cinfo[2].items()}
+    if len(pos) < 2 or not re.fullmatch(r"[A-Za-z]\w*", pos[0].strip()):
+        return None
+    callback = pos[1].strip()
+    m_callback = re.fullmatch(
+        r"function\s*\(\s*([A-Za-z]\w*)\s*\)\s*\1\s*\$\s*([A-Za-z]\w*)",
+        callback,
+        re.IGNORECASE,
+    )
+    if m_callback is None:
+        return None
+    template = (pos[2] if len(pos) >= 3 else kw.get("fun_value", "numeric(1)"))
+    template_l = template.strip().lower().replace(" ", "")
+    kind = "integer" if template_l == "integer(1)" else "logical" if template_l == "logical(1)" else "real"
+    return pos[0].strip(), _sanitize_fortran_kwarg_name(m_callback.group(2)), kind
+
+
+def _replicate_object_call_info(
+    expr: str, list_specs: dict[str, ListReturnSpec] | None
+) -> tuple[str, str, str] | None:
+    """Return (count, value expression, result type) for object-valued replicate."""
+    cinfo = parse_call_text(expr.strip())
+    if cinfo is None or cinfo[0].lower() != "replicate":
+        return None
+    pos, kw = cinfo[1], cinfo[2]
+    count = pos[0].strip() if pos else kw.get("n", "").strip()
+    value = pos[1].strip() if len(pos) >= 2 else kw.get("expr", "").strip()
+    simplify = kw.get("simplify", "TRUE").strip().upper()
+    value_call = parse_call_text(value)
+    if not count or value_call is None or simplify not in {"FALSE", "F"}:
+        return None
+    fn_name = value_call[0]
+    if list_specs is not None and fn_name not in list_specs:
+        return None
+    return count, value, _type_name_for_path(fn_name, ()) if list_specs is not None else ""
 
 
 def lower_supported_vapply_writes_text(f90: str) -> str:
@@ -49738,8 +49867,20 @@ def promote_integer_index_result_decls_text(f90: str) -> str:
 def promote_vectorized_assignment_result_decls_text(f90: str) -> str:
     lines = f90.splitlines()
     rank1: set[str] = set()
+    object_rank1: set[str] = set()
     scalar_decl_kinds: dict[str, str] = {}
     for line in lines:
+        m_obj_alloc = re.match(
+            r"^\s*type\s*\([^)]*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_obj_alloc is not None:
+            for part in split_top_level_commas(m_obj_alloc.group(1)):
+                mm_obj = re.match(r"\s*([A-Za-z]\w*)\s*\(:\)\s*$", part.strip())
+                if mm_obj is not None:
+                    object_rank1.add(mm_obj.group(1))
+            continue
         m_alloc = re.match(
             r"^\s*(integer(?:\s*\([^)]*\))?|real\s*\([^)]*\)|logical)\s*,\s*allocatable\s*::\s*(.+)$",
             line,
@@ -49792,6 +49933,13 @@ def promote_vectorized_assignment_result_decls_text(f90: str) -> str:
             if any(re.search(rf"\b{re.escape(nm)}\b(?!\s*\()", rhs) for nm in rank1):
                 rank1.add(lhs)
                 changed = True
+                continue
+            if any(
+                re.search(rf"\b{re.escape(nm)}\s*%\s*[A-Za-z]\w*\b", rhs)
+                for nm in object_rank1
+            ):
+                rank1.add(lhs)
+                changed = True
 
     promote = rank1 & set(scalar_decl_kinds)
     if not promote:
@@ -49815,6 +49963,62 @@ def promote_vectorized_assignment_result_decls_text(f90: str) -> str:
                 vector_parts.append(f"{base}(:)")
             elif p:
                 scalar_parts.append(p)
+        if vector_parts:
+            out.append(f"{m_scalar.group(1)}{m_scalar.group(2)}, allocatable :: " + ", ".join(vector_parts))
+            if scalar_parts:
+                out.append(f"{m_scalar.group(1)}{m_scalar.group(2)} :: " + ", ".join(scalar_parts))
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
+def promote_object_array_component_assignment_decls_text(f90: str) -> str:
+    """Promote locals assigned an intrinsic component of a derived-type array."""
+    object_arrays: set[str] = set()
+    for line in f90.splitlines():
+        m_decl = re.match(
+            r"^\s*type\s*\([^)]*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_decl is None:
+            continue
+        for part in split_top_level_commas(m_decl.group(1)):
+            m_item = re.fullmatch(r"([A-Za-z]\w*)\s*\(:\)", part.strip())
+            if m_item is not None:
+                object_arrays.add(m_item.group(1).lower())
+    if not object_arrays:
+        return f90
+
+    targets: set[str] = set()
+    for m_assign in re.finditer(
+        r"(?im)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*%\s*[A-Za-z]\w*\s*$",
+        f90,
+    ):
+        if m_assign.group(2).lower() in object_arrays:
+            targets.add(m_assign.group(1).lower())
+    if not targets:
+        return f90
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_scalar = re.match(
+            r"^(\s*)(integer(?:\s*\([^)]*\))?|real\s*\([^)]*\)|logical)\s*::\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_scalar is None:
+            out.append(line)
+            continue
+        vector_parts: list[str] = []
+        scalar_parts: list[str] = []
+        for part in split_top_level_commas(m_scalar.group(3)):
+            item = part.strip()
+            base = item.split("=", 1)[0].strip().lower()
+            if base in targets and re.fullmatch(r"[A-Za-z]\w*", base):
+                vector_parts.append(f"{base}(:)")
+            elif item:
+                scalar_parts.append(item)
         if vector_parts:
             out.append(f"{m_scalar.group(1)}{m_scalar.group(2)}, allocatable :: " + ", ".join(vector_parts))
             if scalar_parts:
@@ -59928,6 +60132,7 @@ def main() -> int:
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
     f90 = demote_scalar_reduction_local_declarations_text(f90)
+    f90 = promote_object_array_component_assignment_decls_text(f90)
     f90 = promote_real_matrix_initializer_decls_text(f90)
     f90 = demote_smoother_prediction_point_decls_text(f90)
     f90 = rewrite_scalar_table_extract_decls_text(f90)
