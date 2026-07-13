@@ -3630,15 +3630,54 @@ def parse_block(
                         return [Assign(lhs_if, only.expr, only.comment)]
                     if isinstance(only, Assign):
                         return [Assign(lhs_if, only.expr, only.comment)]
+                    if isinstance(only, IfStmt):
+                        return [
+                            IfStmt(
+                                cond=only.cond,
+                                then_body=_branch_as_assignment(only.then_body),
+                                else_body=_branch_as_assignment(only.else_body),
+                            )
+                        ]
                     return branch
 
-                stmts.append(
-                    IfStmt(
-                        cond=cond,
-                        then_body=_branch_as_assignment(then_body_raw),
-                        else_body=_branch_as_assignment(else_body_raw),
-                    )
+                assigned_if = IfStmt(
+                    cond=cond,
+                    then_body=_branch_as_assignment(then_body_raw),
+                    else_body=_branch_as_assignment(else_body_raw),
                 )
+
+                def _assigned_if_values(ss_if: list[object]) -> list[str]:
+                    values_if: list[str] = []
+                    for item_if in ss_if:
+                        if isinstance(item_if, Assign) and item_if.name == lhs_if:
+                            values_if.append(item_if.expr.strip())
+                        elif isinstance(item_if, IfStmt):
+                            values_if.extend(_assigned_if_values(item_if.then_body))
+                            values_if.extend(_assigned_if_values(item_if.else_body))
+                    return values_if
+
+                terminal_if_values = _assigned_if_values([assigned_if])
+                if terminal_if_values and any(_is_real_literal(v) for v in terminal_if_values):
+                    def _promote_assigned_if_literals(ss_if: list[object]) -> list[object]:
+                        promoted_if: list[object] = []
+                        for item_if in ss_if:
+                            if isinstance(item_if, Assign) and item_if.name == lhs_if and _is_int_literal(item_if.expr):
+                                lit_if = re.sub(r"[lL]$", "", item_if.expr.strip())
+                                promoted_if.append(Assign(item_if.name, f"{lit_if}.0", item_if.comment))
+                            elif isinstance(item_if, IfStmt):
+                                promoted_if.append(
+                                    IfStmt(
+                                        cond=item_if.cond,
+                                        then_body=_promote_assigned_if_literals(item_if.then_body),
+                                        else_body=_promote_assigned_if_literals(item_if.else_body),
+                                    )
+                                )
+                            else:
+                                promoted_if.append(item_if)
+                        return promoted_if
+
+                    assigned_if = _promote_assigned_if_literals([assigned_if])[0]  # type: ignore[assignment]
+                stmts.append(assigned_if)
                 continue
 
         ih = _parse_if_head(ln)
