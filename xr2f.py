@@ -44845,32 +44845,71 @@ def validate_no_expression_component_refs_text(f90: str) -> str:
 
 
 def remove_pure_from_impure_call_graph_text(f90: str) -> str:
-    """Remove PURE from functions that call integrate() directly or transitively."""
-    if "pure function" not in f90.lower() or "integrate(" not in f90.lower():
+    """Remove PURE/ELEMENTAL from directly or transitively impure procedures."""
+    if not re.search(r"\b(?:pure|elemental)\b", f90, re.IGNORECASE):
         return f90
     lines = f90.splitlines()
-    func_pat = re.compile(
-        r"^(\s*)((?:(?:pure|elemental|recursive)\s+)*)function\s+([A-Za-z]\w*)\b",
+    proc_pat = re.compile(
+        r"^(\s*)((?:(?:pure|elemental|recursive|impure|module)\s+)*)"
+        r"(function|subroutine)\s+([A-Za-z]\w*)\b",
         re.IGNORECASE,
     )
-    end_pat = re.compile(r"^\s*end\s+function\b", re.IGNORECASE)
+    end_pat = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
     funcs: dict[str, dict[str, object]] = {}
     i = 0
     while i < len(lines):
-        m = func_pat.match(lines[i])
+        m = proc_pat.match(lines[i])
         if m is None:
             i += 1
             continue
         end = next((j for j in range(i + 1, len(lines)) if end_pat.match(lines[j])), i)
         block = "\n".join(lines[i : end + 1])
-        funcs[m.group(3).lower()] = {"start": i, "block": block}
+        funcs[m.group(4).lower()] = {"start": i, "block": block}
         i = end + 1
     if not funcs:
         return f90
+
+    known_impure_calls = {
+        "integrate", "random_number", "random_seed", "execute_command_line",
+        "set_seed_int", "rnorm1", "rnorm_vec", "runif1", "runif_vec",
+        "rexp", "rgamma", "rbeta", "rchisq", "rlogis", "rlnorm",
+        "rweibull", "rcauchy", "rgeom", "rnbinom", "rhyper", "rwilcox",
+        "rsignrank", "rmultinom", "rbinom", "rpois", "sample_int",
+        "sample_int1", "read_csv_real_matrix", "write_csv_real_matrix",
+        "file_create", "file_remove", "dir_create",
+    }
+
+    def directly_impure(block: str) -> bool:
+        body = re.sub(r"(?m)!.*$", "", block)
+        if re.search(r"(?im)^\s*print\s*(?:\*|\()", body):
+            return True
+        char_names: set[str] = set()
+        for m_char in re.finditer(
+            r"(?im)^\s*character\s*(?:\([^)]*\)|\*\s*\d+)?(?:\s*,[^:]*)?\s*::\s*([^\n]+)$",
+            body,
+        ):
+            for entity in split_top_level_commas(m_char.group(1)):
+                m_name = re.match(r"\s*([A-Za-z]\w*)", entity)
+                if m_name is not None:
+                    char_names.add(m_name.group(1).lower())
+        for m_io in re.finditer(
+            r"\b(?:write|read)\s*\(\s*(?:unit\s*=\s*)?([A-Za-z]\w*|\*|\d+)",
+            body,
+            re.IGNORECASE,
+        ):
+            unit = m_io.group(1).lower()
+            if unit == "*" or unit.isdigit() or unit not in char_names:
+                return True
+        if re.search(r"\b(?:open|close|flush|rewind|backspace|endfile)\s*\(", body, re.IGNORECASE):
+            return True
+        if re.search(r"\bcall\s+(?:display|print_[A-Za-z0-9_]*)\s*\(", body, re.IGNORECASE):
+            return True
+        return any(re.search(rf"\b{re.escape(name)}\s*\(", body, re.IGNORECASE) for name in known_impure_calls)
+
     impure = {
         name
         for name, info in funcs.items()
-        if re.search(r"\bintegrate\s*\(", str(info["block"]), re.IGNORECASE)
+        if directly_impure(str(info["block"]))
     }
     changed = True
     while changed:
@@ -44887,8 +44926,8 @@ def remove_pure_from_impure_call_graph_text(f90: str) -> str:
     changed_lines = False
     for name in impure:
         start = int(funcs[name]["start"])
-        if re.search(r"\bpure\b", lines[start], re.IGNORECASE):
-            lines[start] = re.sub(r"\bpure\s+", "", lines[start], count=1, flags=re.IGNORECASE)
+        if re.search(r"\b(?:pure|elemental)\b", lines[start], re.IGNORECASE):
+            lines[start] = re.sub(r"\b(?:pure|elemental)\s+", "", lines[start], flags=re.IGNORECASE)
             changed_lines = True
     if not changed_lines:
         return f90
@@ -60197,6 +60236,8 @@ def main() -> int:
     f90 = rewrite_named_real_row_prints_text(f90)
     if "call print_named_real_row(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
+    # Final safety check after all late rewrites that can introduce I/O/calls.
+    f90 = remove_pure_from_impure_call_graph_text(f90)
     f90 = validate_no_expression_component_refs_text(f90)
     final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
