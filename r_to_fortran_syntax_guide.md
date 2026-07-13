@@ -46,6 +46,24 @@ real(kind=dp) :: x
 x = 1.5_dp
 ```
 
+## Identifier Names
+
+R names are case-sensitive and may contain periods:
+
+```r
+daily.return <- 0.01
+ex.kurt <- 2.5
+```
+
+Fortran names are case-insensitive.  A standard Fortran name begins with a letter and contains only letters, digits, and underscores, so an embedded period is not allowed.  `xr2f.py` normally replaces each period with `_dot_`:
+
+```fortran
+daily_dot_return = 0.01_dp
+ex_dot_kurt = 2.5_dp
+```
+
+Backtick-quoted R names may require additional sanitization.  The transpiler also disambiguates names when different R spellings would otherwise produce the same Fortran identifier.
+
 ## Complex Numbers
 
 R writes the imaginary unit as `1i`:
@@ -86,6 +104,21 @@ Fortran also uses `=` in declarations for initialization:
 ```fortran
 integer, parameter :: n = 100
 ```
+
+R permits chained assignment:
+
+```r
+a <- b <- expensive_call()
+```
+
+Fortran has no chained assignment.  The equivalent statements must preserve R's right-to-left order and evaluate the final expression only once:
+
+```fortran
+b = expensive_call()
+a = b
+```
+
+`xr2f.py` lowers chained assignments internally, and `xnormalize_r.py` can make the same expansion in normalized R source.
 
 ## If Statements
 
