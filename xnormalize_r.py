@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+from r_assignment import expand_top_level_assignment_chain
+
 
 def split_top_level_commas(text: str) -> list[str]:
     parts: list[str] = []
@@ -226,6 +228,15 @@ def normalize_r_source(src: str, *, explicit_drop: bool = False, temp_prefix: st
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             out.append(line.rstrip())
+            continue
+
+        code, comment = strip_comment(line)
+        indent = code[: len(code) - len(code.lstrip())]
+        if (rewritten := expand_top_level_assignment_chain(code.strip())) is not None:
+            rewritten = [indent + item for item in rewritten]
+            if comment:
+                rewritten[-1] += " " + comment
+            out.extend(rewritten)
             continue
 
         if (rewritten := normalize_if_in_operator(line, temps.next())) is not None:
