@@ -32,6 +32,7 @@ from typing import Callable
 
 import fortran_post as fpost
 import fortran_scan as fscan
+from r_assignment import expand_top_level_assignment_chain
 
 _HAS_R_MOD = False
 _FORTRAN_COMMENTS = True
@@ -3484,7 +3485,14 @@ def preprocess_r_lines(src: str) -> list[str]:
                 cur = right
             if cur.strip():
                 out.append(cur.strip())
-    return out
+    expanded: list[str] = []
+    for statement in out:
+        chain = expand_top_level_assignment_chain(statement)
+        if chain is None:
+            expanded.append(statement)
+        else:
+            expanded.extend(chain)
+    return expanded
 
 
 def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | None = None) -> object:
@@ -48970,6 +48978,7 @@ def rewrite_rank1_component_matrix_prints_text(f90: str) -> str:
 
 
 def rewrite_rank1_derived_field_writes_text(f90: str) -> str:
+    """Use rank-aware helpers for writes of declared derived-type array components."""
     type_fields: dict[tuple[str, str], tuple[str, int]] = {}
     var_types: dict[str, str] = {}
     current_type: str | None = None
@@ -49034,6 +49043,9 @@ def rewrite_rank1_derived_field_writes_text(f90: str) -> str:
         if m_write_vec is not None:
             indent, obj, field = m_write_vec.groups()
             component = type_fields.get((var_types.get(obj, ""), field.lower()))
+            if component is not None and component[1] >= 2:
+                out.append(f"{indent}call display({obj}%{field})")
+                continue
             if component == ("character", 1):
                 out.append(f"{indent}call print_char_vector({obj}%{field})")
                 continue
@@ -60450,6 +60462,9 @@ def main() -> int:
     f90 = restore_missing_vector_formal_declarations_text(f90)
     f90 = fix_result_field_ranks_from_local_assignments_text(f90)
     f90 = repair_result_fields_from_array_sections_text(f90)
+    f90 = rewrite_rank1_derived_field_writes_text(f90)
+    if "call display(" in f90:
+        f90 = add_missing_r_mod_uses_per_scope_text(f90, {"display"})
     f90 = repair_known_scalar_result_fields_text(f90)
     f90 = demote_result_type_scalar_fields_text(f90)
     f90 = repair_cev_strike_local_k_collision_text(f90)
