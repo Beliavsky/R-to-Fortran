@@ -3741,19 +3741,54 @@ def parse_block(
                         else:
                             then_body_raw = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
                         i += 1
-                if i < len(lines):
-                    else_ln = lines[i].strip()
-                    if else_ln in {"else", "else {"}:
-                        i += 1
-                        if else_ln == "else {":
-                            else_body_raw, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
-                        elif i < len(lines) and lines[i].strip() == "{":
-                            else_body_raw, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                head_else_if: IfStmt | None = None
+                tail_else_if: IfStmt | None = None
+                while i < len(lines) and lines[i].strip().lower().startswith("else if"):
+                    e_line = lines[i].strip()
+                    e_if = _parse_if_head(e_line[len("else ") :].strip())
+                    if e_if is None:
+                        break
+                    e_cond, e_tail = e_if
+                    e_then: list[object] = []
+                    i += 1
+                    if e_tail:
+                        if e_tail == "{":
+                            e_then, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
                         else:
-                            if i >= len(lines):
-                                raise NotImplementedError("assignment else missing body")
-                            else_body_raw = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
-                            i += 1
+                            e_then = [parse_single_statement(e_tail, comment_lookup=comment_lookup)]
+                    elif i < len(lines) and lines[i].strip() == "{":
+                        e_then, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    else:
+                        if i >= len(lines):
+                            raise NotImplementedError("assignment else if missing body")
+                        e_then = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
+                        i += 1
+                    node = IfStmt(cond=e_cond, then_body=e_then, else_body=[])
+                    if head_else_if is None:
+                        head_else_if = node
+                    if tail_else_if is not None:
+                        tail_else_if.else_body = [node]
+                    tail_else_if = node
+
+                final_else: list[object] = []
+                if i < len(lines) and lines[i].strip() in {"else", "else {"}:
+                    else_ln = lines[i].strip()
+                    i += 1
+                    if else_ln == "else {":
+                        final_else, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    elif i < len(lines) and lines[i].strip() == "{":
+                        final_else, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                    else:
+                        if i >= len(lines):
+                            raise NotImplementedError("assignment else missing body")
+                        final_else = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
+                        i += 1
+                if tail_else_if is not None:
+                    tail_else_if.else_body = final_else
+                if head_else_if is not None:
+                    else_body_raw = [head_else_if]
+                elif final_else:
+                    else_body_raw = final_else
 
                 def _branch_as_assignment(branch: list[object]) -> list[object]:
                     if len(branch) != 1:
@@ -3790,6 +3825,30 @@ def parse_block(
                     return values_if
 
                 terminal_if_values = _assigned_if_values([assigned_if])
+                terminal_if_ranks = [_infer_assignment_rank_hint(v, {}) for v in terminal_if_values]
+                if terminal_if_ranks and max(terminal_if_ranks) == 1 and any(r == 0 for r in terminal_if_ranks):
+                    def _promote_assigned_if_scalars(ss_if: list[object]) -> list[object]:
+                        promoted_if: list[object] = []
+                        for item_if in ss_if:
+                            if (
+                                isinstance(item_if, Assign)
+                                and item_if.name == lhs_if
+                                and _infer_assignment_rank_hint(item_if.expr, {}) == 0
+                            ):
+                                promoted_if.append(Assign(item_if.name, f"c({item_if.expr})", item_if.comment))
+                            elif isinstance(item_if, IfStmt):
+                                promoted_if.append(
+                                    IfStmt(
+                                        cond=item_if.cond,
+                                        then_body=_promote_assigned_if_scalars(item_if.then_body),
+                                        else_body=_promote_assigned_if_scalars(item_if.else_body),
+                                    )
+                                )
+                            else:
+                                promoted_if.append(item_if)
+                        return promoted_if
+
+                    assigned_if = _promote_assigned_if_scalars([assigned_if])[0]  # type: ignore[assignment]
                 if terminal_if_values and any(_is_real_literal(v) for v in terminal_if_values):
                     def _promote_assigned_if_literals(ss_if: list[object]) -> list[object]:
                         promoted_if: list[object] = []
@@ -19443,10 +19502,12 @@ def emit_stmts(
         out_ss: list[object] = []
         for b in ss:
             if isinstance(b, PrintStmt):
-                out_ss.append(_replace_name_in_stmt(b, var, value_expr))
+                normalized = PrintStmt([_replace_dotted_var_refs(a) for a in b.args], b.comment)
+                out_ss.append(_replace_name_in_stmt(normalized, var, value_expr))
                 continue
             if isinstance(b, CallStmt) and b.name.lower() in {"cat", "print"}:
-                out_ss.append(_replace_name_in_stmt(b, var, value_expr))
+                normalized = CallStmt(b.name, [_replace_dotted_var_refs(a) for a in b.args], b.comment)
+                out_ss.append(_replace_name_in_stmt(normalized, var, value_expr))
                 continue
             return None
         return out_ss
@@ -23188,7 +23249,7 @@ def emit_stmts(
                 continue
             raise NotImplementedError(f"unsupported call statement: {st.name}")
         elif isinstance(st, ForStmt):
-            it = st.iter_expr.strip()
+            it = _replace_dotted_var_refs(st.iter_expr.strip())
             m_colon = re.match(r"^(.+):(.+)$", it)
             m_seq_len = re.match(r"^seq_len\s*\((.+)\)$", it, re.IGNORECASE)
             m_seq_along = re.match(r"^seq_along\s*\((.+)\)$", it, re.IGNORECASE)
@@ -23396,7 +23457,8 @@ def emit_stmts(
             if ret_arg is not None:
                 if not return_var:
                     raise NotImplementedError("return(...) is only supported inside functions")
-                if ret_arg:
+                return_is_list = bool(helper_ctx is not None and helper_ctx.get("return_is_list"))
+                if ret_arg and not (return_is_list and ret_arg.strip().upper() == "NULL"):
                     ret_src = ret_arg
                     if helper_ctx is not None:
                         ram = helper_ctx.get("return_alias_map")
@@ -25895,7 +25957,10 @@ def emit_function(
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     fn_char_array_lowers = {x.lower() for x in fn_char_arrays}
     for st_char_loop in fn.body:
-        if isinstance(st_char_loop, ForStmt) and st_char_loop.iter_expr.strip().lower() in fn_char_array_lowers:
+        if (
+            isinstance(st_char_loop, ForStmt)
+            and _replace_dotted_var_refs(st_char_loop.iter_expr.strip()).lower() in fn_char_array_lowers
+        ):
             fn_char_scalars.add(st_char_loop.var)
     fn_int_args = infer_function_integer_names(fn)
     fn_int_mod_args = infer_function_integer_modulus_arg_names(fn)
@@ -27766,6 +27831,7 @@ def emit_function(
         helper_ctx_loc["local_ranks"] = dict(local_ranks)
         if not emit_as_subroutine:
             helper_ctx_loc["return_var"] = rname
+            helper_ctx_loc["return_is_list"] = fn.name in list_specs
         if return_alias_map:
             helper_ctx_loc["return_alias_map"] = return_alias_map
         def _register_local_call_matrix_labels(ss_labs_loc: list[object]) -> None:
@@ -28534,7 +28600,7 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                 walk(st.then_body)
                 walk(st.else_body)
             elif isinstance(st, ForStmt):
-                iter_src = st.iter_expr.strip()
+                iter_src = _replace_dotted_var_refs(st.iter_expr.strip())
                 if iter_src.lower() in {x.lower() for x in char_arrays_seen}:
                     out.add(st.var)
                 walk(st.body)
