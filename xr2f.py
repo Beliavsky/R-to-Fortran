@@ -50,6 +50,7 @@ _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE: dict[tuple[int, int, int, int, int], fro
 _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE: dict[tuple[int, int, int, int, int], frozenset[str]] = {}
 _USER_FUNC_RETURN_RANK: dict[str, int] = {}
 _USER_FUNC_RETURN_KIND: dict[str, str] = {}
+_COMBN_SCALAR_CALLBACKS: set[str] = set()
 _USER_FUNC_ELEMENTAL: set[str] = set()
 _FUNC_DEFS_BY_NAME: dict[str, object] = {}
 _VECTORIZED_ALIASES: dict[str, str] = {}
@@ -9237,6 +9238,11 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
     if simple_ctor_rank is not None:
         return simple_ctor_rank
     if re.match(r"^combn\s*\(", expr_l):
+        c_combn_rank = parse_call_text(expr)
+        if c_combn_rank is not None:
+            pos_combn_rank, kw_combn_rank = c_combn_rank[1], c_combn_rank[2]
+            if len(pos_combn_rank) >= 3 or any(k.lower() == "fun" for k in kw_combn_rank):
+                return 1
         return 2
     if re.match(r"^(?:colmeans|rowmeans|colsums|rowsums|apply)\s*\(", expr_l):
         return 1
@@ -18003,6 +18009,99 @@ def emit_stmts(
         return f"{pred}({actual_f})"
 
     find_print_counter = {"n": 0}
+    combn_fun_counter = {"n": 0}
+
+    def _combn_args(
+        cinfo: tuple[str, list[str], dict[str, str]],
+    ) -> tuple[str, str, str | None, str | None]:
+        pos = cinfo[1]
+        kw_lower = {k.lower(): v for k, v in cinfo[2].items()}
+        unsupported = set(kw_lower) - {"x", "m", "fun", "simplify"}
+        if len(pos) > 4 or unsupported:
+            raise NotImplementedError("combn supports x, m, scalar FUN, and simplify=TRUE")
+        x_src = pos[0] if pos else kw_lower.get("x", "")
+        m_src = pos[1] if len(pos) >= 2 else kw_lower.get("m", "")
+        fun_src = pos[2] if len(pos) >= 3 else kw_lower.get("fun")
+        simplify_src = pos[3] if len(pos) >= 4 else kw_lower.get("simplify")
+        if not x_src or not m_src:
+            raise NotImplementedError("combn requires x and m")
+        if simplify_src is not None and simplify_src.strip().lower() not in {"true", "t"}:
+            raise NotImplementedError("combn currently supports FUN only with simplify=TRUE")
+        return x_src, m_src, fun_src, simplify_src
+
+    def _emit_combn_fun(
+        cinfo: tuple[str, list[str], dict[str, str]],
+        target: str | None,
+        comment: str,
+    ) -> bool:
+        x_src, m_src, fun_src, _simplify_src = _combn_args(cinfo)
+        if fun_src is None:
+            return False
+        fun_name = fun_src.strip()
+        fun_l = fun_name.lower()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", fun_name):
+            raise NotImplementedError("combn FUN must be a named scalar function")
+
+        x_l = x_src.strip().lower()
+        x_is_int = (
+            _is_static_integer_vector_expr(x_src)
+            or _split_top_level_colon(x_src) is not None
+            or x_src.strip() in int_vector_vars
+            or x_l in _KNOWN_INT_VECTOR_NAMES
+        )
+        x_is_char = (
+            _static_character_vector_values(x_src) is not None
+            or x_src.strip() in char_vector_vars_ctx
+            or x_l in _KNOWN_CHAR_VECTOR_NAMES
+        )
+        if x_is_char:
+            raise NotImplementedError("combn FUN currently supports numeric inputs")
+
+        combn_fun_counter["n"] += 1
+        suffix = combn_fun_counter["n"]
+        tmp_nm = f"xr2f_combn_tmp_{suffix}"
+        idx_nm = f"i_combn_{suffix}"
+        x_f = r_expr_to_fortran(x_src)
+        m_f = r_expr_to_fortran(m_src)
+        slice_f = f"{tmp_nm}(:, {idx_nm})"
+
+        if fun_l == "sum":
+            value_f = f"sum({slice_f})"
+        elif fun_l == "prod":
+            value_f = f"real(product({slice_f}), kind=dp)"
+        else:
+            fn_obj = _FUNC_DEFS_BY_NAME.get(fun_l)
+            if fn_obj is None:
+                raise NotImplementedError(f"combn FUN `{fun_name}` must be a translated function or sum/prod")
+            if _USER_FUNC_RETURN_RANK.get(fun_l, 0) != 0:
+                raise NotImplementedError("combn currently supports only scalar-result FUN callbacks")
+            actual_f = slice_f
+            kinds = _USER_FUNC_ARG_KIND.get(fun_l, [])
+            wanted = kinds[0] if kinds else "real"
+            if wanted == "real" and x_is_int:
+                actual_f = f"real({actual_f}, kind=dp)"
+            elif wanted in {"int", "integer"} and not x_is_int:
+                actual_f = f"int({actual_f})"
+            value_f = f"{_sanitize_r_var_name(fun_name)}({actual_f})"
+
+        result_f = f"[({value_f}, {idx_nm}=1,size({tmp_nm},2))]"
+        o.w("block")
+        o.push()
+        if x_is_int:
+            o.w(f"integer, allocatable :: {tmp_nm}(:,:)")
+        else:
+            o.w(f"real(kind=dp), allocatable :: {tmp_nm}(:,:)")
+        o.w(f"integer :: {idx_nm}")
+        o.w(f"{tmp_nm} = combn({x_f}, int({m_f}))")
+        if target is None:
+            o.w(f"call display({result_f})")
+            need_r_mod.add("display")
+        else:
+            o.w(f"{target} = {result_f}")
+        o.pop()
+        o.w("end block" + (f" {comment}" if comment else ""))
+        need_r_mod.add("combn")
+        return True
 
     def _emit_find_print(expr: str, comment: str) -> bool:
         parsed = _parse_find_call(expr)
@@ -21159,14 +21258,10 @@ def emit_stmts(
                     o.w("end block")
                     continue
             if cinfo is not None and cinfo[0].lower() == "combn":
-                _nm, pos, kw = cinfo
-                unsupported_kw = {k for k in kw if k.lower() not in {"x", "m"}}
-                if len(pos) > 2 or unsupported_kw:
-                    raise NotImplementedError("combn currently supports only combn(x, m)")
-                has_x = len(pos) >= 1 or any(k.lower() == "x" for k in kw)
-                has_m = len(pos) >= 2 or any(k.lower() == "m" for k in kw)
-                if not has_x or not has_m:
-                    raise NotImplementedError("combn requires x and m")
+                _x_combn, _m_combn, fun_combn, _simplify_combn = _combn_args(cinfo)
+                if fun_combn is not None:
+                    _emit_combn_fun(cinfo, st.name, st.comment)
+                    continue
                 _wstmt(f"{st.name} = {rhs_f}", st.comment)
                 need_r_mod.add("combn")
                 continue
@@ -21413,9 +21508,10 @@ def emit_stmts(
                         continue
                     c_combn_print = parse_call_text(one.strip())
                     if c_combn_print is not None and c_combn_print[0].lower() == "combn":
-                        unsupported_kw = {k for k in c_combn_print[2] if k.lower() not in {"x", "m"}}
-                        if len(c_combn_print[1]) > 2 or unsupported_kw:
-                            raise NotImplementedError("combn currently supports only combn(x, m)")
+                        _x_combn, _m_combn, fun_combn, _simplify_combn = _combn_args(c_combn_print)
+                        if fun_combn is not None:
+                            _emit_combn_fun(c_combn_print, None, st.comment)
+                            continue
                         _wstmt(f"call display({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.update({"combn", "display"})
                         continue
@@ -25871,7 +25967,7 @@ def emit_function(
     ):
         ranked_return_names = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
         has_bare_ranked_name = any(
-            re.search(rf"\b{re.escape(nm_ret_rank)}\b(?!\s*\[)", ret_expr_src)
+            re.search(rf"\b{re.escape(nm_ret_rank)}\b(?!\s*[\[(])", ret_expr_src)
             for nm_ret_rank in ranked_return_names
         )
         if not has_bare_ranked_name:
@@ -25916,6 +26012,18 @@ def emit_function(
             rdecl = "integer"
         elif ret_ident_decl in b_real_scalars0:
             rdecl = "real(kind=dp)"
+    combn_scalar_callbacks_ctx = (
+        helper_ctx.get("combn_scalar_callbacks", set())
+        if isinstance(helper_ctx, dict)
+        else set()
+    )
+    fn_is_combn_scalar_callback = (
+        fn.name.lower() in _COMBN_SCALAR_CALLBACKS
+        or fn.name.lower() in combn_scalar_callbacks_ctx
+    )
+    if fn_is_combn_scalar_callback:
+        ret_rank = 0
+        rdecl = rdecl.replace(", allocatable", "")
     if ret_type_name is not None:
         rdecl = f"type({ret_type_name})"
     elif ret_is_char:
@@ -26033,7 +26141,7 @@ def emit_function(
         o.w("end do")
         o.w(f"end function {fn.name}")
         return False
-    if list_spec is None and ret_rank == 0:
+    if list_spec is None and ret_rank == 0 and not fn_is_combn_scalar_callback:
         ex_last = last.expr.strip()
         if (
             not re.match(r"^-?\s*(?:sum|mean|prod|min|max)\s*\(", ex_last, re.IGNORECASE)
@@ -31792,7 +31900,7 @@ def transpile_r_to_fortran(
     strict_r_numeric_literals: bool = False,
     ignore_directives: bool = False,
 ) -> str:
-    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
+    global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _COMBN_SCALAR_CALLBACKS, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS, _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
     global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
@@ -31807,6 +31915,7 @@ def transpile_r_to_fortran(
     _FORTRAN_COMMENTS = bool(fortran_comments)
     _LEXICAL_INOUT_ARGS = {}
     _LEXICALLY_MUTATED_LOCALS = {}
+    _COMBN_SCALAR_CALLBACKS = set()
     _STRICT_R_NUMERIC_LITERALS = bool(strict_r_numeric_literals)
     _IGNORE_XR2F_DIRECTIVES = bool(ignore_directives)
     _XR2F_FORCE_KIND, _XR2F_FORCE_RANK = parse_xr2f_directives(src, ignore=_IGNORE_XR2F_DIRECTIVES)
@@ -33014,7 +33123,11 @@ def transpile_r_to_fortran(
         if _infer_assignment_rank_hint(expr_vec_ret, arg_ranks_vec_ret) == 0:
             continue
         for arg_vec_ret, rank_vec_ret in arg_ranks_vec_ret.items():
-            if rank_vec_ret > 0 and re.search(rf"\b{re.escape(arg_vec_ret)}\b", expr_vec_ret, re.IGNORECASE):
+            if rank_vec_ret > 0 and re.search(
+                rf"\b{re.escape(arg_vec_ret)}\b(?!\s*[\[(])",
+                expr_vec_ret,
+                re.IGNORECASE,
+            ):
                 if re.search(r"(?:\+|-|\*|/|\^)", expr_vec_ret):
                     _USER_FUNC_RETURN_RANK[fn_l_vec_ret] = rank_vec_ret
                     break
@@ -33050,6 +33163,22 @@ def transpile_r_to_fortran(
     helper_modules = set(m.lower() for m in (helper_modules or set()))
     _HAS_R_MOD = ("r_mod" in helper_modules)
     _NO_RECYCLE = bool(no_recycle)
+    combn_scalar_callbacks_for_ctx = set(_COMBN_SCALAR_CALLBACKS)
+    for st_combn_ctx in main_stmts:
+        if not isinstance(st_combn_ctx, Assign):
+            continue
+        c_combn_ctx = parse_call_text(st_combn_ctx.expr.strip())
+        if c_combn_ctx is None or c_combn_ctx[0].lower() != "combn":
+            continue
+        kw_combn_ctx = {k.lower(): v for k, v in c_combn_ctx[2].items()}
+        fun_combn_ctx = (
+            c_combn_ctx[1][2]
+            if len(c_combn_ctx[1]) >= 3
+            else kw_combn_ctx.get("fun", "")
+        ).strip().lower()
+        if fun_combn_ctx and fun_combn_ctx not in {"sum", "prod"}:
+            combn_scalar_callbacks_for_ctx.add(fun_combn_ctx)
+    _COMBN_SCALAR_CALLBACKS.update(combn_scalar_callbacks_for_ctx)
     helper_ctx_mod: dict[str, object] = {
         "has_r_mod": ("r_mod" in helper_modules),
         "need_r_mod": set(),
@@ -33070,6 +33199,7 @@ def transpile_r_to_fortran(
         "matrix_rowname_exprs": collect_rownames_sources(stmts),
         "function_matrix_col_labels": {k.lower(): v for k, v in fn_matrix_col_labels.items()},
         "function_matrix_row_exprs": {k.lower(): v for k, v in fn_matrix_row_exprs.items()},
+        "combn_scalar_callbacks": combn_scalar_callbacks_for_ctx,
     }
     helper_ctx_main: dict[str, object] = {
         "has_r_mod": ("r_mod" in helper_modules),
@@ -33328,6 +33458,8 @@ def transpile_r_to_fortran(
         c_combn = parse_call_text(st_combn.expr.strip())
         if c_combn is None or c_combn[0].lower() != "combn":
             continue
+        kw_combn_lower = {k.lower(): v for k, v in c_combn[2].items()}
+        fun_combn = c_combn[1][2].strip() if len(c_combn[1]) >= 3 else kw_combn_lower.get("fun", "").strip()
         x_combn = c_combn[1][0].strip() if c_combn[1] else next(
             (v.strip() for k, v in c_combn[2].items() if k.lower() == "x"),
             "",
@@ -33350,6 +33482,19 @@ def transpile_r_to_fortran(
         char_arrays.discard(st_combn.name)
         params.pop(st_combn.name, None)
         array_params.pop(st_combn.name, None)
+        if fun_combn:
+            int_matrices.discard(st_combn.name)
+            real_matrices.discard(st_combn.name)
+            if fun_combn.lower() not in {"sum", "prod"}:
+                _COMBN_SCALAR_CALLBACKS.add(fun_combn.lower())
+                _USER_FUNC_RETURN_RANK[fun_combn.lower()] = 0
+            if fun_combn.lower() == "sum" and is_int_combn:
+                int_arrays.add(st_combn.name)
+                real_arrays.discard(st_combn.name)
+            else:
+                real_arrays.add(st_combn.name)
+                int_arrays.discard(st_combn.name)
+            continue
         if is_char_combn:
             char_matrices.add(st_combn.name)
             int_matrices.discard(st_combn.name)
@@ -33654,6 +33799,17 @@ def transpile_r_to_fortran(
 
     def _force_user_arg_ranks_from_call(c_call_force: tuple[str, list[str], dict[str, str]]) -> None:
         callee_l = c_call_force[0].lower()
+        if callee_l == "combn":
+            pos_combn_force = c_call_force[1]
+            kw_combn_force = {k.lower(): v for k, v in c_call_force[2].items()}
+            fun_src_force = pos_combn_force[2] if len(pos_combn_force) >= 3 else kw_combn_force.get("fun", "")
+            fn_l_combn_force = fun_src_force.strip().lower()
+            fn_combn_force = user_func_by_lower.get(fn_l_combn_force)
+            if fn_combn_force is not None and fn_combn_force.args:
+                formal_combn_force = fn_combn_force.args[0].lower()
+                _FORCED_FUNC_ARG_RANKS.setdefault(fn_l_combn_force, {})[formal_combn_force] = 1
+                _USER_FUNC_ARG_RANK.setdefault(fn_l_combn_force, {})[formal_combn_force] = 1
+            return
         if callee_l == "optim":
             pos_opt_force, kw_opt_force = c_call_force[1], c_call_force[2]
             fn_src_force = kw_opt_force.get("fn") or (pos_opt_force[1] if len(pos_opt_force) >= 2 else "")
@@ -33944,7 +34100,11 @@ def transpile_r_to_fortran(
         if _infer_assignment_rank_hint(expr_vec_ret, arg_ranks_vec_ret) == 0:
             continue
         for arg_vec_ret, rank_vec_ret in arg_ranks_vec_ret.items():
-            if rank_vec_ret > 0 and re.search(rf"\b{re.escape(arg_vec_ret)}\b", expr_vec_ret, re.IGNORECASE):
+            if rank_vec_ret > 0 and re.search(
+                rf"\b{re.escape(arg_vec_ret)}\b(?!\s*[\[(])",
+                expr_vec_ret,
+                re.IGNORECASE,
+            ):
                 if re.search(r"(?:\+|-|\*|/|\^)", expr_vec_ret):
                     _USER_FUNC_RETURN_RANK[fn_l_vec_ret] = rank_vec_ret
                     break
@@ -46289,6 +46449,12 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
         if m_fn is None:
             i += 1
             continue
+        if m_fn.group(1).lower() in _COMBN_SCALAR_CALLBACKS:
+            end = i + 1
+            while end < len(out) and scope_end_pat.match(out[end]) is None:
+                end += 1
+            i = end + 1
+            continue
         result_name = m_fn.group(2)
         end = i + 1
         while end < len(out) and scope_end_pat.match(out[end]) is None:
@@ -46336,10 +46502,14 @@ def promote_vector_function_results(lines: list[str]) -> list[str]:
                     continue
                 for nm in rank1_names:
                     direct_vector_expr = (
-                        re.search(rf"\breal\s*\(\s*{re.escape(nm)}\b", rhs_for_vector_check, re.IGNORECASE) is not None
-                        or re.search(rf"^\s*{re.escape(nm)}\b", rhs_for_vector_check) is not None
-                        or re.search(rf"\b{re.escape(nm)}\s*[*+/\\-]", rhs_for_vector_check) is not None
-                        or re.search(rf"[*+/\\-]\s*{re.escape(nm)}\b", rhs_for_vector_check) is not None
+                        re.search(
+                            rf"\breal\s*\(\s*{re.escape(nm)}\b(?!\s*\()",
+                            rhs_for_vector_check,
+                            re.IGNORECASE,
+                        ) is not None
+                        or re.search(rf"^\s*{re.escape(nm)}\b(?!\s*\()", rhs_for_vector_check) is not None
+                        or re.search(rf"\b{re.escape(nm)}\b(?!\s*\()\s*[*+/\\-]", rhs_for_vector_check) is not None
+                        or re.search(rf"[*+/\\-]\s*{re.escape(nm)}\b(?!\s*\()", rhs_for_vector_check) is not None
                     )
                     if direct_vector_expr and not re.fullmatch(
                         rf"\s*(?:sum|mean|maxval|minval|dot_product)\s*\(.*\b{re.escape(nm)}\b.*\)\s*",
@@ -51983,11 +52153,44 @@ def promote_vector_result_from_vector_dummy_expr_text(f90: str) -> str:
                     vector_dummies.add(m_item.group(1).lower())
         if not vector_dummies:
             return block
+
+        def dummy_contributes_vector(rhs: str, name: str) -> bool:
+            if re.search(rf"\b{re.escape(name)}\b(?!\s*\()", rhs, re.IGNORECASE):
+                return True
+            for m_ref in re.finditer(rf"\b{re.escape(name)}\s*\(", rhs, re.IGNORECASE):
+                open_pos = rhs.find("(", m_ref.start())
+                depth = 0
+                close_pos = -1
+                quote = ""
+                for pos in range(open_pos, len(rhs)):
+                    ch = rhs[pos]
+                    if quote:
+                        if ch == quote and (pos == 0 or rhs[pos - 1] != "\\"):
+                            quote = ""
+                        continue
+                    if ch in {'"', "'"}:
+                        quote = ch
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            close_pos = pos
+                            break
+                if close_pos < 0:
+                    continue
+                index_src = rhs[open_pos + 1 : close_pos].strip()
+                if len(split_top_level_commas(index_src)) != 1:
+                    continue
+                if index_src == ":" or _infer_assignment_rank_hint(index_src, {}) > 0:
+                    return True
+            return False
+
         for m_assign in re.finditer(rf"(?im)^\s*{re.escape(result)}\s*=\s*(.+)$", block):
             rhs = m_assign.group(1)
             if re.search(r"\b(?:sum|mean|minval|maxval|dot_product|count|all|any)\s*\(", rhs, re.IGNORECASE):
                 continue
-            if any(re.search(rf"\b{re.escape(nm)}\b", rhs, re.IGNORECASE) for nm in vector_dummies):
+            if any(dummy_contributes_vector(rhs, nm) for nm in vector_dummies):
                 return re.sub(
                     rf"(?im)^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)(?:\s*,[^:]*)?\s*::\s*{re.escape(result)}\s*$",
                     rf"\1real(kind=dp), allocatable :: {result}(:)",
