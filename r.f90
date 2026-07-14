@@ -30,10 +30,10 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
    & print_real_vector, print_complex_vector, print_integer_vector, print_char_vector, &
-   & print_named_real_vector, print_named_real_row, print_table1, print_table2, print_summary, set_print_int_like, &
+   & display, print_named_real_vector, print_named_real_row, print_table1, print_table2, print_summary, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
-   & union, intersect, setdiff, setequal, findInterval, cut, outer, &
+   & union, intersect, setdiff, setequal, combn, findInterval, cut, cut_n, outer, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
    & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
@@ -1100,6 +1100,12 @@ interface setequal
    module procedure setequal_char
 end interface setequal
 
+interface combn
+   module procedure combn_int
+   module procedure combn_real
+   module procedure combn_char
+end interface combn
+
 interface print_matrix
    module procedure print_matrix_real
    module procedure print_matrix_int
@@ -1118,6 +1124,16 @@ interface print_matrix_rstyle_named
    module procedure print_matrix_rstyle_named_real
    module procedure print_matrix_rstyle_named_int
 end interface print_matrix_rstyle_named
+
+interface display
+   module procedure print_real_scalar
+   module procedure display_integer_scalar, display_logical_scalar, display_complex_scalar, display_char_scalar
+   module procedure print_real_vector, print_integer_vector, display_logical_vector, print_complex_vector, print_char_vector
+   module procedure print_matrix_rstyle_real, print_matrix_rstyle_int, print_matrix_rstyle_logical
+   module procedure print_matrix_complex, display_char_matrix
+   module procedure display_real_array3, display_integer_array3, display_logical_array3
+   module procedure display_complex_array3, display_char_array3
+end interface display
 
 interface cumsum
    module procedure cumsum_real
@@ -5464,6 +5480,30 @@ else
 end if
 end subroutine print_real_scalar
 
+subroutine display_integer_scalar(x)
+! Display one default-kind integer.
+integer, intent(in) :: x
+write(*,"(g0)") x
+end subroutine display_integer_scalar
+
+subroutine display_logical_scalar(x)
+! Display one logical value.
+logical, intent(in) :: x
+write(*,"(g0)") x
+end subroutine display_logical_scalar
+
+subroutine display_complex_scalar(x)
+! Display one double-precision complex value.
+complex(kind=dp), intent(in) :: x
+call print_complex_vector([x])
+end subroutine display_complex_scalar
+
+subroutine display_char_scalar(x)
+! Display one character value without trailing blanks.
+character(len=*), intent(in) :: x
+write(*,"(a)") trim(x)
+end subroutine display_char_scalar
+
 subroutine print_real_vector(x, int_like, digits)
 ! Print one real vector; use integer format when all values are integer-like.
 real(kind=dp), intent(in) :: x(:) ! values to print
@@ -5533,6 +5573,12 @@ write (*,"(20(g0,1x,:))") x
 write(*,*)
 end subroutine print_integer_vector
 
+subroutine display_logical_vector(x)
+! Display one logical vector.
+logical, intent(in) :: x(:)
+write(*,"(20(g0,1x,:))") x
+end subroutine display_logical_vector
+
 subroutine print_char_vector(x)
 ! Print char vector values in an R-like format.
 character(len=*), intent(in) :: x(:) ! input vector
@@ -5543,6 +5589,60 @@ do i = 1, size(x)
 end do
 write(*,*)
 end subroutine print_char_vector
+
+subroutine display_char_matrix(x)
+! Display a rank-2 character array one row per line.
+character(len=*), intent(in) :: x(:,:)
+integer :: i
+do i = 1, size(x, 1)
+   call print_char_vector(x(i, :))
+end do
+end subroutine display_char_matrix
+
+subroutine display_real_array3(x)
+! Display a rank-3 real array as consecutive matrix slices.
+real(kind=dp), intent(in) :: x(:,:,:)
+integer :: k
+do k = 1, size(x, 3)
+   call print_matrix_rstyle_real(x(:, :, k))
+end do
+end subroutine display_real_array3
+
+subroutine display_integer_array3(x)
+! Display a rank-3 integer array as consecutive matrix slices.
+integer, intent(in) :: x(:,:,:)
+integer :: k
+do k = 1, size(x, 3)
+   call print_matrix_rstyle_int(x(:, :, k))
+end do
+end subroutine display_integer_array3
+
+subroutine display_logical_array3(x)
+! Display a rank-3 logical array as consecutive matrix slices.
+logical, intent(in) :: x(:,:,:)
+integer :: k
+do k = 1, size(x, 3)
+   call print_matrix_rstyle_logical(x(:, :, k))
+end do
+end subroutine display_logical_array3
+
+subroutine display_complex_array3(x)
+! Display a rank-3 complex array as consecutive matrix slices.
+complex(kind=dp), intent(in) :: x(:,:,:)
+integer :: k
+do k = 1, size(x, 3)
+   call print_matrix_complex(x(:, :, k))
+end do
+end subroutine display_complex_array3
+
+subroutine display_char_array3(x)
+! Display a rank-3 character array as consecutive matrix slices.
+character(len=*), intent(in) :: x(:,:,:)
+integer :: k
+do k = 1, size(x, 3)
+   call display_char_matrix(x(:, :, k))
+end do
+end subroutine display_char_array3
 
 subroutine print_named_real_vector(x, names, digits)
 ! Print named real vector values in an R-like format.
@@ -7562,6 +7662,69 @@ else
 end if
 out = tmp(1)
 end function sample_int1
+
+pure function combn_indices(n, m) result(out)
+! Return lexicographically ordered column indices for all m-combinations of n items.
+integer, intent(in) :: n, m
+integer, allocatable :: out(:,:)
+integer(kind=int64) :: count64
+integer, allocatable :: idx(:)
+integer :: i, j, ncomb
+
+if (m < 0 .or. m > n) error stop "combn: m must be between 0 and length(x)"
+count64 = 1_int64
+do i = 1, min(m, n - m)
+   count64 = count64 * int(n - min(m, n - m) + i, kind=int64) / int(i, kind=int64)
+end do
+if (count64 > int(huge(ncomb), kind=int64)) error stop "combn: result has too many columns"
+ncomb = int(count64)
+allocate(out(m, ncomb))
+if (m == 0) return
+allocate(idx(m))
+idx = [(i, i=1,m)]
+do j = 1, ncomb
+   out(:, j) = idx
+   i = m
+   do while (i >= 1 .and. idx(i) == n - m + i)
+      i = i - 1
+   end do
+   if (i == 0) exit
+   idx(i) = idx(i) + 1
+   do while (i < m)
+      idx(i + 1) = idx(i) + 1
+      i = i + 1
+   end do
+end do
+end function combn_indices
+
+pure function combn_int(x, m) result(out)
+! Return all size-m combinations of an integer vector as matrix columns.
+integer, intent(in) :: x(:), m
+integer, allocatable :: out(:,:), indices(:,:)
+indices = combn_indices(size(x), m)
+out = reshape(x(reshape(indices, [size(indices)])), shape(indices))
+end function combn_int
+
+pure function combn_real(x, m) result(out)
+! Return all size-m combinations of a real vector as matrix columns.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: m
+real(kind=dp), allocatable :: out(:,:)
+integer, allocatable :: indices(:,:)
+indices = combn_indices(size(x), m)
+out = reshape(x(reshape(indices, [size(indices)])), shape(indices))
+end function combn_real
+
+pure function combn_char(x, m) result(out)
+! Return all size-m combinations of a character vector as matrix columns.
+character(len=*), intent(in) :: x(:)
+integer, intent(in) :: m
+character(len=:), allocatable :: out(:,:)
+integer, allocatable :: indices(:,:)
+indices = combn_indices(size(x), m)
+allocate(character(len=len(x)) :: out(size(indices, 1), size(indices, 2)))
+out = reshape(x(reshape(indices, [size(indices)])), shape(indices))
+end function combn_char
 
 pure subroutine sort_increasing(x)
 ! Sort a real vector in increasing order (insertion sort).
@@ -9746,6 +9909,33 @@ do i = 1, size(x)
 end do
 if (present(labels)) continue
 end function cut
+
+pure function cut_n(x, breaks, include_lowest, labels) result(out)
+! Return integer bin numbers for cut(x, breaks_count, labels = FALSE).
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: breaks
+logical, intent(in), optional :: include_lowest
+logical, intent(in), optional :: labels
+integer, allocatable :: out(:)
+real(kind=dp), allocatable :: edges(:)
+real(kind=dp) :: dx, lo, hi
+integer :: i
+if (breaks < 1) then
+   allocate(out(size(x)), source=0)
+   return
+end if
+lo = minval(x)
+hi = maxval(x)
+dx = hi - lo
+if (dx == 0.0_dp) dx = max(abs(lo), 1.0_dp)
+allocate(edges(breaks + 1))
+do i = 1, breaks + 1
+   edges(i) = lo + real(i - 1, kind=dp) * (hi - lo) / real(breaks, kind=dp)
+end do
+edges(1) = edges(1) - dx / 1000.0_dp
+edges(breaks + 1) = edges(breaks + 1) + dx / 1000.0_dp
+out = cut(x, edges, include_lowest=include_lowest, labels=labels)
+end function cut_n
 
 pure function outer(x, y) result(out)
 ! Return the default R outer(x, y) product matrix.
@@ -13719,10 +13909,10 @@ else
       if (.not. all_int) exit
    end do
 end if
-write(*,'(7x)', advance='no')
+write(*,'(5x)', advance='no')
 do i = 1, size(x, 2)
    write(col_label, '("[,",i0,"]")') i
-   write(*,'(a12,1x)', advance='no') adjustl(col_label)
+   write(*,'(a12,1x)', advance='no') adjustr(col_label)
 end do
 write(*,*)
 do i = 1, size(x, 1)
@@ -13755,7 +13945,7 @@ integer :: i, j
 logical :: as_int_col
 character(len=32) :: fmt
 if (present(digits)) write(fmt, '("(f12.",i0,",1x)")') max(0, digits)
-write(*,'(7x)', advance='no')
+write(*,'(5x)', advance='no')
 do i = 1, size(x, 2)
    if (i <= size(names)) then
       write(*,'(a12,1x)', advance='no') trim(names(i))
@@ -13794,7 +13984,7 @@ subroutine print_matrix_rstyle_named_int(x, names)
 integer, intent(in) :: x(:,:) ! matrix to print
 character(len=*), intent(in) :: names(:) ! column names
 integer :: i, j
-write(*,'(7x)', advance='no')
+write(*,'(5x)', advance='no')
 do i = 1, size(x, 2)
    if (i <= size(names)) then
       write(*,'(a12,1x)', advance='no') trim(names(i))
@@ -13851,9 +14041,11 @@ subroutine print_matrix_rstyle_int(x)
 ! Print an integer matrix with R-like column and row labels.
 integer, intent(in) :: x(:,:) ! matrix to print
 integer :: i
-write(*,'(7x)', advance='no')
+character(len=12) :: col_label
+write(*,'(5x)', advance='no')
 do i = 1, size(x, 2)
-   write(*,'("[,",i0,"]",8x)', advance='no') i
+   write(col_label, '("[,",i0,"]")') i
+   write(*,'(a12,1x)', advance='no') adjustr(col_label)
 end do
 write(*,*)
 do i = 1, size(x, 1)
