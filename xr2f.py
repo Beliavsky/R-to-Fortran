@@ -4141,16 +4141,55 @@ def _lower_switch_assign_stmt(st: Assign) -> object:
     c_switch = parse_call_text(st.expr.strip())
     if c_switch is None or c_switch[0].lower() != "switch" or not c_switch[1]:
         return st
-    selector_src = c_switch[1][0].strip()
-    cases: list[tuple[str, list[object]]] = []
-    for idx_case, case_src in enumerate(c_switch[1][1:], start=1):
-        case_expr = case_src.strip()
+    m_body = re.match(r"^switch\s*\((.*)\)\s*$", st.expr.strip(), re.DOTALL)
+    if m_body is None:
+        return st
+    ordered = split_top_level_commas(m_body.group(1))
+    if len(ordered) < 2:
+        return st
+    selector_src = ordered[0].strip()
+    branches = ordered[1:]
+    parsed: list[tuple[str | None, str]] = []
+    for b in branches:
+        mb = re.match(r"^([A-Za-z.][\w.]*)\s*=(?!=)(.*)$", b.strip(), re.DOTALL)
+        if mb is not None:
+            parsed.append((mb.group(1), mb.group(2).strip()))
+        else:
+            parsed.append((None, b.strip()))
+    if any(nm is not None for nm, _ in parsed):
+        # Character switch assigning to st.name; honour fall-through (empty
+        # value uses the next branch's value) and an unnamed default branch.
+        cases: list[tuple[str, list[object]]] = []
+        default_body: list[object] = []
+        n = len(parsed)
+        for i, (nm, val) in enumerate(parsed):
+            if nm is None:
+                if val != "":
+                    default_body = [Assign(st.name, val, "")]
+                continue
+            value = val
+            if value == "":
+                j = i + 1
+                while j < n and parsed[j][1] == "":
+                    j += 1
+                if j >= n:
+                    continue
+                value = parsed[j][1]
+            if _parse_switch_case_block(value) is not None or _parse_switch_positional_block(value) is not None:
+                return st
+            cases.append((f'"{nm}"', [Assign(st.name, value, st.comment if i == 0 else "")]))
+        if not cases:
+            return st
+        return SwitchStmt(selector=selector_src, cases=cases, default_body=default_body, selector_kind="character")
+    # Positional (integer) switch.
+    int_cases: list[tuple[str, list[object]]] = []
+    for idx_case, (_nm, case_expr) in enumerate(parsed, start=1):
         if _parse_switch_case_block(case_expr) is not None or _parse_switch_positional_block(case_expr) is not None:
             return st
-        cases.append((str(idx_case), [Assign(st.name, case_expr, st.comment if idx_case == 1 else "")]))
-    if not cases:
+        int_cases.append((str(idx_case), [Assign(st.name, case_expr, st.comment if idx_case == 1 else "")]))
+    if not int_cases:
         return st
-    return SwitchStmt(selector=selector_src, cases=cases, default_body=[], selector_kind="integer")
+    return SwitchStmt(selector=selector_src, cases=int_cases, default_body=[], selector_kind="integer")
 
 
 def lower_switch_statements(stmts: list[object]) -> list[object]:
@@ -11303,6 +11342,51 @@ def _acf_series_name_arg(expr: str) -> str:
     return ""
 
 
+def _fold_switch_literal(s: str) -> str | None:
+    """Constant-fold switch(sel, ...) when the selector and every branch value
+    are literals. Returns the selected branch's Fortran expression, or the
+    string "NULL" when nothing matches (R prints NULL for that)."""
+    m = re.match(r"^switch\s*\((.*)\)\s*$", s.strip(), re.DOTALL)
+    if m is None:
+        return None
+    args = split_top_level_commas(m.group(1))
+    if len(args) < 2:
+        return None
+    sel = args[0].strip()
+    branches = args[1:]
+    parsed: list[tuple[str | None, str]] = []
+    for b in branches:
+        bt = b.strip()
+        mb = re.match(r"^([A-Za-z.][\w.]*)\s*=(?!=)(.*)$", bt, re.DOTALL)
+        if mb is not None:
+            parsed.append((mb.group(1), mb.group(2).strip()))
+        else:
+            parsed.append((None, bt))
+    sel_str = _dequote_string_literal(sel)
+    if sel_str is not None:
+        # Character selector: match by branch name, honouring fall-through
+        # (an empty value uses the next branch's value).
+        for i, (nm, _val) in enumerate(parsed):
+            if nm == sel_str:
+                j = i
+                while j < len(parsed) and parsed[j][1] == "":
+                    j += 1
+                if j < len(parsed):
+                    return r_expr_to_fortran(parsed[j][1])
+                return '"NULL"'
+        defaults = [val for nm, val in parsed if nm is None and val != ""]
+        if len(defaults) == 1:
+            return r_expr_to_fortran(defaults[0])
+        return '"NULL"'
+    m_int = re.fullmatch(r"[+-]?\d+[Ll]?", sel)
+    if m_int is not None and all(nm is None for nm, _ in parsed):
+        idx = int(sel.rstrip("Ll"))
+        if 1 <= idx <= len(parsed):
+            return r_expr_to_fortran(parsed[idx - 1][1])
+        return '"NULL"'
+    return None
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
@@ -12140,6 +12224,17 @@ def r_expr_to_fortran(expr: str) -> str:
                 f"merge({r_expr_to_fortran(then_src)}, "
                 f"{r_expr_to_fortran(else_src)}, {r_expr_to_fortran(cond_src)})"
             )
+    m_machine = re.fullmatch(r"\.Machine\s*\$\s*([\w.]+)", s)
+    if m_machine is not None:
+        machine_consts = {
+            "integer.max": "2147483647",
+            "double.eps": "epsilon(1.0_dp)",
+            "double.xmax": "huge(1.0_dp)",
+            "double.xmin": "tiny(1.0_dp)",
+        }
+        mapped = machine_consts.get(m_machine.group(1))
+        if mapped is not None:
+            return mapped
     if re.fullmatch(r"2\s*(?:\^|\*\*)\s*31", s):
         return "2147483648.0_dp"
     if re.fullmatch(r"2\s*\^\s*31\s*-\s*1[Ll]?", s):
@@ -12154,6 +12249,10 @@ def r_expr_to_fortran(expr: str) -> str:
     if c_pre is not None:
         nm_pre = c_pre[0].lower()
         pos_pre = c_pre[1]
+        if nm_pre == "switch":
+            folded_switch = _fold_switch_literal(s)
+            if folded_switch is not None:
+                return folded_switch
         if nm_pre == "class":
             return '"acf"'
         if nm_pre == "mode":
