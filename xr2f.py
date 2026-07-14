@@ -18045,7 +18045,7 @@ def emit_stmts(
         fun_name = fun_src.strip()
         fun_l = fun_name.lower()
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", fun_name):
-            raise NotImplementedError("combn FUN must be a named scalar function")
+            raise NotImplementedError("combn FUN must be a named function")
 
         x_l = x_src.strip().lower()
         x_is_int = (
@@ -18070,10 +18070,13 @@ def emit_stmts(
         m_f = r_expr_to_fortran(m_src)
         slice_f = f"{tmp_nm}(:, {idx_nm})"
 
+        callback_rank = 0
+        callback_kind = "real"
         if fun_l == "sum":
             if extra_pos or extra_kw:
                 raise NotImplementedError("combn FUN=sum does not yet support forwarded arguments")
             value_f = f"sum({slice_f})"
+            callback_kind = "int" if x_is_int else "real"
         elif fun_l == "prod":
             if extra_pos or extra_kw:
                 raise NotImplementedError("combn FUN=prod does not yet support forwarded arguments")
@@ -18082,8 +18085,12 @@ def emit_stmts(
             fn_obj = _FUNC_DEFS_BY_NAME.get(fun_l)
             if fn_obj is None:
                 raise NotImplementedError(f"combn FUN `{fun_name}` must be a translated function or sum/prod")
-            if _USER_FUNC_RETURN_RANK.get(fun_l, 0) != 0:
-                raise NotImplementedError("combn currently supports only scalar-result FUN callbacks")
+            callback_rank = _USER_FUNC_RETURN_RANK.get(fun_l, 0)
+            callback_kind = _USER_FUNC_RETURN_KIND.get(fun_l, "real")
+            if callback_rank > 1:
+                raise NotImplementedError("combn currently supports scalar or vector-result FUN callbacks")
+            if callback_kind not in {"real", "int", "integer"}:
+                raise NotImplementedError("combn vector-result FUN callbacks must currently return numeric values")
             actual_f = slice_f
             kinds = _USER_FUNC_ARG_KIND.get(fun_l, [])
             wanted = kinds[0] if kinds else "real"
@@ -18141,9 +18148,39 @@ def emit_stmts(
             o.w(f"integer, allocatable :: {tmp_nm}(:,:)")
         else:
             o.w(f"real(kind=dp), allocatable :: {tmp_nm}(:,:)")
+        result_nm = target or f"xr2f_combn_result_{suffix}"
+        callback_tmp_nm = f"xr2f_combn_value_{suffix}"
+        if callback_rank == 1:
+            decl_type = "integer" if callback_kind in {"int", "integer"} else "real(kind=dp)"
+            o.w(f"{decl_type}, allocatable :: {callback_tmp_nm}(:)")
+            if target is None:
+                o.w(f"{decl_type}, allocatable :: {result_nm}(:,:)")
         o.w(f"integer :: {idx_nm}")
         o.w(f"{tmp_nm} = combn({x_f}, int({m_f}))")
-        if target is None:
+        if callback_rank == 1:
+            o.w(f"if (size({tmp_nm}, 2) > 0) then")
+            o.push()
+            o.w(f"{idx_nm} = 1")
+            o.w(f"{callback_tmp_nm} = {value_f}")
+            o.w(f"if (allocated({result_nm})) deallocate({result_nm})")
+            o.w(f"allocate({result_nm}(size({callback_tmp_nm}), size({tmp_nm}, 2)))")
+            o.w(f"{result_nm}(:, 1) = {callback_tmp_nm}")
+            o.w(f"do {idx_nm} = 2, size({tmp_nm}, 2)")
+            o.push()
+            o.w(f"{result_nm}(:, {idx_nm}) = {value_f}")
+            o.pop()
+            o.w("end do")
+            o.pop()
+            o.w("else")
+            o.push()
+            o.w(f"if (allocated({result_nm})) deallocate({result_nm})")
+            o.w(f"allocate({result_nm}(0, 0))")
+            o.pop()
+            o.w("end if")
+            if target is None:
+                o.w(f"call display({result_nm})")
+                need_r_mod.add("display")
+        elif target is None:
             o.w(f"call display({result_f})")
             need_r_mod.add("display")
         else:
@@ -33317,7 +33354,11 @@ def transpile_r_to_fortran(
             if len(c_combn_ctx[1]) >= 3
             else kw_combn_ctx.get("fun", "")
         ).strip().lower()
-        if fun_combn_ctx and fun_combn_ctx not in {"sum", "prod"}:
+        if (
+            fun_combn_ctx
+            and fun_combn_ctx not in {"sum", "prod"}
+            and _USER_FUNC_RETURN_RANK.get(fun_combn_ctx, 0) == 0
+        ):
             combn_scalar_callbacks_for_ctx.add(fun_combn_ctx)
     _COMBN_SCALAR_CALLBACKS.update(combn_scalar_callbacks_for_ctx)
     helper_ctx_mod: dict[str, object] = {
@@ -33626,6 +33667,20 @@ def transpile_r_to_fortran(
         if fun_combn:
             int_matrices.discard(st_combn.name)
             real_matrices.discard(st_combn.name)
+            callback_rank_combn = (
+                0
+                if fun_combn.lower() in {"sum", "prod"}
+                else _USER_FUNC_RETURN_RANK.get(fun_combn.lower(), 0)
+            )
+            callback_kind_combn = _USER_FUNC_RETURN_KIND.get(fun_combn.lower(), "real")
+            if callback_rank_combn >= 1:
+                if callback_kind_combn in {"int", "integer"}:
+                    int_matrices.add(st_combn.name)
+                    real_matrices.discard(st_combn.name)
+                else:
+                    real_matrices.add(st_combn.name)
+                    int_matrices.discard(st_combn.name)
+                continue
             if fun_combn.lower() not in {"sum", "prod"}:
                 _COMBN_SCALAR_CALLBACKS.add(fun_combn.lower())
                 _USER_FUNC_RETURN_RANK[fun_combn.lower()] = 0
