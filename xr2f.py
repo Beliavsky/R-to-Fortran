@@ -3320,6 +3320,33 @@ def _lower_trycatch_assignment_blocks(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _lower_inline_try_nonscalar_if(src: str) -> str:
+    """Replace caught if(vector) errors when the condition is statically rank one."""
+    vector_names: set[str] = set()
+    for raw in src.splitlines():
+        code, _comment = split_r_code_comment(raw)
+        asn = split_top_level_assignment(code.strip())
+        if asn is None or not re.fullmatch(r"[A-Za-z]\w*", asn[0].strip()):
+            continue
+        rhs_call = parse_call_text(asn[1].strip())
+        if rhs_call is not None and rhs_call[0].lower() == "c" and len(rhs_call[1]) + len(rhs_call[2]) > 1:
+            vector_names.add(asn[0].strip().lower())
+
+    pat = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)print\s*\(\s*try\s*\(\s*\{\s*"
+        r"if\s*\(\s*(?P<cond>[A-Za-z]\w*)\s*\)\s*.+?\s*\}\s*,\s*"
+        r"silent\s*=\s*(?:TRUE|T)\s*\)\s*\)\s*$",
+        re.IGNORECASE,
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        if match.group("cond").lower() not in vector_names:
+            return match.group(0)
+        return match.group("indent") + 'print("try error - the condition has length > 1")'
+
+    return pat.sub(repl, src)
+
+
 def _lower_replicate_assignment_blocks(src: str) -> str:
     """Lower `x <- replicate(n, { ... })` to a repeatable helper call."""
     start_re = re.compile(
@@ -3455,6 +3482,7 @@ def _lower_replicate_assignment_blocks(src: str) -> str:
 def preprocess_r_lines(src: str) -> list[str]:
     src = _lower_replicate_assignment_blocks(src)
     src = _lower_trycatch_assignment_blocks(src)
+    src = _lower_inline_try_nonscalar_if(src)
     lines0: list[str] = []
     seen_code = False
     for raw in src.splitlines():
