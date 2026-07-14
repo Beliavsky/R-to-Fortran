@@ -5684,6 +5684,30 @@ def _factor_sample_string_labels(expr: str) -> list[str] | None:
     return _parse_string_c_vector(x_src.strip())
 
 
+def _factor_literal_string_info(expr: str) -> tuple[list[str], list[str], list[int]] | None:
+    """Return values, levels, and integer codes for factor(c("...", ...))."""
+    c_factor = parse_call_text(expr.strip())
+    if c_factor is None or c_factor[0].lower() != "factor":
+        return None
+    values_src = c_factor[1][0].strip() if c_factor[1] else c_factor[2].get("x", "").strip()
+    values = _parse_string_c_vector(values_src)
+    if values is None:
+        return None
+    levels_src = c_factor[2].get("levels", "").strip()
+    if not levels_src and len(c_factor[1]) >= 2:
+        levels_src = c_factor[1][1].strip()
+    if levels_src:
+        levels = _parse_string_c_vector(levels_src)
+        if levels is None or len(set(levels)) != len(levels):
+            return None
+    else:
+        levels = sorted(set(values))
+    if any(value not in levels for value in values):
+        return None
+    codes = [levels.index(value) + 1 for value in values]
+    return values, levels, codes
+
+
 def classify_vars(
     stmts: list[object], assign_counts: dict[str, int], known_arrays: set[str] | None = None
 ) -> tuple[set[str], set[str], set[str], set[str], dict[str, str]]:
@@ -5849,6 +5873,13 @@ def classify_vars(
                     params.pop(st.name, None)
                     ints.discard(st.name)
                     int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif _factor_literal_string_info(rhs) is not None:
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
                     real_scalars.discard(st.name)
                 elif _factor_rep_string_info(rhs) is not None:
                     int_arrays.add(st.name)
@@ -12559,6 +12590,9 @@ def r_expr_to_fortran(expr: str) -> str:
         return nested_list_arr[0]
     if list_arr is not None:
         return list_arr[0]
+    factor_literal = _factor_literal_string_info(s)
+    if factor_literal is not None:
+        return "[" + ", ".join(str(code) for code in factor_literal[2]) + "]"
     factor_rep = _factor_rep_string_info(s)
     if factor_rep is not None:
         labels, each_src = factor_rep
@@ -12569,8 +12603,22 @@ def r_expr_to_fortran(expr: str) -> str:
         if src_ac.lower() in _KNOWN_CHAR_VECTOR_NAMES:
             return "cmplx([real(kind=dp) :: ], [real(kind=dp) :: ], kind=dp)"
         return _as_complex_fortran_expr(r_expr_to_fortran(src_ac))
+    if c_cast0 is not None and c_cast0[0].lower() == "as.character" and c_cast0[1]:
+        src_char0 = c_cast0[1][0].strip()
+        if _literal_c_kind(src_char0) == "logical":
+            c_logical0 = parse_call_text(src_char0)
+            logical_values0 = list(c_logical0[1]) + list(c_logical0[2].values()) if c_logical0 is not None else []
+            labels0 = ["TRUE" if value.strip().upper() in {"TRUE", "T"} else "FALSE" for value in logical_values0]
+            return _char_array_literal_for_labels(labels0)
     if c_cast0 is not None and c_cast0[0].lower() in {"as.numeric", "as.double"} and c_cast0[1]:
         cast_inner0 = fscan.strip_redundant_outer_parens_expr(c_cast0[1][0].strip())
+        if re.fullmatch(r"[A-Za-z]\w*", cast_inner0) and cast_inner0.lower() in _CATEGORICAL_LABELS:
+            return f"real({r_expr_to_fortran(cast_inner0)}, kind=dp)"
+        cast_char0 = parse_call_text(cast_inner0)
+        if cast_char0 is not None and cast_char0[0].lower() == "as.character" and cast_char0[1]:
+            cast_char_arg0 = cast_char0[1][0].strip()
+            if cast_char_arg0.lower() in _CATEGORICAL_LABELS:
+                return f"r_as_real({r_expr_to_fortran(cast_inner0)})"
         cast_mm0 = _split_top_level_token(cast_inner0, "%*%", from_right=True)
         if cast_mm0 is not None:
             cast_lhs0 = fscan.strip_redundant_outer_parens_expr(cast_mm0[0].strip())
@@ -15690,8 +15738,18 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"date_to_char({r_expr_to_fortran(txt)})"
         if _is_date_vector_source(txt):
             return f"date_to_char_vec({r_expr_to_fortran(txt)})"
+        if _literal_c_kind(txt) == "logical":
+            c_logical = parse_call_text(txt)
+            logical_values = list(c_logical[1]) + list(c_logical[2].values()) if c_logical is not None else []
+            labels = ["TRUE" if value.strip().upper() in {"TRUE", "T"} else "FALSE" for value in logical_values]
+            return _char_array_literal_for_labels(labels)
+        if re.fullmatch(r"\[\s*\.(?:true|false)\.\s*(?:,\s*\.(?:true|false)\.\s*)*\]", txt, re.IGNORECASE):
+            labels = ["TRUE" if value.lower() == "true" else "FALSE" for value in re.findall(r"\.(true|false)\.", txt, re.IGNORECASE)]
+            return _char_array_literal_for_labels(labels)
         txt_f = r_expr_to_fortran(txt)
         txt_simple = _sanitize_r_var_name(txt).lower() if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt) else ""
+        if txt_simple in _CATEGORICAL_LABELS:
+            return f"r_factor_labels({txt_f}, {_char_array_literal_for_labels(_CATEGORICAL_LABELS[txt_simple])})"
         if _is_int_literal(txt) or txt_simple in (
             _KNOWN_INT_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_SCALAR_NAMES | _CURRENT_INT_ARRAY_NAMES
         ):
@@ -15701,6 +15759,13 @@ def r_expr_to_fortran(expr: str) -> str:
         return txt
 
     s = _replace_balanced_func_calls(s, "as.character", _as_character_repl)
+    def _levels_repl(inner: str) -> str:
+        txt = inner.strip()
+        key = txt.lower() if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt) else ""
+        labels = _CATEGORICAL_LABELS.get(key)
+        return _char_array_literal_for_labels(labels) if labels is not None else f"levels({inner})"
+
+    s = _replace_balanced_func_calls(s, "levels", _levels_repl)
     s = _replace_balanced_func_calls(
         s,
         "na.omit",
@@ -18829,6 +18894,9 @@ def emit_stmts(
             nm_c = c[0].lower()
             if nm_c in _USER_FUNC_RETURN_RANK and nm_c not in _USER_FUNC_ELEMENTAL:
                 return _USER_FUNC_RETURN_RANK.get(nm_c, 0)
+            if nm_c in {"as.integer", "as.numeric", "as.double", "as.character"}:
+                cast_arg_pr = c[1][0].strip() if c[1] else c[2].get("x", "").strip()
+                return _expr_rank_for_print(cast_arg_pr) if cast_arg_pr else 0
             if nm_c == "apply":
                 vals_apply = list(c[1]) + list(c[2].values())
                 x_apply = vals_apply[0].strip() if vals_apply else ""
@@ -21740,6 +21808,27 @@ def emit_stmts(
                         _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
                         need_r_mod.add("print_char_vector")
                         continue
+                    factor_labels_print = _CATEGORICAL_LABELS.get(one.lower()) if re.fullmatch(r"[A-Za-z]\w*", one) else None
+                    if has_r_mod and factor_labels_print is not None:
+                        _wstmt(
+                            f"call print_factor({r_expr_to_fortran(one)}, {_char_array_literal(factor_labels_print)})",
+                            st.comment,
+                        )
+                        need_r_mod.add("print_factor")
+                        continue
+                    c_factor_view_print = parse_call_text(one)
+                    if has_r_mod and c_factor_view_print is not None and c_factor_view_print[0].lower() in {"as.character", "levels"}:
+                        factor_view_arg = c_factor_view_print[1][0].strip() if c_factor_view_print[1] else c_factor_view_print[2].get("x", "").strip()
+                        if factor_view_arg.lower() in _CATEGORICAL_LABELS:
+                            _wstmt(f"call print_char_vector({r_expr_to_fortran(one)})", st.comment)
+                            need_r_mod.update({"print_char_vector", "r_factor_labels"})
+                            continue
+                    if has_r_mod and c_factor_view_print is not None and c_factor_view_print[0].lower() == "as.character":
+                        factor_view_f = r_expr_to_fortran(one)
+                        if factor_view_f.lstrip().lower().startswith("[character("):
+                            _wstmt(f"call print_char_vector({factor_view_f})", st.comment)
+                            need_r_mod.add("print_char_vector")
+                            continue
                     if re.fullmatch(r"[A-Za-z]\w*", one) and one in char_scalar_vars:
                         _wstmt(f'write(*,"(a)") trim({r_expr_to_fortran(one)})', st.comment)
                         continue
@@ -29227,6 +29316,10 @@ def collect_categorical_sample_labels(stmts: list[object]) -> dict[str, list[str
     out: dict[str, list[str]] = {}
 
     def visit(st: Assign) -> None:
+        factor_literal = _factor_literal_string_info(st.expr.strip())
+        if factor_literal is not None:
+            out[st.name.lower()] = factor_literal[1]
+            return
         factor_rep = _factor_rep_string_info(st.expr.strip())
         if factor_rep is not None:
             out[st.name.lower()] = factor_rep[0]
@@ -37672,6 +37765,9 @@ def transpile_r_to_fortran(
         "print_rle",
         "r_typeof",
         "r_character",
+        "r_as_real",
+        "r_factor_labels",
+        "print_factor",
         "r_command_args",
         "rank_average",
         "rank_first",
