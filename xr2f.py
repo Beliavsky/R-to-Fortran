@@ -11934,6 +11934,24 @@ def r_expr_to_fortran(expr: str) -> str:
                 if len(name_idx_subset) == 1:
                     return f"{r_expr_to_fortran(base_subset)}({name_idx_subset[0]})"
                 return f"{r_expr_to_fortran(base_subset)}([{', '.join(str(i) for i in name_idx_subset)}])"
+            static_idx_subset = _strict_int_vector_literal_from_c(idx_dims_clean_subset[0].strip())
+            if static_idx_subset is not None:
+                static_idx_values = [
+                    int(v.strip())
+                    for v in split_top_level_commas(static_idx_subset[1:-1])
+                    if v.strip()
+                ]
+                if 0 in static_idx_values:
+                    nonzero_idx_values = [v for v in static_idx_values if v != 0]
+                    base_f_subset = r_expr_to_fortran(base_subset)
+                    if not nonzero_idx_values:
+                        return f"{base_f_subset}(1:0)"
+                    if all(v > 0 for v in nonzero_idx_values):
+                        idx_f_subset = ", ".join(str(v) for v in nonzero_idx_values)
+                        return f"{base_f_subset}([{idx_f_subset}])"
+                    if all(v < 0 for v in nonzero_idx_values):
+                        idx_f_subset = ", ".join(str(abs(v)) for v in nonzero_idx_values)
+                        return f"r_drop_indices({base_f_subset}, [{idx_f_subset}])"
         if (
             len(idx_dims_clean_subset) == 1
             and c_name_subset is not None
@@ -19070,12 +19088,18 @@ def emit_stmts(
         ):
             inner = m_r_ix.group(2).strip()
             inner_l = inner.lower()
+            inner_call = parse_call_text(inner)
             if (
                 inner.startswith("-")
                 or re.fullmatch(r"[+-]?0+[lL]?", inner.strip()) is not None
                 or inner_l in {"true", "false", "t", "f", ".true.", ".false."}
                 or inner_l in _KNOWN_VECTOR_NAMES
                 or inner_l in _KNOWN_LOGICAL_VECTOR_NAMES
+                or (
+                    inner_call is not None
+                    and inner_call[0].lower()
+                    in {"c", "seq", "seq.int", "seq_len", "seq_along", "which", "order", "rep"}
+                )
                 or "ieee_value" in inner_l
                 or re.search(r"\bNA\b", inner, re.IGNORECASE) is not None
                 or re.match(r"^is\.na\s*\(", inner_l)
