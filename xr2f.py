@@ -15619,11 +15619,13 @@ def r_expr_to_fortran(expr: str) -> str:
             width_ifelse = max(len(m_yes_char.group(1)), len(m_no_char.group(1)), 1)
             yes_f = '"' + m_yes_char.group(1).ljust(width_ifelse) + '"'
             no_f = '"' + m_no_char.group(1).ljust(width_ifelse) + '"'
-        return (
-            f"merge({yes_f}, "
-            f"{no_f}, "
-            f"{r_expr_to_fortran(parts[0].strip())})"
-        )
+        cond_src = parts[0].strip()
+        cond_f = r_expr_to_fortran(cond_src)
+        cond_key = _sanitize_r_var_name(cond_src).lower() if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", cond_src) else ""
+        cond_is_real_coded = cond_key in (_CURRENT_REAL_ARRAY_NAMES | _KNOWN_VECTOR_NAMES)
+        if cond_is_real_coded and _ifelse_branch_is_real(yes_src, yes_f) and _ifelse_branch_is_real(no_src, no_f):
+            return f"r_ifelse_real({cond_f}, {yes_f}, {no_f})"
+        return f"merge({yes_f}, {no_f}, {cond_f})"
 
     s = _replace_balanced_func_calls(s, "ifelse", _ifelse_to_fortran)
     # basic helpers
@@ -17004,6 +17006,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 v_s = v.strip()
                 if re.search(r"%(?:convergence|iter|nobs|ncomp|ndim|order|nfit)\b", v_s, re.IGNORECASE):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
+                    continue
+                if v_s.lower() in {".true.", ".false."}:
+                    coerced_vals.append("1.0_dp" if v_s.lower() == ".true." else "0.0_dp")
                     continue
                 if re.fullmatch(r"(?:count|size)\s*\(.+\)", v_s, re.IGNORECASE):
                     coerced_vals.append(f"real({v_s}, kind=dp)")
@@ -37796,6 +37801,7 @@ def transpile_r_to_fortran(
         "r_as_real",
         "r_factor_labels",
         "print_factor",
+        "r_ifelse_real",
         "r_command_args",
         "rank_average",
         "rank_first",
