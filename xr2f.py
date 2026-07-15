@@ -3167,6 +3167,123 @@ def validate_unsupported_environment_assignment(
     walk(stmts)
 
 
+def validate_unsupported_runtime_semantics_source(src: str) -> None:
+    """Reject R runtime semantics that cannot be represented by static Fortran."""
+    code = "\n".join(split_r_code_comment(line)[0] for line in src.splitlines())
+
+    if re.search(r"\bwithCallingHandlers\s*\(", code, re.IGNORECASE) or re.search(
+        r"\binvokeRestart\s*\(", code, re.IGNORECASE
+    ):
+        raise NotImplementedError(
+            "R condition handlers and restarts (withCallingHandlers/invokeRestart) are unsupported; "
+            "standalone Fortran has no compatible dynamic condition/restart stack"
+        )
+    if re.search(r"\bon\.exit\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "on.exit() cleanup handlers are unsupported; preserving them would require R-style "
+            "function-exit and error-unwinding semantics"
+        )
+    if re.search(r"\bconditionMessage\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "R condition objects and conditionMessage() are unsupported; tryCatch is only translated "
+            "for constrained fallback expressions that do not inspect condition objects"
+        )
+
+    if re.search(r"\bsubstitute\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "substitute() and non-standard evaluation are unsupported because Fortran arguments do not "
+            "retain their unevaluated R source expressions"
+        )
+    if re.search(r"\bquote\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "quote() language objects are unsupported; the transpiler does not provide a runtime R AST "
+            "that can later be printed, modified, or evaluated"
+        )
+    if re.search(r"\bcall\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "constructing or modifying R call objects with call() is unsupported; generated Fortran has "
+            "no runtime language-object evaluator"
+        )
+    if re.search(r"\beval\s*\(\s*as\.name\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "dynamic symbol evaluation with eval(as.name(...)) is unsupported; Fortran identifiers must "
+            "be resolved statically during transpilation"
+        )
+
+    env_names = {
+        m.group(1)
+        for m in re.finditer(
+            rf"(?m)^\s*({_R_IDENT_RE})\s*(?:<-|=)\s*new\.env\s*\(",
+            code,
+            re.IGNORECASE,
+        )
+    }
+    if re.search(r"\bnew\.env\s*\([^)]*\bparent\s*=", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "parent-linked R environments are unsupported; lexical environment lookup and mutable "
+            "parent chains cannot be represented by the static new.env() field subset"
+        )
+    if re.search(r"\bassign\s*\([^)]*\benvir\s*=", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "assign(..., envir=...) is unsupported because it performs dynamic name-based mutation of an "
+            "R environment; Fortran variables and components must be known statically"
+        )
+    if env_names:
+        env_alt = "|".join(re.escape(name) for name in sorted(env_names, key=len, reverse=True))
+        if re.search(
+            rf"(?m)^\s*{_R_IDENT_RE}\s*(?:<-|=)\s*(?:{env_alt})\s*$",
+            code,
+        ):
+            raise NotImplementedError(
+                "R environment reference aliasing is unsupported; assignment copies ordinary Fortran "
+                "values and cannot preserve new.env() reference identity"
+            )
+        if re.search(rf"\blist\s*\([^)]*\b(?:{env_alt})\b", code, re.IGNORECASE | re.DOTALL):
+            raise NotImplementedError(
+                "storing an R environment inside a list is unsupported; static derived-type lists cannot "
+                "preserve mutable environment reference semantics"
+            )
+
+    if re.search(r"\blocal\s*\(\s*\{", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "local({...}) returning a closure with private lexical state is unsupported; generated "
+            "Fortran procedures do not carry dynamically created R environments"
+        )
+    if re.search(r"(?m)^\s*function\s*\([^)]*\)", code) or re.search(
+        r"\[\[[^]]+\]\]\s*(?:<-|=)\s*function\s*\(", code
+    ):
+        raise NotImplementedError(
+            "returned or collection-stored closures are unsupported; procedure values with captured R "
+            "lexical environments cannot be represented by the static closure-lifting subset"
+        )
+
+    if re.search(
+        r"\b(?!try\b|tryCatch\b|local\b)([A-Za-z]\w*)\s*\(\s*\{",
+        code,
+        re.IGNORECASE,
+    ):
+        raise NotImplementedError(
+            "braced function arguments that depend on R promise evaluation timing or memoization are "
+            "unsupported; Fortran evaluates actual arguments before a call"
+        )
+    if re.search(r"\b[A-Za-z]\w*\s*\([^\n)]*\bstop\s*\(", code, re.IGNORECASE):
+        raise NotImplementedError(
+            "unevaluated arguments relying on R lazy promises are unsupported; Fortran evaluates actual "
+            "arguments eagerly, including calls such as stop()"
+        )
+    for m_fun in re.finditer(r"\bfunction\s*\(([^)]*)\)", code, re.IGNORECASE):
+        for formal in split_top_level_commas(m_fun.group(1)):
+            default = split_top_level_assignment(formal.strip())
+            if default is None:
+                continue
+            formal_name, default_expr = (part.strip() for part in default)
+            if re.fullmatch(r"[A-Za-z]\w*", formal_name) and default_expr == formal_name:
+                raise NotImplementedError(
+                    f"recursive default argument `{formal_name} = {formal_name}` is unsupported; its R "
+                    "behavior depends on lazy promise lookup and recursive-promise errors"
+                )
+
+
 def _split_top_level_pipe(expr: str) -> list[str] | None:
     parts: list[str] = []
     cur: list[str] = []
@@ -11130,6 +11247,56 @@ def _static_list_field_kind(expr: object, list_vars: dict[str, dict[str, str]] |
     return "unknown"
 
 
+def _static_named_list_field_target(lhs: str) -> tuple[str, str] | None:
+    """Return the base and field for a statically named R list component."""
+    txt = lhs.strip()
+    m_field = re.fullmatch(r"([A-Za-z]\w*)[\$%]([A-Za-z]\w*)", txt)
+    if m_field is not None:
+        return m_field.group(1), m_field.group(2)
+    m_bracket = re.fullmatch(
+        r"([A-Za-z]\w*)\[\[\s*(['\"])([A-Za-z]\w*)\2\s*\]\]",
+        txt,
+    )
+    if m_bracket is not None:
+        return m_bracket.group(1), m_bracket.group(3)
+    return None
+
+
+def _collect_static_list_null_fields(
+    stmts: list[object],
+    known_lists: dict[str, dict[str, object]],
+) -> dict[str, set[str]]:
+    removed: dict[str, set[str]] = {}
+
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            lhs_rhs: tuple[str, str] | None = None
+            if isinstance(st, Assign):
+                lhs_rhs = (st.name.strip(), st.expr.strip())
+            elif isinstance(st, ExprStmt):
+                asn = split_top_level_assignment(st.expr.strip())
+                if asn is not None:
+                    lhs_rhs = (asn[0].strip(), asn[1].strip())
+            if lhs_rhs is not None and lhs_rhs[1].upper() == "NULL":
+                target = _static_named_list_field_target(lhs_rhs[0])
+                if target is not None:
+                    base, field = target
+                    if field in known_lists.get(base, {}):
+                        removed.setdefault(base, set()).add(field)
+            if isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, (ForStmt, WhileStmt, RepeatStmt)):
+                walk(st.body)
+            elif isinstance(st, SwitchStmt):
+                for _label, body in st.cases:
+                    walk(body)
+                walk(st.default_body)
+
+    walk(stmts)
+    return removed
+
+
 def validate_static_list_field_updates(stmts: list[object]) -> None:
     def walk(ss: list[object], scope_lists: dict[str, dict[str, str]], allow_new_fields: bool = False) -> None:
         for st in ss:
@@ -11153,9 +11320,9 @@ def validate_static_list_field_updates(stmts: list[object]) -> None:
                 if m_alias is not None and m_alias.group(1) in scope_lists:
                     scope_lists[lhs] = dict(scope_lists[m_alias.group(1)])
                     continue
-                m_field = re.match(r"^([A-Za-z]\w*)[\$%]([A-Za-z]\w*)$", lhs)
-                if m_field is not None and m_field.group(1) in scope_lists:
-                    base, fld = m_field.group(1), m_field.group(2)
+                field_target = _static_named_list_field_target(lhs)
+                if field_target is not None and field_target[0] in scope_lists:
+                    base, fld = field_target
                     if fld not in scope_lists[base]:
                         if allow_new_fields:
                             scope_lists[base][fld] = _static_list_field_kind(rhs, scope_lists)
@@ -11164,6 +11331,8 @@ def validate_static_list_field_updates(stmts: list[object]) -> None:
                             f"dynamic R list field `{base}${fld}` is not supported; "
                             "static Fortran derived-type lists require fields to be present in the original list(...) constructor"
                         )
+                    if rhs.upper() == "NULL":
+                        continue
                     old_kind = scope_lists[base][fld]
                     new_kind = _static_list_field_kind(rhs, scope_lists)
                     if old_kind != "unknown" and new_kind != "unknown" and old_kind != new_kind:
@@ -17649,10 +17818,18 @@ def emit_stmts(
     _CURRENT_CHAR_SCALAR_NAMES = {n.lower() for n in char_scalar_vars}
     _CURRENT_LOGICAL_SCALAR_NAMES = {n.lower() for n in logical_scalar_vars}
     list_locals: dict[str, dict[str, object]] = {}
+    removable_list_fields: dict[str, set[str]] = {}
     if helper_ctx is not None:
         ll = helper_ctx.get("list_locals")
         if isinstance(ll, dict):
             list_locals = ll
+        rlf = helper_ctx.get("removable_list_fields")
+        if isinstance(rlf, dict):
+            removable_list_fields = {
+                str(name): {str(field) for field in fields}
+                for name, fields in rlf.items()
+                if isinstance(fields, (set, list, tuple))
+            }
     return_var = ""
     if helper_ctx is not None:
         rv = helper_ctx.get("return_var")
@@ -20154,6 +20331,15 @@ def emit_stmts(
             _wcomment(st.text)
             continue
         if isinstance(st, Assign):
+            null_target = _static_named_list_field_target(st.name)
+            if (
+                st.expr.strip().upper() == "NULL"
+                and null_target is not None
+                and null_target[1] in removable_list_fields.get(null_target[0], set())
+            ):
+                target_f = f"{_sanitize_r_var_name(null_target[0])}%{_sanitize_r_var_name(null_target[1])}"
+                _wstmt(f"if (allocated({target_f})) deallocate({target_f})", st.comment)
+                continue
             c_symbolic_assign = parse_call_text(st.expr.strip())
             if c_symbolic_assign is not None and c_symbolic_assign[0].lower() in {"expression", "d"}:
                 _wcomment(f"symbolic expression assignment `{st.name}` resolved at transpile time")
@@ -21854,8 +22040,23 @@ def emit_stmts(
                             if re.fullmatch(r"[A-Za-z]\w*", str(k)) and not isinstance(v, dict)
                         ]
                         if fields_print:
-                            field_items = ", ".join(f"{_sanitize_r_var_name(one)}%{_sanitize_r_var_name(k)}" for k in fields_print)
-                            _wstmt(f'write(*,"(*(g0,:,1x))") {field_items}', st.comment)
+                            removable_print = removable_list_fields.get(one, set())
+                            if removable_print:
+                                obj_print_f = _sanitize_r_var_name(one)
+                                for k in fields_print:
+                                    field_print_f = _sanitize_r_var_name(k)
+                                    if k in removable_print:
+                                        o.w(f"if (allocated({obj_print_f}%{field_print_f})) then")
+                                        o.push()
+                                    _wstmt(f'write(*,"(a)") "${k}"', st.comment)
+                                    _wstmt(f'write(*,"(*(g0,:,1x))") {obj_print_f}%{field_print_f}', st.comment)
+                                    o.w('write(*,"(a)") ""')
+                                    if k in removable_print:
+                                        o.pop()
+                                        o.w("end if")
+                            else:
+                                field_items = ", ".join(f"{_sanitize_r_var_name(one)}%{_sanitize_r_var_name(k)}" for k in fields_print)
+                                _wstmt(f'write(*,"(*(g0,:,1x))") {field_items}', st.comment)
                         else:
                             _wstmt('write(*,"(a)") "[list print not translated]"', st.comment)
                         continue
@@ -24230,12 +24431,21 @@ def emit_stmts(
                         continue
             asn = split_top_level_assignment(st.expr.strip())
             if asn is not None:
+                lhs_src = asn[0].strip()
+                null_target = _static_named_list_field_target(lhs_src)
+                if (
+                    asn[1].strip().upper() == "NULL"
+                    and null_target is not None
+                    and null_target[1] in removable_list_fields.get(null_target[0], set())
+                ):
+                    target_f = f"{_sanitize_r_var_name(null_target[0])}%{_sanitize_r_var_name(null_target[1])}"
+                    _wstmt(f"if (allocated({target_f})) deallocate({target_f})", st.comment)
+                    continue
                 rhs = r_expr_to_fortran(asn[1].strip())
                 if "r_matrix_index(" in rhs:
                     need_r_mod.add("r_matrix_index")
                 if "t_test_p_value(" in rhs:
                     need_r_mod.update({"t_test_p_value", "t_test", "t_test_result_t"})
-                lhs_src = asn[0].strip()
                 m_obj_list_lhs = re.match(r"^([A-Za-z]\w*)\s*\[\[\s*(.+)\s*\]\]$", lhs_src)
                 if m_obj_list_lhs is not None and m_obj_list_lhs.group(1) in object_list_vars:
                     idx_obj = _int_bound_expr(r_expr_to_fortran(m_obj_list_lhs.group(2).strip()))
@@ -27314,6 +27524,7 @@ def emit_function(
                     _collect_local_list_fields(st.body)
 
         _collect_local_list_fields(body_use)
+        removable_local_list_fields = _collect_static_list_null_fields(body_use, local_list_fields)
         _KNOWN_OBJECT_LIST_NAMES.update(nm.lower() for nm in local_list_types)
         vector_list_names: set[str] = set()
         object_list_locals: dict[str, str] = {}
@@ -28417,6 +28628,8 @@ def emit_function(
         helper_ctx_loc["char_vector_vars"] = set(helper_ctx_loc.get("char_vector_vars", set())) | set(fn_char_arrays)
         if local_list_fields:
             helper_ctx_loc["list_locals"] = local_list_fields
+        if removable_local_list_fields:
+            helper_ctx_loc["removable_list_fields"] = removable_local_list_fields
         if object_list_locals:
             helper_ctx_loc["object_list_vars"] = object_list_locals
         index_scalar_names_for_ctx = {
@@ -28561,13 +28774,21 @@ def emit_function(
             return bool(need_rnorm_local["used"])
         o.w(f"{rname} = {r_expr_to_fortran(ret_expr)}")
     else:
-        ret_alias_m = re.match(r"^[A-Za-z]\w*$", last.expr.strip())
+        ret_alias_expr = last.expr.strip()
+        ret_alias_arg = _return_call_arg(ret_alias_expr)
+        if ret_alias_arg is not None and ret_alias_arg.strip():
+            ret_alias_expr = ret_alias_arg.strip()
+        ret_alias_m = re.fullmatch(r"[A-Za-z]\w*", ret_alias_expr)
         if ret_alias_m is not None:
             rename_all = {}
             rename_all.update(arg_local_map)
             rename_all.update(return_alias_map)
             rename_all.update(local_rename_map)
             ret_nm = rename_all.get(ret_alias_m.group(0), ret_alias_m.group(0))
+            if ret_nm in removable_local_list_fields:
+                o.w(f"{rname} = {ret_nm}")
+                o.w(f"end function {fn.name}")
+                return bool(need_rnorm_local["used"])
             if ret_nm == ret_alias_m.group(0):
                 ret_nm_src = ret_nm
                 if any(
@@ -32348,6 +32569,7 @@ def transpile_r_to_fortran(
     _IGNORE_XR2F_DIRECTIVES = bool(ignore_directives)
     _XR2F_FORCE_KIND, _XR2F_FORCE_RANK = parse_xr2f_directives(src, ignore=_IGNORE_XR2F_DIRECTIVES)
     check_xr2f_directive_declare_conflicts(src, _XR2F_FORCE_KIND, _XR2F_FORCE_RANK)
+    validate_unsupported_runtime_semantics_source(src)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
@@ -34897,6 +35119,40 @@ def transpile_r_to_fortran(
 
     _collect_main_list_constructors(main_stmts)
 
+    removable_main_list_fields: dict[str, set[str]] = {}
+
+    def _collect_removable_main_list_fields(ss_null: list[object]) -> None:
+        for st_null in ss_null:
+            lhs_rhs_null: tuple[str, str] | None = None
+            if isinstance(st_null, Assign):
+                lhs_rhs_null = (st_null.name.strip(), st_null.expr.strip())
+            elif isinstance(st_null, ExprStmt):
+                asn_null = split_top_level_assignment(st_null.expr.strip())
+                if asn_null is not None:
+                    lhs_rhs_null = (asn_null[0].strip(), asn_null[1].strip())
+            if lhs_rhs_null is not None and lhs_rhs_null[1].upper() == "NULL":
+                target_null = _static_named_list_field_target(lhs_rhs_null[0])
+                if target_null is not None:
+                    base_null, field_null = target_null
+                    known_fields_null = main_list_var_fields.get(base_null)
+                    if known_fields_null is not None and field_null in known_fields_null:
+                        removable_main_list_fields.setdefault(base_null, set()).add(field_null)
+            if isinstance(st_null, IfStmt):
+                _collect_removable_main_list_fields(st_null.then_body)
+                _collect_removable_main_list_fields(st_null.else_body)
+            elif isinstance(st_null, ForStmt):
+                _collect_removable_main_list_fields(st_null.body)
+            elif isinstance(st_null, WhileStmt):
+                _collect_removable_main_list_fields(st_null.body)
+            elif isinstance(st_null, RepeatStmt):
+                _collect_removable_main_list_fields(st_null.body)
+            elif isinstance(st_null, SwitchStmt):
+                for _label_null, body_null in st_null.cases:
+                    _collect_removable_main_list_fields(body_null)
+                _collect_removable_main_list_fields(st_null.default_body)
+
+    _collect_removable_main_list_fields(main_stmts)
+
     for st in main_stmts:
         if isinstance(st, Assign):
             if re.match(r"^vector\s*\(\s*['\"]list['\"]", st.expr.strip(), re.IGNORECASE):
@@ -36185,6 +36441,10 @@ def transpile_r_to_fortran(
             pbody.w(f"type({tn}) :: {nm}")
     if main_list_var_fields:
         helper_ctx_main["list_locals"] = dict(main_list_var_fields)
+    if removable_main_list_fields:
+        helper_ctx_main["removable_list_fields"] = {
+            name: set(fields) for name, fields in removable_main_list_fields.items()
+        }
     if list_vars:
         existing_object_vars = helper_ctx_main.get("object_list_vars")
         merged_object_vars = dict(existing_object_vars) if isinstance(existing_object_vars, dict) else {}
@@ -38280,6 +38540,50 @@ def transpile_r_to_fortran(
     all_list_specs.update(list_specs)
     all_list_specs.update(main_list_specs)
     funcs_by_name = {f.name: f for f in funcs}
+    removable_list_fields_by_spec: dict[str, set[str]] = {
+        name: set(fields) for name, fields in removable_main_list_fields.items()
+    }
+
+    def _constructor_lists_in_scope(ss_scope: list[object]) -> dict[str, dict[str, object]]:
+        found_scope: dict[str, dict[str, object]] = {}
+
+        def walk_scope(items_scope: list[object]) -> None:
+            for st_scope in items_scope:
+                if isinstance(st_scope, Assign):
+                    fields_scope = _parse_list_constructor(st_scope.expr.strip())
+                    if fields_scope is not None:
+                        found_scope[st_scope.name] = fields_scope
+                    elif re.fullmatch(r"[A-Za-z]\w*", st_scope.expr.strip()):
+                        alias_scope = st_scope.expr.strip()
+                        if alias_scope in found_scope:
+                            found_scope[st_scope.name] = found_scope[alias_scope]
+                if isinstance(st_scope, IfStmt):
+                    walk_scope(st_scope.then_body)
+                    walk_scope(st_scope.else_body)
+                elif isinstance(st_scope, (ForStmt, WhileStmt, RepeatStmt)):
+                    walk_scope(st_scope.body)
+                elif isinstance(st_scope, SwitchStmt):
+                    for _label_scope, body_scope in st_scope.cases:
+                        walk_scope(body_scope)
+                    walk_scope(st_scope.default_body)
+
+        walk_scope(ss_scope)
+        return found_scope
+
+    for fn_scope in funcs:
+        if fn_scope.name not in list_specs:
+            continue
+        known_scope = _constructor_lists_in_scope(fn_scope.body)
+        removed_scope = _collect_static_list_null_fields(fn_scope.body, known_scope)
+        valid_scope_fields = set(list_specs[fn_scope.name].root_fields)
+        removed_for_spec = {
+            field
+            for fields in removed_scope.values()
+            for field in fields
+            if field in valid_scope_fields
+        }
+        if removed_for_spec:
+            removable_list_fields_by_spec[fn_scope.name] = removed_for_spec
 
     def _local_rank_for_type_field(fn_name: str, txt: str) -> int:
         if not re.match(r"^[A-Za-z]\w*$", txt):
@@ -38427,6 +38731,8 @@ def transpile_r_to_fortran(
             re.IGNORECASE,
         ):
             return f"integer :: {k}"
+        if _is_real_literal(txt):
+            return f"real(kind=dp) :: {k}"
         if re.match(r"^[A-Za-z]\w*$", txt):
             if txt.lower() in {x.lower() for x in fn_char_scalar_names}:
                 return f"character(len=:), allocatable :: {k}"
@@ -38563,6 +38869,12 @@ def transpile_r_to_fortran(
                         continue
                     structural_decl = _field_decl_from_expr(fn_name, k, txt)
                     if structural_decl is not None:
+                        if (
+                            not path
+                            and k in removable_list_fields_by_spec.get(fn_name, set())
+                            and "allocatable" not in structural_decl.lower()
+                        ):
+                            structural_decl = structural_decl.replace(" ::", ", allocatable ::", 1)
                         o.w(structural_decl)
                         continue
                     fn_ints = fn_int_names.get(fn_name, set())
@@ -48959,19 +49271,39 @@ def add_missing_derived_type_fields_from_assignments_text(f90: str) -> str:
             out.append(buf)
         return out
 
-    type_vars: dict[str, str] = {}
-    rhs_decls: dict[str, str] = {}
-    rhs_ranks: dict[str, tuple[str, int]] = {}
+    global_scope = "__global__"
+    type_vars: dict[tuple[str, str], str] = {}
+    rhs_decls: dict[tuple[str, str], str] = {}
+    rhs_ranks: dict[tuple[str, str], tuple[str, int]] = {}
     type_fields: dict[str, set[str]] = {}
 
+    def procedure_start(line: str) -> str | None:
+        m = re.match(
+            r"^\s*(?:(?:pure|impure|elemental|recursive)\s+)*"
+            r"(?:function|subroutine|program)\s+([A-Za-z]\w*)\b",
+            line,
+            re.IGNORECASE,
+        )
+        return m.group(1).lower() if m is not None else None
+
+    def procedure_end(line: str) -> bool:
+        return re.match(r"^\s*end\s+(?:function|subroutine|program)\b", line, re.IGNORECASE) is not None
+
+    current_scope = global_scope
     for ll in logical_lines(lines):
+        start_scope = procedure_start(ll)
+        if start_scope is not None:
+            current_scope = start_scope
+        if procedure_end(ll):
+            current_scope = global_scope
+            continue
         m_type_var = re.match(r"^\s*type\s*\(\s*([A-Za-z]\w*)\s*\)\s*(?:,[^:]*)?::\s*(.+)$", ll, re.IGNORECASE)
         if m_type_var is not None:
             tname = m_type_var.group(1)
             for part in split_top_level_commas(m_type_var.group(2)):
                 mm = re.match(r"\s*([A-Za-z]\w*)", part)
                 if mm is not None:
-                    type_vars[mm.group(1)] = tname
+                    type_vars[(current_scope, mm.group(1))] = tname
             continue
 
         m_decl = re.match(
@@ -49023,14 +49355,15 @@ def add_missing_derived_type_fields_from_assignments_text(f90: str) -> str:
                     decl_text = "character(len=:), allocatable :: {field}(:)"
                 else:
                     decl_text = "character(len=:), allocatable :: {field}"
-            prev_rank = rhs_ranks.get(nm, ("", -1))[1]
+            scoped_name = (current_scope, nm)
+            prev_rank = rhs_ranks.get(scoped_name, ("", -1))[1]
             if decl_text is not None and (
-                nm not in rhs_decls
+                scoped_name not in rhs_decls
                 or rank > prev_rank
-                or "allocatable" in decl_text and "allocatable" not in rhs_decls[nm]
+                or "allocatable" in decl_text and "allocatable" not in rhs_decls[scoped_name]
             ):
-                rhs_decls[nm] = decl_text
-                rhs_ranks[nm] = (base_l, rank)
+                rhs_decls[scoped_name] = decl_text
+                rhs_ranks[scoped_name] = (base_l, rank)
 
     current_type: str | None = None
     type_field_ranks: dict[tuple[str, str], int] = {}
@@ -49069,22 +49402,34 @@ def add_missing_derived_type_fields_from_assignments_text(f90: str) -> str:
         dims = m_dims.group(1).replace(" ", "")
         return max(1, dims.count(",") + 1, dims.count(":"))
 
+    current_scope = global_scope
     for ll in logical_lines(lines):
+        start_scope = procedure_start(ll)
+        if start_scope is not None:
+            current_scope = start_scope
+        if procedure_end(ll):
+            current_scope = global_scope
+            continue
         m_assign = re.match(r"^\s*([A-Za-z]\w*)\s*%\s*([A-Za-z]\w*)\s*=\s*(.+)$", ll)
         if m_assign is None:
             continue
         obj, field, rhs_expr = m_assign.groups()
-        tname = type_vars.get(obj)
+        tname = type_vars.get((current_scope, obj)) or type_vars.get((global_scope, obj))
         if tname is None:
             continue
         field_exists = field.lower() in type_fields.get(tname, set())
         m_rhs_name = re.match(r"^\s*([A-Za-z]\w*)\b", rhs_expr)
         rhs = m_rhs_name.group(1) if m_rhs_name is not None else ""
-        decl_tmpl = rhs_decls.get(rhs)
+        decl_tmpl = rhs_decls.get((current_scope, rhs)) or rhs_decls.get((global_scope, rhs))
         if decl_tmpl is None:
             best_rank = -1
             best_base = "real"
-            for nm_rhs, (base_rhs, rank_rhs) in rhs_ranks.items():
+            scoped_rhs_ranks = {
+                nm_rhs: info
+                for (scope_rhs, nm_rhs), info in rhs_ranks.items()
+                if scope_rhs in {global_scope, current_scope}
+            }
+            for nm_rhs, (base_rhs, rank_rhs) in scoped_rhs_ranks.items():
                 if rank_rhs > best_rank and re.search(rf"\b{re.escape(nm_rhs)}\b", rhs_expr):
                     best_rank = rank_rhs
                     best_base = base_rhs
