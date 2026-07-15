@@ -12301,9 +12301,9 @@ def r_expr_to_fortran(expr: str) -> str:
     if re.fullmatch(r"2\s*\*\*\s*31\s*-\s*1", s):
         return "2147483647"
     if re.match(r"^\+?Inf$", s, re.IGNORECASE):
-        return "huge(1.0_dp)"
+        return "r_inf()"
     if re.match(r"^-Inf$", s, re.IGNORECASE):
-        return "-huge(1.0_dp)"
+        return "-r_inf()"
     c_pre = parse_call_text(s)
     if c_pre is not None:
         nm_pre = c_pre[0].lower()
@@ -14741,14 +14741,17 @@ def r_expr_to_fortran(expr: str) -> str:
             or _real_vector_constructor_from_mixed_c(data_src.strip())
             or r_expr_to_fortran(data_src)
         )
-        scalar_fill = (
+        scalar_runtime_value = bool(
+            re.match(r"^(?:ieee_value|r_na_real|r_inf)\s*\(", data_f.strip(), re.IGNORECASE)
+        )
+        scalar_fill = scalar_runtime_value or (
             not data_f.strip().startswith("[")
             and not re.match(r"^[A-Za-z]\w*\s*\(", data_f.strip())
             and data_f.strip().lower() not in _KNOWN_VECTOR_NAMES
             and data_f.strip().lower() not in _KNOWN_MATRIX_NAMES
         )
         scalar_data_f = data_f
-        if data_f.strip().startswith("ieee_value("):
+        if scalar_runtime_value:
             data_f = f"[{data_f}]"
         elif not (
             (data_f.startswith("[") and data_f.endswith("]"))
@@ -14958,7 +14961,7 @@ def r_expr_to_fortran(expr: str) -> str:
             u = t.strip()
             if u.startswith("[") and u.endswith("]"):
                 return True
-            if re.match(r"^(?:ieee_value|r_elapsed)\s*\(", u, re.IGNORECASE):
+            if re.match(r"^(?:ieee_value|r_na_real|r_inf|r_elapsed)\s*\(", u, re.IGNORECASE):
                 return False
             if re.match(r"^[A-Za-z]\w*\s*\(", u):
                 return True
@@ -15633,6 +15636,15 @@ def r_expr_to_fortran(expr: str) -> str:
         txt = inner.strip()
         if txt.upper() == "NULL" or txt.lower() in _KNOWN_NULL_NAMES:
             return "0"
+        if (
+            txt.upper() in {"NA", "NA_REAL_", "NA_INTEGER_", "NA_LOGICAL_", "NA_CHARACTER_", "NAN", "INF", "+INF", "-INF"}
+            or txt in {"TRUE", "FALSE", "T", "F"}
+            or _dequote_string_literal(txt) is not None
+            or _is_int_literal(txt)
+            or _is_real_literal(txt)
+            or _contains_r_complex_literal(txt)
+        ):
+            return "1"
         simple_name = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
         if simple_name:
             ft = _sanitize_r_var_name(txt)
@@ -16076,7 +16088,7 @@ def r_expr_to_fortran(expr: str) -> str:
             return _logical_constant_like(x_src, False)
         if _is_predicate_static_to_fortran("complex", x_src) == ".true.":
             return f"((real({x_f}, kind=dp) /= real({x_f}, kind=dp)) .or. (aimag({x_f}) /= aimag({x_f})))"
-        return f"is_na({x_f})"
+        return f"r_is_nan({x_f})"
 
     def _is_finite_to_fortran(inner: str) -> str:
         x_src = inner.strip()
@@ -16337,8 +16349,8 @@ def r_expr_to_fortran(expr: str) -> str:
     s = re.sub(r"\bNA_integer_\b", "-huge(0.0_dp)", s)
     s = re.sub(r"\bNA_character_\b", '" "', s)
     s = re.sub(r"\bNA_logical_\b", ".false.", s)
-    s = re.sub(r"\bNA_real_\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
-    s = re.sub(r"\bNA\b", "ieee_value(0.0_dp, ieee_quiet_nan)", s)
+    s = re.sub(r"\bNA_real_\b", "r_na_real()", s)
+    s = re.sub(r"\bNA\b", "r_na_real()", s)
     def _split_reduction_args(inner: str) -> tuple[str, bool]:
         x_parts, na_rm = _split_reduction_arg_list(inner)
         return (x_parts[0] if x_parts else ""), na_rm
@@ -16977,6 +16989,17 @@ def r_expr_to_fortran(expr: str) -> str:
         if nonempty_parts and all(re.fullmatch(r"[+-]?\d+[lL]", _strip_named_actual_value(p).strip()) for p in nonempty_parts):
             vals_i = [re.sub(r"[lL]$", "", _strip_named_actual_value(p).strip()) for p in nonempty_parts]
             return "[" + ", ".join(vals_i) + "]"
+        logical_na_parts = [_strip_named_actual_value(p).strip().upper() for p in nonempty_parts]
+        logical_values = {"TRUE", "FALSE", "T", "F", ".TRUE.", ".FALSE."}
+        logical_na_values = {"NA", "NA_LOGICAL_", "R_NA_REAL()"}
+        if logical_na_parts and all(t in logical_values | logical_na_values for t in logical_na_parts):
+            if any(t in logical_na_values for t in logical_na_parts):
+                return "[" + ", ".join(
+                    "1.0_dp" if t in {"TRUE", "T", ".TRUE."}
+                    else "0.0_dp" if t in {"FALSE", "F", ".FALSE."}
+                    else "r_na_real()"
+                    for t in logical_na_parts
+                ) + "]"
         vals = []
         for p in parts:
             t = _lower_inline_if_arg(_strip_named_actual_value(p))
@@ -21015,7 +21038,10 @@ def emit_stmts(
                         or _real_vector_constructor_from_mixed_c(data_src.strip())
                         or r_expr_to_fortran(data_src)
                     )
-                    scalar_fill = (
+                    scalar_runtime_value = bool(
+                        re.match(r"^(?:ieee_value|r_na_real|r_inf)\s*\(", data_f.strip(), re.IGNORECASE)
+                    )
+                    scalar_fill = scalar_runtime_value or (
                         not data_f.strip().startswith("[")
                         and not re.match(r"^[A-Za-z]\w*\s*\(", data_f.strip())
                         and data_f.strip().lower() not in _KNOWN_VECTOR_NAMES
@@ -21054,7 +21080,7 @@ def emit_stmts(
                             else:
                                 nc_f = _int_bound_expr(r_expr_to_fortran(ncol_src))
 
-                    if data_f.strip().startswith("ieee_value("):
+                    if scalar_runtime_value:
                         data_f = f"[{data_f}]"
                     elif not (
                         (data_f.startswith("[") and data_f.endswith("]"))
@@ -22679,7 +22705,7 @@ def emit_stmts(
                     if rank_one == 3:
                         one_f = r_expr_to_fortran(_rewrite_predict_expr(one))
                         if (
-                            re.match(r"^(?:is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE)
+                            re.match(r"^(?:is_na|r_is_nan|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE)
                             or one_f.strip().lower().startswith("reshape(spread(.")
                             or one_f.strip().lower().startswith("(.not. ieee_is_finite(")
                         ):
@@ -22764,8 +22790,8 @@ def emit_stmts(
                             _wstmt(f"call print_t_test({one_f})", st.comment)
                             need_r_mod.update({"print_t_test", "t_test", "t_test_result_t"})
                             continue
-                        if re.match(r"^(?:r_in|setequal|all|any|is_na|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE):
-                            m_scalar_logical_vec = re.match(r"^(?:is_na|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
+                        if re.match(r"^(?:r_in|setequal|all|any|is_na|r_is_nan|ieee_is_finite)\s*\(", one_f.strip(), re.IGNORECASE):
+                            m_scalar_logical_vec = re.match(r"^(?:is_na|r_is_nan|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
                             if m_scalar_logical_vec is not None and m_scalar_logical_vec.group(1).lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
                                 _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                                 continue
@@ -22779,7 +22805,7 @@ def emit_stmts(
                             _wstmt(f'write(*,"(g0)") {one_f}', st.comment)
                             continue
                         if scalar_kind_one == "logical":
-                            m_scalar_logical_vec = re.match(r"^(?:is_na|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
+                            m_scalar_logical_vec = re.match(r"^(?:is_na|r_is_nan|ieee_is_finite)\s*\(\s*([A-Za-z]\w*)\s*\)$", one_f.strip(), re.IGNORECASE)
                             if m_scalar_logical_vec is not None and m_scalar_logical_vec.group(1).lower() in _KNOWN_COMPLEX_VECTOR_NAMES:
                                 _wstmt(f'write(*,"(*(g0,1x))") {one_f}', st.comment)
                                 continue
@@ -22863,7 +22889,7 @@ def emit_stmts(
                                 re.search(rf"\b{re.escape(nm)}\b", one_f_simple, re.IGNORECASE)
                                 for nm in set(logical_vector_vars) | set(_KNOWN_LOGICAL_VECTOR_NAMES)
                             )
-                        ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple|is_na|ieee_is_finite)\s*\(", one_f_simple, re.IGNORECASE) or re.match(r"^spread\s*\(\s*\.(?:true|false)\.", one_f_simple, re.IGNORECASE) or (
+                        ) or re.match(r"^(?:r_in|duplicated|starts_with_simple|ends_with_simple|is_na|r_is_nan|ieee_is_finite)\s*\(", one_f_simple, re.IGNORECASE) or re.match(r"^spread\s*\(\s*\.(?:true|false)\.", one_f_simple, re.IGNORECASE) or (
                             one_f_simple.lower().startswith("(.not. ieee_is_finite(")
                         ) or (
                             c_user_logical_vec_print is not None
@@ -37802,6 +37828,9 @@ def transpile_r_to_fortran(
         "r_factor_labels",
         "print_factor",
         "r_ifelse_real",
+        "r_na_real",
+        "r_inf",
+        "r_is_nan",
         "r_command_args",
         "rank_average",
         "rank_first",
@@ -40081,7 +40110,7 @@ def rewrite_arma_table_label_access(lines: list[str]) -> list[str]:
         s = s.replace('aic_order("ma.order")', "aic_order(2)")
         s = s.replace('bic_order("ar.order")', "bic_order(1)")
         s = s.replace('bic_order("ma.order")', "bic_order(2)")
-        s = re.sub(r"\bInf\b", "huge(1.0_dp)", s)
+        s = re.sub(r"\bInf\b", "r_inf()", s)
         out.append(s)
     return out
 
@@ -60915,6 +60944,9 @@ def main() -> int:
     f90 = rewrite_integerish_real_seq_subscripts_text(f90)
     f90 = rewrite_named_real_row_prints_text(f90)
     extra_use_names: list[str] = []
+    for late_runtime_name in ("r_na_real", "r_inf", "r_is_nan"):
+        if re.search(rf"\b{late_runtime_name}\s*\(", f90, re.IGNORECASE):
+            extra_use_names.append(late_runtime_name)
     if "type(decompose_result_t)" in f90 or "decompose(" in f90:
         extra_use_names.extend(["decompose", "decompose_result_t"])
     if "type(optim_result_t)" in f90:
