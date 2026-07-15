@@ -11934,6 +11934,19 @@ def r_expr_to_fortran(expr: str) -> str:
                 if len(name_idx_subset) == 1:
                     return f"{r_expr_to_fortran(base_subset)}({name_idx_subset[0]})"
                 return f"{r_expr_to_fortran(base_subset)}([{', '.join(str(i) for i in name_idx_subset)}])"
+            logical_idx_src = idx_dims_clean_subset[0].strip()
+            if _literal_c_kind(logical_idx_src) == "logical":
+                logical_idx_call = parse_call_text(logical_idx_src)
+                logical_idx_values = (
+                    list(logical_idx_call[1]) + list(logical_idx_call[2].values())
+                    if logical_idx_call is not None
+                    else []
+                )
+                logical_idx_f = "[" + ", ".join(
+                    ".true." if value.strip().upper() in {"TRUE", "T"} else ".false."
+                    for value in logical_idx_values
+                ) + "]"
+                return f"r_matrix_index({r_expr_to_fortran(base_subset)}, {logical_idx_f})"
             static_idx_subset = _strict_int_vector_literal_from_c(idx_dims_clean_subset[0].strip())
             if static_idx_subset is not None:
                 static_idx_values = [
