@@ -73,6 +73,7 @@ _CURRENT_INT_MATRIX_NAMES: set[str] = set()
 _CURRENT_REAL_MATRIX_NAMES: set[str] = set()
 _CURRENT_VECTOR_NAMES: set[str] = set()
 _CURRENT_MATRIX_NAMES: set[str] = set()
+_TRANSLATING_LHS = False
 _CURRENT_RANK_HINTS: dict[str, int] = {}
 _CURRENT_CHAR_SCALAR_NAMES: set[str] = set()
 _KNOWN_INT_CONSTANTS: dict[str, int] = {}
@@ -11935,7 +11936,7 @@ def r_expr_to_fortran(expr: str) -> str:
                     return f"{r_expr_to_fortran(base_subset)}({name_idx_subset[0]})"
                 return f"{r_expr_to_fortran(base_subset)}([{', '.join(str(i) for i in name_idx_subset)}])"
             logical_idx_src = idx_dims_clean_subset[0].strip()
-            if _literal_c_kind(logical_idx_src) == "logical":
+            if not _TRANSLATING_LHS and _literal_c_kind(logical_idx_src) == "logical":
                 logical_idx_call = parse_call_text(logical_idx_src)
                 logical_idx_values = (
                     list(logical_idx_call[1]) + list(logical_idx_call[2].values())
@@ -11947,6 +11948,20 @@ def r_expr_to_fortran(expr: str) -> str:
                     for value in logical_idx_values
                 ) + "]"
                 return f"r_matrix_index({r_expr_to_fortran(base_subset)}, {logical_idx_f})"
+            scalar_idx_src = idx_dims_clean_subset[0].strip()
+            if (
+                not _TRANSLATING_LHS
+                and
+                _is_int_literal(scalar_idx_src)
+                and int(_normalize_r_int_literal(scalar_idx_src)) > 0
+                and base_subset_name in (_KNOWN_VECTOR_NAMES - _KNOWN_INT_VECTOR_NAMES)
+                and base_subset_name not in _KNOWN_LOGICAL_VECTOR_NAMES
+                and base_subset_name not in _KNOWN_CHAR_VECTOR_NAMES
+            ):
+                return (
+                    f"r_index_scalar_real({r_expr_to_fortran(base_subset)}, "
+                    f"{_normalize_r_int_literal(scalar_idx_src)})"
+                )
             static_idx_subset = _strict_int_vector_literal_from_c(idx_dims_clean_subset[0].strip())
             if static_idx_subset is not None:
                 static_idx_values = [
@@ -11965,6 +11980,17 @@ def r_expr_to_fortran(expr: str) -> str:
                     if all(v < 0 for v in nonzero_idx_values):
                         idx_f_subset = ", ".join(str(abs(v)) for v in nonzero_idx_values)
                         return f"r_drop_indices({base_f_subset}, [{idx_f_subset}])"
+                elif (
+                    not _TRANSLATING_LHS
+                    and
+                    static_idx_values
+                    and all(v > 0 for v in static_idx_values)
+                    and base_subset_name in (_KNOWN_VECTOR_NAMES - _KNOWN_INT_VECTOR_NAMES)
+                    and base_subset_name not in _KNOWN_LOGICAL_VECTOR_NAMES
+                    and base_subset_name not in _KNOWN_CHAR_VECTOR_NAMES
+                ):
+                    idx_f_subset = ", ".join(str(v) for v in static_idx_values)
+                    return f"r_matrix_index({r_expr_to_fortran(base_subset)}, [{idx_f_subset}])"
         if (
             len(idx_dims_clean_subset) == 1
             and c_name_subset is not None
@@ -17663,6 +17689,7 @@ def emit_stmts(
     global _CURRENT_VECTOR_NAMES, _CURRENT_MATRIX_NAMES
     global _CURRENT_RANK_HINTS
     global _CURRENT_WARNING_STMT_TEXT
+    global _TRANSLATING_LHS
     if alloc_seen is None:
         alloc_seen = set()
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
@@ -24716,7 +24743,14 @@ def emit_stmts(
                             _wstmt(f"{base_lhs_f} = replace({base_lhs_f}, {idx_f}, {rhs})", st.comment)
                             need_r_mod.add("replace")
                             continue
-                lhs = _named_subscript_lhs_to_fortran(lhs_src) or r_expr_to_fortran(lhs_src)
+                lhs = _named_subscript_lhs_to_fortran(lhs_src)
+                if lhs is None:
+                    previous_lhs_context = _TRANSLATING_LHS
+                    _TRANSLATING_LHS = True
+                    try:
+                        lhs = r_expr_to_fortran(lhs_src)
+                    finally:
+                        _TRANSLATING_LHS = previous_lhs_context
                 m_row_assign = re.match(r"^([A-Za-z]\w*)\s*\[\s*([^,\]]+)\s*,\s*\]\s*$", lhs_src)
                 if m_row_assign is not None and re.match(r"^rmvnorm_chol\s*\(", rhs, re.IGNORECASE):
                     row_idx_src = m_row_assign.group(2).strip()
@@ -28586,6 +28620,42 @@ def emit_function(
             if c_rng_vec is not None and c_rng_vec[0].lower() in {"rnorm", "rnorm_vec", "runif", "runif_vec"}:
                 _force_local_real_array(st_rng_vec.name)
                 local_ranks[st_rng_vec.name] = 1
+        # A scalar element selected from a ranked vector remains scalar when
+        # passed through an elemental intrinsic.  Reassert this after the
+        # broader propagation passes, which can otherwise promote these
+        # callback locals back to rank one.
+        scalar_elemental_fns = {
+            "abs", "acos", "asin", "atan", "ceiling", "cos", "cosh", "exp",
+            "floor", "log", "log10", "log2", "round", "sign", "sin", "sinh",
+            "sqrt", "tan", "tanh", "trunc",
+        }
+        scalar_element_rank_ctx = {
+            **{a.lower(): infer_arg_rank(fn, a) for a in fn.args},
+            **{n.lower(): max(1, local_ranks.get(n, 1)) for n in known_arrays | real_arrays | int_arrays | logical_arrays},
+        }
+
+        def _is_scalar_ranked_element_expr(expr_scalar_element: str) -> bool:
+            expr_se = fscan.strip_redundant_outer_parens_expr(expr_scalar_element.strip())
+            m_se = re.fullmatch(r"([A-Za-z]\w*)\s*\[\s*([^,\]]+)\s*\]", expr_se)
+            if m_se is not None:
+                base_se = m_se.group(1).lower()
+                idx_se = m_se.group(2).strip()
+                return (
+                    scalar_element_rank_ctx.get(base_se, 0) >= 1
+                    and _infer_assignment_rank_hint(idx_se, scalar_element_rank_ctx) == 0
+                    and _split_top_level_colon(idx_se) is None
+                    and re.search(r"[A-Za-z]\w*\s*\(", idx_se) is None
+                    and not re.match(r"^(?:c|seq|seq_len|seq_along|which)\s*\(", idx_se, re.IGNORECASE)
+                )
+            c_se = parse_call_text(expr_se)
+            if c_se is None or c_se[0].lower() not in scalar_elemental_fns:
+                return False
+            arg_se = _first_call_arg(c_se, "x")
+            return bool(arg_se) and _is_scalar_ranked_element_expr(arg_se)
+
+        for st_scalar_element in assign_nodes:
+            if _is_scalar_ranked_element_expr(st_scalar_element.expr):
+                _force_real_scalar_local(st_scalar_element.name)
         # Late rank/kind inference must not redeclare a derived-type local as
         # an intrinsic variable.  These names are scoped to this procedure.
         for nm in set(local_list_types) | set(object_list_locals):
@@ -38042,6 +38112,7 @@ def transpile_r_to_fortran(
         "rev_int",
         "rev_real",
         "r_index_real",
+        "r_index_scalar_real",
         "r_matrix_col",
         "r_matrix_row",
         "char_join",
@@ -44710,6 +44781,8 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
         e = expr.strip()
         if not e:
             return False
+        if "%" in e:
+            return False
         if any(tok in e for tok in ("[", "]")):
             return False
         if ":" in e:
@@ -44734,11 +44807,18 @@ def demote_scalar_assigned_rank1_real_locals_text(f90: str) -> str:
             "abs", "sqrt", "exp", "log", "r_log", "sin", "cos", "tan",
             "asin", "acos", "atan", "dnorm", "pnorm", "sd", "mean",
             "sum", "min", "max", "maxval", "minval", "real", "int", "merge",
+            "r_index_scalar_real", "r_index_scalar_integer", "r_index_scalar_logical",
             }
         ):
             return False
         e_refs = e
         for nm in array_names:
+            e_refs = re.sub(
+                rf"\br_index_scalar_(?:real|integer|logical)\s*\(\s*{re.escape(nm)}\s*,\s*[^()]+\)",
+                "0.0_dp",
+                e_refs,
+                flags=re.IGNORECASE,
+            )
             e_refs = re.sub(
                 rf"\b(?:sum|product|maxval|minval|count|mean|sd|r_sd)\s*\(\s*{re.escape(nm)}\s*(?:,\s*(?!dim\s*=)[^()]*)?\)",
                 "0.0_dp",
@@ -47415,10 +47495,48 @@ def hoist_module_used_real_matrix_globals(lines: list[str]) -> list[str]:
     if not program_arrays:
         return lines
 
+    def module_has_free_reference(name: str) -> bool:
+        """Return whether a module procedure uses name without declaring it locally."""
+        name_re = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+        proc_re = re.compile(
+            r"(?ims)^\s*(?:(?:pure|elemental|recursive)\s+)*(?:function|subroutine)\s+"
+            r"[A-Za-z]\w*\s*\((.*?)\).*?^\s*end\s+(?:function|subroutine)\b[^\n]*"
+        )
+        spans: list[tuple[int, int]] = []
+        for proc_match in proc_re.finditer(module_body):
+            spans.append(proc_match.span())
+            proc_text = proc_match.group(0)
+            if name_re.search(proc_text) is None:
+                continue
+            dummy_names = {
+                part.strip().lower()
+                for part in split_top_level_commas(proc_match.group(1))
+                if re.fullmatch(r"[A-Za-z]\w*", part.strip())
+            }
+            declared_local = name.lower() in dummy_names
+            if not declared_local:
+                for decl_match in re.finditer(r"(?im)^\s*[^!\n]*::\s*(.+)$", proc_text):
+                    for part in split_top_level_commas(decl_match.group(1)):
+                        declared_name = re.match(r"\s*([A-Za-z]\w*)\b", part)
+                        if declared_name is not None and declared_name.group(1).lower() == name.lower():
+                            declared_local = True
+                            break
+                    if declared_local:
+                        break
+            if not declared_local:
+                return True
+        residual_parts: list[str] = []
+        start = 0
+        for left, right in spans:
+            residual_parts.append(module_body[start:left])
+            start = right
+        residual_parts.append(module_body[start:])
+        return name_re.search("\n".join(residual_parts)) is not None
+
     hoist = {
         key: info
         for key, info in sorted(program_arrays.items())
-        if re.search(rf"\b{re.escape(info[0])}\b", module_body)
+        if module_has_free_reference(info[0])
         and re.search(rf"\b{re.escape(info[0])}\b", module_head) is None
     }
     if not hoist:
@@ -49099,6 +49217,7 @@ def promote_real_matrix_initializer_decls_text(f90: str) -> str:
             or "0.0_dp" in rhs_head
             or "_dp" in rhs_head
             or re.search(r"\breal\s*\(", rhs_head)
+            or re.search(r"\b(?:rnorm_vec|runif_vec)\s*\(", rhs_head)
         ):
             real_matrix_names.add(m.group(1))
     if not real_matrix_names:
@@ -49106,6 +49225,25 @@ def promote_real_matrix_initializer_decls_text(f90: str) -> str:
     lines = f90.splitlines()
     out: list[str] = []
     for ln in lines:
+        m_real = re.match(
+            r"^(\s*)real\s*\(\s*kind\s*=\s*dp\s*\)\s*,\s*allocatable\s*::\s*(.+)$",
+            ln,
+            re.IGNORECASE,
+        )
+        if m_real is not None:
+            parts: list[str] = []
+            changed = False
+            for part in split_top_level_commas(m_real.group(2)):
+                p = part.strip()
+                mm = re.match(r"^([A-Za-z]\w*)\s*\(:\s*\)$", p)
+                if mm is not None and mm.group(1) in real_matrix_names:
+                    parts.append(f"{mm.group(1)}(:,:)")
+                    changed = True
+                else:
+                    parts.append(p)
+            if changed:
+                out.append(f"{m_real.group(1)}real(kind=dp), allocatable :: {', '.join(parts)}")
+                continue
         m = re.match(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+)$", ln, re.IGNORECASE)
         if m is None:
             out.append(ln)
@@ -61387,6 +61525,8 @@ def main() -> int:
         extra_use_names.append("date_to_char_vec")
     if "r_matrix_index(" in f90:
         extra_use_names.append("r_matrix_index")
+    if "r_index_scalar_real(" in f90:
+        extra_use_names.append("r_index_scalar_real")
     if "matrix_elem(" in f90:
         extra_use_names.append("matrix_elem")
     if "r_matrix_rows(" in f90:
@@ -61925,6 +62065,9 @@ def main() -> int:
     f90_lines = final_wrapped_lines
     f90 = "\n".join(f90_lines) + ("\n" if f90_had_trailing_newline else "")
     f90 = "\n".join(format_derived_type_blocks(f90.splitlines())) + ("\n" if f90.endswith("\n") else "")
+    # Late rank-repair passes can promote scalar element extracts back to
+    # rank-one locals. Reassert scalar declarations after those promotions.
+    f90 = demote_scalar_assigned_rank1_real_locals_text(f90)
     f90 = demote_scalar_reduction_local_declarations_text(f90)
     f90 = promote_object_array_component_assignment_decls_text(f90)
     f90 = promote_real_matrix_initializer_decls_text(f90)
