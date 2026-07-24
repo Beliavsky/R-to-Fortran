@@ -12721,6 +12721,8 @@ def r_expr_to_fortran(expr: str) -> str:
             return r_expr_to_fortran(pos_pre[0])
         if nm_pre == "invisible":
             return r_expr_to_fortran(pos_pre[0]) if pos_pre else "0"
+        if nm_pre in {"noquote", "identity"} and len(pos_pre) == 1:
+            return r_expr_to_fortran(pos_pre[0])
         if nm_pre == "try":
             return r_expr_to_fortran(pos_pre[0]) if pos_pre else "0"
         if nm_pre == "subset":
@@ -31935,6 +31937,77 @@ def _collect_func_open_lines(src: str) -> dict[str, int]:
     return out
 
 
+_RECALL_CALL_RE = re.compile(r"(?<![\w.$@])Recall\s*\(")
+
+
+def _replace_recall_in_text(text: str, fname: str) -> str:
+    if "Recall" not in text:
+        return text
+    return _RECALL_CALL_RE.sub(fname + "(", text)
+
+
+def _lower_recall_in_body(body: list[object], fname: str) -> None:
+    """Rewrite R's ``Recall(...)`` recursion helper to the enclosing function name."""
+    for st in body:
+        if isinstance(st, FuncDef):
+            _lower_recall_in_body(st.body, st.name)
+        elif isinstance(st, Assign):
+            st.expr = _replace_recall_in_text(st.expr, fname)
+        elif isinstance(st, ExprStmt):
+            st.expr = _replace_recall_in_text(st.expr, fname)
+        elif isinstance(st, PrintStmt):
+            st.args = [_replace_recall_in_text(a, fname) for a in st.args]
+        elif isinstance(st, CallStmt):
+            if st.name == "Recall":
+                st.name = fname
+            st.args = [_replace_recall_in_text(a, fname) for a in st.args]
+        elif isinstance(st, ForStmt):
+            st.iter_expr = _replace_recall_in_text(st.iter_expr, fname)
+            _lower_recall_in_body(st.body, fname)
+        elif isinstance(st, WhileStmt):
+            st.cond = _replace_recall_in_text(st.cond, fname)
+            _lower_recall_in_body(st.body, fname)
+        elif isinstance(st, RepeatStmt):
+            _lower_recall_in_body(st.body, fname)
+        elif isinstance(st, IfStmt):
+            st.cond = _replace_recall_in_text(st.cond, fname)
+            _lower_recall_in_body(st.then_body, fname)
+            _lower_recall_in_body(st.else_body, fname)
+        elif isinstance(st, SwitchStmt):
+            st.selector = _replace_recall_in_text(st.selector, fname)
+            for _cond, cbody in st.cases:
+                _lower_recall_in_body(cbody, fname)
+            _lower_recall_in_body(st.default_body, fname)
+
+
+def _lower_recall_calls(stmts: list[object]) -> list[object]:
+    """Bind every ``Recall(...)`` to the name of the function it appears in.
+
+    R's ``Recall`` re-invokes the currently running closure; for a named
+    top-level (or nested) function that is simply the function's own name, so
+    the recursion can be expressed directly in Fortran.
+    """
+    def walk(ss: list[object]) -> None:
+        for st in ss:
+            if isinstance(st, FuncDef):
+                _lower_recall_in_body(st.body, st.name)
+            elif isinstance(st, ForStmt):
+                walk(st.body)
+            elif isinstance(st, WhileStmt):
+                walk(st.body)
+            elif isinstance(st, RepeatStmt):
+                walk(st.body)
+            elif isinstance(st, IfStmt):
+                walk(st.then_body)
+                walk(st.else_body)
+            elif isinstance(st, SwitchStmt):
+                for _cond, cbody in st.cases:
+                    walk(cbody)
+                walk(st.default_body)
+    walk(stmts)
+    return stmts
+
+
 def _rename_duplicate_function_defs(stmts: list[object]) -> list[object]:
     """Rename repeated top-level function definitions and bind later uses to the latest definition."""
     counts: dict[str, int] = {}
@@ -32905,6 +32978,7 @@ def transpile_r_to_fortran(
     stmts = _lower_minimal_s3(stmts)
     stmts = _normalize_dotted_function_names(stmts)
     stmts = _rename_duplicate_function_defs(stmts)
+    stmts = _lower_recall_calls(stmts)
     stmts = attach_function_adjacent_comments(stmts)
     loop_shadow_warnings: list[tuple[str, str, int | None]] = []
     stmts = rename_conflicting_loop_vars(stmts, warnings=loop_shadow_warnings, src=src)
