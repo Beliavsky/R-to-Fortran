@@ -8600,9 +8600,12 @@ def _replace_name_in_stmt(st: object, name: str, repl: str) -> object:
 
 def _r_condition_to_fortran(expr: str) -> str:
     cond = r_expr_to_fortran(expr)
-    m_size = re.fullmatch(r"\s*size\s*\((.+)\)\s*", cond, re.IGNORECASE)
-    if m_size is not None:
-        return f"size({m_size.group(1).strip()}) > 0"
+    # `if (length(x))` is truthy when nonzero; wrap a bare `size(...)` call as a
+    # comparison. Use a balanced-call check so a comparison whose operands are
+    # themselves size() calls (e.g. `size(a) > size(b)`) is left untouched.
+    c_size = parse_call_text(cond.strip())
+    if c_size is not None and c_size[0].lower() == "size":
+        return f"{cond.strip()} > 0"
     return cond
 
 
