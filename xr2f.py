@@ -3761,7 +3761,7 @@ def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | No
         return ExprStmt(expr="next", comment=cmt)
     if ln.startswith("function("):
         raise NotImplementedError("nested/anonymous function definitions not supported")
-    m_display = re.match(r"^(print|show)\s*\((.*)\)$", ln, re.IGNORECASE)
+    m_display = re.match(r"^(print|show|println)\s*\((.*)\)$", ln, re.IGNORECASE)
     if m_display is not None:
         inner = m_display.group(2).strip()
         args = split_top_level_commas(inner) if inner else []
@@ -15679,7 +15679,39 @@ def r_expr_to_fortran(expr: str) -> str:
                 return " // ".join(vals_fmt)
         sep_src = kw_p.get("sep", '""' if c_paste[0].lower() == "paste0" else '" "')
         sep_f = r_expr_to_fortran(sep_src)
-        vals: list[str] = [r_expr_to_fortran(p) for p in pos_p]
+
+        def _paste_operand_char(p_src: str) -> str:
+            """Render a paste/paste0 operand as a Fortran character expression.
+
+            R coerces every argument to character; Fortran `//` requires
+            character operands, so provably-numeric operands are wrapped in a
+            to-string conversion. Operands whose kind can't be shown to be
+            numeric are left untouched (they are character in the cases the
+            surrounding code already handles)."""
+            p = p_src.strip()
+            p_f = r_expr_to_fortran(p)
+            if _dequote_string_literal(p) is not None:
+                return p_f
+            simple = (
+                _sanitize_r_var_name(p).lower()
+                if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", p)
+                else ""
+            )
+            if simple in _KNOWN_CHAR_VECTOR_NAMES or simple in _CURRENT_CHAR_SCALAR_NAMES:
+                return p_f
+            call_p = parse_call_text(p)
+            call_kind = _USER_FUNC_RETURN_KIND.get(call_p[0].lower()) if call_p is not None else None
+            if (
+                _is_int_literal(p)
+                or simple in (_KNOWN_INT_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_SCALAR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+                or call_kind in {"int", "integer"}
+            ):
+                return f"int_to_string({_int_bound_expr(p_f)})"
+            if _is_real_literal(p) or simple in _KNOWN_VECTOR_NAMES or call_kind == "real":
+                return f"real_to_string_g(real({p_f}, kind=dp), 6)"
+            return p_f
+
+        vals: list[str] = [_paste_operand_char(p) for p in pos_p]
         if not vals:
             return '""'
         out = vals[0]
@@ -26203,7 +26235,13 @@ def emit_function(
 
         def _branch_expr_to_assign(branch: list[object], target: str) -> list[object]:
             if branch and isinstance(branch[-1], ExprStmt):
-                return list(branch[:-1]) + [Assign(target, branch[-1].expr, branch[-1].comment)]
+                tail_expr = branch[-1].expr
+                # A tail-position `return(X)` yields the value X; unwrap it so it
+                # is not emitted as `result = return(X)`.
+                ret_a = _return_call_arg(tail_expr.strip())
+                if ret_a:
+                    tail_expr = ret_a
+                return list(branch[:-1]) + [Assign(target, tail_expr, branch[-1].comment)]
             if branch and isinstance(branch[-1], IfStmt):
                 last_if = branch[-1]
                 if _branch_has_expr_tail(last_if.then_body) and _branch_has_expr_tail(last_if.else_body):
