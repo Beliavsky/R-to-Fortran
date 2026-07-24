@@ -11665,9 +11665,59 @@ def _fold_switch_literal(s: str) -> str | None:
     return None
 
 
+def _collapse_strsplit_first_index(s: str) -> str:
+    """Drop the redundant ``[[1]]`` in ``strsplit(x, sep)[[1]]``.
+
+    ``strsplit`` on a scalar string returns a length-one list whose single
+    element is the vector of pieces; ``[[1]]`` selects that vector. The runtime
+    ``strsplit_fixed`` already returns that vector directly, so the trailing
+    ``[[1]]`` (or ``[[1L]]``) is a no-op that otherwise mis-lowers to an element
+    extraction."""
+    if "strsplit" not in s:
+        return s
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        m = re.match(r"strsplit\s*\(", s[i:])
+        if m is not None and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] in "._")):
+            k = i + m.end() - 1  # index of '('
+            depth = 0
+            in_s = in_d = esc = False
+            while k < n:
+                ch = s[k]
+                if esc:
+                    esc = False
+                elif ch == "\\" and (in_s or in_d):
+                    esc = True
+                elif ch == "'" and not in_d:
+                    in_s = not in_s
+                elif ch == '"' and not in_s:
+                    in_d = not in_d
+                elif not in_s and not in_d:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                k += 1
+            if k < n:  # matched close paren at k
+                end_call = k + 1
+                m2 = re.match(r"\s*\[\[\s*1L?\s*\]\]", s[end_call:])
+                if m2 is not None:
+                    out.append(s[i:end_call])
+                    i = end_call + m2.end()
+                    continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
+    s = _collapse_strsplit_first_index(s)
     s = fscan.strip_redundant_outer_parens_expr(s)
     try_primary = _trycatch_primary_expr(s)
     if try_primary is not None:
@@ -24169,7 +24219,7 @@ def emit_stmts(
                 continue
             raise NotImplementedError(f"unsupported call statement: {st.name}")
         elif isinstance(st, ForStmt):
-            it = _replace_dotted_var_refs(st.iter_expr.strip())
+            it = _collapse_strsplit_first_index(_replace_dotted_var_refs(st.iter_expr.strip()))
             m_colon = re.match(r"^(.+):(.+)$", it)
             m_seq_len = re.match(r"^seq_len\s*\((.+)\)$", it, re.IGNORECASE)
             m_seq_along = re.match(r"^seq_along\s*\((.+)\)$", it, re.IGNORECASE)
@@ -24229,6 +24279,8 @@ def emit_stmts(
                         _dequote_string_literal(v.strip()) is not None for v in iter_vals
                     )
                 if arr.strip().startswith("[character(") or it.strip() in _KNOWN_CHAR_VECTOR_NAMES:
+                    is_char_iter = True
+                if c_it_call is not None and c_it_call[0].lower() in {"strsplit", "strsplit_fixed"}:
                     is_char_iter = True
                 direct_body = _print_only_loop_body_with_value(st.body, st.var, f"{tmp}({idx})")
                 o.w("block")
@@ -37328,6 +37380,18 @@ def transpile_r_to_fortran(
         mprocs.w("character(len=*), intent(in) :: s, delim")
         mprocs.w("character(len=:), allocatable :: out(:)")
         mprocs.w("integer :: i, start, pos, n, dlen, maxlen")
+        # R's strsplit(s, "") splits into individual characters.
+        mprocs.w("if (len(delim) == 0) then")
+        mprocs.push()
+        mprocs.w("allocate(character(len=1) :: out(len(s)))")
+        mprocs.w("do i = 1, len(s)")
+        mprocs.push()
+        mprocs.w("out(i) = s(i:i)")
+        mprocs.pop()
+        mprocs.w("end do")
+        mprocs.w("return")
+        mprocs.pop()
+        mprocs.w("end if")
         mprocs.w("dlen = max(1, len(delim))")
         mprocs.w("n = 1")
         mprocs.w("start = 1")
