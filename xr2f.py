@@ -1315,6 +1315,29 @@ def _split_top_level_else(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _bare_else_expr(line: str) -> str | None:
+    """Return the else-branch expression for a bare ``else <expr>`` line.
+
+    Recognises R's brace-less else whose body is a single tail expression on
+    the same line (e.g. ``} else v`` after the closing brace is stripped, or a
+    dangling ``else n * f(x)``). Returns ``None`` for the plain ``else`` /
+    ``else {`` / ``else if ...`` forms, which are handled by their own paths.
+    """
+    s = line.strip()
+    if not s.lower().startswith("else"):
+        return None
+    after = s[4:]
+    if after and not after[0].isspace():
+        return None
+    rest = after.strip()
+    if rest == "" or rest == "{":
+        return None
+    low = rest.lower()
+    if low.startswith("if ") or low.startswith("if("):
+        return None
+    return rest
+
+
 def _split_trailing_r_subset(expr: str) -> tuple[str, str] | None:
     s = expr.strip()
     if not s.endswith("]"):
@@ -4104,6 +4127,24 @@ def parse_block(
                 else:
                     then_body = [parse_single_statement(tail, comment_lookup=comment_lookup)]
                     i += 1
+                    # R permits the matching `else` on the following line inside
+                    # `{}` (e.g. `if (n <= 1) 1` / `else n * f(n - 1)`).
+                    if i < len(lines):
+                        cur_e = lines[i].strip()
+                        bare_e = _bare_else_expr(cur_e)
+                        if cur_e == "else":
+                            i += 1
+                            if i < len(lines) and lines[i].strip() == "{":
+                                else_body, i = parse_block(lines, i + 1, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                            elif i < len(lines):
+                                else_body = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
+                                i += 1
+                        elif cur_e == "else {":
+                            i += 1
+                            else_body, i = parse_block(lines, i, stop_at_rbrace=True, comment_lookup=comment_lookup)
+                        elif bare_e is not None:
+                            else_body = [parse_single_statement(bare_e, comment_lookup=comment_lookup)]
+                            i += 1
             else:
                 i += 1
                 if i < len(lines) and lines[i].strip() == "{":
@@ -4126,6 +4167,11 @@ def parse_block(
                             raise NotImplementedError("else missing body")
                         else_body = [parse_single_statement(lines[i], comment_lookup=comment_lookup)]
                         i += 1
+                elif i < len(lines) and _bare_else_expr(lines[i].strip()) is not None:
+                    # `} else <expr>`: brace-less else whose body is a single
+                    # tail expression left on the line after `}` was stripped.
+                    else_body = [parse_single_statement(_bare_else_expr(lines[i].strip()), comment_lookup=comment_lookup)]
+                    i += 1
                 # Support brace-style chained else-if / else blocks:
                 #   if (...) { ... } else if (...) { ... } else { ... }
                 head_else_if: IfStmt | None = None
@@ -17602,7 +17648,18 @@ def r_expr_to_fortran(expr: str) -> str:
                     ):
                         return f"{base}({row_f_idx}:{row_f_idx}, :)"
                     return f"{base}({row_f_idx}, :)"
-        return f"{base}({_index_inner_to_fortran(inner, base=base)})"
+        inner_f = _index_inner_to_fortran(inner, base=base)
+        if (
+            "," not in inner
+            and base.lower() in (_KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+            and (
+                re.search(r"\br_seq_(?:int|len)\s*\(", inner_f, re.IGNORECASE)
+                or re.match(r"^\s*\[", inner_f)
+                or inner.strip().lower() in (_KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+            )
+        ):
+            return f"r_matrix_index({base}, {inner_f})"
+        return f"{base}({inner_f})"
     while prev != s:
         prev = s
         s = idx_pat.sub(_repl_idx, s)
@@ -29352,10 +29409,27 @@ def _fortran_ident(name: str) -> str:
     return s
 
 
+_MAX_FORTRAN_IDENT = 63
+
+
+def _cap_fortran_ident(name: str, reserve: int = 0) -> str:
+    """Truncate a Fortran identifier to the standard 63-character limit.
+
+    ``reserve`` leaves room for a suffix that will be appended afterwards
+    (e.g. ``_mod``, ``_main``). Truncation is deterministic on the input so
+    the same stem always maps to the same unit name.
+    """
+    limit = _MAX_FORTRAN_IDENT - reserve
+    if len(name) <= limit:
+        return name
+    return name[:limit].rstrip("_") or name[:limit]
+
+
 def _module_name_from_stem(stem: str) -> str:
     base = _fortran_ident(stem)
     if base.lower().startswith("x") and len(base) > 1:
         base = base[1:]
+    base = _cap_fortran_ident(base, reserve=len("_mod"))
     return _fortran_ident(base + "_mod")
 
 
@@ -32540,6 +32614,85 @@ def _rewrite_simple_anonymous_combn_functions(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _normalize_r_bare_logical_abbrevs(src: str) -> str:
+    """Rewrite R's bare ``T``/``F`` logical abbreviations to ``TRUE``/``FALSE``.
+
+    In R, ``T`` and ``F`` are default bindings for ``TRUE``/``FALSE`` and are
+    commonly used as logical literals (``byrow=T``, ``while(T)``, ``win=F``).
+    The downstream translator understands ``TRUE``/``FALSE`` but not the bare
+    single-letter forms, which leak through as undeclared Fortran symbols.
+
+    If a script ever uses ``T`` or ``F`` as an ordinary variable (assignment
+    target, right-assignment, loop variable, or named argument/parameter), we
+    conservatively leave that letter untouched so we never clobber a real name.
+    """
+    convertible = {}
+    for letter in ("T", "F"):
+        used_as_name = bool(
+            # left-assignment target or named argument / parameter: `T <- `, `T <<- `, `T = `
+            re.search(rf"(?<![A-Za-z0-9_.]){letter}\s*(?:<<?-|=(?!=))", src)
+            # right-assignment target: `expr -> T`, `expr ->> T`
+            or re.search(rf"(?:->>|->)\s*{letter}(?![A-Za-z0-9_.])", src)
+            # for-loop variable: `for (T in ...)`
+            or re.search(rf"\bfor\s*\(\s*{letter}\s+in\b", src)
+        )
+        convertible[letter] = not used_as_name
+    if not convertible["T"] and not convertible["F"]:
+        return src
+    repl = {"T": "TRUE", "F": "FALSE"}
+    out_lines: list[str] = []
+    for raw in src.splitlines():
+        code, cmt = split_r_code_comment(raw)
+        had_comment = len(code) + len(cmt) + 1 == len(raw)
+        res: list[str] = []
+        in_single = in_double = esc = False
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if esc:
+                res.append(ch)
+                esc = False
+                i += 1
+                continue
+            if ch == "\\" and (in_single or in_double):
+                res.append(ch)
+                esc = True
+                i += 1
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                res.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                res.append(ch)
+                i += 1
+                continue
+            if in_single or in_double:
+                res.append(ch)
+                i += 1
+                continue
+            if ch.isalpha() or ch in "._":
+                j = i + 1
+                while j < n and (code[j].isalnum() or code[j] in "._"):
+                    j += 1
+                tok = code[i:j]
+                prev = code[i - 1] if i > 0 else ""
+                if tok in ("T", "F") and convertible[tok] and prev not in ("$", "@"):
+                    res.append(repl[tok])
+                else:
+                    res.append(tok)
+                i = j
+                continue
+            res.append(ch)
+            i += 1
+        new_code = "".join(res)
+        out_lines.append(new_code + "#" + cmt if had_comment else new_code)
+    return "\n".join(out_lines)
+
+
 def _rewrite_simple_transposed_sapply_field(src: str) -> str:
     """Lower t(sapply(xs, function(f) { f$field })) into an explicit row loop."""
     lines = src.splitlines()
@@ -32678,6 +32831,7 @@ def transpile_r_to_fortran(
     check_xr2f_directive_declare_conflicts(src, _XR2F_FORCE_KIND, _XR2F_FORCE_RANK)
     validate_unsupported_runtime_semantics_source(src)
     _COMMAND_ARGS_FILE_ARG = source_path
+    src = _normalize_r_bare_logical_abbrevs(src)
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
@@ -32720,7 +32874,7 @@ def transpile_r_to_fortran(
     _CALL_COERCION_WARNINGS = set()
     _WARNING_SOURCE_TEXT = src
     _CURRENT_WARNING_STMT_TEXT = None
-    unit_name = _fortran_ident(stem)
+    unit_name = _cap_fortran_ident(_fortran_ident(stem), reserve=len("_main_9"))
     module_name = _module_name_from_stem(stem)
     comment_lookup = build_r_comment_lookup(src)
     lines = preprocess_r_lines(src)
