@@ -11047,7 +11047,7 @@ def _literal_noninteger_int_source(expr: str) -> str | None:
         t = m_real.group(1).strip()
     if t.startswith("["):
         inner = t[1:-1].strip() if t.endswith("]") else ""
-        parts = split_top_level_args(inner)
+        parts = split_top_level_commas(inner)
         if not parts:
             return None
         t = parts[0].strip()
