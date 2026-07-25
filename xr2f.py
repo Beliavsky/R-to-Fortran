@@ -2668,6 +2668,11 @@ def _replace_balanced_func_calls(expr: str, fname: str, repl_fn) -> str:
 def _display_expr_to_fortran(expr: str) -> str:
     """Lower display-oriented R wrappers (sprintf/paste) to printable Fortran expr."""
     s = expr.strip()
+    # A bare string literal is printed verbatim; don't run it through the
+    # expression transforms, which would rewrite `!`/`%`/`&`/`|` in its text.
+    lit_s = _dequote_string_literal(s)
+    if lit_s is not None:
+        return _fortran_str_literal(lit_s)
     cinfo = parse_call_text(s)
     if cinfo is not None:
         nm, pos, kw = cinfo
@@ -3789,7 +3794,7 @@ def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | No
     if cinfo is not None:
         nm, pos, kw = cinfo
         args = list(pos) + [f"{k}={v}" for k, v in kw.items()]
-        if nm.lower() in {"print", "stopifnot", "set.seed", "cat", "stop", "write", "writelines", "write.table"}:
+        if nm.lower() in {"print", "stopifnot", "set.seed", "cat", "stop", "write", "writelines", "write.table", "message", "alarm"}:
             return CallStmt(name=nm, args=args, comment=cmt)
         return ExprStmt(expr=ln, comment=cmt)
     return ExprStmt(expr=ln, comment=cmt)
@@ -23939,26 +23944,47 @@ def emit_stmts(
                 _wstmt(f"call sys_sleep(real({r_expr_to_fortran(delay_src)}, kind=dp))", st.comment)
                 need_r_mod.add("sys_sleep")
                 continue
+            if nm == "message":
+                # R's message() writes its arguments to stderr, followed by a newline.
+                msg_args: list[str] = []
+                for a in st.args:
+                    a_s = a.strip()
+                    lit = _dequote_string_literal(a_s)
+                    msg_args.append(_fortran_str_literal(lit) if lit is not None else _display_expr_to_fortran(a_s))
+                _wstmt('write(error_unit,"(*(g0))") ' + (", ".join(msg_args) if msg_args else '""'), st.comment)
+                continue
+            if nm == "alarm":
+                # R's alarm() rings the terminal bell.
+                _wstmt('write(*,"(a)",advance="no") char(7)', st.comment)
+                continue
             if nm == "cat":
                 if st.args:
                     c_cat_full = parse_call_text(st.name + "(" + ", ".join(st.args) + ")")
                     if c_cat_full is not None and "file" in c_cat_full[2]:
-                        file_f_cat = r_expr_to_fortran(c_cat_full[2]["file"])
+                        file_src_cat = c_cat_full[2]["file"].strip()
+                        c_file_cat = parse_call_text(file_src_cat)
+                        special_unit_cat = None
+                        if c_file_cat is not None and c_file_cat[0].lower() == "stderr":
+                            special_unit_cat = "error_unit"
+                        elif c_file_cat is not None and c_file_cat[0].lower() == "stdout":
+                            special_unit_cat = "output_unit"
+                        fp_cat = special_unit_cat or "fp_cat"
                         payload_cat = list(c_cat_full[1])
                         o.w("block")
                         o.push()
-                        o.w("integer :: fp_cat")
-                        o.w(f'open(newunit=fp_cat, file={file_f_cat}, status="replace", action="write")')
+                        if special_unit_cat is None:
+                            o.w("integer :: fp_cat")
+                            o.w(f'open(newunit=fp_cat, file={r_expr_to_fortran(file_src_cat)}, status="replace", action="write")')
                         line_items_cat: list[str] = []
                         for a_cat in payload_cat:
                             a_cat_s = a_cat.strip()
                             lit_cat = _dequote_string_literal(a_cat_s)
                             if lit_cat is not None and re.fullmatch(r"(?:\\n|\n)+", lit_cat):
                                 if line_items_cat:
-                                    o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                                    o.w(f'write({fp_cat},"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
                                     line_items_cat = []
                                 else:
-                                    o.w("write(fp_cat,*)")
+                                    o.w(f"write({fp_cat},*)")
                                 continue
                             if lit_cat is not None and ("\\n" in lit_cat or "\n" in lit_cat):
                                 parts_cat = re.split(r"(?:\\n|\n)", lit_cat)
@@ -23967,18 +23993,19 @@ def emit_stmts(
                                         line_items_cat.append(_fortran_str_literal(part_cat))
                                     if i_part_cat < len(parts_cat) - 1:
                                         if line_items_cat:
-                                            o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                                            o.w(f'write({fp_cat},"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
                                             line_items_cat = []
                                         else:
-                                            o.w("write(fp_cat,*)")
+                                            o.w(f"write({fp_cat},*)")
                                 continue
                             item_cat_f = _display_expr_to_fortran(a_cat_s)
                             if re.fullmatch(r"[A-Za-z]\w*", item_cat_f.strip()) and item_cat_f.strip() in char_scalar_vars:
                                 item_cat_f = f"trim({item_cat_f.strip()})"
                             line_items_cat.append(item_cat_f)
                         if line_items_cat:
-                            o.w('write(fp_cat,"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
-                        o.w("close(fp_cat)")
+                            o.w(f'write({fp_cat},"(*(g0,:,1x))") ' + ", ".join(line_items_cat))
+                        if special_unit_cat is None:
+                            o.w(f"close({fp_cat})")
                         o.pop()
                         o.w("end block")
                         continue
@@ -38839,6 +38866,8 @@ def transpile_r_to_fortran(
         re.search(r"\bint64\b|_int64\b", mod_text_now, re.IGNORECASE)
         or re.search(r"\bint64\b|_int64\b", mod_decl_text, re.IGNORECASE)
     )
+    err_unit_pat = re.compile(r"\b(?:error_unit|output_unit)\b", re.IGNORECASE)
+    need_std_units_mod = bool(err_unit_pat.search(mod_text_now))
     mod_call_names = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(", mod_text_now)}
     main_call_names = {m.group(1).lower() for m in re.finditer(r"\b([A-Za-z]\w*)\s*\(", main_text_now)}
     for hn in helper_names:
@@ -38898,6 +38927,9 @@ def transpile_r_to_fortran(
     iso_imports_mod = "dp => real64"
     if need_int64_mod:
         iso_imports_mod += ", int64"
+    for _u in ("error_unit", "output_unit"):
+        if re.search(rf"\b{_u}\b", mod_text_now, re.IGNORECASE):
+            iso_imports_mod += f", {_u}"
     o.w(f"use, intrinsic :: iso_fortran_env, only: {iso_imports_mod}")
     if need_ieee_mod:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
@@ -39517,12 +39549,14 @@ def transpile_r_to_fortran(
         if main_needs_pi:
             main_needs_dp = True
         o.w(f"program {program_name}")
-        if main_needs_dp or main_needs_int64:
+        main_std_units = [u for u in ("error_unit", "output_unit") if re.search(rf"\b{u}\b", main_text_now, re.IGNORECASE)]
+        if main_needs_dp or main_needs_int64 or main_std_units:
             iso_imports_main: list[str] = []
             if main_needs_dp:
                 iso_imports_main.append("dp => real64")
             if main_needs_int64:
                 iso_imports_main.append("int64")
+            iso_imports_main.extend(main_std_units)
             o.w("use, intrinsic :: iso_fortran_env, only: " + ", ".join(iso_imports_main))
         if need_ieee_main:
             o.w("use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_value, ieee_quiet_nan")
