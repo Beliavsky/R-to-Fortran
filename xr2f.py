@@ -24437,11 +24437,11 @@ def emit_stmts(
             ret_arg = _return_call_arg(st.expr.strip())
             if ret_arg is not None:
                 if not return_var:
-                    ret_arg_compact = re.sub(r"\s+", "", ret_arg).lower()
-                    if ret_arg_compact in {"", "null", "invisible(null)"}:
-                        o.w("return")
-                        continue
-                    raise NotImplementedError("return(value) is not supported inside subroutine-like procedures")
+                    # Subroutine-like procedure: its result is never consumed, so
+                    # an early `return(value)` is just an early exit — discard the
+                    # value and emit a bare `return`.
+                    o.w("return")
+                    continue
                 return_is_list = bool(helper_ctx is not None and helper_ctx.get("return_is_list"))
                 if ret_arg and not (return_is_list and ret_arg.strip().upper() == "NULL"):
                     ret_src = ret_arg
