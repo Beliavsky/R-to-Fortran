@@ -32927,6 +32927,80 @@ def _normalize_r_bare_logical_abbrevs(src: str) -> str:
     return "\n".join(out_lines)
 
 
+_LETTERS_CONST_NAMES = {"letters": "xr_letters_lc", "LETTERS": "xr_letters_uc"}
+
+
+def _normalize_r_builtin_char_constants(src: str) -> str:
+    """Rename R's built-in alphabet constants ``letters``/``LETTERS`` to
+    case-distinct identifiers so they can be emitted as Fortran parameters
+    (Fortran is case-insensitive, so ``letters`` and ``LETTERS`` cannot coexist).
+
+    A name that the script ever assigns to as an ordinary variable is left
+    untouched.
+    """
+    convertible = {}
+    for name in _LETTERS_CONST_NAMES:
+        if not re.search(rf"(?<![A-Za-z0-9_.]){name}(?![A-Za-z0-9_.])", src):
+            convertible[name] = False
+            continue
+        used_as_name = bool(
+            re.search(rf"(?<![A-Za-z0-9_.]){name}\s*(?:<<?-|=(?!=))", src)
+            or re.search(rf"(?:->>|->)\s*{name}(?![A-Za-z0-9_.])", src)
+            or re.search(rf"\bfor\s*\(\s*{name}\s+in\b", src)
+        )
+        convertible[name] = not used_as_name
+    if not any(convertible.values()):
+        return src
+    out_lines: list[str] = []
+    for raw in src.splitlines():
+        code, cmt = split_r_code_comment(raw)
+        had_comment = len(code) + len(cmt) + 1 == len(raw)
+        res: list[str] = []
+        in_single = in_double = esc = False
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if esc:
+                res.append(ch); esc = False; i += 1; continue
+            if ch == "\\" and (in_single or in_double):
+                res.append(ch); esc = True; i += 1; continue
+            if ch == "'" and not in_double:
+                in_single = not in_single; res.append(ch); i += 1; continue
+            if ch == '"' and not in_single:
+                in_double = not in_double; res.append(ch); i += 1; continue
+            if in_single or in_double:
+                res.append(ch); i += 1; continue
+            if ch.isalpha() or ch in "._":
+                j = i + 1
+                while j < n and (code[j].isalnum() or code[j] in "._"):
+                    j += 1
+                tok = code[i:j]
+                prev = code[i - 1] if i > 0 else ""
+                if tok in _LETTERS_CONST_NAMES and convertible.get(tok) and prev not in ("$", "@"):
+                    res.append(_LETTERS_CONST_NAMES[tok])
+                else:
+                    res.append(tok)
+                i = j
+                continue
+            res.append(ch); i += 1
+        new_code = "".join(res)
+        out_lines.append(new_code + "#" + cmt if had_comment else new_code)
+    return "\n".join(out_lines)
+
+
+def _letters_param_decls(text: str) -> list[str]:
+    """Parameter declarations for R's letters/LETTERS constants used in `text`."""
+    out: list[str] = []
+    if re.search(r"\bxr_letters_lc\b", text):
+        vals = ", ".join(f'"{chr(c)}"' for c in range(ord("a"), ord("z") + 1))
+        out.append(f"character(len=1), parameter :: xr_letters_lc(26) = [character(len=1) :: {vals}]")
+    if re.search(r"\bxr_letters_uc\b", text):
+        vals = ", ".join(f'"{chr(c)}"' for c in range(ord("A"), ord("Z") + 1))
+        out.append(f"character(len=1), parameter :: xr_letters_uc(26) = [character(len=1) :: {vals}]")
+    return out
+
+
 def _rewrite_simple_transposed_sapply_field(src: str) -> str:
     """Lower t(sapply(xs, function(f) { f$field })) into an explicit row loop."""
     lines = src.splitlines()
@@ -33066,6 +33140,7 @@ def transpile_r_to_fortran(
     validate_unsupported_runtime_semantics_source(src)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _normalize_r_bare_logical_abbrevs(src)
+    src = _normalize_r_builtin_char_constants(src)
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
@@ -34959,6 +35034,9 @@ def transpile_r_to_fortran(
     _KNOWN_LOGICAL_VECTOR_NAMES = {n.lower() for n in logical_arrays}
     _KNOWN_LOGICAL_MATRIX_NAMES = {n.lower() for n in logical_matrices}
     _KNOWN_CHAR_VECTOR_NAMES = {n.lower() for n in char_arrays}
+    for _lc in _LETTERS_CONST_NAMES.values():
+        if re.search(rf"\b{_lc}\b", src):
+            _KNOWN_CHAR_VECTOR_NAMES.add(_lc)
     _KNOWN_CHAR_MATRIX_NAMES = {n.lower() for n in char_matrices}
     user_func_by_lower = {f.name.lower(): f for f in funcs}
 
@@ -38940,6 +39018,8 @@ def transpile_r_to_fortran(
     o.w("implicit none")
     if need_pi_mod:
         o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
+    for _ldecl in _letters_param_decls(mod_text_now + " " + mod_decl_text):
+        o.w(_ldecl)
     if promoted_params:
         promoted_int64_params = [(k, v) for k, v in sorted(promoted_params.items()) if _expr_uses_int64(v)]
         promoted_default_params = [(k, v) for k, v in sorted(promoted_params.items()) if not _expr_uses_int64(v)]
@@ -39567,6 +39647,8 @@ def transpile_r_to_fortran(
         o.w("implicit none")
         if main_needs_pi:
             o.w("real(kind=dp), parameter :: pi = acos(-1.0_dp)")
+        for _ldecl in _letters_param_decls(main_text_now):
+            o.w(_ldecl)
         o.lines.extend(pbody.lines)
         o.w(f"end program {program_name}")
     return o.text()
