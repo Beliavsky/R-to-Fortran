@@ -44538,6 +44538,25 @@ def repair_vector_call_scalar_index_assignments_text(f90: str) -> str:
                 nm = re.sub(r"\s*\(.*\)\s*$", "", nm).strip()
                 if re.fullmatch(r"[A-Za-z]\w*", nm):
                     logical_names.add(nm.lower())
+        m_write = re.match(r'^(\s*)(write\s*\(\*\s*,\s*"[^"]*"\s*\))\s+(\S.*)$', line)
+        if m_write is not None:
+            split_w = _split_call_index(m_write.group(3))
+            if split_w is not None:
+                call_txt_w, idx_w = split_w
+                tmp_i += 1
+                tmp_w = f"xr2f_call_idx_tmp_{tmp_i}"
+                indent_w = m_write.group(1)
+                tmp_decl_w = "integer, allocatable" if re.match(r"^which\s*\(", call_txt_w, re.IGNORECASE) else "real(kind=dp), allocatable"
+                out.extend(
+                    [
+                        f"{indent_w}block",
+                        f"{indent_w}   {tmp_decl_w} :: {tmp_w}(:)",
+                        f"{indent_w}   {tmp_w} = {call_txt_w}",
+                        f"{indent_w}   {m_write.group(2)} {tmp_w}({_int_bound_expr(idx_w)})",
+                        f"{indent_w}end block",
+                    ]
+                )
+                continue
         m = re.match(r"^(\s*)([A-Za-z]\w*(?:%[A-Za-z]\w*)?)\s*=\s*(.+)$", line)
         if m is None:
             out.append(line)
