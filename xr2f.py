@@ -4305,6 +4305,35 @@ def _parse_switch_positional_block(case_src: str) -> list[object] | None:
     return body
 
 
+def _lower_value_switch_to_if(selector_src: str, case_srcs: list[str]) -> object | None:
+    """Lower a value-returning character ``switch(sel, "a"=v1, "b"=v2, def)`` with
+    brace-less expression branches into an if/else-if chain of expression
+    statements. This lets the tail-value machinery assign each branch to the
+    result and — because the selector is compared to string literals — lets the
+    inference type ``sel`` as character."""
+    named: list[tuple[str, str]] = []
+    default_expr: str | None = None
+    for cs in case_srcs:
+        m = re.match(r'^\s*("(?:""|[^"])*")\s*=(?!=)(.*)$', cs.strip(), re.DOTALL)
+        if m is not None:
+            named.append((m.group(1).strip(), m.group(2).strip()))
+        else:
+            if default_expr is not None:
+                return None  # more than one unnamed branch is unsupported here
+            default_expr = cs.strip()
+    if not named or any(val == "" for _, val in named):
+        return None  # empty branch = R fall-through, not handled here
+    if default_expr is not None:
+        guarded = named
+        else_body: list[object] = [ExprStmt(default_expr)]
+    else:
+        guarded = named[:-1]
+        else_body = [ExprStmt(named[-1][1])]
+    for label, val in reversed(guarded):
+        else_body = [IfStmt(f"{selector_src} == {label}", [ExprStmt(val)], else_body)]
+    return else_body[0]
+
+
 def _lower_switch_expr_stmt(st: ExprStmt) -> object:
     c_switch = parse_call_text(st.expr.strip())
     if c_switch is None or c_switch[0].lower() != "switch" or not c_switch[1]:
@@ -4319,6 +4348,9 @@ def _lower_switch_expr_stmt(st: ExprStmt) -> object:
             continue
     if cases:
         return SwitchStmt(selector=selector_src, cases=cases, default_body=default_body, selector_kind="character")
+    value_if = _lower_value_switch_to_if(selector_src, c_switch[1][1:])
+    if value_if is not None:
+        return value_if
     for idx_case, case_src in enumerate(c_switch[1][1:], start=1):
         body = _parse_switch_positional_block(case_src)
         if body is None:
