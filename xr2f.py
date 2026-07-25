@@ -18084,6 +18084,15 @@ def emit_stmts(
         local_int_actuals |= {n.lower() for n in _KNOWN_INT_NAMES}
         local_int_actuals |= set(_KNOWN_INT_VECTOR_NAMES)
         if local_int_actuals:
+            def _is_int_actual(expr_s: str) -> bool:
+                e = expr_s.strip().lower()
+                if e in local_int_actuals:
+                    return True
+                # An element/section of an integer array is still integer, e.g.
+                # `elements(i)` where `elements` is an integer vector.
+                m_idx = re.match(r"^([a-z]\w*)\s*\(", e)
+                return m_idx is not None and m_idx.group(1) in local_int_actuals
+
             def _coerce_user_call_actuals(fn_name: str, inner: str) -> str:
                 kinds = _USER_FUNC_ARG_KIND.get(fn_name.lower())
                 if not kinds or "real" not in kinds:
@@ -18099,11 +18108,11 @@ def emit_stmts(
                         key = _sanitize_fortran_kwarg_name(m_kw.group(1)).lower()
                         val = m_kw.group(2).strip()
                         idx = idx_map.get(key, -1)
-                        if idx >= 0 and idx < len(kinds) and kinds[idx] == "real" and val.lower() in local_int_actuals:
+                        if idx >= 0 and idx < len(kinds) and kinds[idx] == "real" and _is_int_actual(val):
                             val = f"real({val}, kind=dp)"
                         out_parts.append(f"{m_kw.group(1)}={val}")
                         continue
-                    if pos_i < len(kinds) and kinds[pos_i] == "real" and ps.lower() in local_int_actuals:
+                    if pos_i < len(kinds) and kinds[pos_i] == "real" and _is_int_actual(ps):
                         ps = f"real({ps}, kind=dp)"
                     out_parts.append(ps)
                     pos_i += 1
