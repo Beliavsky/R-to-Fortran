@@ -11763,9 +11763,60 @@ def _collapse_strsplit_first_index(s: str) -> str:
     return "".join(out)
 
 
+def _lower_inttobits_index(s: str) -> str:
+    """Lower ``intToBits(x)[i]`` (single scalar index) to a bit test.
+
+    R's ``intToBits(x)`` returns the 32 bits of ``x`` least-significant first;
+    ``intToBits(x)[i]`` is bit (i-1). That equals ``iand(ishft(int(x), 1-i), 1)``,
+    which avoids indexing a call result (a Fortran coarray syntax error)."""
+    if "inttobits" not in s.lower():
+        return s
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        m = re.match(r"intToBits\s*\(", s[i:], re.IGNORECASE)
+        if m is not None and (i == 0 or not (s[i - 1].isalnum() or s[i - 1] in "._")):
+            k = i + m.end() - 1  # index of '('
+            arg_start = k + 1
+            depth = 0
+            in_s = in_d = esc = False
+            while k < n:
+                ch = s[k]
+                if esc:
+                    esc = False
+                elif ch == "\\" and (in_s or in_d):
+                    esc = True
+                elif ch == "'" and not in_d:
+                    in_s = not in_s
+                elif ch == '"' and not in_s:
+                    in_d = not in_d
+                elif not in_s and not in_d:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                k += 1
+            if k < n:
+                arg = s[arg_start:k].strip()
+                end_call = k + 1
+                m2 = re.match(r"\s*\[\s*([^\[\]]+?)\s*\]", s[end_call:])
+                if m2 is not None:
+                    idx = m2.group(1).strip()
+                    out.append(f"iand(ishft(int({arg}), 1 - ({idx})), 1)")
+                    i = end_call + m2.end()
+                    continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
+    s = _lower_inttobits_index(s)
     s = _collapse_strsplit_first_index(s)
     s = fscan.strip_redundant_outer_parens_expr(s)
     try_primary = _trycatch_primary_expr(s)
