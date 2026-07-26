@@ -1,7 +1,7 @@
 ﻿! helper functions for R-to-Fortran transpiler
 module r_mod
 use, intrinsic :: iso_fortran_env, only: real64, int64
-use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, &
+use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf, &
    & ieee_is_finite
 #ifdef XR2F_USE_R_RNG
 use, intrinsic :: iso_c_binding, only: c_double, c_int
@@ -25,17 +25,18 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & prcomp, print_prcomp_summary, eigen, print_eigen, arima_fit_t, arima_predict_result_t, arima_sim, arima_fit, arima_predict, arima_predict_result, print_arima_fit, &
    & acf_fit_t, acf, r_acf, r_acf_values, r_ccf, print_acf, ar_fit_t, ar_fit, ARMAacf, &
    & r_seq_int_by, r_seq_int_length, r_seq_real_by, r_seq_real_length, &
-   & r_paste0_real, r_paste0_int, r_index_real, r_matrix_col, r_matrix_row, r_matrix_rows, r_matrix_row_filter, r_matrix_col_filter, &
+   & r_paste0_real, r_paste0_int, r_index_real, r_index_scalar_real, r_matrix_col, r_matrix_row, r_matrix_rows, r_matrix_row_filter, r_matrix_col_filter, &
    & r_rep_real, r_rep_char, r_rep_int, r_drop_index, r_drop_indices, r_matrix_index, matrix_elem, r_head, rev_int, rev_real, r_array_real, r_array_int, r_array_char, matrix, &
    & r_matmul, r_add, r_sub, r_mul, r_div, print_matrix, &
    & print_matrix_rstyle, print_matrix_rstyle_named, print_real_scalar, &
    & print_real_vector, print_complex_vector, print_integer_vector, print_char_vector, &
-   & display, print_named_real_vector, print_named_real_row, print_table1, print_table2, print_summary, set_print_int_like, &
+   & display, print_named_real_vector, print_named_real_row, print_table1, print_table2, print_summary, &
+   & print_factor, r_factor_labels, r_as_real, r_ifelse_real, r_na_real, r_inf, r_is_nan, set_print_int_like, &
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, combn, findInterval, cut, cut_n, outer, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
-   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, urldecode, nextn, kronecker, fft, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
@@ -1024,8 +1025,14 @@ interface r_drop_indices
 end interface r_drop_indices
 
 interface r_matrix_index
+   module procedure r_vector_index_real_int
+   module procedure r_vector_index_int_int
+   module procedure r_vector_index_real_logical
+   module procedure r_vector_index_int_logical
    module procedure r_matrix_index_real
    module procedure r_matrix_index_int
+   module procedure r_matrix_index_real_logical_vec
+   module procedure r_matrix_index_int_logical_vec
    module procedure r_matrix_index_real_logical
    module procedure r_matrix_index_int_logical
 end interface r_matrix_index
@@ -1134,6 +1141,10 @@ interface display
    module procedure display_real_array3, display_integer_array3, display_logical_array3
    module procedure display_complex_array3, display_char_array3
 end interface display
+
+interface r_as_real
+   module procedure r_as_real_char
+end interface r_as_real
 
 interface cumsum
    module procedure cumsum_real
@@ -2986,6 +2997,133 @@ else
 end if
 end function r_matrix_index_int
 
+pure function r_vector_index_real_int(x, idx) result(out)
+! Return bounds-checked R-style positive indexing of a real vector.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: idx(:)
+real(kind=dp), allocatable :: out(:)
+integer :: i, k
+allocate(out(count(idx /= 0)))
+k = 0
+do i = 1, size(idx)
+   if (idx(i) == 0) cycle
+   k = k + 1
+   if (idx(i) >= 1 .and. idx(i) <= size(x)) then
+      out(k) = x(idx(i))
+   else
+      out(k) = r_na_real()
+   end if
+end do
+end function r_vector_index_real_int
+
+pure function r_vector_index_int_int(x, idx) result(out)
+! Return R-style integer indexing of an integer vector, omitting zero indices.
+integer, intent(in) :: x(:)
+integer, intent(in) :: idx(:)
+integer, allocatable :: out(:)
+logical, allocatable :: keep(:)
+integer :: i, k, m
+if (all(idx <= 0) .and. any(idx < 0)) then
+   allocate(keep(size(x)))
+   keep = .true.
+   do i = 1, size(idx)
+      k = abs(idx(i))
+      if (k >= 1 .and. k <= size(x)) keep(k) = .false.
+   end do
+   out = pack(x, keep)
+   return
+end if
+allocate(out(count(idx /= 0)))
+k = 0
+do i = 1, size(idx)
+   if (idx(i) == 0) cycle
+   k = k + 1
+   if (idx(i) >= 1 .and. idx(i) <= size(x)) then
+      out(k) = x(idx(i))
+   else
+      out(k) = -huge(0)
+   end if
+end do
+end function r_vector_index_int_int
+
+pure function r_vector_index_real_logical(x, mask) result(out)
+! Return R-style vector indexing with a recycled logical mask.
+real(kind=dp), intent(in) :: x(:)
+logical, intent(in) :: mask(:)
+real(kind=dp), allocatable :: out(:)
+integer :: i, k, m, n
+if (size(mask) == 0) then
+   allocate(out(0))
+   return
+end if
+n = max(size(x), size(mask))
+m = 0
+do i = 1, n
+   if (mask(mod(i - 1, size(mask)) + 1)) m = m + 1
+end do
+allocate(out(m))
+k = 0
+do i = 1, n
+   if (.not. mask(mod(i - 1, size(mask)) + 1)) cycle
+   k = k + 1
+   if (i <= size(x)) then
+      out(k) = x(i)
+   else
+      out(k) = r_na_real()
+   end if
+end do
+end function r_vector_index_real_logical
+
+pure function r_vector_index_int_logical(x, mask) result(out)
+! Return R-style integer-vector indexing with a recycled logical mask.
+integer, intent(in) :: x(:)
+logical, intent(in) :: mask(:)
+integer, allocatable :: out(:)
+integer :: i, k, m, n
+if (size(mask) == 0) then
+   allocate(out(0))
+   return
+end if
+n = max(size(x), size(mask))
+m = 0
+do i = 1, n
+   if (mask(mod(i - 1, size(mask)) + 1)) m = m + 1
+end do
+allocate(out(m))
+k = 0
+do i = 1, n
+   if (.not. mask(mod(i - 1, size(mask)) + 1)) cycle
+   k = k + 1
+   if (i <= size(x)) then
+      out(k) = x(i)
+   else
+      out(k) = -huge(0)
+   end if
+end do
+end function r_vector_index_int_logical
+
+pure function r_matrix_index_real_logical_vec(x, mask) result(out)
+! Return R-style linear matrix indexing with a recycled logical vector.
+real(kind=dp), intent(in) :: x(:,:)
+logical, intent(in) :: mask(:)
+real(kind=dp), allocatable :: out(:)
+real(kind=dp), allocatable :: flat(:)
+allocate(flat(size(x)))
+flat = reshape(x, [size(x)])
+out = r_vector_index_real_logical(flat, mask)
+end function r_matrix_index_real_logical_vec
+
+pure function r_matrix_index_int_logical_vec(x, mask) result(out)
+! Return R-style linear integer-matrix indexing with a recycled logical vector.
+integer, intent(in) :: x(:,:)
+logical, intent(in) :: mask(:)
+integer, allocatable :: out(:)
+integer, allocatable :: flat(:)
+allocate(flat(size(x)))
+flat = reshape(x, [size(x)])
+out = r_vector_index_int_logical(flat, mask)
+end function r_matrix_index_int_logical_vec
+
 pure function r_matrix_index_real_logical(x, mask) result(out)
 ! Return R-style logical linear indexing of a matrix in column-major order.
 real(kind=dp), intent(in) :: x(:,:) ! source matrix
@@ -3007,6 +3145,18 @@ m = count(mask)
 allocate(out(m))
 if (m > 0) out = pack(x, mask)
 end function r_matrix_index_int_logical
+
+pure function r_index_scalar_real(x, idx) result(out)
+! Return one real-vector element or R's numeric NA when out of range.
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: idx
+real(kind=dp) :: out
+if (idx >= 1 .and. idx <= size(x)) then
+   out = x(idx)
+else
+   out = r_na_real()
+end if
+end function r_index_scalar_real
 
 pure function r_matrix_col_real(x, j) result(out)
 ! Return one matrix column as a vector.
@@ -5463,6 +5613,10 @@ logical, intent(in), optional :: int_like ! force integer-like formatting
 logical :: use_int_like, as_int
 integer(kind=int64) :: k
 real(kind=dp) :: tol
+if (r_is_na_payload(x)) then
+   write(*,"(a)") "NA"
+   return
+end if
 use_int_like = print_int_like_default
 if (present(int_like)) use_int_like = int_like
 as_int = .false.
@@ -5514,6 +5668,22 @@ integer :: i
 integer(kind=int64) :: k
 real(kind=dp) :: r, tol
 character(len=32) :: fmt
+if (size(x) == 0) then
+   write(*,"(a)") "numeric(0)"
+   return
+end if
+if (any(r_is_na_payload(x))) then
+   do i = 1, size(x)
+      if (r_is_na_payload(x(i))) then
+         write(*,"(a)", advance="no") "NA"
+      else
+         write(*,"(g0)", advance="no") x(i)
+      end if
+      if (i < size(x)) write(*,"(a)", advance="no") " "
+   end do
+   write(*,*)
+   return
+end if
 if (present(digits)) then
    write(fmt, '("(20(f0.",i0,",1x,:))")') max(0, digits)
    write(*,fmt) (x(i), i = 1, size(x))
@@ -5589,6 +5759,75 @@ do i = 1, size(x)
 end do
 write(*,*)
 end subroutine print_char_vector
+
+pure function r_factor_labels(codes, levels) result(out)
+! Convert one-based factor codes to their character level labels.
+integer, intent(in) :: codes(:)
+character(len=*), intent(in) :: levels(:)
+character(len=:), allocatable :: out(:)
+integer :: i
+allocate(character(len=len(levels)) :: out(size(codes)))
+do i = 1, size(codes)
+   if (codes(i) >= 1 .and. codes(i) <= size(levels)) then
+      out(i) = levels(codes(i))
+   else
+      out(i) = "NA"
+   end if
+end do
+end function r_factor_labels
+
+subroutine print_factor(codes, levels)
+! Display factor labels followed by the factor's levels.
+integer, intent(in) :: codes(:)
+character(len=*), intent(in) :: levels(:)
+call print_char_vector(r_factor_labels(codes, levels))
+write(*,"(a)", advance="no") "Levels: "
+call print_char_vector(levels)
+end subroutine print_factor
+
+impure elemental function r_as_real_char(x) result(out)
+! Convert a character value to double precision, returning NaN on failure.
+character(len=*), intent(in) :: x
+real(kind=dp) :: out
+integer :: ios
+read(x, *, iostat=ios) out
+if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
+end function r_as_real_char
+
+pure function r_ifelse_real(test, yes, no) result(out)
+! Apply scalar real branches to a logical vector encoded as 0, 1, or NaN.
+real(kind=dp), intent(in) :: test(:), yes, no
+real(kind=dp), allocatable :: out(:)
+allocate(out(size(test)))
+out = merge(yes, no, test /= 0.0_dp)
+where (.not. ieee_is_finite(test))
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+end where
+end function r_ifelse_real
+
+pure function r_na_real() result(out)
+! Return a quiet NaN carrying R's NA payload.
+real(kind=dp) :: out
+out = transfer(int(z'7ff00000000007a2', kind=int64), out)
+end function r_na_real
+
+pure elemental logical function r_is_na_payload(x) result(out)
+! Distinguish the runtime's R NA payload from an ordinary IEEE NaN.
+real(kind=dp), intent(in) :: x
+out = transfer(x, 0_int64) == int(z'7ff00000000007a2', kind=int64)
+end function r_is_na_payload
+
+pure function r_inf() result(out)
+! Return positive IEEE infinity.
+real(kind=dp) :: out
+out = ieee_value(0.0_dp, ieee_positive_inf)
+end function r_inf
+
+pure elemental logical function r_is_nan(x) result(out)
+! True for ordinary NaN but false for the distinct R NA payload.
+real(kind=dp), intent(in) :: x
+out = (x /= x) .and. transfer(x, 0_int64) /= int(z'7ff00000000007a2', kind=int64)
+end function r_is_nan
 
 subroutine display_char_matrix(x)
 ! Display a rank-2 character array one row per line.
@@ -11051,6 +11290,14 @@ character(len=*), intent(in) :: s ! string to split
 character(len=*), intent(in) :: delim ! fixed delimiter string
 character(len=:), allocatable :: out(:)
 integer :: i, start, pos, n, dlen, maxlen
+! R's strsplit(s, "") splits into individual characters.
+if (len(delim) == 0) then
+   allocate(character(len=1) :: out(len(s)))
+   do i = 1, len(s)
+      out(i) = s(i:i)
+   end do
+   return
+end if
 dlen = max(1, len(delim))
 n = 1
 start = 1
@@ -11224,6 +11471,89 @@ do i = 1, len(s)
 end do
 end function chartr
 
+pure function fft(x) result(out)
+! Discrete Fourier transform (forward), matching R's fft() for numeric input.
+real(kind=dp), intent(in) :: x(:)
+complex(kind=dp), allocatable :: out(:)
+integer :: nfft, k, j
+real(kind=dp) :: ang, twopi
+nfft = size(x)
+allocate(out(nfft))
+twopi = 2.0_dp * acos(-1.0_dp)
+do k = 1, nfft
+   out(k) = (0.0_dp, 0.0_dp)
+   do j = 1, nfft
+      ang = -twopi * real((k - 1) * (j - 1), dp) / real(nfft, dp)
+      out(k) = out(k) + x(j) * cmplx(cos(ang), sin(ang), kind=dp)
+   end do
+end do
+end function fft
+
+pure function kronecker(a, b) result(out)
+! Kronecker product of two matrices (R's %x% / kronecker()).
+real(kind=dp), intent(in) :: a(:,:), b(:,:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: ma, na, mb, nb, i, j, k, l
+ma = size(a, 1); na = size(a, 2)
+mb = size(b, 1); nb = size(b, 2)
+allocate(out(ma * mb, na * nb))
+do j = 1, na
+   do i = 1, ma
+      do l = 1, nb
+         do k = 1, mb
+            out((i - 1) * mb + k, (j - 1) * nb + l) = a(i, j) * b(k, l)
+         end do
+      end do
+   end do
+end do
+end function kronecker
+
+pure function nextn(n) result(out)
+! Smallest integer >= n that is a product of factors 2, 3 and 5 (R's nextn default).
+integer, intent(in) :: n
+integer :: out, m
+out = max(n, 1)
+do
+   m = out
+   do while (mod(m, 2) == 0)
+      m = m / 2
+   end do
+   do while (mod(m, 3) == 0)
+      m = m / 3
+   end do
+   do while (mod(m, 5) == 0)
+      m = m / 5
+   end do
+   if (m == 1) exit
+   out = out + 1
+end do
+end function nextn
+
+pure function urldecode(s) result(out)
+! Decode percent-encoded (%XX) escapes as R's utils::URLdecode does.
+character(len=*), intent(in) :: s
+character(len=:), allocatable :: out
+character(len=len(s)) :: buf
+integer :: i, n, code, ios
+n = 0
+i = 1
+do while (i <= len(s))
+   if (s(i:i) == "%" .and. i + 2 <= len(s)) then
+      read(s(i+1:i+2), "(z2)", iostat=ios) code
+      if (ios == 0) then
+         n = n + 1
+         buf(n:n) = achar(code)
+         i = i + 3
+         cycle
+      end if
+   end if
+   n = n + 1
+   buf(n:n) = s(i:i)
+   i = i + 1
+end do
+out = buf(1:n)
+end function urldecode
+
 pure function lower_tri(x, diag) result(out)
 ! Return R-like matrix index helper lower_tri.
 ! If diag is absent or false, exclude diagonal positions.
@@ -11293,7 +11623,7 @@ end function col_index_mat
 pure elemental logical function is_na_real_scalar(x) result(out)
 ! True when real scalar is NA/NaN in this subset.
 real(kind=dp), intent(in) :: x ! value to test
-out = .not. ieee_is_finite(x)
+out = (x /= x)
 end function is_na_real_scalar
 
 pure function is_na_real_vec(x) result(out)
@@ -11301,7 +11631,7 @@ pure function is_na_real_vec(x) result(out)
 real(kind=dp), intent(in) :: x(:) ! values to test
 logical, allocatable :: out(:)
 allocate(out(size(x)))
-out = .not. ieee_is_finite(x)
+out = (x /= x)
 end function is_na_real_vec
 
 pure elemental logical function is_na_int_scalar(x) result(out)
@@ -11333,9 +11663,9 @@ out = .false.
 end function is_na_logical_vec
 
 pure elemental logical function is_na_complex_scalar(x) result(out)
-! True when either complex component is non-finite in this subset.
+! True when either complex component is NA/NaN.
 complex(kind=dp), intent(in) :: x ! value to test
-out = (.not. ieee_is_finite(real(x, kind=dp))) .or. (.not. ieee_is_finite(aimag(x)))
+out = (real(x, kind=dp) /= real(x, kind=dp)) .or. (aimag(x) /= aimag(x))
 end function is_na_complex_scalar
 
 pure function is_na_complex_vec(x) result(out)
@@ -11343,7 +11673,7 @@ pure function is_na_complex_vec(x) result(out)
 complex(kind=dp), intent(in) :: x(:) ! values to test
 logical, allocatable :: out(:)
 allocate(out(size(x)))
-out = (.not. ieee_is_finite(real(x, kind=dp))) .or. (.not. ieee_is_finite(aimag(x)))
+out = (real(x, kind=dp) /= real(x, kind=dp)) .or. (aimag(x) /= aimag(x))
 end function is_na_complex_vec
 
 pure elemental logical function is_na_char_scalar(x) result(out)

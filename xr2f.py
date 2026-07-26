@@ -8702,6 +8702,11 @@ def _is_inline_temp_rhs(expr: str) -> bool:
     # Keep named constants/constructor candidates as explicit declarations.
     if _is_int_literal(t) or _is_real_literal(t) or t in {"TRUE", "FALSE"}:
         return False
+    # Keep complex-vector results materialized so a following print() can use the
+    # complex vector printer rather than inlining into a flat write.
+    c_t = parse_call_text(t)
+    if c_t is not None and c_t[0].lower() == "fft":
+        return False
     if t.startswith("c(") or (t.startswith("[") and t.endswith("]")):
         return False
     m_subset = re.match(r"^[A-Za-z]\w*\s*\[(.+)\]$", t)
@@ -10008,6 +10013,8 @@ def _simple_vector_constructor_array_kind(expr: str) -> str | None:
         return "character-array"
     if nm in {"numeric", "double", "rep", "rnorm", "runif"}:
         return "real-array"
+    if nm == "fft":
+        return "complex-array"
     return None
 
 
@@ -10031,6 +10038,7 @@ def _simple_vector_constructor_rank(expr: str) -> int | None:
         "seq_along",
         "ls",
         "armaacf",
+        "fft",
     }:
         return 1
     return None
@@ -10118,7 +10126,7 @@ def _infer_assignment_kind_hint(expr: str, inferred_kinds: dict[str, str]) -> st
             lit_kind = _literal_c_kind(expr)
             if lit_kind is not None:
                 return lit_kind
-        if nm in {"complex", "as.complex"}:
+        if nm in {"complex", "as.complex", "fft"}:
             return "complex"
         if nm in {"solve", "qr.solve", "qr_solve"}:
             if any(_infer_assignment_kind_hint(v, inferred_kinds) == "complex" for v in vals[:2]):
@@ -10752,7 +10760,7 @@ def _expr_mentions_known_complex(expr: str) -> bool:
 
 def _is_complex_expr_source(expr: str) -> bool:
     return _contains_r_complex_literal(expr) or _expr_mentions_known_complex(expr) or bool(
-        re.search(r"\b(?:complex|as\.complex|cmplx|conjg)\s*\(", expr, re.IGNORECASE)
+        re.search(r"\b(?:complex|as\.complex|cmplx|conjg|fft)\s*\(", expr, re.IGNORECASE)
     )
 
 
@@ -19614,7 +19622,7 @@ def emit_stmts(
                     if rr is not None:
                         return rr
                 return 1
-            if nm_c in {"dim", "rev", "rep.int"}:
+            if nm_c in {"dim", "rev", "rep.int", "fft"}:
                 return 1
             if nm_c == "head":
                 x_arg = None
@@ -30549,6 +30557,8 @@ def infer_main_complex_vars(stmts: list[object], known_matrices: set[str] | None
                 if _is_complex_matrix_arg(arg):
                     return False
                 return True
+            if nm == "fft":
+                return True
             if nm == "c":
                 vals = cinfo[1] + list(cinfo[2].values())
                 return any(_is_complex_expr_source(v.strip()) for v in vals)
@@ -38715,6 +38725,7 @@ def transpile_r_to_fortran(
         "urldecode",
         "nextn",
         "kronecker",
+        "fft",
         "ar_coef_names",
         "lag_names",
         "lower_tri",
