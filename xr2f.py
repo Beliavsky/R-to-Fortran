@@ -6446,7 +6446,7 @@ def classify_vars(
                         ints.add(st.name)
                     else:
                         ints.discard(st.name)
-                elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag|toeplitz|autocov_matrices|read\.csv)\s*\(", rhs, re.IGNORECASE) or re.match(r"^try\s*\(\s*(?:matrix|array|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag)\s*\(", rhs, re.IGNORECASE):
+                elif re.match(r"^(matrix|array|cbind|cbind2|rbind|outer|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|kronecker|diag|toeplitz|autocov_matrices|read\.csv)\s*\(", rhs, re.IGNORECASE) or re.match(r"^try\s*\(\s*(?:matrix|array|chol|forwardsolve|backsolve|sweep|crossprod|tcrossprod|t|r_matmul|diag)\s*\(", rhs, re.IGNORECASE):
                     real_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -7636,7 +7636,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
         if m_rank1_colon is not None:
             rank1_names.add(m_rank1_colon.group(1))
     pat_mat_rhs = re.compile(
-        rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|data\.frame)\s*\(",
+        rf"^\s*{nm}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|kronecker|data\.frame)\s*\(",
         re.IGNORECASE,
     )
     pat_mat_call_rhs = re.compile(
@@ -7663,7 +7663,7 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
     def _has_rank2_evidence(var: str) -> bool:
         v = re.escape(var)
         mat_rhs = re.compile(
-            rf"^\s*{v}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|data\.frame)\s*\(",
+            rf"^\s*{v}\s*<-\s*(matrix|array|cbind|cbind2|rbind|outer|kronecker|data\.frame)\s*\(",
             re.IGNORECASE,
         )
         mat_call_rhs = re.compile(
@@ -14083,6 +14083,11 @@ def r_expr_to_fortran(expr: str) -> str:
         if _mod_operand_is_integer_fortran_expr(lhs) and _mod_operand_is_integer_fortran_expr(rhs):
             return f"mod({_int_bound_expr(lhs)}, {_int_bound_expr(rhs)})"
         return f"mod(real({lhs}, kind=dp), real({rhs}, kind=dp))"
+    mm_kron = _split_top_level_token(s, "%x%", from_right=True)
+    if mm_kron is not None:
+        lhs_k = r_expr_to_fortran(mm_kron[0])
+        rhs_k = r_expr_to_fortran(mm_kron[1])
+        return f"kronecker(real({lhs_k}, kind=dp), real({rhs_k}, kind=dp))"
     mm = _split_top_level_token(s, "%*%", from_right=True)
     if mm is not None:
         lhs_src_full = fscan.strip_redundant_outer_parens_expr(mm[0].strip())
@@ -26806,7 +26811,7 @@ def emit_function(
             and _USER_FUNC_RETURN_RANK.get(fn.name.lower(), 0) > 0
         )
         or re.search(
-            r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul|factorial|lfactorial|beta|lbeta|choose|lchoose|gamma|lgamma|psigamma|digamma|trigamma)\s*\(",
+            r"\b(rowMeans|colMeans|rowSums|colSums|apply|rep|rep_len|numeric|integer|double|logical|seq|seq_len|seq_along|matrix|array|cbind|cbind2|outer|sweep|r_matmul|kronecker|factorial|lfactorial|beta|lbeta|choose|lchoose|gamma|lgamma|psigamma|digamma|trigamma)\s*\(",
             ret_expr_src,
             re.IGNORECASE,
         )
@@ -38630,6 +38635,9 @@ def transpile_r_to_fortran(
         "replace_first_fixed",
         "replace_all_fixed",
         "chartr",
+        "urldecode",
+        "nextn",
+        "kronecker",
         "ar_coef_names",
         "lag_names",
         "lower_tri",
