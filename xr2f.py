@@ -11980,6 +11980,10 @@ def r_expr_to_fortran(expr: str) -> str:
             return "sys_date_string()"
         if sys_nm0 in {"sys.timezone", "sys_timezone"}:
             return "sys_timezone()"
+        if sys_nm0 == "nextn":
+            arg_nn = c_sys0[1][0].strip() if c_sys0[1] else c_sys0[2].get("n", "").strip()
+            if arg_nn:
+                return f"nextn(int({r_expr_to_fortran(arg_nn)}))"
         if sys_nm0 in {"sys.getenv", "sys_getenv"}:
             arg_ge = c_sys0[1][0].strip() if c_sys0[1] else c_sys0[2].get("x", "").strip()
             if not arg_ge:
@@ -15935,6 +15939,47 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"int_to_string({_int_bound_expr(p_f)})"
             if _is_real_literal(p) or simple in _KNOWN_VECTOR_NAMES or call_kind == "real":
                 return f"real_to_string_g(real({p_f}, kind=dp), 6)"
+            # Indexed known vectors: x[i] keeps the base vector's kind.
+            m_idx_p = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\[.+\]$", p, re.DOTALL)
+            if m_idx_p is not None:
+                base_p = _sanitize_r_var_name(m_idx_p.group(1)).lower()
+                if base_p in _KNOWN_CHAR_VECTOR_NAMES:
+                    return p_f
+                if base_p in (_KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES):
+                    return f"int_to_string({_int_bound_expr(p_f)})"
+                if base_p in _KNOWN_VECTOR_NAMES:
+                    return f"real_to_string_g({p_f}, 15)"
+            # Arithmetic over provably-numeric atoms: coerce like R's as.character.
+            if '"' not in p and "'" not in p and re.search(r"[+\-*/^]", p):
+                # Integer-returning calls neutralize their arguments so a real
+                # vector inside length()/nchar() doesn't make the whole
+                # expression look real, e.g. length(phi)-1 stays integer.
+                masked_p = re.sub(
+                    r"\b(?:length|nchar|nrow|ncol)\s*\([^()]*\)", "0", p, flags=re.IGNORECASE
+                )
+                ids_p = set(re.findall(r"[A-Za-z][\w.]*", masked_p))
+                real_funcs_p = {
+                    "sqrt", "abs", "sum", "prod", "mean", "exp", "log", "log2",
+                    "log10", "sin", "cos", "tan", "min", "max",
+                }
+                numeric_names_p = (
+                    _KNOWN_INT_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_SCALAR_NAMES
+                    | _CURRENT_INT_ARRAY_NAMES | _KNOWN_VECTOR_NAMES
+                )
+                if all(
+                    i.lower() in real_funcs_p
+                    or _sanitize_r_var_name(i).lower() in numeric_names_p
+                    for i in ids_p
+                ):
+                    real_sign_p = (
+                        "." in masked_p
+                        or "/" in masked_p
+                        or any(i.lower() in (real_funcs_p - {"sum", "min", "max", "abs"}) for i in ids_p)
+                        or any(_sanitize_r_var_name(i).lower() in _KNOWN_VECTOR_NAMES for i in ids_p)
+                    )
+                    if real_sign_p:
+                        return f"real_to_string_g(real({p_f}, kind=dp), 15)"
+                    return f"int_to_string({_int_bound_expr(p_f)})"
             return p_f
 
         vals: list[str] = [_paste_operand_char(p) for p in pos_p]
@@ -16090,6 +16135,15 @@ def r_expr_to_fortran(expr: str) -> str:
             lo_pow = _int_bound_expr(r_expr_to_fortran(seq_pow[0].strip()))
             hi_pow = _int_bound_expr(r_expr_to_fortran(seq_pow[1].strip()))
             return f"{lhs_pow}**r_seq_int({lo_pow}, {hi_pow})"
+        if (
+            re.fullmatch(r"-\s*\d+(?:\.\d+)?[Ll]?", rhs_pow_src.strip()) is not None
+            and "." not in lhs_pow
+            and "_dp" not in lhs_pow
+            and "real(" not in lhs_pow.lower()
+        ):
+            # R's ^ with a negative exponent is always fractional; an integer
+            # Fortran base would truncate to 0, so force a real base.
+            lhs_pow = f"real({lhs_pow}, kind=dp)"
         return f"{lhs_pow}**({r_expr_to_fortran(rhs_pow_src)})"
     s = s.replace("^", "**")
     # ifelse(a,b,c) -> merge(b,c,a), recursively lowering the condition so
