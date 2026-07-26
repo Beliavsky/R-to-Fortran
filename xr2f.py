@@ -4310,12 +4310,17 @@ def _parse_switch_positional_block(case_src: str) -> list[object] | None:
     return body
 
 
-def _lower_value_switch_to_if(selector_src: str, case_srcs: list[str]) -> object | None:
-    """Lower a value-returning character ``switch(sel, "a"=v1, "b"=v2, def)`` with
-    brace-less expression branches into an if/else-if chain of expression
-    statements. This lets the tail-value machinery assign each branch to the
-    result and — because the selector is compared to string literals — lets the
-    inference type ``sel`` as character."""
+def _lower_value_switch_to_if(selector_src: str, case_srcs: list[str], assign_target: str | None = None) -> object | None:
+    """Lower a character ``switch(sel, "a"=v1, "b"=v2, def)`` with brace-less
+    expression branches into an if/else-if chain. Because the selector is
+    compared to string literals, the inference types ``sel`` as character.
+
+    With ``assign_target`` each branch assigns the value to that variable
+    (assignment context); otherwise each branch is a bare expression, letting
+    the tail-value machinery assign it to the function result."""
+    def _leaf(val: str) -> object:
+        return Assign(assign_target, val, "") if assign_target is not None else ExprStmt(val)
+
     named: list[tuple[str, str]] = []
     default_expr: str | None = None
     for cs in case_srcs:
@@ -4330,12 +4335,12 @@ def _lower_value_switch_to_if(selector_src: str, case_srcs: list[str]) -> object
         return None  # empty branch = R fall-through, not handled here
     if default_expr is not None:
         guarded = named
-        else_body: list[object] = [ExprStmt(default_expr)]
+        else_body: list[object] = [_leaf(default_expr)]
     else:
         guarded = named[:-1]
-        else_body = [ExprStmt(named[-1][1])]
+        else_body = [_leaf(named[-1][1])]
     for label, val in reversed(guarded):
-        else_body = [IfStmt(f"{selector_src} == {label}", [ExprStmt(val)], else_body)]
+        else_body = [IfStmt(f"{selector_src} == {label}", [_leaf(val)], else_body)]
     return else_body[0]
 
 
@@ -4378,6 +4383,13 @@ def _lower_switch_assign_stmt(st: Assign) -> object:
         return st
     selector_src = ordered[0].strip()
     branches = ordered[1:]
+    # A character switch with quoted string labels (and possibly vector-valued
+    # branches) lowers to an if/else-if chain assigning to st.name; this also
+    # types the selector as character.
+    if any(re.match(r'^\s*"', b) for b in branches):
+        value_if = _lower_value_switch_to_if(selector_src, branches, assign_target=st.name)
+        if value_if is not None:
+            return value_if
     parsed: list[tuple[str | None, str]] = []
     for b in branches:
         mb = re.match(r"^([A-Za-z.][\w.]*)\s*=(?!=)(.*)$", b.strip(), re.DOTALL)
