@@ -1564,7 +1564,7 @@ def _custom_infix_function_name(op: str) -> str:
 
 def _parse_function_assign_head(line: str) -> tuple[str, str, str] | None:
     s = line.strip()
-    m_op = re.match(r"""^["'](%[^"']+%)["']\s*(?:<-|=)\s*function\s*\(""", s)
+    m_op = re.match(r"""^["'`](%[^"'`]+%)["'`]\s*(?:<-|=)\s*function\s*\(""", s)
     if m_op:
         raw_op = m_op.group(1)
         fname = _custom_infix_function_name(raw_op)
@@ -27059,6 +27059,13 @@ def emit_function(
     arg_local_decl_lines: list[str] = []
     arg_local_init_lines: list[str] = []
     fn_char_scalars = infer_function_character_scalars(fn)
+    # Fold in arguments the caller-side inference already typed as character
+    # (e.g. a custom-infix operator invoked with string-literal operands), which
+    # a body-only scan of a generic wrapper like paste0(x1, x2) can't see.
+    _caller_arg_kinds = _USER_FUNC_ARG_KIND.get(fn.name.lower(), [])
+    for _ai, _ak in enumerate(_caller_arg_kinds):
+        if _ak == "character" and _ai < len(fn.args):
+            fn_char_scalars.add(fn.args[_ai])
     fn_char_arrays = infer_function_character_array_names(fn, fn_char_scalars)
     fn_char_array_lowers = {x.lower() for x in fn_char_arrays}
     for st_char_loop in fn.body:
@@ -34119,10 +34126,29 @@ def transpile_r_to_fortran(
             i_call_walk = close_idx + 1
         return out_call_walk
 
+    def _register_infix_string_operands(expr_infix: str) -> None:
+        # `lhs %op% rhs` with a string-literal operand types the corresponding
+        # argument of the custom-infix operator's function as character.
+        split_inf = _split_known_custom_infix_expr(expr_infix.strip())
+        if split_inf is None:
+            return
+        op_inf, lhs_inf, rhs_inf = split_inf
+        fname_inf = _CUSTOM_INFIX_OPS.get(op_inf) or _CUSTOM_INFIX_OPS.get(op_inf.lower())
+        fn_def_inf = _FUNC_DEFS_BY_NAME.get(fname_inf.lower()) if fname_inf else None
+        if fn_def_inf is not None and len(fn_def_inf.args) >= 2:
+            out_args_inf = fn_char_args_from_calls.setdefault(fname_inf.lower(), set())
+            if _dequote_string_literal(lhs_inf.strip()) is not None:
+                out_args_inf.add(fn_def_inf.args[0])
+            if _dequote_string_literal(rhs_inf.strip()) is not None:
+                out_args_inf.add(fn_def_inf.args[1])
+        _register_infix_string_operands(lhs_inf)
+        _register_infix_string_operands(rhs_inf)
+
     def _register_user_calls_in_expr(expr_user_call: str) -> None:
         for call_src_user in _iter_call_texts_in_expr(expr_user_call):
             _register_string_literal_user_call(call_src_user)
             _register_complex_actual_user_call(call_src_user)
+        _register_infix_string_operands(expr_user_call)
 
     def _walk_register_string_literal_user_calls(ss_user_call: list[object]) -> None:
         for st_user_call in ss_user_call:
