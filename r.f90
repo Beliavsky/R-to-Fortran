@@ -52,7 +52,8 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
 public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char, date_to_char_vec, &
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
-   & sys_timezone, sys_time_format, sys_sleep, proc_time_vec
+   & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
+   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive
 public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
@@ -2537,6 +2538,112 @@ real(kind=dp) :: out(5)
 out = 0.0_dp
 out(3) = r_elapsed()
 end function proc_time_vec
+
+function sys_getenv(name) result(out)
+! R-like Sys.getenv: value of an environment variable ("" when unset).
+character(len=*), intent(in) :: name
+character(len=:), allocatable :: out
+integer :: len_env, stat_env
+call get_environment_variable(name, length=len_env, status=stat_env)
+if (stat_env /= 0 .or. len_env <= 0) then
+   out = ""
+   return
+end if
+allocate(character(len=len_env) :: out)
+call get_environment_variable(name, value=out)
+end function sys_getenv
+
+function file_rename(from, to) result(ok)
+! R-like file.rename via copy-and-delete; returns .true. on success.
+character(len=*), intent(in) :: from, to
+logical :: ok
+integer :: u_in, u_out, ios
+integer(kind=int64) :: nbytes, i
+character(len=1) :: byte
+ok = .false.
+open(newunit=u_in, file=from, access="stream", form="unformatted", &
+   & status="old", action="read", iostat=ios)
+if (ios /= 0) return
+inquire(unit=u_in, size=nbytes)
+open(newunit=u_out, file=to, access="stream", form="unformatted", &
+   & status="replace", action="write", iostat=ios)
+if (ios /= 0) then
+   close(u_in)
+   return
+end if
+do i = 1, nbytes
+   read(u_in, iostat=ios) byte
+   if (ios /= 0) exit
+   write(u_out) byte
+end do
+close(u_out)
+close(u_in, status="delete")
+ok = .true.
+end function file_rename
+
+function unlink_recursive(path) result(out)
+! R-like unlink(path, recursive=TRUE): delete a file or directory tree.
+! Returns 0 on success, 1 on failure (R convention).
+character(len=*), intent(in) :: path
+integer :: out
+integer :: stat
+if (file_exists(path)) then
+   if (file_remove(path)) then
+      out = 0
+   else
+      out = 1
+   end if
+   return
+end if
+if (is_windows_path_env()) then
+   call execute_command_line('cmd /c rmdir /s /q "' // trim(path) // '" >nul 2>nul', &
+      & wait=.true., exitstat=stat)
+else
+   call execute_command_line('rm -rf "' // trim(path) // '" >/dev/null 2>&1', &
+      & wait=.true., exitstat=stat)
+end if
+out = merge(0, 1, stat == 0)
+end function unlink_recursive
+
+function as_octmode(x) result(out)
+! R-like as.octmode: integer rendered as octal digits.
+integer, intent(in) :: x
+character(len=:), allocatable :: out
+character(len=32) :: buf
+write(buf, "(o0)") x
+out = trim(buf)
+end function as_octmode
+
+function as_hexmode(x) result(out)
+! R-like as.hexmode: integer rendered as lowercase hex digits.
+integer, intent(in) :: x
+character(len=:), allocatable :: out
+character(len=32) :: buf
+write(buf, "(z0)") x
+out = tolower(trim(buf))
+end function as_hexmode
+
+function as_roman(x) result(out)
+! R-like as.roman: Roman-numeral string for 1..3899.
+integer, intent(in) :: x
+character(len=:), allocatable :: out
+integer, parameter :: vals(13) = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+character(len=2), parameter :: syms(13) = ["M ", "CM", "D ", "CD", "C ", "XC", &
+   & "L ", "XL", "X ", "IX", "V ", "IV", "I "]
+integer :: n, k
+if (x < 1 .or. x > 3899) then
+   out = "NA"
+   return
+end if
+n = x
+out = ""
+do k = 1, 13
+   do while (n >= vals(k))
+      out = out // trim(syms(k))
+      n = n - vals(k)
+   end do
+end do
+end function as_roman
 
 subroutine sys_sleep(seconds)
 ! Busy-wait sleep for Tier-1 Sys.sleep support.

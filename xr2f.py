@@ -2758,6 +2758,14 @@ def _expr_returns_character(expr: str) -> bool:
         "colnames",
         "rownames",
         "names",
+        "sys.getenv",
+        "sys_getenv",
+        "as.octmode",
+        "as_octmode",
+        "as.hexmode",
+        "as_hexmode",
+        "as.roman",
+        "as_roman",
     }
 
 
@@ -11825,6 +11833,11 @@ def r_expr_to_fortran(expr: str) -> str:
     global _R_SD_CALL_NAME, _COMMAND_ARGS_FILE_ARG
     s = expr.strip()
     s = _lower_inttobits_index(s)
+    if "as.roman" in s:
+        # R arithmetic on roman objects stays roman: as.roman(x) + n -> as.roman(x + n)
+        m_rom = re.match(r"^\s*as\.roman\s*\(([^()]*)\)\s*([+\-])\s*(\d+)\s*$", s)
+        if m_rom is not None:
+            s = f"as.roman(({m_rom.group(1)}) {m_rom.group(2)} {m_rom.group(3)})"
     s = _collapse_strsplit_first_index(s)
     s = fscan.strip_redundant_outer_parens_expr(s)
     try_primary = _trycatch_primary_expr(s)
@@ -11967,6 +11980,37 @@ def r_expr_to_fortran(expr: str) -> str:
             return "sys_date_string()"
         if sys_nm0 in {"sys.timezone", "sys_timezone"}:
             return "sys_timezone()"
+        if sys_nm0 in {"sys.getenv", "sys_getenv"}:
+            arg_ge = c_sys0[1][0].strip() if c_sys0[1] else c_sys0[2].get("x", "").strip()
+            if not arg_ge:
+                raise NotImplementedError("Sys.getenv() without a variable name is not supported")
+            return f"sys_getenv({r_expr_to_fortran(arg_ge)})"
+        if sys_nm0 in {"as.octmode", "as_octmode", "as.hexmode", "as_hexmode", "as.roman", "as_roman"}:
+            arg_om = c_sys0[1][0].strip() if c_sys0[1] else c_sys0[2].get("x", "").strip()
+            fn_om = sys_nm0.replace(".", "_")
+            base_om = 16 if "hexmode" in fn_om else 8 if "octmode" in fn_om else 10
+
+            def _mode_arg_const(txt: str) -> int | None:
+                lit_om = _dequote_string_literal(txt.strip())
+                if lit_om is not None:
+                    try:
+                        return int(lit_om, 16) if lit_om.lower().startswith("0x") else int(float(lit_om)) if base_om == 10 else int(lit_om, base_om)
+                    except ValueError:
+                        return None
+                c_in_om = parse_call_text(txt.strip())
+                if c_in_om is not None and c_in_om[0].lower() in {"as.numeric", "as.integer", "as.double"} and c_in_om[1]:
+                    lit_in = _dequote_string_literal(c_in_om[1][0].strip())
+                    if lit_in is not None:
+                        try:
+                            return int(lit_in, 16) if lit_in.lower().startswith("0x") else int(float(lit_in))
+                        except ValueError:
+                            return None
+                return None
+
+            const_om = _mode_arg_const(arg_om)
+            if const_om is not None:
+                return f"{fn_om}({const_om})"
+            return f"{fn_om}(int({r_expr_to_fortran(arg_om)}))"
         if sys_nm0 == "proc.time":
             return "proc_time_vec()"
         if sys_nm0 == "class":
@@ -13517,6 +13561,14 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_fe0, pos_fe0, kw_fe0 = c_file_exists0
         path_src = pos_fe0[0] if pos_fe0 else kw_fe0.get("x", kw_fe0.get("file", ""))
         return f"file_exists({r_expr_to_fortran(path_src)})"
+    c_file_rename0 = parse_call_text(s)
+    if c_file_rename0 is not None and c_file_rename0[0].lower() in {"file.rename", "file_rename"}:
+        _nm_fr0, pos_fr0, kw_fr0 = c_file_rename0
+        from_src = pos_fr0[0] if len(pos_fr0) >= 1 else kw_fr0.get("from", "")
+        to_src = pos_fr0[1] if len(pos_fr0) >= 2 else kw_fr0.get("to", "")
+        if not from_src or not to_src:
+            raise NotImplementedError("file.rename requires from and to arguments")
+        return f"file_rename({r_expr_to_fortran(from_src)}, {r_expr_to_fortran(to_src)})"
     c_dir_exists0 = parse_call_text(s)
     if c_dir_exists0 is not None and c_dir_exists0[0].lower() in {"dir.exists", "dir_exists"}:
         _nm_de0, pos_de0, kw_de0 = c_dir_exists0
@@ -13532,6 +13584,14 @@ def r_expr_to_fortran(expr: str) -> str:
         _nm_fr0, pos_fr0, kw_fr0 = c_file_remove0
         path_src = pos_fr0[0] if pos_fr0 else kw_fr0.get("file", kw_fr0.get("files", ""))
         return f"file_remove({r_expr_to_fortran(path_src)})"
+    c_unlink0 = parse_call_text(s)
+    if c_unlink0 is not None and c_unlink0[0].lower() == "unlink":
+        _nm_ul0, pos_ul0, kw_ul0 = c_unlink0
+        path_src = pos_ul0[0] if pos_ul0 else kw_ul0.get("x", "")
+        rec_src = kw_ul0.get("recursive", "").strip().lower()
+        if rec_src in {"true", "t", ".true."} or (len(pos_ul0) >= 2 and pos_ul0[1].strip().lower() in {"true", "t"}):
+            return f"unlink_recursive({r_expr_to_fortran(path_src)})"
+        return f"merge(0, 1, file_remove({r_expr_to_fortran(path_src)}))"
     c_file_info0 = parse_call_text(s)
     if c_file_info0 is not None and c_file_info0[0].lower() in {"file.info", "file_info"}:
         _nm_fi0, pos_fi0, kw_fi0 = c_file_info0
@@ -25077,6 +25137,15 @@ def emit_stmts(
                 o.pop()
                 o.w("end block")
                 continue
+            if c_expr_print is not None and c_expr_print[0].lower() == "unlink":
+                # R's unlink returns its status invisibly: discard, print nothing
+                o.w("block")
+                o.push()
+                o.w("integer :: xr2f_unlink_stat")
+                _wstmt(f"xr2f_unlink_stat = {r_expr_to_fortran(expr_print_src)}", st.comment)
+                o.pop()
+                o.w("end block")
+                continue
             if re.fullmatch(r"[A-Za-z]\w*", expr_print_src) and expr_print_src in rle_vars_ctx:
                 _wstmt(f"call print_rle({expr_print_src})", st.comment)
                 need_r_mod.update({"print_rle", rle_vars_ctx[expr_print_src]})
@@ -33015,6 +33084,58 @@ def _normalize_r_bare_logical_abbrevs(src: str) -> str:
 _LETTERS_CONST_NAMES = {"letters": "xr_letters_lc", "LETTERS": "xr_letters_uc"}
 
 
+def _normalize_r_hex_literals(src: str) -> str:
+    """Rewrite R hex literals (0x2d7, 0x2d7L, 0x1p2) to decimal equivalents,
+    outside string literals and comments, so Fortran never sees C-style hex."""
+    if not re.search(r"0[xX][0-9A-Fa-f]", src):
+        return src
+    hex_re = re.compile(
+        r"(?<![\w.])0[xX]([0-9A-Fa-f]+)(?:\.([0-9A-Fa-f]*))?(?:[pP]([+-]?\d+))?(L?)(?![\w.])"
+    )
+    out_lines: list[str] = []
+    for raw in src.splitlines():
+        code, cmt = split_r_code_comment(raw)
+        res: list[str] = []
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch in "\"'":
+                j = i + 1
+                while j < n:
+                    if code[j] == "\\":
+                        j += 2
+                        continue
+                    if code[j] == ch:
+                        j += 1
+                        break
+                    j += 1
+                res.append(code[i:j])
+                i = j
+                continue
+            m = hex_re.match(code, i)
+            if m is not None:
+                val = float(int(m.group(1), 16))
+                if m.group(2):
+                    val += int(m.group(2), 16) / (16.0 ** len(m.group(2)))
+                if m.group(3) is not None:
+                    val *= 2.0 ** int(m.group(3))
+                if m.group(3) is not None or (m.group(2) or "") != "" or not val.is_integer():
+                    rep = repr(val)
+                elif abs(val) <= 2147483647:
+                    rep = str(int(val)) + m.group(4)
+                else:
+                    rep = repr(val)
+                res.append(rep)
+                i = m.end()
+                continue
+            res.append(ch)
+            i += 1
+        new_code = "".join(res)
+        out_lines.append(new_code + "#" + cmt if len(code) < len(raw) else new_code)
+    return "\n".join(out_lines) + ("\n" if src.endswith("\n") else "")
+
+
 def _normalize_r_builtin_char_constants(src: str) -> str:
     """Rename R's built-in alphabet constants ``letters``/``LETTERS`` to
     case-distinct identifiers so they can be emitted as Fortran parameters
@@ -33225,6 +33346,7 @@ def transpile_r_to_fortran(
     validate_unsupported_runtime_semantics_source(src)
     _COMMAND_ARGS_FILE_ARG = source_path
     src = _normalize_r_bare_logical_abbrevs(src)
+    src = _normalize_r_hex_literals(src)
     src = _normalize_r_builtin_char_constants(src)
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
@@ -39010,6 +39132,12 @@ def transpile_r_to_fortran(
         "sys_time_format",
         "sys_sleep",
         "proc_time_vec",
+        "sys_getenv",
+        "file_rename",
+        "as_octmode",
+        "as_hexmode",
+        "as_roman",
+        "unlink_recursive",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
@@ -60376,6 +60504,102 @@ def _write_llm_bundle(
     print(f"wrote {prompt_path}")
 
 
+_R_LEAK_CALL_MESSAGES = {
+    "sapply": "sapply() with a function argument that cannot be translated",
+    "lapply": "lapply() with a function argument that cannot be translated",
+    "vapply": "vapply() with a function argument that cannot be translated",
+    "mapply": "mapply() with a function argument that cannot be translated",
+    "tapply": "tapply() with a function argument that cannot be translated",
+    "rapply": "rapply() with a function argument that cannot be translated",
+    "apply": "apply() with a function argument that cannot be translated",
+    "reduce": "the higher-order function Reduce()",
+    "filter": "the higher-order function Filter()",
+    "map": "the higher-order function Map()",
+    "position": "the higher-order function Position()",
+    "find": "the higher-order function Find()",
+    "trycatch": "tryCatch() in this form",
+    "structure": "S3 objects built with structure()",
+    "list": "R list() values in this context",
+    "unlist": "unlist() of a general list in this context",
+    "with": "with() data environments",
+    "environment": "R environments",
+    "eval": "R metaprogramming (eval)",
+    "parse": "R metaprogramming (parse)",
+    "deparse": "R metaprogramming (deparse)",
+    "substitute": "R metaprogramming (substitute)",
+    "quote": "R metaprogramming (quote)",
+    "bquote": "R metaprogramming (bquote)",
+    "gregexpr": "gregexpr() regular-expression match data",
+    "regmatches": "regmatches() regular-expression match data",
+    "stem": "stem() text plots",
+    "file": "R file connections (file())",
+    "url": "R url connections (url())",
+    "readchar": "readChar()",
+    "readbin": "readBin()",
+    "writebin": "writeBin()",
+    "poly": "poly() model terms",
+    "lsfit": "lsfit() least-squares objects",
+    "grep": "grep() in this form",
+    "writelines": "writeLines() in this form",
+}
+
+
+def _check_untranslated_r_leaks(f90: str) -> None:
+    """Detect known-untranslatable R constructs that leaked into the generated
+    Fortran and raise NotImplementedError naming the R feature, instead of
+    letting gfortran fail with a cryptic message."""
+    joined = re.sub(r"&\s*\n\s*&?", " ", f90)
+    defined: set[str] = set()
+    for m in re.finditer(
+        r"(?im)^[^!\n]*?\b(?:function|subroutine)\s+([A-Za-z]\w*)", joined
+    ):
+        defined.add(m.group(1).lower())
+    for m in re.finditer(r"(?im)^\s*use\b[^!\n]*only\s*:\s*([^!\n]+)", joined):
+        for nm in re.findall(r"[A-Za-z]\w*", m.group(1)):
+            defined.add(nm.lower())
+    for m in re.finditer(r"(?im)^[^!\n]*::\s*([^!\n]+)$", joined):
+        tail = m.group(1)
+        for _ in range(6):
+            tail = re.sub(r"\([^()]*\)", "", tail)
+        tail = re.sub(r"=[^,]*", "", tail)
+        for nm in re.findall(r"[A-Za-z]\w*", tail):
+            defined.add(nm.lower())
+    op_words = {
+        "and", "or", "not", "eqv", "neqv", "true", "false",
+        "lt", "le", "gt", "ge", "eq", "ne",
+    }
+    for ln in joined.splitlines():
+        if ln.lstrip().startswith("!"):
+            continue
+        nostr = re.sub(r'"[^"]*"', '""', ln)
+        nostr = re.sub(r"'[^']*'", "''", nostr)
+        nostr = nostr.split("!", 1)[0]
+        for m in re.finditer(r"(?<![\w.%])([A-Za-z]\w*)\s*\(", nostr):
+            nm = m.group(1).lower()
+            msg = _R_LEAK_CALL_MESSAGES.get(nm)
+            if msg is not None and nm not in defined:
+                raise NotImplementedError(f"unsupported R feature: {msg}")
+        for m in re.finditer(r"(?<![\w.])([A-Za-z]\w*(?:\.[A-Za-z]\w*)+)", nostr):
+            parts = {p.lower() for p in m.group(1).split(".")}
+            if parts & op_words:
+                continue
+            raise NotImplementedError(
+                f"unsupported R feature: the builtin '{m.group(1)}' is not translated"
+            )
+        if re.search(r"(?<![\w.])function\s*\(", nostr, re.IGNORECASE):
+            raise NotImplementedError(
+                "unsupported R feature: anonymous functions (closures) used as values"
+            )
+        if re.search(r"[\w)\]]\s*\[\[", nostr):
+            raise NotImplementedError(
+                "unsupported R feature: list indexing x[[i]] in this context"
+            )
+        if re.search(r"\)\[", nostr):
+            raise NotImplementedError(
+                "unsupported R feature: subscripting a function-call result in this context"
+            )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial R-to-Fortran transpiler")
     ap.add_argument("input_r", help="input .R/.r source file")
@@ -62715,6 +62939,11 @@ def main() -> int:
     # Final safety check after all late rewrites that can introduce I/O/calls.
     f90 = remove_pure_from_impure_call_graph_text(f90)
     f90 = validate_no_expression_component_refs_text(f90)
+    try:
+        _check_untranslated_r_leaks(f90)
+    except NotImplementedError as e:
+        print(f"Transpile: FAIL ({e})")
+        return 1
     final_f90_for_report = f90
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
