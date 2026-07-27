@@ -62,6 +62,15 @@ _INTEGRATE_OBJECTIVE_NAMES: set[str] = set()
 _R_EXPRESSION_OBJECTS: dict[str, str] = {}
 _R_DERIVATIVE_OBJECTS: dict[str, str] = {}
 _CUSTOM_INFIX_OPS: dict[str, str] = {}
+
+# Single-argument elemental math functions that map to a same-named Fortran
+# intrinsic requiring a real/complex argument. When the argument is an integer
+# arithmetic expression it must be real-coerced (R's `/` is real, and sqrt/atan
+# reject integers). Excludes log2/log1p/expm1 which get their own lowering.
+_ELEMENTAL_MATH_1ARG: frozenset[str] = frozenset({
+    "acos", "asin", "atan", "cos", "cosh", "exp",
+    "log", "log10", "sin", "sinh", "sqrt", "tan", "tanh",
+})
 _KNOWN_VECTOR_NAMES: set[str] = set()
 _KNOWN_NA_VECTOR_NAMES: set[str] = set()
 _KNOWN_INT_NAMES: set[str] = set()
@@ -11901,6 +11910,30 @@ def r_expr_to_fortran(expr: str) -> str:
             xo = r_expr_to_fortran(c_outer_expr[1][0].strip())
             yo = r_expr_to_fortran(c_outer_expr[1][1].strip())
             return f"{_outer_variant}(real({xo}, kind=dp), real({yo}, kind=dp))"
+    # Single-argument elemental math functions: R's `/` is always real and
+    # `sqrt`/`atan`/... require a real/complex argument, but a passthrough emit
+    # keeps e.g. `atan(1/5)` with an integer argument. Re-translate an
+    # arithmetic argument so its operands get real-coerced.
+    c_math1 = parse_call_text(s)
+    if (
+        c_math1 is not None
+        and c_math1[0].lower() in _ELEMENTAL_MATH_1ARG
+        and len(c_math1[1]) == 1
+        and not c_math1[2]
+    ):
+        arg_math1 = c_math1[1][0].strip()
+        if (
+            any(
+                _split_top_level_token(arg_math1, op, from_right=True) is not None
+                for op in ("/", "+", "-", "*", "^")
+            )
+            and _expr_kind_simple(arg_math1) == "int"
+        ):
+            # Integer arithmetic argument to sqrt/atan/... : real-coerce it so
+            # the intrinsic gets a real argument (R's `/` is real too). Real
+            # arguments fall through to the normal path (which handles any
+            # name shadowing such as a local variable named `log`).
+            return f"{c_math1[0].lower()}(real({r_expr_to_fortran(arg_math1)}, kind=dp))"
     try_primary = _trycatch_primary_expr(s)
     if try_primary is not None:
         return r_expr_to_fortran(try_primary)
