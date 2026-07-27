@@ -8005,6 +8005,32 @@ def _infer_local_array_rank(stmts: list[object], name: str) -> int:
                 for side in (mm[0].strip(), mm[1].strip()):
                     if re.match(r"^[A-Za-z]\w*$", side) and _has_rank2_evidence(side):
                         return 2
+
+    # Scalar accumulator: initialized to a scalar literal and only reassigned
+    # self-referential scalar-rank expressions (e.g. s <- 0; s <- s + x[i]*y[i]).
+    # Without this, the default below would over-promote such a local to rank 1.
+    rank1_hint_map = {nm_r1: 1 for nm_r1 in rank1_names}
+    acc_init_scalar = False
+    acc_reassigns: list[str] = []
+    for t_acc in texts:
+        m_acc = re.match(rf"^\s*{nm}\s*<-\s*(.+?)\s*$", t_acc, re.IGNORECASE)
+        if m_acc is None:
+            continue
+        rhs_acc = m_acc.group(1).strip()
+        if _is_int_literal(rhs_acc) or _is_real_literal(rhs_acc):
+            acc_init_scalar = True
+        else:
+            acc_reassigns.append(rhs_acc)
+    if (
+        acc_init_scalar
+        and acc_reassigns
+        and all(
+            re.search(rf"(?<![A-Za-z0-9_]){nm}(?![A-Za-z0-9_])", ra, re.IGNORECASE)
+            and _infer_assignment_rank_hint(ra, rank1_hint_map) == 0
+            for ra in acc_reassigns
+        )
+    ):
+        return 0
     return 1
 
 
