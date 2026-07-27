@@ -140,6 +140,10 @@ interface hist
    module procedure hist_breaks_real
 end interface hist
 
+interface r_seq_int
+   module procedure r_seq_int_ii, r_seq_int_ir, r_seq_int_ri, r_seq_int_rr
+end interface r_seq_int
+
 interface file_info
    module procedure file_info_scalar
    module procedure file_info_vector
@@ -6560,7 +6564,7 @@ do j = 1, 6
 end do
 end subroutine print_summary_mat
 
-pure function r_seq_int(a, b) result(out)
+pure function r_seq_int_ii(a, b) result(out)
 ! Return integer sequence a, a+step, ..., b with step +/-1.
 integer, intent(in) :: a, b
 integer, allocatable :: out(:)
@@ -6571,7 +6575,30 @@ step = merge(1, -1, a <= b)
 do i = 1, n
    out(i) = a + (i - 1) * step
 end do
-end function r_seq_int
+end function r_seq_int_ii
+
+pure function r_seq_int_ir(a, b) result(out)
+! r_seq_int with a real upper bound (R's `:` accepts numeric operands).
+integer, intent(in) :: a
+real(kind=dp), intent(in) :: b
+integer, allocatable :: out(:)
+out = r_seq_int_ii(a, nint(b))
+end function r_seq_int_ir
+
+pure function r_seq_int_ri(a, b) result(out)
+! r_seq_int with a real lower bound.
+real(kind=dp), intent(in) :: a
+integer, intent(in) :: b
+integer, allocatable :: out(:)
+out = r_seq_int_ii(nint(a), b)
+end function r_seq_int_ri
+
+pure function r_seq_int_rr(a, b) result(out)
+! r_seq_int with real bounds (e.g. to:from where to, from are numeric).
+real(kind=dp), intent(in) :: a, b
+integer, allocatable :: out(:)
+out = r_seq_int_ii(nint(a), nint(b))
+end function r_seq_int_rr
 
 pure function r_seq_len(n) result(out)
 ! Return integer sequence 1..n (empty for n<=0).
