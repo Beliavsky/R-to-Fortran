@@ -2769,6 +2769,49 @@ def _expr_returns_character(expr: str) -> bool:
     }
 
 
+def _paste_like_scalar_result(expr: str) -> bool:
+    """Conservative test that a character-returning call yields a *scalar*.
+
+    Used to distinguish `hl <- paste(a, "b")` (scalar) from
+    `v <- paste(vec, "b")` (vector), so only the former is declared as a
+    character scalar."""
+    t = expr.strip()
+    if _dequote_string_literal(t) is not None:
+        return True
+    c = parse_call_text(t)
+    if c is None:
+        return False
+    nm = c[0].lower()
+    kw = c[2]
+    if nm in {"paste", "paste0"} and any(k.lower() == "collapse" for k in kw):
+        return True
+
+    def _atom_is_vectorish(a: str) -> bool:
+        a = a.strip()
+        if _dequote_string_literal(a) is not None:
+            return False
+        al = a.lower()
+        if re.fullmatch(r"[A-Za-z]\w*", a):
+            return (
+                al in _KNOWN_CHAR_VECTOR_NAMES
+                or al in _KNOWN_VECTOR_NAMES
+                or al in _KNOWN_INT_VECTOR_NAMES
+                or al in _KNOWN_LOGICAL_VECTOR_NAMES
+            )
+        if _split_top_level_colon(a) is not None:
+            return True
+        ca = parse_call_text(a)
+        if ca is not None and ca[0].lower() in {
+            "c", "seq", "seq.int", "seq_len", "seq_along", "rep", "rep.int",
+            "sort", "unique", "rev", "strsplit",
+        }:
+            return True
+        return False
+
+    args = list(c[1]) + [v for k, v in kw.items() if k.lower() not in {"sep", "collapse"}]
+    return not any(_atom_is_vectorish(a) for a in args)
+
+
 def _character_array_literal_expr(labels: list[str]) -> str:
     if not labels:
         return "[character(len=1) :: ]"
@@ -29965,6 +30008,19 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                 if _dequote_string_literal(rhs) is not None:
                     out.add(st.name)
                     continue
+                # Copy of an already-known character scalar: str2 <- str1
+                if re.fullmatch(r"[A-Za-z]\w*", rhs) and rhs in out:
+                    out.add(st.name)
+                    continue
+                # Scalar result of a character-returning call: hl <- paste(...).
+                # Guarded by char_arrays_seen so char *vectors* stay vectors.
+                if (
+                    st.name.lower() not in {x.lower() for x in char_arrays_seen}
+                    and _expr_returns_character(rhs)
+                    and _paste_like_scalar_result(rhs)
+                ):
+                    out.add(st.name)
+                    continue
                 c_rhs = parse_call_text(rhs)
                 if c_rhs is not None and c_rhs[0] == "Find":
                     x_src = c_rhs[1][1].strip() if len(c_rhs[1]) >= 2 else c_rhs[2].get("x", "").strip()
@@ -30033,7 +30089,10 @@ def infer_main_character_scalars(stmts: list[object]) -> set[str]:
                     walk(body)
                 walk(st.default_body)
 
-    walk(stmts)
+    prev = -1
+    while len(out) != prev:
+        prev = len(out)
+        walk(stmts)
     return out
 
 
