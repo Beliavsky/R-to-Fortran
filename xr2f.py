@@ -1006,6 +1006,32 @@ def remove_program_decls_for_public_module_vars_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rename_program_helper_collision_text(f90: str) -> str:
+    """Rename `program NAME` when NAME collides (case-insensitively) with a
+    name imported into the program scope (e.g. a script literally named after a
+    runtime helper such as `fivenum`). Fortran would otherwise reject the
+    same identifier used as both the program unit and an imported symbol."""
+    m_prog = re.search(r"(?im)^\s*program\s+([A-Za-z]\w*)\s*$", f90)
+    if m_prog is None:
+        return f90
+    prog = m_prog.group(1)
+    prog_l = prog.lower()
+    prog_body = f90[m_prog.end():]
+    imported: set[str] = set()
+    for m_use in re.finditer(r"(?im)^\s*use\b[^\n!]*?\bonly\s*:\s*([^\n!]+)", prog_body):
+        for nm in re.findall(r"[A-Za-z]\w*", m_use.group(1)):
+            if "=>" not in m_use.group(1) or nm not in {"dp", "real64", "int64"}:
+                imported.add(nm.lower())
+    if prog_l not in imported:
+        return f90
+    new_name = f"{prog}_prog"
+    while re.search(rf"(?im)\b{re.escape(new_name)}\b", f90):
+        new_name += "0"
+    f90 = re.sub(rf"(?im)^(\s*program\s+){re.escape(prog)}(\s*)$", rf"\g<1>{new_name}\g<2>", f90)
+    f90 = re.sub(rf"(?im)^(\s*end\s+program\s+){re.escape(prog)}(\s*)$", rf"\g<1>{new_name}\g<2>", f90)
+    return f90
+
+
 def _r_mod_needed_public_names(f90: str) -> set[str]:
     txt = re.sub(r"&\s*\n\s*&?", "", f90)
     out: set[str] = set()
@@ -19865,7 +19891,7 @@ def emit_stmts(
                     if rr is not None:
                         return rr
                 return 1
-            if nm_c in {"dim", "rev", "rep.int", "fft"}:
+            if nm_c in {"dim", "rev", "rep.int", "fft", "fivenum"}:
                 return 1
             if nm_c == "head":
                 x_arg = None
@@ -39386,6 +39412,7 @@ def transpile_r_to_fortran(
         "unlink_recursive",
         "inttobits",
         "str_to_real",
+        "fivenum",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
@@ -63184,6 +63211,7 @@ def main() -> int:
     f90 = rewrite_named_real_row_prints_text(f90)
     if "call print_named_real_row(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
+    f90 = rename_program_helper_collision_text(f90)
     # Final safety check after all late rewrites that can introduce I/O/calls.
     f90 = remove_pure_from_impure_call_graph_text(f90)
     f90 = validate_no_expression_component_refs_text(f90)

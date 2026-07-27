@@ -54,7 +54,7 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
-   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_real
+   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_real, fivenum
 public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
@@ -8091,6 +8091,25 @@ indices = combn_indices(size(x), m)
 allocate(character(len=len(x)) :: out(size(indices, 1), size(indices, 2)))
 out = reshape(x(reshape(indices, [size(indices)])), shape(indices))
 end function combn_char
+
+pure function fivenum(x) result(out)
+! R-like fivenum(): Tukey five-number summary
+! (minimum, lower hinge, median, upper hinge, maximum).
+real(kind=dp), intent(in) :: x(:)
+real(kind=dp) :: out(5)
+real(kind=dp), allocatable :: xs(:)
+real(kind=dp) :: n4, d(5), rn
+integer :: n, k
+n = size(x)
+xs = x
+call sort_increasing(xs)
+rn = real(n, kind=dp)
+n4 = floor((rn + 3.0_dp) / 2.0_dp) / 2.0_dp
+d = [1.0_dp, n4, (rn + 1.0_dp) / 2.0_dp, rn + 1.0_dp - n4, rn]
+do k = 1, 5
+   out(k) = 0.5_dp * (xs(floor(d(k))) + xs(ceiling(d(k))))
+end do
+end function fivenum
 
 pure subroutine sort_increasing(x)
 ! Sort a real vector in increasing order (insertion sort).
