@@ -2864,7 +2864,13 @@ def _expr_returns_character(expr: str) -> bool:
         "format",
         "as.character",
         "sub",
+        "gsub",
         "substr",
+        "substring",
+        "chartr",
+        "toupper",
+        "tolower",
+        "trimws",
         "getwd",
         "mode",
         "colnames",
@@ -2909,6 +2915,7 @@ def _paste_like_scalar_result(expr: str) -> bool:
                 or al in _KNOWN_VECTOR_NAMES
                 or al in _KNOWN_INT_VECTOR_NAMES
                 or al in _KNOWN_LOGICAL_VECTOR_NAMES
+                or al in {"letters", "letters", "xr_letters_lc", "xr_letters_uc"}
             )
         if _split_top_level_colon(a) is not None:
             return True
@@ -16223,6 +16230,37 @@ def r_expr_to_fortran(expr: str) -> str:
         out = vals[0]
         for v in vals[1:]:
             out = f"{out} // {sep_f} // {v}"
+        # collapse= joins the (element-wise) vector result into one string.
+        collapse_src = kw_p.get("collapse")
+
+        def _paste_operand_is_vector(p_v: str) -> bool:
+            pv = p_v.strip()
+            if _dequote_string_literal(pv) is not None:
+                return False
+            pvl = (
+                _sanitize_r_var_name(pv).lower()
+                if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", pv)
+                else ""
+            )
+            if pvl in (
+                _KNOWN_CHAR_VECTOR_NAMES | _KNOWN_VECTOR_NAMES
+                | _KNOWN_INT_VECTOR_NAMES | _KNOWN_LOGICAL_VECTOR_NAMES
+            ) or pvl in {"letters", "xr_letters_lc", "xr_letters_uc"}:
+                return True
+            if _split_top_level_colon(pv) is not None:
+                return True
+            cc_v = parse_call_text(pv)
+            return cc_v is not None and cc_v[0].lower() in {
+                "c", "seq", "seq_len", "seq_along", "rep", "rep.int",
+                "strsplit", "sort", "unique", "rev",
+            }
+
+        if (
+            collapse_src is not None
+            and collapse_src.strip().upper() not in {"NULL", "NA"}
+            and any(_paste_operand_is_vector(p) for p in pos_p)
+        ):
+            return f"char_join({out}, {r_expr_to_fortran(collapse_src.strip())})"
         return out
     # lm accessors / summary fields (subset)
     s = re.sub(r"\bsummary\s*\(\s*([A-Za-z]\w*)\s*\)\s*\$\s*r\.squared\b", r"\1%r_squared", s)
@@ -30555,6 +30593,18 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
 
         _ = _replace_balanced_func_calls(txt, "nchar", _collect)
 
+    def _mark_char_fn_args(txt: str) -> None:
+        # Arguments passed to these functions are character.
+        for fn_cc in ("chartr", "toupper", "tolower", "trimws", "casefold"):
+            def _collect_cc(inner: str, _fn=fn_cc) -> str:
+                c_cc = parse_call_text(f"{_fn}(" + inner + ")")
+                if c_cc is not None:
+                    for arg_cc in list(c_cc[1]) + list(c_cc[2].values()):
+                        _mark_char_arg(arg_cc)
+                return f"{_fn}(" + inner + ")"
+
+            _ = _replace_balanced_func_calls(txt, fn_cc, _collect_cc)
+
     def _scan(ss: list[object]) -> None:
         for st in ss:
             texts: list[str] = []
@@ -30624,6 +30674,7 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                             _mark_char_arg(actual_arg)
             for txt in texts:
                 _mark_nchar_arg_calls(txt)
+                _mark_char_fn_args(txt)
                 def _mark_path_args(inner: str) -> str:
                     parts = split_top_level_commas(inner)
                     c_path = parse_call_text("f(" + inner + ")")
