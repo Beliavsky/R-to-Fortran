@@ -53,7 +53,7 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
-   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive
+   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits
 public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
@@ -2580,6 +2580,16 @@ close(u_out)
 close(u_in, status="delete")
 ok = .true.
 end function file_rename
+
+pure function inttobits(n) result(out)
+! R-like intToBits(n): the 32 bits of n, least-significant first, as 0/1.
+integer, intent(in) :: n
+integer :: out(32)
+integer :: k
+do k = 1, 32
+   out(k) = iand(ishft(n, 1 - k), 1)
+end do
+end function inttobits
 
 function unlink_recursive(path) result(out)
 ! R-like unlink(path, recursive=TRUE): delete a file or directory tree.

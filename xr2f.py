@@ -25451,6 +25451,13 @@ def _expr_kind_simple(expr: str) -> str:
         return "logical"
     if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
         return "logical"
+    if _split_top_level_token(t, "%in%", from_right=True) is not None:
+        return "logical"
+    if any(_split_top_level_token(t, op, from_right=True) is not None for op in ["&", "|"]):
+        return "logical"
+    t_nolead = t[1:].lstrip() if (t.startswith("!") and not t.startswith("!=")) else None
+    if t_nolead is not None:
+        return "logical"
     for op in ["%*%", "^", "**", "*", "/", "+", "-"]:
         mm = _split_top_level_token(t, op, from_right=True)
         if mm is not None:
@@ -27250,10 +27257,19 @@ def emit_function(
         and fn.name.lower() not in _NLM_OBJECTIVE_NAMES
         and fn.name.lower() not in _INTEGRATE_OBJECTIVE_NAMES
     )
+    # A self-reference can appear either as a direct call `name(` or, for a
+    # custom infix operator, as the operator symbol itself (e.g. `%gcd%`).
+    self_op_syms = [
+        op for op, fname in _CUSTOM_INFIX_OPS.items()
+        if fname == fn.name and op.startswith("%")
+    ]
+    def _refs_self(txt: str) -> bool:
+        if re.search(rf"\b{re.escape(fn.name)}\s*\(", txt, re.IGNORECASE):
+            return True
+        return any(sym in txt for sym in self_op_syms)
     is_recursive = any(
-        re.search(rf"\b{re.escape(fn.name)}\s*\(", txt, re.IGNORECASE)
-        for txt in _collect_stmt_expr_texts(body_stmts)
-    ) or (isinstance(last, ExprStmt) and re.search(rf"\b{re.escape(fn.name)}\s*\(", last.expr, re.IGNORECASE) is not None)
+        _refs_self(txt) for txt in _collect_stmt_expr_texts(body_stmts)
+    ) or (isinstance(last, ExprStmt) and _refs_self(last.expr))
     if is_recursive:
         is_elemental = False
     pref_parts: list[str] = []
@@ -29498,6 +29514,34 @@ def infer_function_logical_scalar_arg_names(fn: FuncDef) -> set[str]:
         if canon is not None:
             out.add(canon)
 
+    def _logical_operands(expr: str) -> list[str]:
+        for op in ("&&", "||", "&", "|"):
+            sp = _split_top_level_token(expr, op, from_right=True)
+            if sp is not None:
+                return _logical_operands(sp[0]) + _logical_operands(sp[1])
+        return [expr.strip()]
+
+    def mark_logical_operands(txt: str) -> None:
+        # A *whole* operand of &&/||/&/| that is a bare identifier is logical,
+        # e.g. `a && b`. Operands that are themselves comparisons
+        # (`x >= lo && x <= hi`) are not bare identifiers, so their inner names
+        # are left untouched. A bare identifier standing alone (a plain function
+        # argument like `stop("x", file)`) is NOT a logical operand.
+        operands = _logical_operands(txt)
+        binary_split = len(operands) > 1
+        for operand in operands:
+            o = operand.strip()
+            m_not = re.fullmatch(r"!\s*([A-Za-z]\w*)", o)
+            if m_not is not None:
+                canon = arg_names.get(m_not.group(1).lower())
+                if canon is not None:
+                    out.add(canon)
+                continue
+            if binary_split and re.fullmatch(r"[A-Za-z]\w*", o):
+                canon = arg_names.get(o.lower())
+                if canon is not None:
+                    out.add(canon)
+
     def scan(ss: list[object]) -> None:
         for st in ss:
             if isinstance(st, IfStmt):
@@ -29513,6 +29557,8 @@ def infer_function_logical_scalar_arg_names(fn: FuncDef) -> set[str]:
                 scan(st.body)
 
     scan(fn.body)
+    for txt in _collect_stmt_expr_texts(fn.body):
+        mark_logical_operands(txt)
     return out
 
 
@@ -39251,6 +39297,7 @@ def transpile_r_to_fortran(
         "as_hexmode",
         "as_roman",
         "unlink_recursive",
+        "inttobits",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()
