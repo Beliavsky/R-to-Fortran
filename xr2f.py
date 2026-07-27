@@ -13186,6 +13186,18 @@ def r_expr_to_fortran(expr: str) -> str:
         cast_inner0 = fscan.strip_redundant_outer_parens_expr(c_cast0[1][0].strip())
         if re.fullmatch(r"[A-Za-z]\w*", cast_inner0) and cast_inner0.lower() in _CATEGORICAL_LABELS:
             return f"real({r_expr_to_fortran(cast_inner0)}, kind=dp)"
+        # as.numeric() of a character value: parse the string to a real.
+        cast_inner_simple0 = (
+            _sanitize_r_var_name(cast_inner0).lower()
+            if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", cast_inner0)
+            else ""
+        )
+        if (
+            _dequote_string_literal(cast_inner0) is not None
+            or cast_inner_simple0 in _CURRENT_CHAR_SCALAR_NAMES
+            or cast_inner_simple0 in _KNOWN_CHAR_VECTOR_NAMES
+        ):
+            return f"str_to_real({r_expr_to_fortran(cast_inner0)})"
         cast_char0 = parse_call_text(cast_inner0)
         if cast_char0 is not None and cast_char0[0].lower() == "as.character" and cast_char0[1]:
             cast_char_arg0 = cast_char0[1][0].strip()
@@ -16417,8 +16429,24 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"merge(1, 0, {pred_i})"
         return f"int({pred_i})"
     s = _replace_balanced_func_calls(s, "as.integer", _as_integer_to_fortran)
-    s = _replace_balanced_func_calls(s, "as.numeric", lambda inner: r_expr_to_fortran(inner.strip()))
-    s = _replace_balanced_func_calls(s, "as.double", lambda inner: r_expr_to_fortran(inner.strip()))
+
+    def _as_numeric_repl(inner: str) -> str:
+        t_num = inner.strip()
+        t_simple = (
+            _sanitize_r_var_name(t_num).lower()
+            if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", t_num)
+            else ""
+        )
+        if (
+            _dequote_string_literal(t_num) is not None
+            or t_simple in _CURRENT_CHAR_SCALAR_NAMES
+            or t_simple in _KNOWN_CHAR_VECTOR_NAMES
+        ):
+            return f"str_to_real({r_expr_to_fortran(t_num)})"
+        return r_expr_to_fortran(t_num)
+
+    s = _replace_balanced_func_calls(s, "as.numeric", _as_numeric_repl)
+    s = _replace_balanced_func_calls(s, "as.double", _as_numeric_repl)
     def _as_character_repl(inner: str) -> str:
         txt = inner.strip()
         if _is_posixct_source(txt):
@@ -16445,6 +16473,13 @@ def r_expr_to_fortran(expr: str) -> str:
             return f"int_to_string({_int_bound_expr(txt_f)})"
         if _is_real_literal(txt) or txt_simple in _KNOWN_VECTOR_NAMES:
             return f"real_to_string_g(real({txt_f}, kind=dp), 6)"
+        # A compound arithmetic expression that is provably numeric.
+        if not txt_simple and _split_top_level_colon(txt) is None:
+            kind_txt = _expr_kind_simple(txt)
+            if kind_txt == "int":
+                return f"int_to_string({_int_bound_expr(txt_f)})"
+            if kind_txt == "real":
+                return f"real_to_string_g(real({txt_f}, kind=dp), 15)"
         return txt
 
     s = _replace_balanced_func_calls(s, "as.character", _as_character_repl)
@@ -39317,6 +39352,7 @@ def transpile_r_to_fortran(
         "as_roman",
         "unlink_recursive",
         "inttobits",
+        "str_to_real",
     }
     mod_needed: set[str] = set()
     main_needed: set[str] = set()

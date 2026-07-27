@@ -54,7 +54,7 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
-   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits
+   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_real
 public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
@@ -2581,6 +2581,15 @@ close(u_out)
 close(u_in, status="delete")
 ok = .true.
 end function file_rename
+
+impure elemental function str_to_real(s) result(out)
+! R-like as.numeric() of a character value: parse to real, NA(nan) on failure.
+character(len=*), intent(in) :: s
+real(kind=dp) :: out
+integer :: ios
+read(s, *, iostat=ios) out
+if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
+end function str_to_real
 
 pure function inttobits(n) result(out)
 ! R-like intToBits(n): the 32 bits of n, least-significant first, as 0/1.
