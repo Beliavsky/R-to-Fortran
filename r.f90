@@ -35,6 +35,7 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & set_print_int_like_tol, set_recycle_warn, set_recycle_stop, set_seed_int, &
    & kmeans_result_t, kmeans, rbind, max_col, tabulate, table2, prop_table, ave, ave_group_key, aggregate, aggregate_result_t, print_aggregate_result, r_by, by_matrix_result_t, print_by_matrix_result, match, r_in, unique, duplicated, anyDuplicated, &
    & union, intersect, setdiff, setequal, combn, findInterval, cut, cut_n, outer, &
+   & outer_plus, outer_minus, outer_divide, outer_power, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
    & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, urldecode, nextn, kronecker, fft, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
@@ -10306,6 +10307,58 @@ do i = 1, size(x)
    end do
 end do
 end function outer
+
+pure function outer_plus(x, y) result(out)
+! R outer(x, y, "+"): all pairwise sums.
+real(kind=dp), intent(in) :: x(:), y(:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j
+allocate(out(size(x), size(y)))
+do i = 1, size(x)
+   do j = 1, size(y)
+      out(i, j) = x(i) + y(j)
+   end do
+end do
+end function outer_plus
+
+pure function outer_minus(x, y) result(out)
+! R outer(x, y, "-"): all pairwise differences.
+real(kind=dp), intent(in) :: x(:), y(:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j
+allocate(out(size(x), size(y)))
+do i = 1, size(x)
+   do j = 1, size(y)
+      out(i, j) = x(i) - y(j)
+   end do
+end do
+end function outer_minus
+
+pure function outer_divide(x, y) result(out)
+! R outer(x, y, "/"): all pairwise quotients.
+real(kind=dp), intent(in) :: x(:), y(:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j
+allocate(out(size(x), size(y)))
+do i = 1, size(x)
+   do j = 1, size(y)
+      out(i, j) = x(i) / y(j)
+   end do
+end do
+end function outer_divide
+
+pure function outer_power(x, y) result(out)
+! R outer(x, y, "^"): all pairwise powers.
+real(kind=dp), intent(in) :: x(:), y(:)
+real(kind=dp), allocatable :: out(:,:)
+integer :: i, j
+allocate(out(size(x), size(y)))
+do i = 1, size(x)
+   do j = 1, size(y)
+      out(i, j) = x(i) ** y(j)
+   end do
+end do
+end function outer_power
 
 pure function cumprod_real(x) result(out)
 ! Return cumulative products of a real vector.

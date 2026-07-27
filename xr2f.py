@@ -11883,6 +11883,24 @@ def r_expr_to_fortran(expr: str) -> str:
             s = f"as.roman(({m_rom.group(1)}) {m_rom.group(2)} {m_rom.group(3)})"
     s = _collapse_strsplit_first_index(s)
     s = fscan.strip_redundant_outer_parens_expr(s)
+    # outer(x, y, "op") as a sub-expression -> dedicated runtime variant, so it
+    # works anywhere (not only as a bare RHS statement).
+    c_outer_expr = parse_call_text(s)
+    if (
+        c_outer_expr is not None
+        and c_outer_expr[0].lower() == "outer"
+        and len(c_outer_expr[1]) == 3
+        and not c_outer_expr[2]
+    ):
+        _op_outer = c_outer_expr[1][2].strip().strip("\"'")
+        _outer_variant = {
+            "+": "outer_plus", "-": "outer_minus", "*": "outer",
+            "/": "outer_divide", "^": "outer_power",
+        }.get(_op_outer)
+        if _outer_variant is not None:
+            xo = r_expr_to_fortran(c_outer_expr[1][0].strip())
+            yo = r_expr_to_fortran(c_outer_expr[1][1].strip())
+            return f"{_outer_variant}(real({xo}, kind=dp), real({yo}, kind=dp))"
     try_primary = _trycatch_primary_expr(s)
     if try_primary is not None:
         return r_expr_to_fortran(try_primary)
@@ -39035,6 +39053,7 @@ def transpile_r_to_fortran(
         "findInterval",
         "cut", "cut_n",
         "outer",
+        "outer_plus", "outer_minus", "outer_divide", "outer_power",
         "hclust",
         "hist",
         "hist_result_t",
