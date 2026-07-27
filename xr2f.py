@@ -1006,6 +1006,83 @@ def remove_program_decls_for_public_module_vars_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def rename_local_import_collision_text(f90: str) -> str:
+    """Within each program/procedure scope, rename a local variable whose name
+    also names a symbol imported into that scope (e.g. a variable `union` in a
+    scope that imports the runtime `union` function). Variable *uses* (a name
+    not immediately followed by `(`) are renamed; call sites `name(...)` and the
+    `use` line itself keep the imported name."""
+    lines = f90.splitlines()
+    # Identify scope boundaries: program / (pure/elemental/recursive) function /
+    # subroutine ... end.
+    open_re = re.compile(
+        r"(?i)^\s*(?:program\b|(?:(?:pure|elemental|recursive|impure|module)\s+)*(?:function|subroutine)\b)"
+    )
+    close_re = re.compile(r"(?i)^\s*end\s+(?:program|function|subroutine)\b")
+    scopes: list[tuple[int, int]] = []
+    start = None
+    depth = 0
+    for i, ln in enumerate(lines):
+        if open_re.match(ln):
+            if depth == 0:
+                start = i
+            depth += 1
+        elif close_re.match(ln) and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                scopes.append((start, i))
+                start = None
+    in_scope = [False] * len(lines)
+    for a, b in scopes:
+        for i in range(a, b + 1):
+            in_scope[i] = True
+
+    def _imports_in(line_iter) -> set[str]:
+        names: set[str] = set()
+        for ln in line_iter:
+            m_use = re.match(r"(?i)^\s*use\b[^!\n]*?\bonly\s*:\s*([^!\n]+)$", ln)
+            if m_use is not None:
+                for nm in re.findall(r"[A-Za-z]\w*", m_use.group(1)):
+                    names.add(nm.lower())
+        return names
+
+    # Module-level imports (outside any procedure) are visible in every procedure.
+    module_imported = _imports_in(lines[i] for i in range(len(lines)) if not in_scope[i])
+    for a, b in scopes:
+        block = lines[a : b + 1]
+        imported: set[str] = set(module_imported) | _imports_in(block)
+        declared: dict[str, str] = {}
+        for ln in block:
+            m_decl = re.match(r"(?i)^\s*(?:integer|real|logical|complex|character)\b[^:]*::\s*(.+)$", ln)
+            if m_decl is None:
+                continue
+            # Only *scalar*-declared names collide with a function name; an array
+            # `X(:)` is indexed as `X(i)`, which must not be treated as a call.
+            for part in split_top_level_commas(m_decl.group(1)):
+                m_nm = re.match(r"^\s*([A-Za-z]\w*)\s*(\()?", part)
+                if m_nm is None or m_nm.group(2) is not None:
+                    continue
+                nm = m_nm.group(1)
+                if nm.lower() in imported:
+                    declared[nm.lower()] = nm
+        if not declared:
+            continue
+        for _lc, orig in declared.items():
+            new = f"{orig}_v"
+            while re.search(rf"(?i)\b{re.escape(new)}\b", "\n".join(block)):
+                new += "0"
+            for k in range(len(block)):
+                if re.match(r"(?i)^\s*use\b", block[k]):
+                    continue
+                block[k] = re.sub(
+                    rf"(?i)(?<![A-Za-z0-9_%]){re.escape(orig)}\b(?!\s*\()",
+                    new,
+                    block[k],
+                )
+        lines[a : b + 1] = block
+    return "\n".join(lines) + ("\n" if f90.endswith("\n") else "")
+
+
 def rename_program_helper_collision_text(f90: str) -> str:
     """Rename `program NAME` when NAME collides (case-insensitively) with a
     name imported into the program scope (e.g. a script literally named after a
@@ -63237,6 +63314,7 @@ def main() -> int:
     f90 = rewrite_named_real_row_prints_text(f90)
     if "call print_named_real_row(" in f90:
         f90 = add_missing_r_mod_uses_per_scope_text(f90, {"print_named_real_row"})
+    f90 = rename_local_import_collision_text(f90)
     f90 = rename_program_helper_collision_text(f90)
     # Final safety check after all late rewrites that can introduce I/O/calls.
     f90 = remove_pure_from_impure_call_graph_text(f90)
