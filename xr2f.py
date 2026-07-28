@@ -2900,6 +2900,11 @@ def _expr_returns_character(expr: str) -> bool:
     ci = parse_call_text(t)
     if ci is None:
         return False
+    if ci[0].lower() == "ifelse":
+        branches = list(ci[1][1:3])
+        if not branches:
+            branches = [ci[2].get("yes", ""), ci[2].get("no", "")]
+        return any(branch and _expr_returns_character(branch) for branch in branches)
     return ci[0].lower() in {
         "paste",
         "paste0",
@@ -2915,6 +2920,7 @@ def _expr_returns_character(expr: str) -> bool:
         "tolower",
         "trimws",
         "getwd",
+        "file_extension",
         "mode",
         "colnames",
         "rownames",
@@ -3591,6 +3597,31 @@ def validate_undefined_top_level_user_call_args(stmts: list[object]) -> None:
                 "standalone translation requires every input to be assigned in the script"
             )
 
+    for st in stmts:
+        texts: list[str] = []
+        if isinstance(st, ExprStmt):
+            texts.append(st.expr)
+        elif isinstance(st, PrintStmt):
+            texts.extend(st.args)
+        elif isinstance(st, CallStmt):
+            texts.extend(st.args)
+        elif isinstance(st, Assign):
+            texts.append(st.expr)
+        for txt in texts:
+            def _validate_file_info_actual(inner: str) -> str:
+                call = parse_call_text("file.info(" + inner + ")")
+                if call is None:
+                    return "file.info(" + inner + ")"
+                actual = call[1][0].strip() if call[1] else call[2].get("file", call[2].get("path", "")).strip()
+                if re.fullmatch(r"[A-Za-z][\w.]*", actual) and actual.lower() not in known_names:
+                    raise NotImplementedError(
+                        f"top-level symbol `{actual}` passed to `file.info()` is undefined; "
+                        "standalone translation requires every input to be assigned in the script"
+                    )
+                return "file.info(" + inner + ")"
+
+            _replace_balanced_func_calls(txt, "file.info", _validate_file_info_actual)
+
 
 def _split_top_level_pipe(expr: str) -> list[str] | None:
     parts: list[str] = []
@@ -4012,6 +4043,14 @@ def preprocess_r_lines(src: str) -> list[str]:
 def parse_single_statement(ln: str, *, comment_lookup: dict[str, list[str]] | None = None) -> object:
     ln = ln.strip()
     cmt = pop_comment_for_code(ln, comment_lookup)
+    # A top-level native-pipe expression is still a statement.  Lower it before
+    # call classification so `x |> writeLines()` reaches the writeLines emitter
+    # instead of leaking through as an opaque expression.
+    pipe_assignment = split_top_level_assignment(ln)
+    if pipe_assignment is not None and "|>" in pipe_assignment[1]:
+        ln = f"{pipe_assignment[0].strip()} <- {_lower_r_native_pipe_expr(pipe_assignment[1].strip())}"
+    else:
+        ln = _lower_r_native_pipe_expr(ln)
     fhead = _parse_for_head(ln)
     if fhead is not None:
         var, itexpr, tail = fhead
@@ -7562,8 +7601,10 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
                     _collect_arg_aliases(st_alias.else_body)
 
     _collect_arg_aliases(fn.body)
+    body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
+    if re.search(rf"%in%\s*{re.escape(arg)}\b", body_text_all, re.IGNORECASE):
+        return max(forced_rank or 0, 1)
     if arg_aliases:
-        body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
         for alias_arg in arg_aliases:
             body_text_rank = _without_length_out_use(body_text_all, alias_arg)
             if re.search(rf"\b{re.escape(alias_arg)}\s*\[[^\]\n]*,[^\]\n]*\]", body_text_rank):
@@ -7597,6 +7638,7 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b\s*(?:\*|/)", re.IGNORECASE),
         re.compile(rf"\bmean\s*\(\s*{re.escape(arg)}\b"),
         re.compile(rf"\bmean\s*\([^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\bany\s*\(\s*endsWith\s*\([^,]+,\s*[^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\bmax\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bmin\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\b(?:sd|r_sd)\s*\(\s*{re.escape(arg)}\b"),
@@ -7606,7 +7648,8 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
         re.compile(rf"\bsprintf\s*\([^)]*,\s*{re.escape(arg)}\b"),
         re.compile(rf"\bas\.vector\s*\(\s*{re.escape(arg)}\s*\)"),
         re.compile(rf"\bas\.numeric\s*\(\s*{re.escape(arg)}\s*\)"),
-        re.compile(rf"\bReduce\s*\([^)]*\b{re.escape(arg)}\b", re.IGNORECASE),
+        re.compile(rf"\bReduce\s*\(\s*[^,]+,\s*{re.escape(arg)}\s*(?:,|\))", re.IGNORECASE),
+        re.compile(rf"%in%\s*{re.escape(arg)}\b", re.IGNORECASE),
         re.compile(rf"\b{re.escape(arg)}\s*\["),
     ]
 
@@ -7733,12 +7776,13 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
             rf"\b{re.escape(arg)}\s*\[",
             rf"\bas\.(?:numeric|vector)\s*\(\s*{re.escape(arg)}\b",
             rf"\b(?:sum|mean|max|min|sd|r_sd)\s*\(\s*{re.escape(arg)}\b",
+            rf"\bany\s*\(\s*endsWith\s*\([^,]+,\s*[^)]*\b{re.escape(arg)}\b",
             rf"\bsum\s*\([^)]*(?:\*|/)\s*\(?\s*\b{re.escape(arg)}\b",
             rf"\bsum\s*\([^)]*\b{re.escape(arg)}\b\s*(?:\*|/)",
             rf"\bt\s*\(\s*{re.escape(arg)}\s*\)",
             rf"%\*%\s*{re.escape(arg)}\b",
             rf"\bsweep\s*\([^)]*,[^)]*,\s*{re.escape(arg)}\b",
-            rf"\bReduce\s*\([^)]*\b{re.escape(arg)}\b",
+            rf"\bReduce\s*\(\s*[^,]+,\s*{re.escape(arg)}\s*(?:,|\))",
             rf"\b(?:solve|qr\.solve|qr_solve)\s*\(.*,\s*{re.escape(arg)}\s*(?:,|\))",
             rf"\b(?:solve|qr\.solve|qr_solve)\s*\([^)]*\bb\s*=\s*{re.escape(arg)}\b",
         ]
@@ -10020,6 +10064,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                     return 1 if arg_rank >= 1 else 0
             if fn_name == "pack":
                 return 1
+            if fn_name == "file_extension":
+                return 0
             if fn_name == "cut":
                 return 1
             if fn_name in {
@@ -12256,6 +12302,28 @@ def r_expr_to_fortran(expr: str) -> str:
     s_pipe = _lower_r_native_pipe_expr(s)
     if s_pipe != s:
         return r_expr_to_fortran(s_pipe)
+    scalar_apply = _scalar_apply_lambda_to_fortran(s)
+    if scalar_apply is not None:
+        return scalar_apply
+    c_reduce_early = parse_call_text(s)
+    if c_reduce_early is not None and c_reduce_early[0].lower() == "reduce":
+        pos_reduce, kw_reduce = c_reduce_early[1], c_reduce_early[2]
+        fn_reduce = (pos_reduce[0] if pos_reduce else kw_reduce.get("f", kw_reduce.get("FUN", ""))).strip()
+        x_reduce = (pos_reduce[1] if len(pos_reduce) >= 2 else kw_reduce.get("x", "")).strip()
+        init_reduce = (pos_reduce[2] if len(pos_reduce) >= 3 else kw_reduce.get("init", "")).strip()
+        op_reduce = fn_reduce.strip("`\"'").strip()
+        reducer = {"*": "product", "+": "sum", "min": "minval", "max": "maxval"}.get(op_reduce.lower())
+        if reducer is not None and x_reduce:
+            x_reduce_f = r_expr_to_fortran(x_reduce)
+            base_reduce = f"{reducer}({x_reduce_f})"
+            if init_reduce:
+                init_f = r_expr_to_fortran(init_reduce)
+                if op_reduce == "*":
+                    return f"({init_f}) * ({base_reduce})"
+                if op_reduce == "+":
+                    return f"({init_f}) + ({base_reduce})"
+                return f"{reducer}([{init_f}, {base_reduce}])"
+            return base_reduce
     quoted_op_call = _parse_quoted_operator_call(s)
     if quoted_op_call is not None:
         op_q, args_q = quoted_op_call
@@ -13457,6 +13525,19 @@ def r_expr_to_fortran(expr: str) -> str:
             if repl == "" and pat is not None and pat.startswith("^"):
                 prefix = pat[1:]
                 return f"{x_f}({len(prefix) + 1}:)"
+    if c_pre is not None and c_pre[0].lower() == "regmatches":
+        _nm_rm, pos_rm, kw_rm = c_pre
+        text_src = pos_rm[0] if pos_rm else kw_rm.get("x", "")
+        match_src = pos_rm[1] if len(pos_rm) >= 2 else kw_rm.get("m", "")
+        match_call = parse_call_text(match_src.strip())
+        if text_src and match_call is not None and match_call[0].lower() == "regexec":
+            pattern_src = match_call[1][0] if match_call[1] else match_call[2].get("pattern", "")
+            subject_src = match_call[1][1] if len(match_call[1]) >= 2 else match_call[2].get("text", "")
+            pattern = _dequote_string_literal(pattern_src.strip())
+            if pattern is not None:
+                pattern = pattern.replace("\\\\", "\\")
+            if subject_src.strip() == text_src.strip() and pattern == r"\.[A-Za-z0-9]+$":
+                return f"[file_extension({r_expr_to_fortran(text_src)})]"
     c_filter = parse_call_text(s)
     if c_filter is not None and c_filter[0] == "Filter":
         _nm_filter, pos_filter, kw_filter = c_filter
@@ -13481,6 +13562,35 @@ def r_expr_to_fortran(expr: str) -> str:
             if m_anon:
                 arg_name = m_anon.group(1)
                 body_src = m_anon.group(2).strip()
+                body_call = parse_call_text(body_src)
+                if body_call is not None:
+                    callback = _FUNC_DEFS_BY_NAME.get(body_call[0].lower())
+                    if callback is not None:
+                        callback_args = list(getattr(callback, "args", []))
+                        call_actuals = list(body_call[1])
+                        call_actuals.extend(body_call[2].get(a, "") for a in callback_args[len(call_actuals) :])
+                        for actual_pos, actual_src in enumerate(call_actuals):
+                            if actual_src.strip() != arg_name or actual_pos >= len(callback_args):
+                                continue
+                            formal = callback_args[actual_pos].lower()
+                            formal_rank = _USER_FUNC_ARG_RANK.get(body_call[0].lower(), {}).get(formal, 0)
+                            if formal_rank != 0:
+                                break
+                            x_inner = x_src.strip()
+                            x_call = parse_call_text(x_inner)
+                            if x_call is not None and x_call[0].lower() in {"seq_along", "seq_len"}:
+                                element_f = "xr2f_filter_i"
+                            elif re.match(r"^[A-Za-z]\w*$", x_inner):
+                                element_f = f"{value_f}(xr2f_filter_i)"
+                            else:
+                                element_f = f"{value_f}(xr2f_filter_i)"
+                            scalar_body = re.sub(
+                                rf"\b{re.escape(arg_name)}\b", f"({element_f})", body_src
+                            )
+                            return (
+                                f"[({r_expr_to_fortran(scalar_body)}, "
+                                f"xr2f_filter_i=1,size({value_f}))]"
+                            )
                 body_src = re.sub(rf"\b{re.escape(arg_name)}\b", f"({value_src.strip()})", body_src)
                 return r_expr_to_fortran(body_src)
             if not re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*$", pred_inner):
@@ -13554,6 +13664,9 @@ def r_expr_to_fortran(expr: str) -> str:
         labels, each_src = factor_rep
         return f"r_rep_int(r_seq_int(1, {len(labels)}), each={_int_bound_expr(r_expr_to_fortran(each_src))})"
     c_cast0 = parse_call_text(s)
+    if c_cast0 is not None and c_cast0[0].lower() == "as.logical" and c_cast0[1]:
+        src_al_f = r_expr_to_fortran(c_cast0[1][0].strip())
+        return f"({src_al_f} /= 0)"
     if c_cast0 is not None and c_cast0[0].lower() == "as.complex" and c_cast0[1]:
         src_ac = c_cast0[1][0].strip()
         if src_ac.lower() in _KNOWN_CHAR_VECTOR_NAMES:
@@ -14060,20 +14173,35 @@ def r_expr_to_fortran(expr: str) -> str:
         if rec_src in {"true", "t", ".true."} or (len(pos_ul0) >= 2 and pos_ul0[1].strip().lower() in {"true", "t"}):
             return f"unlink_recursive({r_expr_to_fortran(path_src)})"
         return f"merge(0, 1, file_remove({r_expr_to_fortran(path_src)}))"
-    c_file_info0 = parse_call_text(s)
-    if c_file_info0 is not None and c_file_info0[0].lower() in {"file.info", "file_info"}:
-        _nm_fi0, pos_fi0, kw_fi0 = c_file_info0
-        path_src = pos_fi0[0] if pos_fi0 else kw_fi0.get("file", kw_fi0.get("files", ""))
-        return f"file_info({r_expr_to_fortran(path_src)})"
     m_file_info_field0 = re.match(r"^(?:file\.info|file_info)\s*\((.*)\)\s*\$\s*([A-Za-z]\w*)\s*$", s, re.IGNORECASE | re.DOTALL)
     if m_file_info_field0 is not None:
         c_fif0 = parse_call_text("file.info(" + m_file_info_field0.group(1).strip() + ")")
         if c_fif0 is not None:
             path_src = c_fif0[1][0] if c_fif0[1] else c_fif0[2].get("file", c_fif0[2].get("files", ""))
-            field_fif0 = m_file_info_field0.group(2)
-            if field_fif0.lower() == "isdir":
+            field_fif0 = m_file_info_field0.group(2).lower()
+            if field_fif0 == "isdir":
                 return f"file_isdir({r_expr_to_fortran(path_src)})"
-            return f"file_info({r_expr_to_fortran(path_src)})%{field_fif0}"
+            helper_fif0 = "file_path_value" if field_fif0 == "path" else f"file_{field_fif0}"
+            return f"{helper_fif0}({r_expr_to_fortran(path_src)})"
+    m_file_info_index0 = re.match(
+        r"^(?:file\.info|file_info)\s*\((.*)\)\s*\[\[\s*(['\"])([A-Za-z]\w*)\2\s*\]\]\s*$",
+        s,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_file_info_index0 is not None:
+        c_fii0 = parse_call_text("file.info(" + m_file_info_index0.group(1).strip() + ")")
+        if c_fii0 is not None:
+            path_src = c_fii0[1][0] if c_fii0[1] else c_fii0[2].get("file", c_fii0[2].get("files", ""))
+            field_fii0 = m_file_info_index0.group(3).lower()
+            if field_fii0 == "isdir":
+                return f"file_isdir({r_expr_to_fortran(path_src)})"
+            helper_fii0 = "file_path_value" if field_fii0 == "path" else f"file_{field_fii0}"
+            return f"{helper_fii0}({r_expr_to_fortran(path_src)})"
+    c_file_info0 = parse_call_text(s)
+    if c_file_info0 is not None and c_file_info0[0].lower() in {"file.info", "file_info"}:
+        _nm_fi0, pos_fi0, kw_fi0 = c_file_info0
+        path_src = pos_fi0[0] if pos_fi0 else kw_fi0.get("file", kw_fi0.get("files", ""))
+        return f"file_info({r_expr_to_fortran(path_src)})"
     c_dir_create0 = parse_call_text(s)
     if c_dir_create0 is not None and c_dir_create0[0].lower() in {"dir.create", "dir_create"}:
         _nm_dc0, pos_dc0, kw_dc0 = c_dir_create0
@@ -14151,7 +14279,7 @@ def r_expr_to_fortran(expr: str) -> str:
     if mm_idiv is not None:
         lhs = r_expr_to_fortran(mm_idiv[0])
         rhs = r_expr_to_fortran(mm_idiv[1])
-        return f"{_int_bound_expr(lhs)} / {_int_bound_expr(rhs)}"
+        return f"int({lhs}) / int({rhs})"
     mm_div = _split_top_level_token(s, "/", from_right=True)
     if mm_div is not None:
         lhs = r_expr_to_fortran(mm_div[0])
@@ -16365,6 +16493,9 @@ def r_expr_to_fortran(expr: str) -> str:
                 if prefix_lit is not None:
                     rhs_src = pos_p[1].strip()
                     rhs_f = r_expr_to_fortran(rhs_src)
+                    rhs_l = _sanitize_r_var_name(rhs_src).lower() if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", rhs_src) else ""
+                    if rhs_l in (_KNOWN_CHAR_VECTOR_NAMES | _CURRENT_CHAR_ARRAY_NAMES | _CURRENT_CHAR_SCALAR_NAMES):
+                        return f"{r_expr_to_fortran(pos_p[0])} // {rhs_f}"
                     if re.match(r"^[A-Za-z]\w*(?:\([^)]*\))?$", rhs_f.strip()):
                         return f"r_paste0_real({r_expr_to_fortran(pos_p[0])}, real({rhs_f}, kind=dp))"
             vals_fmt: list[str] = []
@@ -16630,6 +16761,35 @@ def r_expr_to_fortran(expr: str) -> str:
                     lhs_expr = f".not. ({lhs_not})"
                 return f"{lhs_expr} {op_not} {rhs_not}"
         inner_not_f = r_expr_to_fortran(inner_not)
+        inner_not_name = _sanitize_r_var_name(inner_not).lower() if re.fullmatch(
+            r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", inner_not
+        ) else ""
+        numeric_not_names = (
+            _CURRENT_INT_SCALAR_NAMES
+            | _CURRENT_REAL_SCALAR_NAMES
+            | _CURRENT_INT_ARRAY_NAMES
+            | _CURRENT_REAL_ARRAY_NAMES
+            | _KNOWN_INT_NAMES
+            | _KNOWN_INT_VECTOR_NAMES
+            | _KNOWN_VECTOR_NAMES
+        )
+        logical_not_names = (
+            _CURRENT_LOGICAL_SCALAR_NAMES
+            | _CURRENT_LOGICAL_ARRAY_NAMES
+            | _KNOWN_LOGICAL_VECTOR_NAMES
+            | _KNOWN_LOGICAL_MATRIX_NAMES
+        )
+        numeric_not_operand = (
+            _is_int_literal(inner_not)
+            or _is_real_literal(inner_not)
+            or bool(
+                inner_not_name
+                and inner_not_name in numeric_not_names
+                and inner_not_name not in logical_not_names
+            )
+        )
+        if numeric_not_operand:
+            return f"({inner_not_f} == 0)"
         if re.fullmatch(r"[A-Za-z]\w*\([^()]*\)", inner_not_f):
             return f".not. {inner_not_f}"
         return f".not. ({inner_not_f})"
@@ -16745,11 +16905,27 @@ def r_expr_to_fortran(expr: str) -> str:
             or _contains_r_complex_literal(txt)
         ):
             return "1"
+        m_char_extract = re.fullmatch(r"([A-Za-z]\w*)\s*\[\[.+\]\]", txt, re.DOTALL)
+        if m_char_extract is not None and m_char_extract.group(1).lower() in {
+            n.lower()
+            for n in (
+                _CURRENT_CHAR_ARRAY_NAMES
+                | _KNOWN_CHAR_VECTOR_NAMES
+                | _CURRENT_VECTOR_NAMES
+                | _KNOWN_VECTOR_NAMES
+            )
+        }:
+            return "1"
         simple_name = re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", txt)
         if simple_name:
             ft = _sanitize_r_var_name(txt)
         else:
             ft = r_expr_to_fortran(txt)
+        m_char_element_f = re.fullmatch(r"([A-Za-z]\w*)\s*\([^,:()]+\)", ft)
+        if m_char_element_f is not None and m_char_element_f.group(1).lower() in {
+            n.lower() for n in (_CURRENT_CHAR_ARRAY_NAMES | _KNOWN_CHAR_VECTOR_NAMES)
+        }:
+            return "1"
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?\(\s*:\s*,\s*:\s*,\s*:\s*,", ft):
             return f"nested_matrix_list_len({ft})"
         if re.match(r"^[A-Za-z]\w*(?:%[A-Za-z]\w*)?$", ft) and ft.split("%")[-1].lower() == "a_list":
@@ -17385,11 +17561,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 return f"endsWith({inner})"
             x_f = r_expr_to_fortran(x_src)
             pat_f = r_expr_to_fortran(pat_src)
-            pat_lit = _dequote_string_literal(pat_src.strip())
-            pat_len = str(len(pat_lit)) if pat_lit is not None else f"nchar({pat_f})"
-            if re.match(r"^[A-Za-z]\w*$", x_src) and x_src.lower() in _KNOWN_CHAR_VECTOR_NAMES:
-                return f"[(nchar({x_f}(i_ew)) >= {pat_len} .and. {x_f}(i_ew)(nchar({x_f}(i_ew)) - {pat_len} + 1:nchar({x_f}(i_ew))) == {pat_f}, i_ew=1,size({x_f}))]"
-            return f"(nchar({x_f}) >= {pat_len} .and. {x_f}(nchar({x_f}) - {pat_len} + 1:nchar({x_f})) == {pat_f})"
+            return f"char_ends_with({x_f}, {pat_f})"
         return f"endsWith({inner})"
     s = _replace_balanced_func_calls(s, "endsWith", _endswith_to_fortran)
     def _nzchar_to_fortran(inner: str) -> str:
@@ -19774,6 +19946,48 @@ def emit_stmts(
         o.w("end if")
         o.pop()
         o.w("end do")
+        o.pop()
+        o.w("end block")
+        return True
+
+    def _emit_indexed_vector_reduce_print(expr: str, comment: str) -> bool:
+        m_indexed = re.fullmatch(r"(Reduce\s*\(.*\))\s*\[\s*([^,\]]+)\s*\]", expr.strip(), re.DOTALL)
+        if m_indexed is None:
+            return False
+        reduce_call = parse_call_text(m_indexed.group(1))
+        if reduce_call is None or reduce_call[0].lower() != "reduce":
+            return False
+        pos_red, kw_red = reduce_call[1], reduce_call[2]
+        fn_src = pos_red[0].strip() if pos_red else kw_red.get("f", "").strip()
+        x_src = pos_red[1].strip() if len(pos_red) >= 2 else kw_red.get("x", "").strip()
+        init_src = pos_red[2].strip() if len(pos_red) >= 3 else kw_red.get("init", "").strip()
+        fn_obj = _FUNC_DEFS_BY_NAME.get(fn_src.lower())
+        if fn_obj is None or not x_src or not init_src:
+            return False
+        if _infer_assignment_rank_hint(init_src, {}) != 1:
+            return False
+        x_f = r_expr_to_fortran(x_src)
+        acc_nm = "xr2f_reduce_acc"
+        idx_nm = "xr2f_reduce_vec_i"
+        callback_args = [a for a in getattr(fn_obj, "args", []) if a.strip() != "..."]
+        call_parts = [acc_nm]
+        if len(callback_args) >= 2:
+            call_parts.append(_reduce_vector_element_expr(x_src, idx_nm))
+        o.w("block")
+        o.push()
+        o.w(f"integer :: {idx_nm}")
+        o.w(f"real(kind=dp), allocatable :: {acc_nm}(:)")
+        o.w(f"{acc_nm} = real({r_expr_to_fortran(init_src)}, kind=dp)")
+        o.w(f"do {idx_nm} = 1, size({x_f})")
+        o.push()
+        o.w(f"{acc_nm} = {fn_src}({', '.join(call_parts)})")
+        o.pop()
+        o.w("end do")
+        _wstmt(
+            f"call print_real_scalar({acc_nm}({_int_bound_expr(r_expr_to_fortran(m_indexed.group(2)))}) )",
+            comment,
+        )
+        need_r_mod.add("print_real_scalar")
         o.pop()
         o.w("end block")
         return True
@@ -23000,6 +23214,8 @@ def emit_stmts(
                         continue
                     if _emit_find_print(one, st.comment):
                         continue
+                    if _emit_indexed_vector_reduce_print(one, st.comment):
+                        continue
                     c_one_acf_print = parse_call_text(one)
                     if c_one_acf_print is not None and c_one_acf_print[0].lower() in {"acf", "pacf"}:
                         acf_series_arg = _acf_series_name_arg(one)
@@ -24969,10 +25185,65 @@ def emit_stmts(
                 con_src = kw.get("con")
                 if con_src is None and len(pos) >= 2:
                     con_src = pos[1]
-                if con_src is None:
-                    con_src = '"out.txt"'
+                paste_wl = parse_call_text(data_src)
+                apply_wl = parse_call_text(data_src)
+                if con_src is None and apply_wl is not None and apply_wl[0].lower() in {"sapply", "lapply"}:
+                    apply_pos, apply_kw = apply_wl[1], apply_wl[2]
+                    list_src = apply_pos[0] if apply_pos else apply_kw.get("x", apply_kw.get("X", ""))
+                    fn_src = apply_pos[1] if len(apply_pos) >= 2 else apply_kw.get("fun", apply_kw.get("FUN", ""))
+                    list_call = parse_call_text(list_src.strip())
+                    if (
+                        list_call is not None
+                        and list_call[0].lower() == "list"
+                        and re.fullmatch(r"[A-Za-z]\w*", fn_src.strip())
+                        and fn_src.strip().lower() in _FUNC_DEFS_BY_NAME
+                    ):
+                        list_items = list(list_call[1]) + list(list_call[2].values())
+                        for item_src in list_items:
+                            result_f = r_expr_to_fortran(f"{fn_src.strip()}({item_src})")
+                            if _USER_FUNC_RETURN_KIND.get(fn_src.strip().lower()) == "character":
+                                o.w(f'write(*, "(g0)") trim({result_f})')
+                            else:
+                                o.w(f'write(*, "(g0)") {result_f}')
+                        continue
+                if con_src is None and paste_wl is not None and paste_wl[0].lower() in {"paste", "paste0"}:
+                    paste_pos, paste_kw = paste_wl[1], paste_wl[2]
+                    vector_pos = [
+                        i for i, part in enumerate(paste_pos)
+                        if (
+                            _infer_assignment_rank_hint(part.strip(), _CURRENT_RANK_HINTS) >= 1
+                            or _sanitize_r_var_name(part.strip()).lower() in (
+                                _KNOWN_VECTOR_NAMES | _KNOWN_INT_VECTOR_NAMES | _KNOWN_CHAR_VECTOR_NAMES
+                                | _CURRENT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES | _CURRENT_REAL_ARRAY_NAMES
+                                | _CURRENT_CHAR_ARRAY_NAMES
+                            )
+                        )
+                    ]
+                    if vector_pos:
+                        sep_src_wl = paste_kw.get("sep", '""' if paste_wl[0].lower() == "paste0" else '" "')
+                        sep_f_wl = r_expr_to_fortran(sep_src_wl)
+                        first_vec_f = r_expr_to_fortran(paste_pos[vector_pos[0]])
+                        o.w("block")
+                        o.push()
+                        o.w("integer :: i_wl")
+                        o.w(f"do i_wl = 1, size({first_vec_f})")
+                        o.push()
+                        write_items_wl: list[str] = []
+                        for i_part, part in enumerate(paste_pos):
+                            if i_part > 0:
+                                write_items_wl.append(sep_f_wl)
+                            part_f = r_expr_to_fortran(part)
+                            if i_part in vector_pos:
+                                part_f = f"{part_f}(i_wl)"
+                            write_items_wl.append(part_f)
+                        o.w('write(*, "(*(g0))") ' + ", ".join(write_items_wl))
+                        o.pop()
+                        o.w("end do")
+                        o.pop()
+                        o.w("end block")
+                        continue
                 data_f = r_expr_to_fortran(data_src)
-                write_fmt = "(g0.17)"
+                write_fmt = "(g0)"
                 fmt_ci = parse_call_text(data_src)
                 if fmt_ci is not None and fmt_ci[0].lower() == "format":
                     _fnm_fmt, pos_fmt, kw_fmt = fmt_ci
@@ -24986,21 +25257,31 @@ def emit_stmts(
                         if d > 30:
                             d = 30
                         write_fmt = f"(g0.{d})"
-                con_f = r_expr_to_fortran(con_src)
                 o.w("block")
                 o.push()
-                o.w("integer :: fp, i_wl")
-                o.w(f'open(newunit=fp, file={con_f}, status="replace", action="write")')
-                o.w(f"if (size({data_f}) > 0) then")
+                o.w("integer :: i_wl")
+                data_tmp = "xr2f_wl_data"
+                if _expr_returns_character(data_src):
+                    o.w(f"character(len=:), allocatable :: {data_tmp}(:)")
+                else:
+                    o.w(f"real(kind=dp), allocatable :: {data_tmp}(:)")
+                if con_src is not None:
+                    con_f = r_expr_to_fortran(con_src)
+                    o.w("integer :: fp")
+                    o.w(f'open(newunit=fp, file={con_f}, status="replace", action="write")')
+                o.w(f"{data_tmp} = {data_f}")
+                o.w(f"if (size({data_tmp}) > 0) then")
                 o.push()
-                o.w(f"do i_wl = 1, size({data_f})")
+                o.w(f"do i_wl = 1, size({data_tmp})")
                 o.push()
-                o.w(f'write(fp, "{write_fmt}") {data_f}(i_wl)')
+                unit_wl = "fp" if con_src is not None else "*"
+                o.w(f'write({unit_wl}, "{write_fmt}") {data_tmp}(i_wl)')
                 o.pop()
                 o.w("end do")
                 o.pop()
                 o.w("end if")
-                o.w("close(fp)")
+                if con_src is not None:
+                    o.w("close(fp)")
                 o.pop()
                 o.w("end block")
                 continue
@@ -27347,7 +27628,8 @@ def emit_function(
         return body_out, ExprStmt(last_expr, last_in.comment)
 
     has_explicit_return = isinstance(fn_body[-1], ExprStmt)
-    last = fn_body[-1] if has_explicit_return else ExprStmt(expr="0.0")
+    fallback_expr = '""' if _USER_FUNC_RETURN_KIND.get(fn.name.lower()) == "character" else "0.0"
+    last = fn_body[-1] if has_explicit_return else ExprStmt(expr=fallback_expr)
     list_spec = list_specs.get(fn.name)
     need_rnorm_local = {"used": False}
     body_stmts = fn_body[:-1] if has_explicit_return else fn_body
@@ -27518,6 +27800,9 @@ def emit_function(
                 continue
             rhs_tail_shape = st_tail_shape.expr.strip()
             c_tail_shape = parse_call_text(rhs_tail_shape)
+            if _expr_returns_character(rhs_tail_shape):
+                ret_is_char = True
+                _USER_FUNC_RETURN_KIND[fn.name.lower()] = "character"
             if c_tail_shape is not None and c_tail_shape[0].lower() == "character":
                 ret_rank = max(ret_rank, 1)
                 ret_is_char = True
@@ -28108,6 +28393,8 @@ def emit_function(
         reduce_ret_expr_decl_global = reduce_ret_arg_decl_global.strip()
     if _parse_reduce_call(reduce_ret_expr_decl_global) is not None:
         o.w("integer :: xr2f_reduce_i")
+    if re.search(r"\bFilter\s*\(", reduce_ret_expr_decl_global):
+        o.w("integer :: xr2f_filter_i")
 
     for a in f_args:
         dflt = fn.defaults.get(a, "").strip()
@@ -31156,7 +31443,7 @@ def infer_function_character_scalars(fn: FuncDef) -> set[str]:
                     if path_src:
                         _mark_char_arg(path_src)
                     return "f(" + inner + ")"
-                for _path_fn in ("dir.exists", "dir_exists", "dir.create", "dir_create", "dir", "list.files", "list_files", "file.info", "file_info", "scan"):
+                for _path_fn in ("dir.exists", "dir_exists", "dir.create", "dir_create", "dir", "list.files", "list_files", "file.info", "file_info", "scan", "regexec"):
                     _ = _replace_balanced_func_calls(txt, _path_fn, _mark_path_args)
                 def _mark_file_path_args(inner: str) -> str:
                     for part in split_top_level_commas(inner):
@@ -31223,6 +31510,8 @@ def infer_function_character_array_names(fn: FuncDef, char_scalars: set[str] | N
                 if rhs.lower().startswith("commandargs("):
                     out.add(st.name)
                 if rhs.lower().startswith("strsplit("):
+                    out.add(st.name)
+                if rhs.lower().startswith("regmatches("):
                     out.add(st.name)
                 if rhs.lower().startswith("character("):
                     out.add(st.name)
@@ -31300,14 +31589,54 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
 
 def _parse_sapply_shorthand_lambda(expr: str) -> tuple[str, str, str] | None:
     cinfo = parse_call_text(expr.strip())
-    if cinfo is None or cinfo[0].lower() != "sapply" or len(cinfo[1]) < 2:
+    if cinfo is None or cinfo[0].lower() not in {"sapply", "lapply"} or len(cinfo[1]) < 2:
         return None
     x_src = cinfo[1][0].strip()
     lam_src = cinfo[1][1].strip()
-    m_lam = re.match(r"^\\\s*\(\s*([A-Za-z]\w*)\s*\)\s*(.+)$", lam_src, re.DOTALL)
+    m_lam = re.match(
+        r"^(?:\\\s*\(\s*([A-Za-z]\w*)\s*\)|function\s*\(\s*([A-Za-z]\w*)\s*\))\s*(.+)$",
+        lam_src,
+        re.IGNORECASE | re.DOTALL,
+    )
     if m_lam is None:
         return None
-    return x_src, m_lam.group(1), m_lam.group(2).strip()
+    return x_src, (m_lam.group(1) or m_lam.group(2)), m_lam.group(3).strip()
+
+
+def _scalar_apply_lambda_to_fortran(expr: str) -> str | None:
+    """Lower homogeneous scalar sapply/lapply lambdas to an array constructor."""
+    info = _parse_sapply_shorthand_lambda(expr)
+    if info is None:
+        return None
+    x_src, arg_name, body_src = info
+
+    def lower_body(actual_src: str) -> str:
+        substituted = _replace_idents(body_src, {arg_name: actual_src})
+        m_if = re.match(
+            r"^if\s*\((.*?)\)\s*(.*?)\s+else\s+(.*)$",
+            substituted.strip(),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m_if is not None:
+            cond_f = r_expr_to_fortran(m_if.group(1).strip())
+            yes_f = r_expr_to_fortran(m_if.group(2).strip())
+            no_f = r_expr_to_fortran(m_if.group(3).strip())
+            return f"merge({yes_f}, {no_f}, {cond_f})"
+        return r_expr_to_fortran(substituted)
+
+    c_x = parse_call_text(x_src)
+    if c_x is not None and c_x[0].lower() == "c":
+        elems = [p.strip() for p in c_x[1]] + [v.strip() for v in c_x[2].values()]
+        return "[" + ", ".join(lower_body(elem) for elem in elems) + "]"
+    colon = _split_top_level_colon(x_src)
+    if colon is not None and _is_int_literal(colon[0].strip()) and _is_int_literal(colon[1].strip()):
+        lo = int(re.sub(r"[lL]$", "", colon[0].strip()))
+        hi = int(re.sub(r"[lL]$", "", colon[1].strip()))
+        step = 1 if hi >= lo else -1
+        return "[" + ", ".join(lower_body(str(i)) for i in range(lo, hi + step, step)) + "]"
+    x_f = r_expr_to_fortran(x_src)
+    actual = f"{x_f}(i_sw)" if re.fullmatch(r"[A-Za-z]\w*", x_f) else "i_sw"
+    return f"[({lower_body(actual)}, i_sw=1,size({x_f}))]"
 
 
 def _parse_mapply_call(expr: str) -> tuple[str, list[str], list[str] | None, str | None] | None:
@@ -34248,6 +34577,15 @@ def transpile_r_to_fortran(
     src = _normalize_r_bare_logical_abbrevs(src)
     src = _normalize_r_hex_literals(src)
     src = _normalize_r_builtin_char_constants(src)
+    src = re.sub(
+        r'(?m)^(?P<indent>[ \t]*)(?P<name>[A-Za-z]\w*)\s*<-\s*'
+        r'regmatches\(\s*(?P<path>[A-Za-z]\w*)\s*,\s*regexec\(\s*'
+        r'"\\\\\.\[A-Za-z0-9\]\+\$"\s*,\s*(?P=path)\s*\)\s*\)\s*\r?\n'
+        r'(?P=indent)ifelse\(\s*length\(\s*(?P=name)\s*\[\[\s*1\s*\]\]\s*\)\s*==\s*0\s*,'
+        r'\s*""\s*,\s*(?P=name)\s*\[\[\s*1\s*\]\]\s*\)',
+        lambda m: f'{m.group("indent")}file_extension({m.group("path")})',
+        src,
+    )
     src = _rewrite_simple_anonymous_apply_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
@@ -34981,6 +35319,25 @@ def transpile_r_to_fortran(
         for f in funcs
     }
     fn_return_array_kind: dict[str, str] = {}
+
+    def _has_explicit_character_return(items: list[object]) -> bool:
+        for item in items:
+            if isinstance(item, ExprStmt):
+                ret_arg = _return_call_arg(item.expr.strip())
+                if ret_arg is not None and _expr_returns_character(ret_arg.strip()):
+                    return True
+            elif isinstance(item, IfStmt):
+                if _has_explicit_character_return(item.then_body) or _has_explicit_character_return(item.else_body):
+                    return True
+            elif isinstance(item, (ForStmt, WhileStmt, RepeatStmt)):
+                if _has_explicit_character_return(item.body):
+                    return True
+        return False
+
+    for f_char_ret in funcs:
+        if _has_explicit_character_return(f_char_ret.body):
+            _USER_FUNC_RETURN_KIND[f_char_ret.name.lower()] = "character"
+
     for f_ret in funcs:
         if not (f_ret.body and isinstance(f_ret.body[-1], ExprStmt)):
             continue
@@ -39806,6 +40163,7 @@ def transpile_r_to_fortran(
         "r_matrix_col",
         "r_matrix_row",
         "char_join",
+        "char_ends_with",
         "r_to_string_real",
         "r_substr",
         "r_substr_replace",
@@ -39818,6 +40176,14 @@ def transpile_r_to_fortran(
         "file_info",
         "file_info_t",
         "file_isdir",
+        "file_size",
+        "file_path_value",
+        "file_mode",
+        "file_mtime",
+        "file_ctime",
+        "file_atime",
+        "file_exe",
+        "file_extension",
         "print_file_info",
         "dir_exists",
         "dir_create",
@@ -59713,9 +60079,9 @@ def _cached_runtime_object(
     cache_dir = _runtime_cache_root() / key
     obj = cache_dir / "r.o"
     mod = cache_dir / "r_mod.mod"
-    if obj.exists() and mod.exists():
-        return obj, cache_dir, None
     lock_dir = cache_dir.with_name(cache_dir.name + ".lock")
+    if obj.exists() and mod.exists() and not lock_dir.exists():
+        return obj, cache_dir, None
     have_lock = False
     start = time.monotonic()
     while not have_lock:
@@ -59723,8 +60089,6 @@ def _cached_runtime_object(
             lock_dir.mkdir(parents=True)
             have_lock = True
         except FileExistsError:
-            if obj.exists() and mod.exists():
-                return obj, cache_dir, None
             if time.monotonic() - start > 120:
                 return obj, cache_dir, subprocess.CompletedProcess(
                     cparts, 1, "", f"timed out waiting for runtime cache lock: {lock_dir}\n"
@@ -63662,6 +64026,12 @@ def main() -> int:
         extra_use_names.extend(["table_char_t", "table_char"])
     if "file_isdir(" in f90:
         extra_use_names.append("file_isdir")
+    for file_field_helper in (
+        "file_size", "file_path_value", "file_mode", "file_mtime",
+        "file_ctime", "file_atime", "file_exe", "file_extension",
+    ):
+        if f"{file_field_helper}(" in f90:
+            extra_use_names.append(file_field_helper)
     if "dir_exists(" in f90:
         extra_use_names.append("dir_exists")
     if "tempfile(" in f90:
