@@ -3547,7 +3547,22 @@ def validate_undefined_top_level_user_call_args(stmts: list[object]) -> None:
         st.name.lower() for st in stmts if isinstance(st, (Assign, FuncDef))
     }
     known_names.update(name.lower() for name in infer_assigned_names(stmts))
-    known_names.update({"pi", "letters", "month.name", "month.abb"})
+    known_names.update(
+        {
+            "true",
+            "false",
+            "t",
+            "f",
+            "null",
+            "na",
+            "nan",
+            "inf",
+            "pi",
+            "letters",
+            "month.name",
+            "month.abb",
+        }
+    )
     for st in stmts:
         if not isinstance(st, ExprStmt):
             continue
@@ -27558,7 +27573,10 @@ def emit_function(
         if infer_arg_rank(fn, a) > 0
     }
     assigned_ret_names = infer_assigned_names(body_stmts)
+    formal_ret_names = {a.lower() for a in fn.args}
     for nm_ret_rank in assigned_ret_names:
+        if nm_ret_rank.lower() in formal_ret_names:
+            continue
         rk_ret_nm = _infer_local_array_rank(body_stmts, nm_ret_rank)
         if rk_ret_nm > 0:
             ret_rank_hints[nm_ret_rank.lower()] = rk_ret_nm
@@ -27630,7 +27648,9 @@ def emit_function(
         )
         or _split_top_level_token(ret_expr_src, "%*%", from_right=True) is not None
     ):
-        ranked_return_names = {a for a in fn.args if infer_arg_rank(fn, a) >= 1}
+        ranked_return_names = {
+            name for name, rank in ret_rank_hints.items() if rank >= 1
+        }
         has_bare_ranked_name = any(
             re.search(rf"\b{re.escape(nm_ret_rank)}\b(?!\s*[\[(])", ret_expr_src)
             for nm_ret_rank in ranked_return_names
