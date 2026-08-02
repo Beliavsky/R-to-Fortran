@@ -2346,8 +2346,16 @@ def _parse_reduce_call(expr: str) -> tuple[str, str] | None:
     if cinfo is None or cinfo[0].lower() != "reduce":
         return None
     _nm, pos, kw = cinfo
-    fn_src = pos[0].strip() if pos else kw.get("f", kw.get("FUN", "")).strip()
-    x_src = pos[1].strip() if len(pos) >= 2 else kw.get("x", kw.get("init", "")).strip()
+    fn_kw = kw.get("f", kw.get("FUN", "")).strip()
+    x_kw = kw.get("x", "").strip()
+    if fn_kw:
+        # R matches named arguments before positional arguments.  Thus in
+        # Reduce(v, f=function(...)) the positional value is x, not f.
+        fn_src = fn_kw
+        x_src = x_kw or (pos[0].strip() if pos else "")
+    else:
+        fn_src = pos[0].strip() if pos else ""
+        x_src = x_kw or (pos[1].strip() if len(pos) >= 2 else "")
     if not fn_src or not x_src:
         return None
     return fn_src, x_src
@@ -3458,7 +3466,7 @@ def validate_unsupported_runtime_semantics_source(src: str) -> None:
             "quote() language objects are unsupported; the transpiler does not provide a runtime R AST "
             "that can later be printed, modified, or evaluated"
         )
-    if re.search(r"\bcall\s*\(", code, re.IGNORECASE):
+    if re.search(r"(?<![\w.])call\s*\(", code, re.IGNORECASE):
         raise NotImplementedError(
             "constructing or modifying R call objects with call() is unsupported; generated Fortran has "
             "no runtime language-object evaluator"
@@ -3508,7 +3516,13 @@ def validate_unsupported_runtime_semantics_source(src: str) -> None:
             "local({...}) returning a closure with private lexical state is unsupported; generated "
             "Fortran procedures do not carry dynamically created R environments"
         )
-    if re.search(r"(?m)^\s*function\s*\([^)]*\)", code) or re.search(
+    returned_closure = False
+    for closure_match in re.finditer(r"(?m)^\s*function\s*\([^)]*\)", code):
+        prefix = code[: closure_match.start()].rstrip()
+        if not prefix or prefix[-1] not in {"(", ","}:
+            returned_closure = True
+            break
+    if returned_closure or re.search(
         r"\[\[[^]]+\]\]\s*(?:<-|=)\s*function\s*\(", code
     ):
         raise NotImplementedError(
@@ -7602,6 +7616,10 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
 
     _collect_arg_aliases(fn.body)
     body_text_all = "\n".join(_stmt_texts_for_rank_scan(fn.body))
+    for reduce_text in _stmt_texts_for_rank_scan(fn.body):
+        reduce_info = _parse_reduce_call(reduce_text.strip())
+        if reduce_info is not None and re.fullmatch(re.escape(arg), reduce_info[1].strip()):
+            return max(forced_rank or 0, 1)
     if re.search(rf"%in%\s*{re.escape(arg)}\b", body_text_all, re.IGNORECASE):
         return max(forced_rank or 0, 1)
     if arg_aliases:
@@ -7764,6 +7782,11 @@ def infer_arg_rank(fn: FuncDef, arg: str) -> int:
 
     rank_out = _scan(fn.body)
     body_text = "\n".join(_stmt_texts_for_rank_scan(fn.body))
+    if (
+        re.search(rf"\blength\s*\(\s*{re.escape(arg)}\s*\)\s*==\s*1L?\b", body_text, re.IGNORECASE)
+        and not re.search(rf"\b{re.escape(arg)}\s*\[", body_text)
+    ):
+        rank_out = 0
     if re.search(rf"\b{re.escape(arg)}\s*<-\s*{re.escape(arg)}\s*\[\s*is\.finite\s*\(", body_text, re.IGNORECASE):
         if not re.search(rf"\b{re.escape(arg)}\s*\[[^\]]*,[^\]]*\]", body_text):
             rank_out = min(rank_out, 1)
@@ -8834,12 +8857,42 @@ def obfuscate_r_source(src: str, seed: int | None = None) -> str:
 
 
 def _qualify_lifted_sibling_calls_expr(expr: str, current_fn_name: str) -> str:
-    if "_" not in current_fn_name:
-        return expr
-    parent_prefix = current_fn_name.rsplit("_", 1)[0]
-    if not parent_prefix:
-        return expr
+    prefixes = [current_fn_name]
+    if "_" in current_fn_name:
+        prefixes.append(current_fn_name.rsplit("_", 1)[0])
+
+    def qualified_helper(short_name: str) -> str | None:
+        for prefix in prefixes:
+            candidate = f"{prefix}_{short_name}"
+            if candidate.lower() in _FUNC_DEFS_BY_NAME:
+                return candidate
+        return None
+
     out = expr
+    for apply_name in ("sapply", "lapply"):
+        def qualify_callback(inner: str, call_name: str = apply_name) -> str:
+            c_apply = parse_call_text(f"{call_name}({inner})")
+            if c_apply is None or len(c_apply[1]) < 2:
+                return f"{call_name}({inner})"
+            callback = c_apply[1][1].strip()
+            if not re.fullmatch(r"[A-Za-z]\w*", callback):
+                return f"{call_name}({inner})"
+            qualified = qualified_helper(callback)
+            helper_def = _FUNC_DEFS_BY_NAME.get(qualified.lower()) if qualified else None
+            if qualified is None or helper_def is None:
+                return f"{call_name}({inner})"
+            pos = list(c_apply[1])
+            helper_args = list(helper_def.args)
+            if len(helper_args) > 1:
+                first = helper_args[0]
+                captures = ", ".join(helper_args[1:])
+                pos[1] = f"function({first}) {qualified}({first}, {captures})"
+            else:
+                pos[1] = qualified
+            rendered = pos + [f"{key}={value}" for key, value in c_apply[2].items()]
+            return f"{call_name}({', '.join(rendered)})"
+
+        out = _replace_balanced_func_calls(out, apply_name, qualify_callback)
     call_names = sorted(set(re.findall(r"\b([A-Za-z]\w*)\s*\(", out)), key=len, reverse=True)
     builtin_call_names = set(globals().get("_PARTIAL_MAIN_IGNORE_NAMES", set())) | {
         "chol",
@@ -8867,8 +8920,8 @@ def _qualify_lifted_sibling_calls_expr(expr: str, current_fn_name: str) -> str:
     for call_nm in call_names:
         if call_nm.lower() in builtin_call_names:
             continue
-        qualified = f"{parent_prefix}_{call_nm}"
-        if qualified.lower() not in _FUNC_DEFS_BY_NAME:
+        qualified = qualified_helper(call_nm)
+        if qualified is None:
             continue
         if call_nm.lower() == current_fn_name.lower() or qualified.lower() == current_fn_name.lower():
             continue
@@ -9990,7 +10043,7 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             return 0
         return 0
 
-    if re.match(r"^[A-Za-z]\w*\(", expr_l):
+    if re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\s*\(", expr_l):
         c_call = parse_call_text(expr)
         if c_call is not None:
             fn_name = c_call[0].lower()
@@ -10031,6 +10084,8 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
                     return 2
                 return 1
             if fn_name == "mapply":
+                return 1
+            if fn_name in {"unlist", "strsplit", "strsplit_fixed"}:
                 return 1
             if fn_name == "ave":
                 return 1
@@ -12254,6 +12309,27 @@ def r_expr_to_fortran(expr: str) -> str:
             s = f"as.roman(({m_rom.group(1)}) {m_rom.group(2)} {m_rom.group(3)})"
     s = _collapse_strsplit_first_index(s)
     s = fscan.strip_redundant_outer_parens_expr(s)
+    nested_idiv_mod = _split_top_level_token(s, "%%", from_right=True)
+    if nested_idiv_mod is not None:
+        lhs_nested_mod = nested_idiv_mod[0].strip()
+        if (
+            lhs_nested_mod.startswith("(")
+            and lhs_nested_mod.endswith(")")
+            and _split_top_level_token(lhs_nested_mod[1:-1], "%/%", from_right=True) is not None
+        ):
+            lhs_nested_f = r_expr_to_fortran(lhs_nested_mod[1:-1])
+            rhs_nested_f = r_expr_to_fortran(nested_idiv_mod[1])
+            if _mod_operand_is_integer_fortran_expr(lhs_nested_f) and _mod_operand_is_integer_fortran_expr(rhs_nested_f):
+                return f"mod({lhs_nested_f}, {rhs_nested_f})"
+            return f"mod(real({lhs_nested_f}, kind=dp), real({rhs_nested_f}, kind=dp))"
+    c_unlist_early = parse_call_text(s)
+    if c_unlist_early is not None and c_unlist_early[0].lower() == "unlist" and c_unlist_early[1]:
+        unlist_arg = c_unlist_early[1][0].strip()
+        c_unlist_arg = parse_call_text(_collapse_strsplit_first_index(unlist_arg))
+        if c_unlist_arg is not None and c_unlist_arg[0].lower() in {"strsplit", "strsplit_fixed"}:
+            # Scalar strsplit is represented directly as its character vector,
+            # so R's one-level list wrapper has nothing left to flatten.
+            return r_expr_to_fortran(unlist_arg)
     # outer(x, y, "op") as a sub-expression -> dedicated runtime variant, so it
     # works anywhere (not only as a bare RHS statement).
     c_outer_expr = parse_call_text(s)
@@ -12302,15 +12378,58 @@ def r_expr_to_fortran(expr: str) -> str:
     s_pipe = _lower_r_native_pipe_expr(s)
     if s_pipe != s:
         return r_expr_to_fortran(s_pipe)
+    c_apply_row = parse_call_text(s)
+    if c_apply_row is not None and c_apply_row[0].lower() == "apply":
+        pos_apply_row, kw_apply_row = c_apply_row[1], c_apply_row[2]
+        x_apply_row = (pos_apply_row[0] if pos_apply_row else kw_apply_row.get("X", kw_apply_row.get("x", ""))).strip()
+        margin_apply_row = (
+            pos_apply_row[1]
+            if len(pos_apply_row) >= 2
+            else kw_apply_row.get("MARGIN", kw_apply_row.get("margin", ""))
+        ).strip()
+        fun_apply_row = (
+            pos_apply_row[2]
+            if len(pos_apply_row) >= 3
+            else kw_apply_row.get("FUN", kw_apply_row.get("fun", ""))
+        ).strip()
+        c_rbind_row = parse_call_text(x_apply_row)
+        if (
+            margin_apply_row in {"2", "2L", "2l"}
+            and re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", fun_apply_row)
+            and c_rbind_row is not None
+            and c_rbind_row[0].lower() == "rbind"
+            and len(c_rbind_row[1]) == 1
+            and not c_rbind_row[2]
+        ):
+            # Applying a scalar/elemental callback to columns of a one-row
+            # rbind is exactly the callback over the source vector.
+            callback_name = _sanitize_r_var_name(fun_apply_row).lower()
+            vector_src = c_rbind_row[1][0].strip()
+            vector_f = r_expr_to_fortran(vector_src)
+            if callback_name in _USER_FUNC_RETURN_RANK and callback_name not in _USER_FUNC_ELEMENTAL:
+                callback_f = r_expr_to_fortran(fun_apply_row)
+                seq_bounds = _split_top_level_colon(vector_src)
+                if seq_bounds is not None:
+                    lo_f = _int_bound_expr(r_expr_to_fortran(seq_bounds[0]))
+                    hi_f = _int_bound_expr(r_expr_to_fortran(seq_bounds[1]))
+                    return f"[({callback_f}(i_sw), i_sw={lo_f},{hi_f})]"
+                return f"[({callback_f}({vector_f}(i_sw)), i_sw=1,size({vector_f}))]"
+            return r_expr_to_fortran(f"{fun_apply_row}({vector_src})")
     scalar_apply = _scalar_apply_lambda_to_fortran(s)
     if scalar_apply is not None:
         return scalar_apply
     c_reduce_early = parse_call_text(s)
     if c_reduce_early is not None and c_reduce_early[0].lower() == "reduce":
         pos_reduce, kw_reduce = c_reduce_early[1], c_reduce_early[2]
-        fn_reduce = (pos_reduce[0] if pos_reduce else kw_reduce.get("f", kw_reduce.get("FUN", ""))).strip()
-        x_reduce = (pos_reduce[1] if len(pos_reduce) >= 2 else kw_reduce.get("x", "")).strip()
-        init_reduce = (pos_reduce[2] if len(pos_reduce) >= 3 else kw_reduce.get("init", "")).strip()
+        fn_kw_reduce = kw_reduce.get("f", kw_reduce.get("FUN", "")).strip()
+        if fn_kw_reduce:
+            fn_reduce = fn_kw_reduce
+            x_reduce = kw_reduce.get("x", pos_reduce[0] if pos_reduce else "").strip()
+            init_reduce = kw_reduce.get("init", pos_reduce[1] if len(pos_reduce) >= 2 else "").strip()
+        else:
+            fn_reduce = (pos_reduce[0] if pos_reduce else "").strip()
+            x_reduce = kw_reduce.get("x", pos_reduce[1] if len(pos_reduce) >= 2 else "").strip()
+            init_reduce = kw_reduce.get("init", pos_reduce[2] if len(pos_reduce) >= 3 else "").strip()
         op_reduce = fn_reduce.strip("`\"'").strip()
         reducer = {"*": "product", "+": "sum", "min": "minval", "max": "maxval"}.get(op_reduce.lower())
         if reducer is not None and x_reduce:
@@ -12649,6 +12768,11 @@ def r_expr_to_fortran(expr: str) -> str:
     if m_dbl_subset is not None:
         base_dbl = m_dbl_subset.group(1)
         idx_dbl_src = m_dbl_subset.group(2).strip()
+        idx_dbl_dims = _split_index_dims(idx_dbl_src)
+        if len(idx_dbl_dims) == 2 and base_dbl.lower() in _KNOWN_MATRIX_NAMES:
+            row_dbl = _int_bound_expr(r_expr_to_fortran(idx_dbl_dims[0].strip()))
+            col_dbl = _int_bound_expr(r_expr_to_fortran(idx_dbl_dims[1].strip()))
+            return f"{base_dbl}({row_dbl}, {col_dbl})"
         if "]][[" in idx_dbl_src and base_dbl.lower() in _KNOWN_MATRIX_NAMES:
             outer_src, inner_src = idx_dbl_src.split("]][[", 1)
             idx_outer = _int_bound_expr(r_expr_to_fortran(outer_src.strip()))
@@ -12772,7 +12896,7 @@ def r_expr_to_fortran(expr: str) -> str:
                 or _split_trailing_r_subset(base_subset) is not None
                 or (
                     base_subset.strip().startswith("(")
-                    and _infer_assignment_rank_hint(fscan.strip_redundant_outer_parens_expr(base_subset.strip()), {}) >= 2
+                    and _infer_assignment_rank_hint(_strip_outer_parens(base_subset), {}) >= 2
                 )
             )
         ):
@@ -13679,6 +13803,17 @@ def r_expr_to_fortran(expr: str) -> str:
             logical_values0 = list(c_logical0[1]) + list(c_logical0[2].values()) if c_logical0 is not None else []
             labels0 = ["TRUE" if value.strip().upper() in {"TRUE", "T"} else "FALSE" for value in logical_values0]
             return _char_array_literal_for_labels(labels0)
+    if c_cast0 is not None and c_cast0[0].lower() == "as.integer" and c_cast0[1]:
+        cast_inner_i0 = fscan.strip_redundant_outer_parens_expr(c_cast0[1][0].strip())
+        cast_inner_i_call0 = parse_call_text(cast_inner_i0)
+        if cast_inner_i_call0 is not None and cast_inner_i_call0[0].lower() == "unlist":
+            cast_inner_i0 = _first_call_arg(cast_inner_i_call0, "x")
+            cast_inner_i_call0 = parse_call_text(cast_inner_i0)
+        if (
+            cast_inner_i_call0 is not None
+            and cast_inner_i_call0[0].lower() in {"strsplit", "strsplit_fixed", "substr", "substring"}
+        ):
+            return f"str_to_int({r_expr_to_fortran(cast_inner_i0)})"
     if c_cast0 is not None and c_cast0[0].lower() in {"as.numeric", "as.double"} and c_cast0[1]:
         cast_inner0 = fscan.strip_redundant_outer_parens_expr(c_cast0[1][0].strip())
         if re.fullmatch(r"[A-Za-z]\w*", cast_inner0) and cast_inner0.lower() in _CATEGORICAL_LABELS:
@@ -16766,7 +16901,7 @@ def r_expr_to_fortran(expr: str) -> str:
         ) else ""
         numeric_not_names = (
             _CURRENT_INT_SCALAR_NAMES
-            | _CURRENT_REAL_SCALAR_NAMES
+            | set(globals().get("_CURRENT_REAL_SCALAR_NAMES", set()))
             | _CURRENT_INT_ARRAY_NAMES
             | _CURRENT_REAL_ARRAY_NAMES
             | _KNOWN_INT_NAMES
@@ -17041,6 +17176,22 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "as.vector", _as_vector_to_fortran)
     def _as_integer_to_fortran(inner: str) -> str:
         src_i = inner.strip()
+        src_i_simple = (
+            _sanitize_r_var_name(src_i).lower()
+            if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", src_i)
+            else ""
+        )
+        src_i_call = parse_call_text(src_i)
+        if (
+            _dequote_string_literal(src_i) is not None
+            or src_i_simple in _CURRENT_CHAR_SCALAR_NAMES
+            or src_i_simple in _KNOWN_CHAR_VECTOR_NAMES
+            or (
+                src_i_call is not None
+                and src_i_call[0].lower() in {"strsplit", "strsplit_fixed", "substr", "substring"}
+            )
+        ):
+            return f"str_to_int({r_expr_to_fortran(src_i)})"
         pred_i = r_expr_to_fortran(src_i)
         if any(_split_top_level_token(src_i, op, from_right=True) is not None for op in ["==", "!=", ">=", "<=", ">", "<"]):
             return f"merge(1, 0, {pred_i})"
@@ -24939,7 +25090,31 @@ def emit_stmts(
                 if not st.args:
                     continue
                 for a in st.args:
-                    cond = fscan.strip_redundant_outer_parens_expr(r_expr_to_fortran(a))
+                    check_src = a
+                    current_check_fn = str(helper_ctx.get("current_fn_name", "")) if helper_ctx else ""
+                    current_check_def = _FUNC_DEFS_BY_NAME.get(current_check_fn.lower())
+                    if current_check_def is not None:
+                        scalar_numeric_formals = {
+                            formal
+                            for formal in current_check_def.args
+                            if _USER_FUNC_ARG_RANK.get(current_check_fn.lower(), {}).get(formal.lower(), 0) == 0
+                            and formal not in infer_function_character_scalars(current_check_def)
+                            and formal not in infer_function_logical_scalar_arg_names(current_check_def)
+                        }
+                        for formal in scalar_numeric_formals:
+                            check_src = re.sub(
+                                rf"\bis\.numeric\s*\(\s*{re.escape(formal)}\s*\)",
+                                "TRUE",
+                                check_src,
+                                flags=re.IGNORECASE,
+                            )
+                            check_src = re.sub(
+                                rf"\blength\s*\(\s*{re.escape(formal)}\s*\)",
+                                "1L",
+                                check_src,
+                                flags=re.IGNORECASE,
+                            )
+                    cond = fscan.strip_redundant_outer_parens_expr(r_expr_to_fortran(check_src))
                     neg = _negate_simple_relational_expr(cond)
                     if neg is not None:
                         msg = _fortran_error_msg(f"error: need {cond}")
@@ -27417,6 +27592,8 @@ def emit_function(
     list_specs: dict[str, ListReturnSpec],
     helper_ctx: dict[str, object] | None = None,
 ) -> bool:
+    global _CURRENT_INT_SCALAR_NAMES, _CURRENT_REAL_SCALAR_NAMES
+    global _CURRENT_CHAR_SCALAR_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES
     has_r_mod = bool(helper_ctx and helper_ctx.get("has_r_mod"))
     need_r_mod: set[str] = set()
     if helper_ctx is not None:
@@ -27787,6 +27964,14 @@ def emit_function(
         last_expr_for_ret = last_ret_arg.strip()
 
     rk = _expr_kind_simple(last_expr_for_ret)
+    if re.fullmatch(r"[A-Za-z]\w*", last_expr_for_ret):
+        ret_ident_probe = re.escape(last_expr_for_ret)
+        if any(
+            re.match(rf"^\s*{ret_ident_probe}\s*<-\s*(?:TRUE|FALSE|T|F)\s*$", txt, re.IGNORECASE)
+            for txt in _stmt_texts_for_rank_scan(fn.body)
+        ):
+            rk = "logical"
+            _USER_FUNC_RETURN_KIND[fn.name.lower()] = "logical"
     rdecl = "real(kind=dp)"
     ret_rank = _USER_FUNC_RETURN_RANK.get(fn.name.lower(), 0)
     ret_expr_src = last_expr_for_ret
@@ -27942,6 +28127,16 @@ def emit_function(
         )
         if not has_bare_ranked_name:
             ret_rank = 0
+    if (
+        _USER_FUNC_RETURN_KIND.get(fn.name.lower()) == "logical"
+        and not re.match(r"^\s*(?:c|rep|rep_len|logical)\s*\(", ret_expr_src, re.IGNORECASE)
+        and "[" not in ret_expr_src
+        and all(infer_arg_rank(fn, arg_name) == 0 for arg_name in fn.args)
+    ):
+        # Scalar predicates are commonly called elementally on vectors.  A
+        # comparison in the tail does not itself make the declared function
+        # result rank one; Fortran elemental invocation supplies that behavior.
+        ret_rank = 0
     ret_ident_m = re.match(r"^[A-Za-z]\w*$", last_expr_for_ret)
     if list_spec is None and ret_ident_m is not None:
         ret_ident = ret_ident_m.group(0)
@@ -28374,6 +28569,18 @@ def emit_function(
         else:
             o.w(f"real(kind=dp), intent({intent}){opt}{scalar_value_attr} :: {a}")
             arg_type[a] = "real"
+    _CURRENT_INT_SCALAR_NAMES = {
+        arg.lower() for arg, kind in arg_type.items() if kind == "integer" and arg_rank.get(arg, 0) == 0
+    }
+    _CURRENT_REAL_SCALAR_NAMES = {
+        arg.lower() for arg, kind in arg_type.items() if kind == "real" and arg_rank.get(arg, 0) == 0
+    }
+    _CURRENT_CHAR_SCALAR_NAMES = {
+        arg.lower() for arg, kind in arg_type.items() if kind == "char" and arg_rank.get(arg, 0) == 0
+    }
+    _CURRENT_LOGICAL_SCALAR_NAMES = {
+        arg.lower() for arg, kind in arg_type.items() if kind == "logical" and arg_rank.get(arg, 0) == 0
+    }
     if emit_as_subroutine:
         pass
     elif list_spec is None and ret_rank >= 1 and "allocatable" in rdecl:
@@ -28671,6 +28878,8 @@ def emit_function(
         ints, real_scalars, int_arrays, real_arrays, params = classify_vars(
             body_use, infer_assigned_names(body_use), known_arrays=known_arrays
         )
+        if re.search(r"\b(?:sapply|lapply)\s*\(", "\n".join(_collect_stmt_expr_texts(fn.body)), re.IGNORECASE):
+            ints.add("i_sw")
         for st_date_local in body_use:
             if not isinstance(st_date_local, Assign):
                 continue
@@ -30138,6 +30347,8 @@ def emit_function(
             char_scalars_loc.discard(nm)
             char_arrays_loc.discard(nm)
             params.pop(nm, None)
+        if re.search(r"\b(?:sapply|lapply|apply)\s*\(", "\n".join(_collect_stmt_expr_texts(body_use)), re.IGNORECASE):
+            ints.add("i_sw")
         real_scalars.difference_update(real_arrays)
         real_arrays.difference_update(ints)
         int_arrays.difference_update(ints)
@@ -30218,8 +30429,20 @@ def emit_function(
                 or re.match(r"^\s*(?:maxloc|minloc)\s*\(", r_expr_to_fortran(st_idx_ctx.expr.strip()), re.IGNORECASE)
             )
         }
-        helper_ctx_loc["int_scalar_vars"] = set(ints) | index_scalar_names_for_ctx
-        helper_ctx_loc["real_scalar_vars"] = set(real_scalars)
+        helper_ctx_loc["int_scalar_vars"] = (
+            set(ints)
+            | index_scalar_names_for_ctx
+            | {
+                arg_local_map.get(a, a)
+                for a in fn.args
+                if arg_type.get(a) == "integer" and arg_rank.get(a, 0) == 0
+            }
+        )
+        helper_ctx_loc["real_scalar_vars"] = set(real_scalars) | {
+            arg_local_map.get(a, a)
+            for a in fn.args
+            if arg_type.get(a) == "real" and arg_rank.get(a, 0) == 0
+        }
         # Local rank map for broadcast-aware assignment lowering.
         local_matrix_vars: set[str] = set()
         local_vector_vars: set[str] = set()
@@ -30360,12 +30583,23 @@ def emit_function(
             reduce_size = _reduce_vector_size_expr(reduce_vec)
             reduce_first = f"real({_reduce_vector_element_expr(reduce_vec, '1')}, kind=dp)"
             reduce_item = f"real({_reduce_vector_element_expr(reduce_vec, 'xr2f_reduce_i')}, kind=dp)"
+            c_reduce_emit = parse_call_text(ret_expr)
+            right_reduce = False
+            if c_reduce_emit is not None:
+                right_src = c_reduce_emit[2].get("right", "FALSE").strip().upper()
+                right_reduce = right_src in {"TRUE", "T"}
             o.w(f"if ({reduce_size} <= 0) then")
             o.w(f"   {rname} = 0.0_dp")
             o.w("else")
-            o.w(f"   {rname} = {reduce_first}")
-            o.w(f"   do xr2f_reduce_i = 2, {reduce_size}")
-            o.w(f"      {rname} = {_reduce_step_expr(reduce_fn, rname, reduce_item)}")
+            if right_reduce:
+                reduce_last = f"real({_reduce_vector_element_expr(reduce_vec, reduce_size)}, kind=dp)"
+                o.w(f"   {rname} = {reduce_last}")
+                o.w(f"   do xr2f_reduce_i = {reduce_size} - 1, 1, -1")
+                o.w(f"      {rname} = {_reduce_step_expr(reduce_fn, reduce_item, rname)}")
+            else:
+                o.w(f"   {rname} = {reduce_first}")
+                o.w(f"   do xr2f_reduce_i = 2, {reduce_size}")
+                o.w(f"      {rname} = {_reduce_step_expr(reduce_fn, rname, reduce_item)}")
             o.w("   end do")
             o.w("end if")
             o.w(f"end function {fn.name}")
@@ -31607,7 +31841,46 @@ def _scalar_apply_lambda_to_fortran(expr: str) -> str | None:
     """Lower homogeneous scalar sapply/lapply lambdas to an array constructor."""
     info = _parse_sapply_shorthand_lambda(expr)
     if info is None:
-        return None
+        c_named = parse_call_text(expr.strip())
+        if c_named is None or c_named[0].lower() not in {"sapply", "lapply"}:
+            return None
+        pos_named, kw_named = c_named[1], c_named[2]
+        x_src_named = (pos_named[0] if pos_named else kw_named.get("X", kw_named.get("x", ""))).strip()
+        fun_src_named = (
+            pos_named[1]
+            if len(pos_named) >= 2
+            else kw_named.get("FUN", kw_named.get("fun", ""))
+        ).strip()
+        if not x_src_named or not re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", fun_src_named):
+            return None
+        fun_l_named = fun_src_named.lower()
+        if (
+            fun_l_named not in {"inttoutf8"}
+            and fun_l_named not in _USER_FUNC_RETURN_RANK
+            and fun_l_named not in _FUNC_DEFS_BY_NAME
+        ):
+            return None
+
+        def named_item(actual_src: str) -> str:
+            if fun_l_named == "inttoutf8":
+                return f"achar({_int_bound_expr(r_expr_to_fortran(actual_src))})"
+            return r_expr_to_fortran(f"{fun_src_named}({actual_src})")
+
+        range_named = _split_top_level_colon(
+            fscan.strip_redundant_outer_parens_expr(x_src_named)
+        )
+        if range_named is not None:
+            lo_named = _int_bound_expr(r_expr_to_fortran(range_named[0].strip()))
+            hi_named = _int_bound_expr(r_expr_to_fortran(range_named[1].strip()))
+            item_named = named_item("i_sw")
+            if fun_l_named == "inttoutf8":
+                return f"[character(len=1) :: ({item_named}, i_sw={lo_named},{hi_named})]"
+            return f"[({item_named}, i_sw={lo_named},{hi_named})]"
+        x_f_named = r_expr_to_fortran(x_src_named)
+        item_named = named_item(f"{x_f_named}(i_sw)")
+        if fun_l_named == "inttoutf8":
+            return f"[character(len=1) :: ({item_named}, i_sw=1,size({x_f_named}))]"
+        return f"[({item_named}, i_sw=1,size({x_f_named}))]"
     x_src, arg_name, body_src = info
 
     def lower_body(actual_src: str) -> str:
@@ -31628,7 +31901,11 @@ def _scalar_apply_lambda_to_fortran(expr: str) -> str | None:
     if c_x is not None and c_x[0].lower() == "c":
         elems = [p.strip() for p in c_x[1]] + [v.strip() for v in c_x[2].values()]
         return "[" + ", ".join(lower_body(elem) for elem in elems) + "]"
-    colon = _split_top_level_colon(x_src)
+    if c_x is not None and c_x[0].lower() in {"seq", "seq.int"} and len(c_x[1]) >= 2:
+        lo = _int_bound_expr(r_expr_to_fortran(c_x[1][0].strip()))
+        hi = _int_bound_expr(r_expr_to_fortran(c_x[1][1].strip()))
+        return f"[({lower_body('i_sw')}, i_sw={lo},{hi})]"
+    colon = _split_top_level_colon(fscan.strip_redundant_outer_parens_expr(x_src))
     if colon is not None and _is_int_literal(colon[0].strip()) and _is_int_literal(colon[1].strip()):
         lo = int(re.sub(r"[lL]$", "", colon[0].strip()))
         hi = int(re.sub(r"[lL]$", "", colon[1].strip()))
@@ -33551,6 +33828,76 @@ def _lower_recall_calls(stmts: list[object]) -> list[object]:
     return stmts
 
 
+def _flatten_static_numeric_list_values(expr: str) -> list[str] | None:
+    """Return scalar leaves for a recursively nested, homogeneous numeric list."""
+    t = expr.strip()
+    cinfo = parse_call_text(t)
+    if cinfo is not None and cinfo[0].lower() == "list":
+        values: list[str] = []
+        for item in list(cinfo[1]) + list(cinfo[2].values()):
+            child = _flatten_static_numeric_list_values(item)
+            if child is None:
+                return None
+            values.extend(child)
+        return values
+    if _is_int_literal(t) or _is_real_literal(t):
+        return [t]
+    return None
+
+
+def lower_static_numeric_unlist(stmts: list[object]) -> list[object]:
+    """Flatten static numeric list trees when their only required list operation is unlist()."""
+
+    def lower_scope(items: list[object]) -> None:
+        used: set[str] = set()
+        for txt in _collect_stmt_expr_texts(items):
+            for m in re.finditer(r"\bunlist\s*\(\s*([A-Za-z]\w*)\s*\)", txt, re.IGNORECASE):
+                used.add(m.group(1))
+        flattened: set[str] = set()
+        for st in items:
+            if not isinstance(st, Assign) or st.name not in used:
+                continue
+            values = _flatten_static_numeric_list_values(st.expr)
+            if values is None:
+                continue
+            st.expr = "c(" + ", ".join(values) + ")"
+            flattened.add(st.name)
+
+        def rewrite(txt: str) -> str:
+            return _replace_balanced_func_calls(
+                txt,
+                "unlist",
+                lambda inner: inner.strip() if inner.strip() in flattened else f"unlist({inner})",
+            )
+
+        for st in items:
+            if isinstance(st, FuncDef):
+                lower_scope(st.body)
+            elif isinstance(st, Assign):
+                st.expr = rewrite(st.expr)
+            elif isinstance(st, ExprStmt):
+                st.expr = rewrite(st.expr)
+            elif isinstance(st, CallStmt):
+                st.args = [rewrite(arg) for arg in st.args]
+            elif isinstance(st, PrintStmt):
+                st.args = [rewrite(arg) for arg in st.args]
+            elif isinstance(st, IfStmt):
+                st.cond = rewrite(st.cond)
+                lower_scope(st.then_body)
+                lower_scope(st.else_body)
+            elif isinstance(st, ForStmt):
+                st.iter_expr = rewrite(st.iter_expr)
+                lower_scope(st.body)
+            elif isinstance(st, WhileStmt):
+                st.cond = rewrite(st.cond)
+                lower_scope(st.body)
+            elif isinstance(st, RepeatStmt):
+                lower_scope(st.body)
+
+    lower_scope(stmts)
+    return stmts
+
+
 def _rename_duplicate_function_defs(stmts: list[object]) -> list[object]:
     """Rename repeated top-level function definitions and bind later uses to the latest definition."""
     counts: dict[str, int] = {}
@@ -34141,6 +34488,16 @@ def _rewrite_simple_anonymous_apply_functions(src: str) -> str:
     return "\n".join(out) + ("\n" if src.endswith("\n") else "")
 
 
+def _rewrite_simple_anonymous_reduce_functions(src: str) -> str:
+    """Collapse one-expression braced Reduce callbacks into parseable expressions."""
+    return re.sub(
+        r"(\bReduce\s*\(.*?\bf\s*=\s*function\s*\([^)]*\))\s*\{\s*([^{}\n]+?)\s*\}(\s*\))",
+        lambda m: f"{m.group(1)} {m.group(2).strip()}{m.group(3)}",
+        src,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def _rewrite_simple_anonymous_combn_functions(src: str) -> str:
     """Lift one-expression combn anonymous callbacks into named helpers."""
     lines = src.splitlines()
@@ -34587,6 +34944,7 @@ def transpile_r_to_fortran(
         src,
     )
     src = _rewrite_simple_anonymous_apply_functions(src)
+    src = _rewrite_simple_anonymous_reduce_functions(src)
     src = _rewrite_simple_anonymous_combn_functions(src)
     src = _rewrite_simple_transposed_sapply_field(src)
     _DOTTED_VAR_RENAMES = {}
@@ -34637,6 +34995,7 @@ def transpile_r_to_fortran(
     stmts, i = parse_block(lines, 0, comment_lookup=comment_lookup)
     if i != len(lines):
         raise NotImplementedError("could not parse full source")
+    stmts = lower_static_numeric_unlist(stmts)
     validate_undefined_top_level_user_call_args(stmts)
     source_main_stmts = [s for s in stmts if not isinstance(s, FuncDef)]
     source_main_loop_mutated_names = {
@@ -35345,6 +35704,16 @@ def transpile_r_to_fortran(
         ret_arg = _return_call_arg(ret_expr)
         if ret_arg is not None:
             ret_expr = ret_arg
+        ret_call = parse_call_text(ret_expr)
+        if ret_call is not None and ret_call[0].lower() == "as.integer":
+            ret_rank = _infer_assignment_rank_hint(ret_expr, {})
+            if "strsplit" in ret_expr.lower():
+                ret_rank = max(ret_rank, 1)
+            if ret_rank > 0:
+                fn_return_array_kind[f_ret.name.lower()] = "integer"
+                _USER_FUNC_RETURN_KIND[f_ret.name.lower()] = "int"
+                _USER_FUNC_RETURN_RANK[f_ret.name.lower()] = ret_rank
+                continue
         if (
             ret_expr.startswith("c(")
             or (ret_expr.startswith("[") and ret_expr.endswith("]"))
@@ -38453,7 +38822,11 @@ def transpile_r_to_fortran(
             int_arrays.discard(st_arr1.name)
         params.pop(st_arr1.name, None)
 
-    if char_arrays:
+    if char_arrays or re.search(
+        r"\b(?:sapply|lapply|apply)\s*\(",
+        "\n".join(_collect_stmt_expr_texts(main_stmts)),
+        re.IGNORECASE,
+    ):
         ints.add("i_ew")
         ints.add("i_gr")
         ints.add("i_nc")
@@ -40494,6 +40867,7 @@ def transpile_r_to_fortran(
         "as_roman",
         "unlink_recursive",
         "inttobits",
+        "str_to_int",
         "str_to_real",
         "fivenum",
     }
@@ -46847,6 +47221,57 @@ def coerce_positional_integer_actuals_from_decls_text(f90: str) -> str:
     return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
 
 
+def promote_integer_array_function_callers_text(f90: str) -> str:
+    """Keep receivers of rank-1 integer function results rank-1."""
+    array_funcs: set[str] = set()
+    current_fn: str | None = None
+    for line in f90.splitlines():
+        m_fn = re.match(r"^\s*(?:(?:pure|elemental|recursive)\s+)*function\s+([A-Za-z]\w*)\b", line, re.IGNORECASE)
+        if m_fn is not None:
+            current_fn = m_fn.group(1)
+            continue
+        if current_fn and re.match(
+            rf"^\s*integer\s*,\s*allocatable\s*::\s*{re.escape(current_fn)}_result\s*\(:\)",
+            line,
+            re.IGNORECASE,
+        ):
+            array_funcs.add(current_fn.lower())
+        if re.match(r"^\s*end\s+function\b", line, re.IGNORECASE):
+            current_fn = None
+    if not array_funcs:
+        return f90
+    receivers = {
+        m.group(1).lower()
+        for m in re.finditer(
+            r"(?m)^\s*([A-Za-z]\w*)\s*=\s*([A-Za-z]\w*)\s*\(",
+            f90,
+        )
+        if m.group(2).lower() in array_funcs
+    }
+    if not receivers:
+        return f90
+
+    out: list[str] = []
+    for line in f90.splitlines():
+        m_decl = re.match(r"^(\s*)integer\s*::\s*(.+)$", line, re.IGNORECASE)
+        if m_decl is None:
+            out.append(line)
+            continue
+        scalars: list[str] = []
+        arrays: list[str] = []
+        for part in split_top_level_commas(m_decl.group(2)):
+            name = part.strip()
+            if re.fullmatch(r"[A-Za-z]\w*", name) and name.lower() in receivers:
+                arrays.append(name)
+            else:
+                scalars.append(name)
+        if scalars:
+            out.append(f"{m_decl.group(1)}integer :: {', '.join(scalars)}")
+        if arrays:
+            out.append(f"{m_decl.group(1)}integer, allocatable :: {', '.join(name + '(:)' for name in arrays)}")
+    return "\n".join(out) + ("\n" if f90.endswith("\n") else "")
+
+
 def demote_elemental_procedure_actuals_text(f90: str) -> str:
     """An elemental procedure is not a valid non-intrinsic procedure actual."""
     actual_names: set[str] = set()
@@ -49021,7 +49446,7 @@ def remove_pure_from_impure_call_graph_text(f90: str) -> str:
         "rweibull", "rcauchy", "rgeom", "rnbinom", "rhyper", "rwilcox",
         "rsignrank", "rmultinom", "rbinom", "rpois", "sample_int",
         "sample_int1", "read_csv_real_matrix", "write_csv_real_matrix",
-        "file_create", "file_remove", "dir_create",
+        "file_create", "file_remove", "dir_create", "str_to_real",
     }
 
     def directly_impure(block: str) -> bool:
@@ -62298,11 +62723,11 @@ def _check_untranslated_r_leaks(f90: str) -> None:
             )
         if re.search(r"[\w)\]]\s*\[\[", nostr):
             raise NotImplementedError(
-                "unsupported R feature: list indexing x[[i]] in this context"
+                f"unsupported R feature: list indexing x[[i]] in this context: {nostr.strip()}"
             )
         if re.search(r"\)\[", nostr):
             raise NotImplementedError(
-                "unsupported R feature: subscripting a function-call result in this context"
+                f"unsupported R feature: subscripting a function-call result in this context: {nostr.strip()}"
             )
 
 
@@ -64136,6 +64561,7 @@ def main() -> int:
     f90 = rewrite_recursive_io_function_args_text(f90)
     f90 = repair_vector_call_scalar_index_assignments_text(f90)
     f90 = repair_scalar_integer_function_callers_text(f90)
+    f90 = promote_integer_array_function_callers_text(f90)
     f90 = repair_matrix_filter_assignment_targets_text(f90)
     f90 = coerce_user_call_integer_actuals_text(f90)
     f90 = promote_sample_int_bound_scalars_text(f90)
