@@ -16681,6 +16681,7 @@ def r_expr_to_fortran(expr: str) -> str:
             if (
                 _is_int_literal(p)
                 or simple in (_KNOWN_INT_NAMES | _KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_SCALAR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+                or simple in _KNOWN_INT_CONSTANTS
                 or call_kind in {"int", "integer"}
             ):
                 return f"int_to_string({_int_bound_expr(p_f)})"
@@ -16762,12 +16763,35 @@ def r_expr_to_fortran(expr: str) -> str:
                 "strsplit", "sort", "unique", "rev",
             }
 
+        def _paste_operand_is_int_vector(p_v: str) -> bool:
+            pv = p_v.strip()
+            colon = _split_top_level_colon(pv)
+            if colon is not None:
+                return all(
+                    _is_int_literal(b.strip())
+                    or _sanitize_r_var_name(b.strip()).lower()
+                    in (_KNOWN_INT_NAMES | _CURRENT_INT_SCALAR_NAMES | _KNOWN_INT_CONSTANTS)
+                    for b in colon
+                )
+            pvl = (
+                _sanitize_r_var_name(pv).lower()
+                if re.fullmatch(r"[A-Za-z]\w*", pv)
+                else ""
+            )
+            return bool(pvl) and pvl in (_KNOWN_INT_VECTOR_NAMES | _CURRENT_INT_ARRAY_NAMES)
+
         if (
             collapse_src is not None
             and collapse_src.strip().upper() not in {"NULL", "NA"}
             and any(_paste_operand_is_vector(p) for p in pos_p)
         ):
-            return f"char_join({out}, {r_expr_to_fortran(collapse_src.strip())})"
+            sep_collapse = r_expr_to_fortran(collapse_src.strip())
+            # A single integer-vector operand keeps its element-wise character
+            # coercion via the char_join generic's integer procedure (the
+            # char-array `out` would otherwise mismatch).
+            if len(pos_p) == 1 and _paste_operand_is_int_vector(pos_p[0]):
+                return f"char_join({r_expr_to_fortran(pos_p[0].strip())}, {sep_collapse})"
+            return f"char_join({out}, {sep_collapse})"
         return out
     # lm accessors / summary fields (subset)
     s = re.sub(r"\bsummary\s*\(\s*([A-Za-z]\w*)\s*\)\s*\$\s*r\.squared\b", r"\1%r_squared", s)
