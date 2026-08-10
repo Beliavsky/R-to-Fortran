@@ -10,7 +10,7 @@ implicit none
 private
 public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq, rt_vec, rf_rng, rlogis, rlnorm, &
    & rweibull, rcauchy, rgeom, rnbinom, rhyper, rwilcox, rsignrank, rmultinom, rnorm_mat, rbinom, rpois, random_choice2_prob, &
-   & randint_range, sample_int, sample_int1, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
+   & randint_range, sample_int, sample_int1, sample_value_int, quantile, median, summary, dnorm, tail, cbind2, cbind, numeric, &
    & pmax, r_round, sd, r_sd, var, r_format_vec, colMeans, apply_col_cumsum, apply_col_sd, apply_row_sd, count_ws_tokens, &
    & besselJ, besselY, besselI, besselK, &
    & read_real_vector, read_table_real_matrix, read_csv_real_matrix, read_csv_header_names, &
@@ -37,11 +37,11 @@ public :: dp, runif1, runif_vec, rnorm1, rnorm_vec, rexp, rgamma, rbeta, rchisq,
    & union, intersect, setdiff, setequal, combn, findInterval, cut, cut_n, outer, &
    & outer_plus, outer_minus, outer_divide, outer_power, &
    & cumsum, cumprod, cummax, diff, diag, toeplitz, chol, chol2inv, forwardsolve, backsolve, sort, sort_list, polyroot, decompose, ecdf_eval, &
-   & nchar, char_join, int_to_string, real_to_string_f, real_to_string_g, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, urldecode, nextn, kronecker, fft, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
+   & nchar, char_join, char_ends_with, int_to_string, real_to_string_f, real_to_string_g, r_to_string_real, r_substr, r_substr_replace, getwd, tempfile, file_path, file_exists, file_create, file_remove, file_info_t, file_info, file_isdir, file_size, file_path_value, file_mode, file_mtime, file_ctime, file_atime, file_exe, file_extension, print_file_info, dir_exists, dir_create, list_files, scan_real, grep_value_char, r_command_args, strsplit_fixed, toupper, tolower, casefold, trimws, replace_first_fixed, replace_all_fixed, chartr, urldecode, nextn, kronecker, fft, ar_coef_names, lag_names, lower_tri, upper_tri, row_index_mat, col_index_mat, matrix_set_grow_real, is_na, which, which_first, which_last, which_arr_ind, replace, rle, inverse_rle, print_rle, r_typeof, r_character, order_real, rank_average, &
    & rank_first, det_real, kappa_real, eigen_sym_values, solve_real, qr_fit_t, qr, qr_Q, qr_R, qr_coef, qr_rank, qr_pivot, qr_fitted, qr_resid, qr_qty, qr_qy, print_qr, &
    & rle_real_t, rle_int_t, rle_char_t, rle_logical_t, &
    & nested_matrix_list_len, r_beta, r_lbeta, r_choose, r_lchoose, r_gamma, r_lgamma, r_psigamma, r_digamma, r_trigamma, &
-   & r_factorial, r_lfactorial, t_test_result_t, t_test, t_test_p_value, print_t_test, &
+   & r_factorial, r_lfactorial, r_digit_power_sum, t_test_result_t, t_test, t_test_p_value, print_t_test, &
    & chisq_test_result_t, chisq_test, print_chisq_test, prop_test_result_t, &
    & prop_test, print_prop_test, cor_test_result_t, cor_test, print_cor_test, &
    & fisher_test_result_t, fisher_test, print_fisher_test, wilcox_test_result_t, &
@@ -54,8 +54,8 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
-   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_real, fivenum
-public :: r_dataframe_t, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
+   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_int, str_to_real, fivenum
+public :: r_dataframe_t, table_char_t, table_char, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -95,6 +95,11 @@ type :: r_dataframe_t
    character(len=:), allocatable :: names(:)
    real(kind=dp), allocatable :: real_cols(:,:)
 end type r_dataframe_t
+
+type :: table_char_t
+   character(len=:), allocatable :: gene(:)
+   integer, allocatable :: Freq(:)
+end type table_char_t
 
 type :: aggregate_result_t
    character(len=:), allocatable :: group_name, value_name
@@ -153,6 +158,11 @@ interface print_file_info
    module procedure print_file_info_scalar
    module procedure print_file_info_vector
 end interface print_file_info
+
+interface real_to_string_g
+   module procedure real_to_string_g_scalar
+   module procedure real_to_string_g_vector
+end interface real_to_string_g
 
 interface dir_exists
    module procedure dir_exists_scalar
@@ -443,6 +453,9 @@ interface all_equal
    module procedure all_equal_int_mat
    module procedure all_equal_logical_vec
    module procedure all_equal_logical_mat
+   module procedure all_equal_char_scalar
+   module procedure all_equal_char_vec
+   module procedure all_equal_char_mat
 end interface all_equal
 
 interface r_log
@@ -471,6 +484,11 @@ interface rbind
    module procedure rbind_int_vec_mat
    module procedure rbind_int_mat_vec
 end interface rbind
+
+interface char_join
+   module procedure char_join_char
+   module procedure char_join_int
+end interface char_join
 
 interface t_test
    module procedure t_test_one
@@ -2595,6 +2613,42 @@ read(s, *, iostat=ios) out
 if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
 end function str_to_real
 
+pure elemental function str_to_int(s) result(out)
+! R-like as.integer() of a character value: parse to integer, NA on failure.
+character(len=*), intent(in) :: s
+integer :: out
+integer :: i, digit, sign_value
+character(len=:), allocatable :: text
+text = adjustl(trim(s))
+out = 0
+sign_value = 1
+if (len(text) == 0) then
+   out = -huge(0)
+   return
+end if
+i = 1
+if (text(1:1) == "-") then
+   sign_value = -1
+   i = 2
+else if (text(1:1) == "+") then
+   i = 2
+end if
+if (i > len(text)) then
+   out = -huge(0)
+   return
+end if
+do while (i <= len(text))
+   digit = iachar(text(i:i)) - iachar("0")
+   if (digit < 0 .or. digit > 9) then
+      out = -huge(0)
+      return
+   end if
+   out = 10 * out + digit
+   i = i + 1
+end do
+out = sign_value * out
+end function str_to_int
+
 pure function inttobits(n) result(out)
 ! R-like intToBits(n): the 32 bits of n, least-significant first, as 0/1.
 integer, intent(in) :: n
@@ -2860,6 +2914,8 @@ case ("%m")
    write(out, "(i2.2)") m
 case ("%d")
    write(out, "(i2.2)") d
+case ("%d/%m/%Y")
+   write(out, "(i2.2, '/', i2.2, '/', i4.4)") d, m, y
 case default
    out = date_to_char(x)
 end select
@@ -2936,7 +2992,9 @@ pure function r_character(n) result(out)
 ! Allocate an R-like character vector initialized to empty strings.
 integer, intent(in) :: n ! requested vector length
 character(len=:), allocatable :: out(:)
-allocate(character(len=0) :: out(max(0, n)))
+! Deferred-length elements cannot grow independently after allocation.
+! Reserve a practical width so later x[i] <- value assignments are retained.
+allocate(character(len=256) :: out(max(0, n)))
 end function r_character
 
 pure function r_drop_index_real(x, k) result(out)
@@ -4506,6 +4564,36 @@ do i = 1, size(x)
    if (b >= 1 .and. b <= size(out)) out(b) = out(b) + 1
 end do
 end function tabulate_real
+
+pure function table_char(x) result(out)
+character(len=*), intent(in) :: x(:)
+type(table_char_t) :: out
+character(len=max(1, len(x))) :: labels(max(1, size(x))), key
+integer :: i, j, n
+n = 0
+do i = 1, size(x)
+   if (n == 0 .or. .not. any(labels(1:n) == x(i))) then
+      n = n + 1
+      labels(n) = x(i)
+   end if
+end do
+do i = 2, n
+   key = labels(i)
+   j = i - 1
+   do while (j >= 1)
+      if (labels(j) <= key) exit
+      labels(j + 1) = labels(j)
+      j = j - 1
+   end do
+   labels(j + 1) = key
+end do
+allocate(character(len=max(1, len(x))) :: out%gene(n))
+allocate(out%Freq(n))
+if (n > 0) out%gene = labels(1:n)
+do i = 1, n
+   out%Freq(i) = count(x == out%gene(i))
+end do
+end function table_char
 
 pure function table2_int(x, y, nx, ny) result(out)
 ! Count paired integer labels into an nx-by-ny contingency table.
@@ -8056,6 +8144,16 @@ end if
 out = tmp(1)
 end function sample_int1
 
+function sample_value_int(x, replace) result(out)
+integer, intent(in) :: x(:)
+logical, intent(in), optional :: replace
+integer :: out
+logical :: replace_use
+replace_use = .false.
+if (present(replace)) replace_use = replace
+out = x(sample_int1(size(x), replace=replace_use))
+end function sample_value_int
+
 pure function combn_indices(n, m) result(out)
 ! Return lexicographically ordered column indices for all m-combinations of n items.
 integer, intent(in) :: n, m
@@ -10921,13 +11019,23 @@ else
 end if
 end function backsolve_mat_i_i
 
-pure integer function nchar(s) result(out)
+pure elemental integer function nchar(s) result(out)
 ! Return character length (R-like nchar scalar subset).
 character(len=*), intent(in) :: s ! string whose trimmed length is returned
 out = len_trim(s)
 end function nchar
 
-pure function char_join(x, sep) result(out)
+pure elemental logical function char_ends_with(x, suffix) result(out)
+! Return whether x ends with suffix, with scalar/array elemental broadcasting.
+character(len=*), intent(in) :: x, suffix
+integer :: nx, ns
+nx = len_trim(x)
+ns = len_trim(suffix)
+out = nx >= ns
+if (out .and. ns > 0) out = x(nx - ns + 1:nx) == suffix(1:ns)
+end function char_ends_with
+
+pure function char_join_char(x, sep) result(out)
 ! Implement R-like character helper char_join.
 character(len=*), intent(in) :: x(:) ! strings to join
 character(len=*), intent(in) :: sep ! separator between strings
@@ -10944,7 +11052,28 @@ do i = 1, size(x)
    if (i > 1) out = out // sep
    out = out // trim(x(i))
 end do
-end function char_join
+end function char_join_char
+
+pure function char_join_int(x, sep) result(out)
+! Join integer values after applying R-like character coercion.
+integer, intent(in) :: x(:)
+character(len=*), intent(in) :: sep
+character(len=:), allocatable :: out
+character(len=:), allocatable :: item
+integer :: i, total
+total = 0
+do i = 1, size(x)
+   item = int_to_string(x(i))
+   total = total + len(item)
+end do
+if (size(x) > 1) total = total + (size(x) - 1) * len(sep)
+allocate(character(len=max(0, total)) :: out)
+out = ""
+do i = 1, size(x)
+   if (i > 1) out = out // sep
+   out = out // int_to_string(x(i))
+end do
+end function char_join_int
 
 pure function r_paste0_real(prefix, x) result(out)
 ! Prefix each numeric value with a fixed string, matching paste0(prefix, x).
@@ -10954,7 +11083,7 @@ character(len=:), allocatable :: out(:)
 character(len=64) :: buf
 integer :: i, k
 real(kind=dp) :: tol
-allocate(character(len=max(1, len_trim(prefix) + 64)) :: out(size(x)))
+allocate(character(len=max(1, len(prefix) + 64)) :: out(size(x)))
 do i = 1, size(x)
    if (ieee_is_finite(x(i)) .and. abs(x(i)) <= real(huge(0), kind=dp)) then
       k = nint(x(i))
@@ -10974,7 +11103,7 @@ do i = 1, size(x)
    else
       write(buf, "(g0)") x(i)
    end if
-   out(i) = trim(prefix) // trim(adjustl(buf))
+   out(i) = prefix // trim(adjustl(buf))
 end do
 end function r_paste0_real
 
@@ -10985,10 +11114,10 @@ integer, intent(in) :: x(:) ! values to convert and prefix
 character(len=:), allocatable :: out(:)
 character(len=64) :: buf
 integer :: i
-allocate(character(len=max(1, len_trim(prefix) + 64)) :: out(size(x)))
+allocate(character(len=max(1, len(prefix) + 64)) :: out(size(x)))
 do i = 1, size(x)
    write(buf, "(i0)") x(i)
-   out(i) = trim(prefix) // trim(adjustl(buf))
+   out(i) = prefix // trim(adjustl(buf))
 end do
 end function r_paste0_int
 
@@ -11078,6 +11207,91 @@ out%mtime = ""
 out%ctime = ""
 out%atime = ""
 end function file_info_scalar
+
+function file_size(path) result(out)
+character(len=*), intent(in) :: path
+real(kind=dp) :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%size
+end function file_size
+
+function file_path_value(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+out = trim(path)
+end function file_path_value
+
+pure function file_extension(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+integer :: dot_pos, i
+logical :: valid_ext
+dot_pos = 0
+do i = len_trim(path), 1, -1
+   if (path(i:i) == ".") then
+      dot_pos = i
+      exit
+   end if
+   if (path(i:i) == "/" .or. path(i:i) == achar(92)) exit
+end do
+valid_ext = dot_pos > 0 .and. dot_pos < len_trim(path)
+if (valid_ext) then
+   do i = dot_pos + 1, len_trim(path)
+      if (.not. ((path(i:i) >= "A" .and. path(i:i) <= "Z") .or. &
+         (path(i:i) >= "a" .and. path(i:i) <= "z") .or. &
+         (path(i:i) >= "0" .and. path(i:i) <= "9"))) then
+         valid_ext = .false.
+         exit
+      end if
+   end do
+end if
+if (valid_ext) then
+   out = path(dot_pos:len_trim(path))
+else
+   out = ""
+end if
+end function file_extension
+
+function file_mode(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%mode
+end function file_mode
+
+function file_mtime(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%mtime
+end function file_mtime
+
+function file_ctime(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%ctime
+end function file_ctime
+
+function file_atime(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%atime
+end function file_atime
+
+function file_exe(path) result(out)
+character(len=*), intent(in) :: path
+character(len=:), allocatable :: out
+type(file_info_t) :: info
+info = file_info_scalar(path)
+out = info%exe
+end function file_exe
 
 function file_info_vector(path) result(out)
 ! Implement a compact vector subset of R file.info(paths).
@@ -11386,7 +11600,7 @@ write(buf, fmt) x
 out = trim(buf)
 end function real_to_string_f
 
-pure function real_to_string_g(x, digits) result(out)
+pure function real_to_string_g_scalar(x, digits) result(out)
 ! Runtime helper for general-format scalar sprintf real conversion.
 real(kind=dp), intent(in) :: x
 integer, intent(in) :: digits
@@ -11400,7 +11614,70 @@ else
 end if
 write(buf, fmt) x
 out = trim(adjustl(buf))
-end function real_to_string_g
+end function real_to_string_g_scalar
+
+pure function real_to_string_g_vector(x, digits) result(out)
+real(kind=dp), intent(in) :: x(:)
+integer, intent(in) :: digits
+character(len=128), allocatable :: out(:)
+character(len=128) :: buf
+character(len=32) :: fmt
+integer :: i
+allocate(out(size(x)))
+if (digits > 0) then
+   write(fmt, '("(g0.", i0, ")")') digits
+else
+   fmt = "(g0)"
+end if
+do i = 1, size(x)
+   write(buf, fmt) x(i)
+   out(i) = trim(adjustl(buf))
+end do
+end function real_to_string_g_vector
+
+pure function r_to_string_real(x) result(out)
+real(kind=dp), intent(in) :: x
+character(len=:), allocatable :: out
+character(len=128) :: buf
+integer :: dot
+write(buf, "(g0.7)") x
+out = trim(adjustl(buf))
+if (index(out, "E") == 0 .and. index(out, "e") == 0) then
+   dot = index(out, ".")
+   if (dot > 0) then
+      do while (len(out) > dot .and. out(len(out):len(out)) == "0")
+         out = out(:len(out) - 1)
+      end do
+      if (len(out) == dot) out = out(:dot - 1)
+   end if
+end if
+end function r_to_string_real
+
+pure function r_substr(s, first, last) result(out)
+character(len=*), intent(in) :: s
+integer, intent(in) :: first, last
+character(len=:), allocatable :: out
+integer :: lo, hi
+lo = max(1, first)
+hi = min(len(s), last)
+if (hi < lo) then
+   out = ""
+else
+   out = s(lo:hi)
+end if
+end function r_substr
+
+pure function r_substr_replace(s, first, last, value) result(out)
+character(len=*), intent(in) :: s, value
+integer, intent(in) :: first, last
+character(len=:), allocatable :: out
+integer :: lo, hi, nrep
+out = s
+lo = max(1, first)
+hi = min(len(s), last)
+nrep = min(max(0, hi - lo + 1), len_trim(value))
+if (nrep > 0) out(lo:lo + nrep - 1) = value(1:nrep)
+end function r_substr_replace
 
 pure function ar_coef_names(nacf) result(out)
 ! Runtime helper for R-compatible ar coef names.
@@ -11844,6 +12121,24 @@ do j = 1, size(x,2)
    out(:, j) = j
 end do
 end function col_index_mat
+
+pure subroutine matrix_set_grow_real(x, row, col, value)
+! Assign a matrix element, growing matrix-backed R objects as needed.
+real(kind=dp), allocatable, intent(inout) :: x(:,:)
+integer, intent(in) :: row, col
+real(kind=dp), intent(in) :: value
+real(kind=dp), allocatable :: grown(:,:)
+integer :: nr, nc
+nr = max(row, size(x, 1))
+nc = max(col, size(x, 2))
+if (nr /= size(x, 1) .or. nc /= size(x, 2)) then
+   allocate(grown(nr, nc))
+   grown = r_na_real()
+   grown(1:size(x, 1), 1:size(x, 2)) = x
+   call move_alloc(grown, x)
+end if
+x(row, col) = value
+end subroutine matrix_set_grow_real
 
 pure elemental logical function is_na_real_scalar(x) result(out)
 ! True when real scalar is NA/NaN in this subset.
@@ -13736,6 +14031,20 @@ real(kind=dp) :: out
 out = r_lgamma(x + 1.0_dp)
 end function r_lfactorial
 
+pure elemental integer function r_digit_power_sum(x, power) result(out)
+! Sum the decimal digits of x raised to a fixed positive power.
+integer, intent(in) :: x, power
+integer :: work, digit
+out = 0
+work = abs(x)
+do
+   digit = mod(work, 10)
+   out = out + digit**power
+   work = work / 10
+   if (work == 0) exit
+end do
+end function r_digit_power_sum
+
 pure elemental function r_digamma(x) result(out)
 ! Elementwise digamma approximation via finite differences of log_gamma.
 real(kind=dp), intent(in) :: x ! function argument
@@ -14006,6 +14315,32 @@ if (present(tolerance)) continue
 out = all(shape(a) == shape(b))
 if (out) out = all(a .eqv. b)
 end function all_equal_logical_mat
+
+pure function all_equal_char_scalar(a, b, tolerance) result(out)
+character(len=*), intent(in) :: a, b
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+if (present(tolerance)) continue
+out = a == b
+end function all_equal_char_scalar
+
+pure function all_equal_char_vec(a, b, tolerance) result(out)
+character(len=*), intent(in) :: a(:), b(:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+if (present(tolerance)) continue
+out = size(a) == size(b)
+if (out) out = all(a == b)
+end function all_equal_char_vec
+
+pure function all_equal_char_mat(a, b, tolerance) result(out)
+character(len=*), intent(in) :: a(:,:), b(:,:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+if (present(tolerance)) continue
+out = all(shape(a) == shape(b))
+if (out) out = all(a == b)
+end function all_equal_char_mat
 
 elemental function r_log_scalar(x) result(out)
 ! Apply R-like log handling to scalar input.

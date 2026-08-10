@@ -105,24 +105,29 @@ module r2f_llm_runtime_mod
 contains
 
    real(dp) function NA_dp() result(x)
+      ! Return a real NaN sentinel for R-style missing numeric values.
       x = ieee_value(0.0_dp, ieee_quiet_nan)
    end function NA_dp
 
    real(dp) function Inf_dp() result(x)
+      ! Return positive infinity for R-style Inf values.
       x = ieee_value(0.0_dp, ieee_positive_inf)
    end function Inf_dp
 
    elemental logical function is_finite(x) result(ok)
+      ! Test whether a real value is finite, excluding NaN and infinities.
       real(dp), intent(in) :: x
       ok = ieee_is_finite(x)
    end function is_finite
 
    elemental logical function is_na(x) result(ok)
+      ! Treat non-finite real values as R-style missing values.
       real(dp), intent(in) :: x
       ok = .not. ieee_is_finite(x)
    end function is_na
 
    real(dp) function nanmean(x) result(y)
+      ! Compute the mean after omitting non-finite values; return NA_dp if empty.
       real(dp), intent(in) :: x(:)
       logical :: ok(size(x))
       integer :: n
@@ -137,6 +142,7 @@ contains
    end function nanmean
 
    real(dp) function nansd(x) result(y)
+      ! Compute the sample standard deviation after omitting non-finite values.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: z(:)
       real(dp) :: m
@@ -153,6 +159,7 @@ contains
    end function nansd
 
    real(dp) function nanskew(x) result(y)
+      ! Compute a simple skewness estimate after omitting non-finite values.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: z(:)
       real(dp) :: m, s
@@ -174,6 +181,7 @@ contains
    end function nanskew
 
    real(dp) function nankurt(x) result(y)
+      ! Compute excess kurtosis after omitting non-finite values.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: z(:)
       real(dp) :: m, s
@@ -195,12 +203,14 @@ contains
    end function nankurt
 
    function na_omit(x) result(y)
+      ! Return a packed copy containing only finite values.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: y(:)
       y = pack(x, is_finite(x))
    end function na_omit
 
    function which_true(mask) result(idx)
+      ! Return 1-based indices where a logical mask is true.
       logical, intent(in) :: mask(:)
       integer, allocatable :: idx(:)
       integer :: i
@@ -208,6 +218,7 @@ contains
    end function which_true
 
    integer function first_finite(x) result(idx)
+      ! Return the first finite element index, or 0 if none exists.
       real(dp), intent(in) :: x(:)
       integer :: i
       idx = 0
@@ -220,6 +231,7 @@ contains
    end function first_finite
 
    subroutine split_tokens(str, tokens, n)
+      ! Split a blank-separated string into a fixed-size token buffer.
       character(len=*), intent(in) :: str
       character(len=*), intent(out) :: tokens(:)
       integer, intent(out) :: n
@@ -246,6 +258,7 @@ contains
    end subroutine split_tokens
 
    subroutine parse_int_list(str, vals, n)
+      ! Parse blank-separated integers into vals and report how many succeeded.
       character(len=*), intent(in) :: str
       integer, intent(out) :: vals(:)
       integer, intent(out) :: n
@@ -263,6 +276,7 @@ contains
    end subroutine parse_int_list
 
    subroutine parse_real_list(str, vals, n)
+      ! Parse blank-separated real values into vals and report how many succeeded.
       character(len=*), intent(in) :: str
       real(dp), intent(out) :: vals(:)
       integer, intent(out) :: n
@@ -280,6 +294,7 @@ contains
    end subroutine parse_real_list
 
    function itoa(i) result(s)
+      ! Convert an integer to an allocatable character string.
       integer, intent(in) :: i
       character(len=:), allocatable :: s
       character(len=32) :: buf
@@ -289,6 +304,7 @@ contains
    end function itoa
 
    function ftoa(x, digits) result(s)
+      ! Convert a real value to a fixed-decimal allocatable string.
       real(dp), intent(in) :: x
       integer, intent(in), optional :: digits
       character(len=:), allocatable :: s
@@ -303,6 +319,7 @@ contains
    end function ftoa
 
    function cumsum_dp(x) result(y)
+      ! Return the cumulative sum of a real vector.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: y(:)
       integer :: i
@@ -316,6 +333,7 @@ contains
    end function cumsum_dp
 
    function cumprod_dp(x) result(y)
+      ! Return the cumulative product of a real vector.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: y(:)
       integer :: i
@@ -329,6 +347,7 @@ contains
    end function cumprod_dp
 
    function cummax_dp(x) result(y)
+      ! Return the running maximum of a real vector.
       real(dp), intent(in) :: x(:)
       real(dp), allocatable :: y(:)
       integer :: i
@@ -342,6 +361,7 @@ contains
    end function cummax_dp
 
    subroutine init_named_real_matrix(mat, x, row_names, col_names)
+      ! Initialize a named numeric matrix container from a 2D real array.
       type(named_real_matrix_t), intent(out) :: mat
       real(dp), intent(in) :: x(:,:)
       character(len=*), intent(in), optional :: row_names(:), col_names(:)
@@ -355,6 +375,7 @@ contains
    end subroutine init_named_real_matrix
 
    subroutine init_real_table(tab, x, row_names, col_names, title, digits)
+      ! Initialize a printable numeric table with optional labels and title.
       type(real_table_t), intent(out) :: tab
       real(dp), intent(in) :: x(:,:)
       character(len=*), intent(in), optional :: row_names(:), col_names(:), title
@@ -371,54 +392,63 @@ contains
    end subroutine init_real_table
 
    subroutine set_matrix_row_names(mat, names)
+      ! Replace row names on a named matrix, padding or truncating to row count.
       type(named_real_matrix_t), intent(inout) :: mat
       character(len=*), intent(in) :: names(:)
       call assign_names(mat%row_names, names, size(mat%x, 1))
    end subroutine set_matrix_row_names
 
    subroutine set_matrix_col_names(mat, names)
+      ! Replace column names on a named matrix, padding or truncating to column count.
       type(named_real_matrix_t), intent(inout) :: mat
       character(len=*), intent(in) :: names(:)
       call assign_names(mat%col_names, names, size(mat%x, 2))
    end subroutine set_matrix_col_names
 
    subroutine set_table_row_names(tab, names)
+      ! Replace row names on a table, padding or truncating to row count.
       type(real_table_t), intent(inout) :: tab
       character(len=*), intent(in) :: names(:)
       call assign_names(tab%row_names, names, size(tab%x, 1))
    end subroutine set_table_row_names
 
    subroutine set_table_col_names(tab, names)
+      ! Replace column names on a table, padding or truncating to column count.
       type(real_table_t), intent(inout) :: tab
       character(len=*), intent(in) :: names(:)
       call assign_names(tab%col_names, names, size(tab%x, 2))
    end subroutine set_table_col_names
 
    integer function matrix_row_index(mat, name) result(idx)
+      ! Look up a matrix row name and return its 1-based index, or 0 if absent.
       type(named_real_matrix_t), intent(in) :: mat
       character(len=*), intent(in) :: name
       idx = find_name(mat%row_names, name)
    end function matrix_row_index
 
    integer function matrix_col_index(mat, name) result(idx)
+      ! Look up a matrix column name and return its 1-based index, or 0 if absent.
       type(named_real_matrix_t), intent(in) :: mat
       character(len=*), intent(in) :: name
       idx = find_name(mat%col_names, name)
    end function matrix_col_index
 
    integer function table_row_index(tab, name) result(idx)
+      ! Look up a table row name and return its 1-based index, or 0 if absent.
       type(real_table_t), intent(in) :: tab
       character(len=*), intent(in) :: name
       idx = find_name(tab%row_names, name)
    end function table_row_index
 
    integer function table_col_index(tab, name) result(idx)
+      ! Look up a table column name and return its 1-based index, or 0 if absent.
       type(real_table_t), intent(in) :: tab
       character(len=*), intent(in) :: name
       idx = find_name(tab%col_names, name)
    end function table_col_index
 
    subroutine print_named_real_matrix(mat, title, digits)
+      ! Print a named matrix using table formatting and optional title/digits.
       type(named_real_matrix_t), intent(in) :: mat
       character(len=*), intent(in), optional :: title
       integer, intent(in), optional :: digits
@@ -430,6 +460,7 @@ contains
    end subroutine print_named_real_matrix
 
    subroutine print_real_table(tab)
+      ! Print a labeled numeric table with aligned row and column headers.
       type(real_table_t), intent(in) :: tab
       integer :: i, j, w_name, w_num, d
 
@@ -463,6 +494,7 @@ contains
    end subroutine print_real_table
 
    subroutine print_model_summary(summary, title)
+      ! Print common model-fit metadata such as convergence, loglik, AIC, and BIC.
       type(model_summary_t), intent(in) :: summary
       character(len=*), intent(in), optional :: title
 
@@ -483,6 +515,7 @@ contains
    end subroutine print_model_summary
 
    subroutine print_lm_result(fit, title, digits)
+      ! Print a linear-model summary and coefficient table.
       type(lm_result_t), intent(in) :: fit
       character(len=*), intent(in), optional :: title
       integer, intent(in), optional :: digits
@@ -515,6 +548,7 @@ contains
    end subroutine print_lm_result
 
    subroutine default_names(names, prefix, n)
+      ! Allocate default names such as r1, r2, ... or blanks when prefix is empty.
       character(len=name_len), allocatable, intent(out) :: names(:)
       character(len=*), intent(in) :: prefix
       integer, intent(in) :: n
@@ -531,6 +565,7 @@ contains
    end subroutine default_names
 
    subroutine assign_names(dest, src, expected_n)
+      ! Allocate and copy a name vector, padding or truncating to expected_n.
       character(len=name_len), allocatable, intent(inout) :: dest(:)
       character(len=*), intent(in) :: src(:)
       integer, intent(in) :: expected_n
@@ -546,6 +581,7 @@ contains
    end subroutine assign_names
 
    integer function find_name(names, name) result(idx)
+      ! Find an exact trimmed name match and return a 1-based index, or 0.
       character(len=*), intent(in) :: names(:)
       character(len=*), intent(in) :: name
       integer :: i
@@ -560,6 +596,7 @@ contains
    end function find_name
 
    integer function max_name_width(names) result(width)
+      ! Return the maximum trimmed width in a name vector.
       character(len=*), intent(in) :: names(:)
       integer :: i
 
@@ -570,6 +607,7 @@ contains
    end function max_name_width
 
    function pad_left(s, width) result(out)
+      ! Return a left-padded string with at least the requested width.
       character(len=*), intent(in) :: s
       integer, intent(in) :: width
       character(len=:), allocatable :: out
@@ -585,6 +623,7 @@ contains
    end function pad_left
 
    function format_real(x, width, digits) result(out)
+      ! Format a real value into a fixed-width decimal string.
       real(dp), intent(in) :: x
       integer, intent(in) :: width, digits
       character(len=:), allocatable :: out
@@ -596,6 +635,7 @@ contains
    end function format_real
 
    function optional_vector(x, n) result(y)
+      ! Return x when allocated with length n, otherwise a zero vector of length n.
       real(dp), allocatable, intent(in) :: x(:)
       integer, intent(in) :: n
       real(dp) :: y(n)
