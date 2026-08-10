@@ -5,4 +5,5 @@ __pycache__/
 *.o
 *.obj
 *.exe
+*.bat
 *_r.f90

@@ -120,6 +120,31 @@ python xr2f_repl.py
 python xr2f_repl.py r_examples\xrunif.r
 ```
 
+## Package Translation
+
+`xr2f_package.py` provides an initial package-level workflow for dependency-free,
+pure-R packages.  The package must contain `DESCRIPTION`, `NAMESPACE`, and `R/`;
+required package dependencies, `LinkingTo`, compiled sources, and unsupported
+`NAMESPACE` directives are rejected explicitly.
+
+Translate a package into one Fortran module and a JSON coverage report:
+
+```bat
+python xr2f_package.py C:\rcode\public_domain\github\combinat
+```
+
+Compile the generated module, require every declared export, or embed the runtime:
+
+```bat
+python xr2f_package.py C:\rcode\public_domain\github\combinat --compile
+python xr2f_package.py C:\rcode\public_domain\github\combinat --require-all-exports
+python xr2f_package.py C:\rcode\public_domain\github\combinat --self-contained
+```
+
+Output defaults to `<package>\xr2f`.  Package mode may translate only part of a
+package unless `--require-all-exports` is used; inspect the generated
+`*_package_report.json` for translated, skipped, and missing exports.
+
 ## Example
 
 Input R:
@@ -173,8 +198,10 @@ end program xr2f_smoke
 ## Files
 
 - `xr2f.py`: main R-to-Fortran transpiler.
+- `xr2f_package.py`: first-version translator for dependency-free, pure-R packages.  It combines package R sources, validates package metadata, invokes partial translation, and writes a coverage report.
 - `xr2f_repl.py`: interactive R-to-Fortran session runner.  It can load an R file, accept more R statements, run the generated Fortran, run R, compare both, benchmark compiler choices, and run generated Fortran through `ofort`.
 - `xr2f_batch.py`: batch runner for many R files, globs, directories, or `@list` files.
+- `compare_xr2f_batch_results.py`: compares two timestamped batch-result files and lists scripts whose outcomes changed, optionally restricting output to regressions.
 - `xr_obfuscate.py`: standalone batch obfuscator for R sources.  It renames user-defined functions and variables, can preserve directory layout under an output directory, can run the generated R with `Rscript`, and can continue through failures with a quiet summary mode.
 - `xr2f_reduce.py`: reducer for R scripts that trigger a reproducible `xr2f.py` Fortran compile failure.  It can infer the first compile-error signature, reduce while preserving that signature, optionally check R validity, and backtrack to the smallest reduced R file that still runs.
 - `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, string, filesystem, and file-I/O helpers.
@@ -237,7 +264,7 @@ print(y[[2]][-1])
 
 The generated Fortran uses static derived types for heterogeneous lists, so field names and field kinds must be stable.  Adding a field in all branches with the same inferred kind is allowed in selected cases, but unconditional dynamic field creation or changing a field's kind after construction is rejected with a transpile error.  General R list concatenation and fully dynamic list mutation are not complete R-compatible object semantics.
 
-Unsupported or incomplete areas include packages, data frames beyond narrow patterns, formulas beyond simple cases, closures with general lexical scoping, arbitrary S3/S4 dispatch, complex regular-expression behavior, dynamic environments, and dynamic or arbitrary list manipulation where field sets or field kinds change at runtime.  Dynamic environment mutation features such as `assign()` and superassignment `<<-` are intentionally rejected rather than translated incorrectly.  General `get()` is supported only for feasible static name lookups.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
+Unsupported or incomplete areas include packages outside the dependency-free pure-R package-mode subset, data frames beyond narrow patterns, formulas beyond simple cases, closures with general lexical scoping, arbitrary S3/S4 dispatch, complex regular-expression behavior, dynamic environments, and dynamic or arbitrary list manipulation where field sets or field kinds change at runtime.  Dynamic environment mutation features such as `assign()` and superassignment `<<-` are intentionally rejected rather than translated incorrectly.  General `get()` is supported only for feasible static name lookups.  Some translated statistical routines are intentionally approximate rather than bit-for-bit implementations of R internals; use `--warn-approx` to surface known approximate translations.
 
 ## Runtime Modes
 
@@ -507,6 +534,14 @@ Save batch output to a results file:
 
 ```bat
 python xr2f_batch.py r_stat_examples\*.R --compile --tee
+```
+
+Compare two saved result files.  Their `Started` timestamps determine which run
+is older, regardless of argument order:
+
+```bat
+python compare_xr2f_batch_results.py newer_results.txt older_results.txt
+python compare_xr2f_batch_results.py newer_results.txt older_results.txt --worse-only
 ```
 
 For obfuscation-specific batch testing, prefer `xr_obfuscate.py` rather than `xr2f_batch.py`, because it understands obfuscated output paths and optional R validity checks.
