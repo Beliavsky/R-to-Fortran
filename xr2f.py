@@ -34,6 +34,14 @@ import fortran_post as fpost
 import fortran_scan as fscan
 from r_assignment import expand_top_level_assignment_chain
 
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_DEFAULT_R_HELPER = _PROJECT_ROOT / "src" / "r_mod.f90"
+
+
+def _is_r_mod_runtime_helper(path: Path) -> bool:
+    return path.name.lower() in {"r.f90", "r_mod.f90"}
+
+
 _HAS_R_MOD = False
 _FORTRAN_COMMENTS = True
 _FORTRAN_MAX_IDENTIFIER_LEN = 63
@@ -60520,7 +60528,7 @@ def _cached_runtime_object(
     helper: Path,
     cparts: list[str],
 ) -> tuple[Path, Path, subprocess.CompletedProcess[str] | None]:
-    """Return cached object/include dir for r.f90, compiling it on cache miss."""
+    """Return a cached object/include directory for the r_mod runtime."""
     helper = helper.resolve()
     src_hash = _sha256_file(helper)
     key_src = "\0".join(["xr2f-rmod-v3", str(helper), src_hash, *cparts])
@@ -61747,7 +61755,7 @@ def _collect_report_r_constructs(src: str) -> list[dict[str, object]]:
     constructs: list[dict[str, object]] = []
     patterns: list[tuple[str, str, str]] = [
         ("closure", r"\bfunction\s*\(", "Nested or anonymous functions may require lifted helpers and captured state."),
-        ("integrate", r"\bintegrate\s*\(", "Numerical integration uses r.f90 integrate approximation and may need tolerance checks."),
+        ("integrate", r"\bintegrate\s*\(", "Numerical integration uses the r_mod integrate approximation and may need tolerance checks."),
         ("optim", r"\boptim\s*\(", "Optimization uses runtime approximations; compare convergence/value fields."),
         ("data_frame", r"\bdata\.frame\s*\(", "Data frames may be expanded into columns or derived types."),
         ("list", r"\blist\s*\(", "R lists may become derived types with fixed fields."),
@@ -61785,7 +61793,7 @@ def _collect_report_risk_notes(
             {
                 "severity": "medium",
                 "kind": "integrate",
-                "message": "Uses r.f90 integrate(); verify improper bounds, subdivisions, rel.tol, and vectorized callback behavior.",
+                "message": "Uses r_mod integrate(); verify improper bounds, subdivisions, rel.tol, and vectorized callback behavior.",
             }
         )
     if any("xr2f_integrate_closure" in h.lower() or "_xric_" in h.lower() for h in generated_helpers):
@@ -62111,7 +62119,7 @@ def _render_llm_bundle_diagnostics(
                 "Suggested direct build command uses the normal xr2f output path, not the bundle copy:",
                 f"python {Path(__file__).name} <input.r> --out {out_path} --compile",
                 "",
-                "If compiling the bundle copy manually, include r.f90 or the cached runtime module include path as appropriate.",
+                "If compiling the bundle copy manually, include src/r_mod.f90 or the cached runtime module include path as appropriate.",
             ]
         )
         return "\n".join(lines) + "\n"
@@ -62919,7 +62927,7 @@ def main() -> int:
         "--nlm-method",
         choices=("legacy", "newton"),
         default="newton",
-        help="select r.f90 nlm optimizer implementation (default: newton)",
+        help="select the r_mod nlm optimizer implementation (default: newton)",
     )
     ap.add_argument(
         "--normalize-num-output",
@@ -63019,7 +63027,7 @@ def main() -> int:
     ap.add_argument(
         "--self-contained",
         action="store_true",
-        help="prepend the r_mod runtime to the emitted Fortran and compile without an external r.f90 helper",
+        help="prepend the r_mod runtime to the emitted Fortran and compile without an external runtime source",
     )
     ap.add_argument(
         "--obfuscate",
@@ -63205,7 +63213,7 @@ def main() -> int:
         except OSError:
             return str(a).lower() == str(b).lower()
 
-    default_r_helper = Path(__file__).resolve().with_name("r.f90")
+    default_r_helper = _DEFAULT_R_HELPER
     if default_r_helper.exists() and not any(_same_path(default_r_helper, hp) for hp in helper_paths):
         helper_paths.insert(0, default_r_helper)
 
@@ -63472,7 +63480,7 @@ def main() -> int:
             uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
             compile_helper_paths = [
                 hp for hp in helper_paths
-                if hp.name.lower() != "r.f90" or uses_r_mod
+                if not _is_r_mod_runtime_helper(hp) or uses_r_mod
             ]
             if args.self_contained:
                 f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
@@ -63491,7 +63499,7 @@ def main() -> int:
                 compiler_name = Path(cparts_partial[0]).name.lower() if cparts_partial else ""
                 use_runtime_cache = bool(cparts_partial) and ("gfortran" in compiler_name or "ifx" in compiler_name)
                 for hp in compile_helper_paths:
-                    if use_runtime_cache and hp.name.lower() == "r.f90":
+                    if use_runtime_cache and _is_r_mod_runtime_helper(hp):
                         obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts_partial)
                         if helper_cp is not None and helper_cp.returncode != 0:
                             print("Build helper:", " ".join(cparts_partial + ["-c", str(hp.resolve()), "-o", str(obj)]))
@@ -64673,7 +64681,7 @@ def main() -> int:
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
-        if hp.name.lower() != "r.f90" or uses_r_mod
+        if not _is_r_mod_runtime_helper(hp) or uses_r_mod
     ]
     if args.self_contained:
         f90 = prepend_self_contained_runtime(f90, compile_helper_paths)
@@ -65146,7 +65154,7 @@ def main() -> int:
     uses_r_mod = re.search(r"(?im)^\s*use\s+r_mod\b", f90) is not None
     compile_helper_paths = [
         hp for hp in helper_paths
-        if hp.name.lower() != "r.f90" or uses_r_mod
+        if not _is_r_mod_runtime_helper(hp) or uses_r_mod
     ]
     split_module_path: Path | None = None
     if args.split_module:
@@ -65229,7 +65237,7 @@ def main() -> int:
             compiler_name = Path(cparts[0]).name.lower() if cparts else ""
             use_runtime_cache = bool(cparts) and ("gfortran" in compiler_name or "ifx" in compiler_name)
             for hp in compile_helper_paths:
-                if use_runtime_cache and hp.name.lower() == "r.f90":
+                if use_runtime_cache and _is_r_mod_runtime_helper(hp):
                     using_cached_runtime = True
                     obj, inc_dir, helper_cp = _cached_runtime_object(hp, cparts)
                     if helper_cp is not None and helper_cp.returncode != 0:

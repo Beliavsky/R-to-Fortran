@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_XR2F = ROOT / "xr2f.py"
-DEFAULT_R_HELPER = ROOT / "r.f90"
+DEFAULT_R_HELPER = ROOT / "src" / "r_mod.f90"
 DEFAULT_OFORT = Path(r"c:\c\ofort\ofort.exe")
 DEFAULT_SESSION_R = "xr2f_repl_session.R"
 DEFAULT_SESSION_FORTRAN = "xr2f_repl_session.f90"

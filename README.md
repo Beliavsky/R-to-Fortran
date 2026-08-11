@@ -193,7 +193,8 @@ end program xr2f_smoke
 - Intel `ifx` is optional and can be selected with `--ifx` or from the REPL.
 - `ofort` is optional and can be selected from `xr2f_repl.py` to run generated Fortran source directly without compiling an executable.
 - `Rscript` is needed for `--run-both`, `--run-diff`, and `--time-both`.
-- The helper runtime `r.f90` is used by default for R-like helper functions such as `rnorm_vec`, `sd`, `quantile`, matrix printing, and vector recycling.
+- The helper runtime in `src/r_mod.f90` is used by default for R-like helper functions such as `rnorm_vec`, `sd`, `quantile`, matrix printing, and vector recycling.
+- [fpm](https://fpm.fortran-lang.org/) is optional and can build, test, or consume the runtime as a standalone Fortran package.
 
 ## Files
 
@@ -204,8 +205,9 @@ end program xr2f_smoke
 - `compare_xr2f_batch_results.py`: compares two timestamped batch-result files and lists scripts whose outcomes changed, optionally restricting output to regressions.
 - `xr_obfuscate.py`: standalone batch obfuscator for R sources.  It renames user-defined functions and variables, can preserve directory layout under an output directory, can run the generated R with `Rscript`, and can continue through failures with a quiet summary mode.
 - `xr2f_reduce.py`: reducer for R scripts that trigger a reproducible `xr2f.py` Fortran compile failure.  It can infer the first compile-error signature, reduce while preserving that signature, optionally check R validity, and backtrack to the smallest reduced R file that still runs.
-- `r.f90`: Fortran runtime helper module implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, string, filesystem, and file-I/O helpers.
-- `xr2f_runtime_api.md`: curated guide to the stable `r.f90` helpers for generated Fortran, manual repairs, and LLM-assisted translation.
+- `src/r_mod.f90`: Fortran runtime and standalone fpm library implementing R-like vector, matrix, statistics, distribution, model, smoothing, time-series, clustering, hypothesis-test, optimization, string, filesystem, and file-I/O helpers.
+- `fpm.toml`, `example/`, `test/`: package metadata, a direct-use Fortran example, and a small standalone runtime test.
+- `xr2f_runtime_api.md`: curated guide to the stable `r_mod` helpers for generated Fortran, direct Fortran use, manual repairs, and LLM-assisted translation.
 - `r2f_llm_runtime.f90`: optional standalone helper module for LLM/manual translations.  It provides named numeric matrices, printable numeric tables, model summaries, linear-model result records, finite/NA-aware statistics, token parsers, index helpers, string conversion helpers, and cumulative-vector helpers without making normal `xr2f.py` output depend on those containers.
 - `fortran_scan.py`, `fortran_post.py`, `xunused.py`: Fortran scanning and postprocessing helpers used by the transpiler.
 - `xr2p.py`, `xp2f.py`, `xr2r.py`: alternate and normalization pipelines used by selected modes such as `--via-python` and `--via-core-r`.
@@ -268,7 +270,7 @@ Unsupported or incomplete areas include packages outside the dependency-free pur
 
 ## Runtime Modes
 
-By default, compiled output is linked with `r.f90`:
+By default, compiled output is linked with `src/r_mod.f90`:
 
 ```bat
 python xr2f.py foo.r --compile
@@ -326,6 +328,29 @@ python xr2f.py foo.r --r-rng --run-both
 ```
 
 On Windows this requires an R installation with headers/libraries available to the C and Fortran compilers.  `xr2f.py` caches compiled runtime objects to reduce repeat compile time where possible.
+
+## Standalone Fortran Runtime
+
+The same `r_mod` implementation is an fpm library, so Fortran programs can use its numerical and statistical routines without translating R source.  The public API is documented in [`xr2f_runtime_api.md`](xr2f_runtime_api.md).
+
+```text
+fpm build
+fpm test
+fpm run --example descriptive_statistics
+```
+
+As an fpm dependency, add the repository to the consuming package's manifest and import only the routines needed by the program:
+
+```toml
+[dependencies]
+xr2f_runtime = { git = "https://github.com/Beliavsky/R-to-Fortran.git" }
+```
+
+```fortran
+use r_mod, only: dp, dnorm, sd
+```
+
+The runtime currently remains in this repository so generated code and direct Fortran users exercise the same implementation.  Semantic compatibility targets practical R behavior; some advanced statistical routines are approximations rather than bit-for-bit reproductions of R internals.
 
 For direct use of the runtime outside fully generated programs, see [`xr2f_runtime_api.md`](xr2f_runtime_api.md).  It documents the stable `r_mod` helpers for vectors, matrices, printing, distributions, optimization, integration, clustering, models, data frames, files, and common LLM repair patterns.
 
@@ -423,7 +448,7 @@ python xr2f.py foo.r --partial --compile --report
 python xr2f.py foo.r --partial-main --compile --report
 ```
 
-Use [`xr2f_runtime_api.md`](xr2f_runtime_api.md) as the reference for `r.f90` helpers an LLM should prefer when repairing or extending generated Fortran.  The runtime guide is curated rather than generated: it documents recommended public helpers, result types, examples, approximation notes, and known gaps.
+Use [`xr2f_runtime_api.md`](xr2f_runtime_api.md) as the reference for `r_mod` helpers an LLM should prefer when repairing or extending generated Fortran.  The runtime guide is curated rather than generated: it documents recommended public helpers, result types, examples, approximation notes, and known gaps.
 
 ## Interactive REPL
 
@@ -471,7 +496,7 @@ xr2f> time 5 ofort gfortran -O3 ifx /O2
 
 For repeated timing runs, translation and compilation happen once.  The executable or R script is then run repeatedly.  Repeated timing reports mean and sample standard deviation for the run stage.
 
-For `ofort`, translation happens once and the generated Fortran source is run directly by `ofort`.  If the generated program uses `r_mod`, the REPL includes `r.f90` in the `ofort` command.
+For `ofort`, translation happens once and the generated Fortran source is run directly by `ofort`.  If the generated program uses `r_mod`, the REPL includes `src/r_mod.f90` in the `ofort` command.
 
 Use `--batch` for the old run-and-exit file behavior:
 
@@ -596,7 +621,7 @@ Differences can be legitimate when the R script uses random numbers, platform-de
 
 This project is experimental and test-driven.  The practical strategy is to add support for real scripts one feature at a time while checking that existing translated scripts still compile and run.  Most new behavior starts from a small reproducer script and then becomes either a pytest regression test or part of the full example corpus.
 
-The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, optimization routines, table-formatting helpers, and filesystem helpers used by the example corpus.  It can emit reusable modules, use external Fortran modules, create structured translation reports, create obfuscated R copies to detect name-specific lowering, integerize selected R literals, run strict numeric-literal linting with `--r-numeric-literals`, control declaration wrapping with `--decl-line-length`, and reduce compile failures to reproducers.  The `r.f90` runtime is documented in [`xr2f_runtime_api.md`](xr2f_runtime_api.md) so generated Fortran can also be used as a starting point for manual or LLM-assisted translation.
+The current implementation is broader than a syntax translator: it includes many Fortran implementations of base-R-style statistical operations, object containers, printing helpers, optimization routines, table-formatting helpers, and filesystem helpers used by the example corpus.  It can emit reusable modules, use external Fortran modules, create structured translation reports, create obfuscated R copies to detect name-specific lowering, integerize selected R literals, run strict numeric-literal linting with `--r-numeric-literals`, control declaration wrapping with `--decl-line-length`, and reduce compile failures to reproducers.  The `r_mod` runtime is documented in [`xr2f_runtime_api.md`](xr2f_runtime_api.md), packaged for direct fpm use, and available as a starting point for manual or LLM-assisted translation.
 
 Coverage is still selective and pragmatic.  The translator favors real regression examples over full language completeness, and it generally prefers explicit unsupported-feature errors over silently generating misleading Fortran.  Some final post-codegen repairs remain intentionally pragmatic; `--no-post-repairs` and `--special-repairs` exist to separate generic translator behavior from corpus-specific compatibility repairs.
 

@@ -1,0 +1,15 @@
+name = "xr2f_runtime"
+version = "0.1.0"
+license = "MIT"
+author = "Beliavsky"
+maintainer = "Beliavsky <beliavsky@aol.com>"
+description = "R-compatible numerical and statistical routines for modern Fortran"
+
+[build]
+auto-executables = false
+auto-examples = true
+auto-tests = true
+
+[preprocess]
+[preprocess.cpp]
+suffixes = ["f90"]

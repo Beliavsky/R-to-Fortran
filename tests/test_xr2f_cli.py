@@ -53,7 +53,7 @@ def _load_xr2f_module():
     return module
 
 # Refreshed from a local corpus sweep using:
-#   python xr2f.py <file.r> r.f90 --compile
+#   python xr2f.py <file.r> --compile
 SUPPORTED_R_COMPILE_CASES = [
     "xarray.r",
     "xbare.r",

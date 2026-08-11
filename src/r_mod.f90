@@ -318,24 +318,28 @@ type :: integrate_result_t
 end type integrate_result_t
 
 abstract interface
+
    function nlm_objective_scalar(x) result(v)
 ! Support nlm-style optimization for objective scalar.
       import :: dp
       real(kind=dp), intent(in) :: x
       real(kind=dp) :: v
    end function nlm_objective_scalar
+
    function nlm_objective_vec(p) result(v)
 ! Support nlm-style optimization for objective vec.
       import :: dp
       real(kind=dp), intent(in) :: p(:)
       real(kind=dp) :: v
    end function nlm_objective_vec
+
    function integrate_objective(x) result(v)
 ! Support integrate-style scalar objective functions.
       import :: dp
       real(kind=dp), intent(in) :: x
       real(kind=dp) :: v
    end function integrate_objective
+
 end interface
 
 type :: decompose_result_t
