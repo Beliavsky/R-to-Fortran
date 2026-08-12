@@ -1,0 +1,51 @@
+name: fpm
+
+on:
+  push:
+    paths:
+      - ".github/workflows/fpm.yml"
+      - "fpm.toml"
+      - "src/**"
+      - "test/**"
+      - "example/**"
+  pull_request:
+    paths:
+      - ".github/workflows/fpm.yml"
+      - "fpm.toml"
+      - "src/**"
+      - "test/**"
+      - "example/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-gfortran:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up gfortran
+        uses: fortran-lang/setup-fortran@v1
+        with:
+          compiler: gcc
+          version: latest
+
+      - name: Set up fpm
+        uses: fortran-lang/setup-fpm@v10
+
+      - name: Report tool versions
+        run: |
+          gfortran --version
+          fpm --version
+
+      - name: Build package
+        run: fpm build
+
+      - name: Test package
+        run: fpm test
+
+      - name: Run example
+        run: fpm run --example descriptive_statistics

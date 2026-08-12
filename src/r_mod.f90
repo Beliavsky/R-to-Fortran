@@ -54,7 +54,8 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & date_format, date_format_vec, print_date, print_date_vector, r_elapsed, &
    & date_seq_day, date_seq_length, date_range, sys_time, sys_date, sys_date_string, &
    & sys_timezone, sys_time_format, sys_sleep, proc_time_vec, &
-   & sys_getenv, file_rename, as_octmode, as_hexmode, as_roman, unlink_recursive, inttobits, str_to_int, str_to_real, fivenum
+   & sys_getenv, file_rename, unlink_recursive
+public :: as_octmode, as_hexmode, as_roman, inttobits, str_to_int, str_to_real, fivenum
 public :: r_dataframe_t, table_char_t, table_char, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
@@ -2617,13 +2618,12 @@ read(s, *, iostat=ios) out
 if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
 end function str_to_real
 
-pure elemental function str_to_int(s) result(out)
+pure elemental integer function str_to_int(s) result(out)
 ! R-like as.integer() of a character value: parse to integer, NA on failure.
 character(len=*), intent(in) :: s
-integer :: out
 integer :: i, digit, sign_value
 character(len=:), allocatable :: text
-text = adjustl(trim(s))
+text = trim(adjustl(s))
 out = 0
 sign_value = 1
 if (len(text) == 0) then
@@ -3846,10 +3846,10 @@ out%betweenss = out%totss - out%tot_withinss
 out%iter = best_iter
 
 allocate(order_idx(k), remap(k))
+do i = 1, k
+   order_idx(i) = i
+end do
 if (k > 1) then
-   do i = 1, k
-      order_idx(i) = i
-   end do
    do i = 1, k - 1
       do j = i + 1, k
          if (best_size(j) > best_size(order_idx(i))) then
@@ -4116,10 +4116,10 @@ out%betweenss = out%totss - out%tot_withinss
 out%iter = best_iter
 
 allocate(order_idx(k), remap(k), ci(n))
+do i = 1, k
+   order_idx(i) = i
+end do
 if (k > 1) then
-   do i = 1, k
-      order_idx(i) = i
-   end do
    do i = 1, k - 1
       do j = i + 1, k
          if (best_size(j) > best_size(order_idx(i))) then
@@ -7848,18 +7848,23 @@ type(smooth_spline_fit_t) :: out
 type(loess_fit_t) :: lf
 real(kind=dp) :: span_eff, df_eff, spar_eff
 integer :: n
+logical :: use_df, use_spar
 n = min(size(x), size(y))
 out%x = x(1:n)
 if (n <= 0) then
    out%df = 0.0_dp
    return
 end if
-if ((.not. present(df) .or. df <= 0.0_dp) .and. (.not. present(spar) .or. spar < 0.0_dp)) then
+use_df = .false.
+if (present(df)) use_df = df > 0.0_dp
+use_spar = .false.
+if (present(spar)) use_spar = spar >= 0.0_dp
+if (.not. use_df .and. .not. use_spar) then
    out%df = real(n, kind=dp)
    out%y = y(1:n)
    return
 end if
-if (present(df) .and. df > 0.0_dp) then
+if (use_df) then
    df_eff = max(2.0_dp, min(real(n, kind=dp), df))
    out%df = df_eff
    span_eff = min(1.0_dp, max(0.08_dp, 1.78_dp / sqrt(df_eff)))
@@ -8180,7 +8185,8 @@ idx = [(i, i=1,m)]
 do j = 1, ncomb
    out(:, j) = idx
    i = m
-   do while (i >= 1 .and. idx(i) == n - m + i)
+   do while (i >= 1)
+      if (idx(i) /= n - m + i) exit
       i = i - 1
    end do
    if (i == 0) exit
@@ -10002,7 +10008,10 @@ real(kind=dp), intent(in) :: x ! input values
 integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
-out = besselI_core(x, real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
+logical :: scaled
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
+out = besselI_core(x, real(nu, kind=dp), scaled)
 end function besselI_scalar_i
 
 pure function besselI_scalar_r(x, nu, expon_scaled) result(out)
@@ -10011,7 +10020,10 @@ real(kind=dp), intent(in) :: x ! input values
 real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
-out = besselI_core(x, nu, present(expon_scaled) .and. expon_scaled)
+logical :: scaled
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
+out = besselI_core(x, nu, scaled)
 end function besselI_scalar_r
 
 pure function besselI_vec_i(x, nu, expon_scaled) result(out)
@@ -10021,9 +10033,12 @@ integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
+logical :: scaled
 allocate(out(size(x)))
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
 do i = 1, size(x)
-   out(i) = besselI_core(x(i), real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
+   out(i) = besselI_core(x(i), real(nu, kind=dp), scaled)
 end do
 end function besselI_vec_i
 
@@ -10034,9 +10049,12 @@ real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
+logical :: scaled
 allocate(out(size(x)))
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
 do i = 1, size(x)
-   out(i) = besselI_core(x(i), nu, present(expon_scaled) .and. expon_scaled)
+   out(i) = besselI_core(x(i), nu, scaled)
 end do
 end function besselI_vec_r
 
@@ -10046,7 +10064,10 @@ real(kind=dp), intent(in) :: x ! input values
 integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
-out = besselK_core(x, real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
+logical :: scaled
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
+out = besselK_core(x, real(nu, kind=dp), scaled)
 end function besselK_scalar_i
 
 pure function besselK_scalar_r(x, nu, expon_scaled) result(out)
@@ -10055,7 +10076,10 @@ real(kind=dp), intent(in) :: x ! input values
 real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp) :: out
-out = besselK_core(x, nu, present(expon_scaled) .and. expon_scaled)
+logical :: scaled
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
+out = besselK_core(x, nu, scaled)
 end function besselK_scalar_r
 
 pure function besselK_vec_i(x, nu, expon_scaled) result(out)
@@ -10065,9 +10089,12 @@ integer, intent(in) :: nu ! integer argument
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
+logical :: scaled
 allocate(out(size(x)))
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
 do i = 1, size(x)
-   out(i) = besselK_core(x(i), real(nu, kind=dp), present(expon_scaled) .and. expon_scaled)
+   out(i) = besselK_core(x(i), real(nu, kind=dp), scaled)
 end do
 end function besselK_vec_i
 
@@ -10078,9 +10105,12 @@ real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in), optional :: expon_scaled
 real(kind=dp), allocatable :: out(:)
 integer :: i
+logical :: scaled
 allocate(out(size(x)))
+scaled = .false.
+if (present(expon_scaled)) scaled = expon_scaled
 do i = 1, size(x)
-   out(i) = besselK_core(x(i), nu, present(expon_scaled) .and. expon_scaled)
+   out(i) = besselK_core(x(i), nu, scaled)
 end do
 end function besselK_vec_r
 
@@ -17220,8 +17250,14 @@ integer :: i, xx
 allocate(out(size(x)))
 d = dwilcox([(real(xx, kind=dp), xx = 0, m * n)], m, n)
 do i = 1, size(x)
-   xx = max(0, min(m * n, int(floor(x(i)))))
-   out(i) = sum(d(1:xx + 1))
+   if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (x(i) >= real(m * n, kind=dp)) then
+      out(i) = 1.0_dp
+   else
+      xx = int(floor(x(i)))
+      out(i) = sum(d(1:xx + 1))
+   end if
 end do
 end function pwilcox_vec
 
@@ -17293,8 +17329,14 @@ maxs = n * (n + 1) / 2
 allocate(out(size(x)))
 d = dsignrank([(real(xx, kind=dp), xx = 0, maxs)], n)
 do i = 1, size(x)
-   xx = max(0, min(maxs, int(floor(x(i)))))
-   out(i) = sum(d(1:xx + 1))
+   if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (x(i) >= real(maxs, kind=dp)) then
+      out(i) = 1.0_dp
+   else
+      xx = int(floor(x(i)))
+      out(i) = sum(d(1:xx + 1))
+   end if
 end do
 end function psignrank_vec
 
