@@ -337,7 +337,18 @@ The same `r_mod` implementation is an fpm library, so Fortran programs can use i
 fpm build
 fpm test
 fpm run --example descriptive_statistics
+fpm run --example distributions
+fpm run --example linear_algebra
+fpm run --example hypothesis_tests
+fpm run --example linear_models
+fpm run --example time_series
+fpm run --example data_and_strings
 ```
+
+The examples progress from descriptive statistics to probability distributions,
+linear algebra, hypothesis tests, linear models, time-series helpers, and numeric
+data frames with string utilities.  Each is self-contained and uses deterministic
+inputs; the random-number example sets an explicit seed.
 
 As an fpm dependency, add the repository to the consuming package's manifest and import only the routines needed by the program:
 

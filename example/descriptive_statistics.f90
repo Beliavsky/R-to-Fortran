@@ -5,6 +5,10 @@ implicit none
 real(kind=dp) :: observations(5)
 real(kind=dp) :: density(5)
 
+write(*, '(/, a)') repeat("=", 72)
+write(*, '(a)') "r_mod example: Descriptive statistics"
+write(*, '(a, /)') repeat("=", 72)
+
 observations = [1.2_dp, 2.4_dp, 2.8_dp, 3.1_dp, 4.5_dp]
 density = dnorm(observations)
 
