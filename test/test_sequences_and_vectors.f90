@@ -24,6 +24,18 @@ call assert_integer_vector(cumprod([1, 2, 3, 4]), [1, 2, 6, 24], "integer cumula
 call assert_integer_vector(cummax([3, 1, 4, 2]), [3, 3, 4, 4], "integer cumulative maximum")
 call assert_integer_vector(diff([1, 4, 9, 16]), [3, 5, 7], "integer differences")
 call assert_integer_vector(rev_int([1, 2, 3, 4]), [4, 3, 2, 1], "integer reversal")
+call assert_integer_vector(cumsum([1, -huge(0), 2]), [1, -huge(0), -huge(0)], &
+   "integer cumulative sum NA propagation")
+call assert_integer_vector(cumprod([1, -huge(0), 2]), [1, -huge(0), -huge(0)], &
+   "integer cumulative product NA propagation")
+call assert_integer_vector(cummax([1, -huge(0), 2]), [1, -huge(0), -huge(0)], &
+   "integer cumulative maximum NA propagation")
+call assert_integer_vector(diff([1, -huge(0), 2]), [-huge(0), -huge(0)], &
+   "integer difference NA propagation")
+call assert_integer_vector(cumsum([-huge(0), 2, 3]), [-huge(0), -huge(0), -huge(0)], &
+   "leading integer cumulative NA propagation")
+call assert_integer_vector(diff([-huge(0), 2, -huge(0)]), [-huge(0), -huge(0)], &
+   "integer differences around NA")
 
 call assert_real_vector(cumsum([0.5_dp, 1.5_dp, -2.0_dp]), [0.5_dp, 2.0_dp, 0.0_dp], &
    "real cumulative sum")

@@ -122,9 +122,19 @@ call assert_logical_vector_equal(logical_runs%values, [.true., .false., .true.],
 call assert_logical_vector_equal(inverse_rle(logical_runs), [.true., .true., .false., .true.], &
    "logical RLE round trip")
 
+real_runs = rle([-0.0_dp, 0.0_dp, -0.0_dp])
+call assert_integer_vector_equal(real_runs%lengths, [3], "signed-zero RLE run length")
+if (size(real_runs%values) /= 1) error stop "signed-zero RLE values failed"
+
 int_runs = rle([integer ::])
 if (size(int_runs%lengths) /= 0 .or. size(int_runs%values) /= 0) error stop "empty RLE metadata failed"
 if (size(inverse_rle(int_runs)) /= 0) error stop "empty RLE round trip failed"
+char_runs = rle([character(len=1) ::])
+if (size(char_runs%lengths) /= 0 .or. size(char_runs%values) /= 0) &
+   error stop "empty character RLE failed"
+logical_runs = rle([logical ::])
+if (size(logical_runs%lengths) /= 0 .or. size(logical_runs%values) /= 0) &
+   error stop "empty logical RLE failed"
 
 contains
 

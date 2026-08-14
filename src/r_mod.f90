@@ -3354,11 +3354,22 @@ end if
 end function r_matrix_index_int
 
 pure function r_vector_index_real_int(x, idx) result(out)
-! Return bounds-checked R-style positive indexing of a real vector.
+! Return R-style integer indexing of a real vector, omitting zero indices.
 real(kind=dp), intent(in) :: x(:)
 integer, intent(in) :: idx(:)
 real(kind=dp), allocatable :: out(:)
+logical, allocatable :: keep(:)
 integer :: i, k
+if (all(idx <= 0) .and. any(idx < 0)) then
+   allocate(keep(size(x)))
+   keep = .true.
+   do i = 1, size(idx)
+      k = abs(idx(i))
+      if (k >= 1 .and. k <= size(x)) keep(k) = .false.
+   end do
+   out = pack(x, keep)
+   return
+end if
 allocate(out(count(idx /= 0)))
 k = 0
 do i = 1, size(idx)
@@ -3577,7 +3588,7 @@ do i = 1, size(idx)
    if (idx(i) >= 1 .and. idx(i) <= size(x, 1)) then
       out(i, :) = x(idx(i), :)
    else
-      out(i, :) = 0.0_dp
+      out(i, :) = r_na_real()
    end if
 end do
 end function r_matrix_rows_real
@@ -3593,7 +3604,7 @@ do i = 1, size(idx)
    if (idx(i) >= 1 .and. idx(i) <= size(x, 1)) then
       out(i, :) = x(idx(i), :)
    else
-      out(i, :) = 0
+      out(i, :) = -huge(0)
    end if
 end do
 end function r_matrix_rows_int
@@ -3695,21 +3706,58 @@ end if
 end function r_matrix_col_filter_int
 
 pure function r_index_real(x, idx) result(out)
-! Return vector indexing with real indices so NaN indices become real NA.
+! Return R-style vector indexing with real indices so NaN indices become real NA.
 integer, intent(in) :: x(:) ! source integer vector
 real(kind=dp), intent(in) :: idx(:) ! one-based real/NA indices
 real(kind=dp), allocatable :: out(:)
-integer :: i, k
-allocate(out(size(idx)))
+logical, allocatable :: keep(:)
+logical :: has_negative, has_nonfinite, has_positive
+integer :: i, k, m
+has_negative = .false.
+has_nonfinite = .false.
+has_positive = .false.
 do i = 1, size(idx)
    if (.not. ieee_is_finite(idx(i))) then
-      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      has_nonfinite = .true.
+   else
+      k = int(idx(i))
+      if (k < 0) has_negative = .true.
+      if (k > 0) has_positive = .true.
+   end if
+end do
+if (has_negative .and. .not. has_positive .and. .not. has_nonfinite) then
+   allocate(keep(size(x)))
+   keep = .true.
+   do i = 1, size(idx)
+      k = abs(int(idx(i)))
+      if (k >= 1 .and. k <= size(x)) keep(k) = .false.
+   end do
+   out = pack(real(x, kind=dp), keep)
+   return
+end if
+m = 0
+do i = 1, size(idx)
+   if (.not. ieee_is_finite(idx(i))) then
+      m = m + 1
+   else if (int(idx(i)) /= 0) then
+      m = m + 1
+   end if
+end do
+allocate(out(m))
+m = 0
+do i = 1, size(idx)
+   if (ieee_is_finite(idx(i))) then
+      if (int(idx(i)) == 0) cycle
+   end if
+   m = m + 1
+   if (.not. ieee_is_finite(idx(i))) then
+      out(m) = r_na_real()
    else
       k = int(idx(i))
       if (k >= 1 .and. k <= size(x)) then
-         out(i) = real(x(k), kind=dp)
+         out(m) = real(x(k), kind=dp)
       else
-         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+         out(m) = r_na_real()
       end if
    end if
 end do
@@ -10808,7 +10856,11 @@ allocate(out(size(x)))
 if (size(x) <= 0) return
 out(1) = x(1)
 do i = 2, size(x)
-   out(i) = out(i - 1) + x(i)
+   if (out(i - 1) == -huge(0) .or. x(i) == -huge(0)) then
+      out(i) = -huge(0)
+   else
+      out(i) = out(i - 1) + x(i)
+   end if
 end do
 end function cumsum_int
 
@@ -11015,7 +11067,11 @@ allocate(out(size(x)))
 if (size(x) <= 0) return
 out(1) = x(1)
 do i = 2, size(x)
-   out(i) = out(i - 1) * x(i)
+   if (out(i - 1) == -huge(0) .or. x(i) == -huge(0)) then
+      out(i) = -huge(0)
+   else
+      out(i) = out(i - 1) * x(i)
+   end if
 end do
 end function cumprod_int
 
@@ -11041,7 +11097,11 @@ allocate(out(size(x)))
 if (size(x) <= 0) return
 out(1) = x(1)
 do i = 2, size(x)
-   out(i) = max(out(i - 1), x(i))
+   if (out(i - 1) == -huge(0) .or. x(i) == -huge(0)) then
+      out(i) = -huge(0)
+   else
+      out(i) = max(out(i - 1), x(i))
+   end if
 end do
 end function cummax_int
 
@@ -11093,10 +11153,16 @@ pure function diff_int(x) result(out)
 ! First differences of an integer vector.
 integer, intent(in) :: x(:) ! input vector
 integer, allocatable :: out(:)
-integer :: n
+integer :: i, n
 n = size(x)
 allocate(out(max(0, n - 1)))
-if (n > 1) out = x(2:n) - x(1:n - 1)
+do i = 1, n - 1
+   if (x(i + 1) == -huge(0) .or. x(i) == -huge(0)) then
+      out(i) = -huge(0)
+   else
+      out(i) = x(i + 1) - x(i)
+   end if
+end do
 end function diff_int
 
 pure function diag_mat_real(a) result(out)
@@ -13717,7 +13783,11 @@ real(kind=dp), intent(in) :: b(:) ! second column source
 real(kind=dp), allocatable :: out(:,:)
 integer :: i, j, n, nc
 n = max(size(a), size(b))
-nc = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+if (n == 0) then
+   nc = 2
+else
+   nc = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+end if
 allocate(out(n, nc))
 j = 0
 if (size(a) > 0) then
@@ -13746,7 +13816,11 @@ if (.not. present(r3)) then
    return
 end if
 n = max(size(r1), max(size(r2), size(r3)))
-nc = merge(1, 0, size(r1) > 0) + merge(1, 0, size(r2) > 0) + merge(1, 0, size(r3) > 0)
+if (n == 0) then
+   nc = 3
+else
+   nc = merge(1, 0, size(r1) > 0) + merge(1, 0, size(r2) > 0) + merge(1, 0, size(r3) > 0)
+end if
 allocate(out(n, nc))
 j = 0
 if (size(r1) > 0) then
@@ -13776,7 +13850,11 @@ real(kind=dp), intent(in) :: b(:) ! second row source
 real(kind=dp), allocatable :: out(:,:)
 integer :: i, j, n, nr
 n = max(size(a), size(b))
-nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+if (n == 0) then
+   nr = 2
+else
+   nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+end if
 allocate(out(nr, n))
 j = 0
 if (size(a) > 0) then
@@ -13855,7 +13933,11 @@ integer, intent(in) :: b(:)
 integer, allocatable :: out(:,:)
 integer :: i, j, n, nr
 n = max(size(a), size(b))
-nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+if (n == 0) then
+   nr = 2
+else
+   nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+end if
 allocate(out(nr, n))
 j = 0
 if (size(a) > 0) then
@@ -14371,7 +14453,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (na <= 0) then
+   allocate(out(size(a, 1), size(a, 2)))
+   return
+end if
+if (nb <= 0) then
    allocate(out(0, 0))
    return
 end if
@@ -14399,7 +14485,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (na <= 0) then
+   allocate(out(size(a, 1), size(a, 2)))
+   return
+end if
+if (nb <= 0) then
    allocate(out(0, 0))
    return
 end if
@@ -14419,7 +14509,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, nb, na
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (nb <= 0) then
+   allocate(out(size(b, 1), size(b, 2)))
+   return
+end if
+if (na <= 0) then
    allocate(out(0, 0))
    return
 end if
@@ -14439,7 +14533,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (na <= 0) then
+   allocate(out(size(a, 1), size(a, 2)))
+   return
+end if
+if (nb <= 0) then
    allocate(out(0, 0))
    return
 end if
@@ -14467,7 +14565,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (na <= 0) then
+   allocate(out(size(a, 1), size(a, 2)))
+   return
+end if
+if (nb <= 0) then
    allocate(out(0, 0))
    return
 end if
@@ -14487,7 +14589,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, nb, na
 na = size(a)
 nb = size(b)
-if (na <= 0 .or. nb <= 0) then
+if (nb <= 0) then
+   allocate(out(size(b, 1), size(b, 2)))
+   return
+end if
+if (na <= 0) then
    allocate(out(0, 0))
    return
 end if

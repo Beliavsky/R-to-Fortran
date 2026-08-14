@@ -11,6 +11,10 @@ call assert_close(r_seq_real_by(0.0_dp, 0.3_dp, 0.1_dp), &
 if (size(r_seq_real_by(2.0_dp, 1.0_dp, 0.5_dp)) /= 0) error stop "invalid ascending direction failed"
 if (size(r_seq_real_by(1.0_dp, 2.0_dp, -0.5_dp)) /= 0) error stop "invalid descending direction failed"
 if (size(r_seq_real_by(1.0_dp, 2.0_dp, 0.0_dp)) /= 0) error stop "zero step failed"
+call assert_close(r_seq_real_by(1.0_dp, 1.0_dp, -2.0_dp), [1.0_dp], &
+   "equal endpoints with negative step")
+call assert_close(r_seq_real_by(1.0_dp, 1.1_dp, 2.0_dp), [1.0_dp], &
+   "step larger than interval")
 
 call assert_close(r_seq_real_length(0.0_dp, 1.0_dp, 5), &
    [0.0_dp, 0.25_dp, 0.5_dp, 0.75_dp, 1.0_dp], "fixed-length real sequence")
@@ -19,6 +23,8 @@ call assert_close(r_seq_real_length(3.0_dp, -1.0_dp, 3), &
 call assert_close(r_seq_real_length(4.0_dp, 9.0_dp, 1), [4.0_dp], "single-value sequence")
 if (size(r_seq_real_length(1.0_dp, 2.0_dp, 0)) /= 0) error stop "zero sequence length failed"
 if (size(r_seq_real_length(1.0_dp, 2.0_dp, -1)) /= 0) error stop "negative sequence length failed"
+call assert_close(r_seq_real_length(-2.0_dp, 2.0_dp, 2), [-2.0_dp, 2.0_dp], &
+   "two-value fixed-length sequence")
 
 contains
 

@@ -483,6 +483,15 @@ xr2f> sum(x)
 6
 ```
 
+Simple assignments are evaluated once in a session workspace, so a bare symbol or expression
+returns the current value immediately without transpiling and compiling the session. Explicit
+`run`, `time`, and `run-both` commands still translate the accumulated R source to Fortran.
+Explicit output calls such as `print(...)`, `cat(...)`, `message(...)`, and `warning(...)` also
+execute immediately. They remain in the accumulated source so an explicit `run` transpiles and
+reproduces their output.
+Sessions containing multiline control constructs use the transpile-and-run path for bare
+expressions because arbitrary compiled Fortran state cannot be kept between commands.
+
 Run commands accept an optional repeat count, `verbose`, and compiler specifications:
 
 ```text

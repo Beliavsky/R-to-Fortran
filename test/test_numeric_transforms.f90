@@ -23,6 +23,7 @@ if (r_round(1.0e300_dp, 400) /= 1.0e300_dp) error stop "large-magnitude positive
 if (r_round(1.2345_dp, -400) /= 0.0_dp) error stop "large negative digits rounding failed"
 if (r_round(1.0e300_dp, -400) /= 0.0_dp) error stop "large-magnitude negative digits failed"
 if (ieee_is_negative(r_round(-0.5_dp, -400))) error stop "extreme rounded zero sign failed"
+if (size(r_round([real(kind=dp) ::], 2)) /= 0) error stop "empty rounding failed"
 
 call assert_real_vector(pmax([1.0_dp, 4.0_dp, -2.0_dp], [2.0_dp, 3.0_dp, -3.0_dp]), &
    [2.0_dp, 4.0_dp, -2.0_dp], "elementwise maximum")
@@ -35,6 +36,10 @@ if (.not. r_is_nan(pmax(na_value, ordinary_nan))) error stop "right NaN preceden
 if (r_is_nan(pmax(ordinary_nan, na_value))) error stop "right NA precedence failed"
 if (.not. ieee_is_negative(pmax(-0.0_dp, 0.0_dp))) error stop "negative-zero tie failed"
 if (ieee_is_negative(pmax(0.0_dp, -0.0_dp))) error stop "positive-zero tie failed"
+if (pmax(-r_inf(), 2.0_dp) /= 2.0_dp) error stop "negative-infinity maximum failed"
+if (pmax(2.0_dp, r_inf()) /= r_inf()) error stop "positive-infinity maximum failed"
+if (size(pmax([real(kind=dp) ::], [real(kind=dp) ::])) /= 0) &
+   error stop "empty vector maximum failed"
 
 values = r_log([1.0_dp, exp(1.0_dp), 0.0_dp, -1.0_dp])
 if (size(values) /= 4) error stop "log vector shape failed"

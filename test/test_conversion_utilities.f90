@@ -13,6 +13,7 @@ real(kind=dp) :: five_values(5), negative_inf, positive_inf
 
 if (str_to_int("42") /= 42) error stop "positive integer parsing failed"
 if (str_to_int("  -17 ") /= -17) error stop "signed integer parsing failed"
+if (str_to_int("-0") /= 0) error stop "negative-zero integer parsing failed"
 if (str_to_int("+8") /= 8) error stop "explicit-positive integer parsing failed"
 if (str_to_int("0012") /= 12) error stop "leading-zero integer parsing failed"
 if (str_to_int("1.9") /= 1) error stop "positive fractional integer parsing failed"
@@ -36,6 +37,8 @@ call assert_integer_vector_equal(integer_values, [1, -2, 30, -huge(0)], "element
 call assert_close(str_to_real("3.25"), 3.25_dp, "decimal real parsing")
 call assert_close(str_to_real("-1.5e2"), -150.0_dp, "exponent real parsing")
 call assert_close(str_to_real("+.5"), 0.5_dp, "leading-decimal real parsing")
+call assert_close(str_to_real("  2.5  "), 2.5_dp, "whitespace real parsing")
+if (.not. ieee_is_negative(str_to_real("-0"))) error stop "negative-zero real parsing failed"
 call assert_close(str_to_real("0x10"), 16.0_dp, "hexadecimal integer real parsing")
 call assert_close(str_to_real("-0Xff"), -255.0_dp, "signed hexadecimal real parsing")
 call assert_close(str_to_real("0x1.8"), 1.5_dp, "hexadecimal fraction parsing")
@@ -88,6 +91,7 @@ call assert_string_equal(as_roman(1), "I", "minimum Roman numeral")
 call assert_string_equal(as_roman(4), "IV", "subtractive Roman numeral")
 call assert_string_equal(as_roman(944), "CMXLIV", "compound Roman numeral")
 call assert_string_equal(as_roman(3899), "MMMDCCCXCIX", "maximum Roman numeral")
+call assert_string_equal(as_roman(3888), "MMMDCCCLXXXVIII", "long Roman numeral")
 call assert_string_equal(as_roman(0), "NA", "low invalid Roman numeral")
 call assert_string_equal(as_roman(3900), "NA", "high invalid Roman numeral")
 

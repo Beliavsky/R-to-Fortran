@@ -1,6 +1,6 @@
 program test_equality_and_factor_helpers
 use, intrinsic :: ieee_arithmetic, only: ieee_positive_inf, ieee_quiet_nan, ieee_value
-use r_mod, only: all_equal, dp, nested_matrix_list_len, r_factor_labels
+use r_mod, only: all_equal, dp, nested_matrix_list_len, r_factor_labels, r_na_real
 implicit none
 
 real(kind=dp) :: slices(2, 2, 4), nan_value, inf
@@ -31,6 +31,7 @@ if (.not. all_equal(inf, inf)) error stop "matching positive infinity failed"
 if (.not. all_equal(-inf, -inf)) error stop "matching negative infinity failed"
 if (all_equal(inf, -inf)) error stop "opposite infinities compared equal"
 if (.not. all_equal(nan_value, nan_value)) error stop "matching NaN failed"
+if (.not. all_equal(r_na_real(), nan_value)) error stop "NA and NaN all.equal semantics failed"
 if (all_equal(nan_value, 1.0_dp)) error stop "NaN compared equal to finite value"
 if (.not. all_equal([1.0_dp, inf, nan_value], [1.0_dp, inf, nan_value])) &
    error stop "nonfinite real-vector equality failed"
@@ -41,6 +42,13 @@ if (.not. all_equal(reshape([0.0_dp, -0.0_dp, inf, nan_value], [2, 2]), &
    error stop "nonfinite real-matrix equality failed"
 if (all_equal(reshape([1.0_dp, 2.0_dp], [1, 2]), &
    reshape([1.0_dp, 2.0_dp], [2, 1]))) error stop "real-matrix shape mismatch failed"
+if (.not. all_equal([1, -huge(0), 3], [1, -huge(0), 3])) &
+   error stop "integer NA-vector equality failed"
+if (all_equal([1, -huge(0), 3], [1, 2, 3])) error stop "integer NA-vector inequality failed"
+if (.not. all_equal(reshape([1, -huge(0), 3, 4], [2, 2]), &
+   reshape([1, -huge(0), 3, 4], [2, 2]))) error stop "integer-matrix equality failed"
+if (all_equal(reshape([1, 2], [1, 2]), reshape([1, 2], [2, 1]))) &
+   error stop "integer-matrix shape mismatch failed"
 if (.not. all_equal(cmplx(1.0_dp, 2.0_dp, kind=dp), &
    cmplx(1.0_dp + 1.0e-10_dp, 2.0_dp - 1.0e-10_dp, kind=dp))) &
    error stop "complex scalar tolerance failed"
@@ -59,6 +67,18 @@ if (all_equal(reshape([cmplx(1.0_dp, 0.0_dp, kind=dp), &
    reshape([cmplx(1.0_dp, 0.0_dp, kind=dp), &
    cmplx(2.0_dp, 0.0_dp, kind=dp)], [2, 1]))) &
    error stop "complex-matrix shape mismatch failed"
+if (.not. all_equal(reshape([complex_nan, cmplx(2.0_dp, 3.0_dp, kind=dp)], [1, 2]), &
+   reshape([cmplx(r_na_real(), inf, kind=dp), cmplx(2.0_dp, 3.0_dp, kind=dp)], [1, 2]))) &
+   error stop "complex-matrix missing equality failed"
+if (.not. all_equal(reshape([.true., .false., .false., .true.], [2, 2]), &
+   reshape([.true., .false., .false., .true.], [2, 2]))) error stop "logical-matrix equality failed"
+if (all_equal(reshape([.true., .false.], [1, 2]), reshape([.true., .false.], [2, 1]))) &
+   error stop "logical-matrix shape mismatch failed"
+if (.not. all_equal(reshape([character(len=2) :: "a", "bb", "c", "dd"], [2, 2]), &
+   reshape([character(len=2) :: "a", "bb", "c", "dd"], [2, 2]))) &
+   error stop "character-matrix equality failed"
+if (all_equal(reshape([character(len=1) :: "a", "b"], [1, 2]), &
+   reshape([character(len=1) :: "a", "b"], [2, 1]))) error stop "character-matrix shape mismatch failed"
 
 call assert_character_vector(r_factor_labels([1, 3, 2, 0, 4], &
    [character(len=6) :: "low", "medium", "high"]), &

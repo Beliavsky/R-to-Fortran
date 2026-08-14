@@ -20,6 +20,10 @@ real_values = matrix([real(kind=dp) ::], 2, 2)
 if (any(shape(real_values) /= [2, 2])) error stop "empty real matrix shape failed"
 if (.not. all(ieee_is_nan(real_values))) error stop "empty real matrix NA fill failed"
 if (any(shape(matrix([1, 2], 0, 3)) /= [0, 3])) error stop "zero-row matrix failed"
+if (any(shape(matrix([1, 2], 3, 0)) /= [3, 0])) error stop "zero-column matrix failed"
+if (any(shape(matrix([integer ::], 2)) /= [2, 0])) error stop "inferred empty matrix failed"
+call assert_integer_matrix(matrix([1, 2, 3, 4, 5], 2, 2), &
+   reshape([1, 2, 3, 4], [2, 2]), "explicit matrix truncation")
 
 call assert_integer_matrix(r_array_int([1, 2, 3], [2, 2]), reshape([1, 2, 3, 1], [2, 2]), &
    "integer array recycling")
@@ -34,6 +38,10 @@ if (any(integer_values /= -huge(0))) error stop "empty integer array NA fill fai
 real_values = r_array_real([real(kind=dp) ::], [2, 2])
 if (.not. all(ieee_is_nan(real_values))) error stop "empty real array NA fill failed"
 if (any(shape(r_array_real([1.0_dp], [3])) /= [0, 0])) error stop "short dimensions failed"
+if (any(shape(r_array_real([1.0_dp], [0, 3])) /= [0, 3])) error stop "zero-row real array failed"
+if (any(shape(r_array_int([1], [3, 0])) /= [3, 0])) error stop "zero-column integer array failed"
+if (any(shape(r_array_char([character(len=1) :: "x"], [0, 2])) /= [0, 2])) &
+   error stop "zero-row character array failed"
 
 integer_rect = reshape([1, 2, 3, 4, 5, 6], [2, 3])
 call assert_integer_vector(diag(integer_rect), [1, 4], "integer diagonal extraction")
@@ -54,6 +62,8 @@ call assert_complex_matrix(diag(complex_vector, 3), reshape([ &
    cmplx(0.0_dp, 0.0_dp, kind=dp), complex_vector(2), cmplx(0.0_dp, 0.0_dp, kind=dp), &
    cmplx(0.0_dp, 0.0_dp, kind=dp), cmplx(0.0_dp, 0.0_dp, kind=dp), complex_vector(1)], [3, 3]), &
    "resized complex diagonal")
+if (any(shape(diag([integer ::])) /= [0, 0])) error stop "empty integer diagonal failed"
+if (any(shape(diag([real(kind=dp) ::], 0)) /= [0, 0])) error stop "empty real diagonal failed"
 
 call assert_real_matrix(toeplitz([1.0_dp, 2.0_dp, 3.0_dp]), &
    reshape([1.0_dp, 2.0_dp, 3.0_dp, 2.0_dp, 1.0_dp, 2.0_dp, &

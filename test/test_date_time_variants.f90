@@ -41,8 +41,12 @@ call assert_integer_vector(date_seq_day(7, 7, by=3), [7], &
    "equal-endpoint positive sequence")
 call assert_integer_vector(date_seq_day(7, 7, by=-3), [7], &
    "equal-endpoint negative sequence")
+if (size(date_seq_day(0, 5, by=-1)) /= 0) error stop "invalid forward date direction failed"
+if (size(date_seq_day(5, 0, by=1)) /= 0) error stop "invalid reverse date direction failed"
 call assert_integer_vector(date_seq_length(10, 0, 4), [10, 10, 10, 10], &
    "repeated fixed-length date sequence")
+call assert_integer_vector(date_seq_length(10, 3, 1), [10], &
+   "single fixed-length date sequence")
 if (size(date_seq_length(10, 3, 0)) /= 0) error stop "zero-length date sequence failed"
 
 if (trim(date_format(0, "%F")) /= "1970-01-01") &
@@ -57,6 +61,8 @@ if (sys_time_format(86400.0_dp, "unsupported") /= "1970-01-02 00:00:00") &
    error stop "timestamp fallback format failed"
 if (sys_time_format(-86401.0_dp, "%Y-%m-%d %H:%M:%S") /= &
    "1969-12-30 23:59:59") error stop "multi-day negative timestamp failed"
+if (sys_time_format(-1.0_dp, "%Y-%m-%d %H:%M:%S") /= &
+   "1969-12-31 23:59:59") error stop "pre-epoch timestamp failed"
 
 contains
 

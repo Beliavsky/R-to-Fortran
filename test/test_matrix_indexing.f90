@@ -23,9 +23,17 @@ call assert_real_vector(r_matrix_row(real_matrix, 3), [3.0_dp, 6.0_dp, 9.0_dp], 
 
 call assert_integer_matrix(r_matrix_rows(integer_matrix, [3, 1]), &
    reshape([3, 1, 6, 4, 9, 7], [2, 3]), "selected integer rows")
-call assert_real_matrix(r_matrix_rows(real_matrix, [2, 4]), &
+call assert_real_matrix_with_na(r_matrix_rows(real_matrix, [2, 4]), &
    reshape([2.0_dp, 0.0_dp, 5.0_dp, 0.0_dp, 8.0_dp, 0.0_dp], [2, 3]), &
+   reshape([.false., .true., .false., .true., .false., .true.], [2, 3]), &
    "selected real rows with invalid index")
+call assert_integer_matrix(r_matrix_rows(integer_matrix, [2, 2]), &
+   reshape([2, 2, 5, 5, 8, 8], [2, 3]), "repeated integer rows")
+call assert_integer_matrix(r_matrix_rows(integer_matrix, [2, 4]), &
+   reshape([2, -huge(0), 5, -huge(0), 8, -huge(0)], [2, 3]), &
+   "selected integer rows with invalid index")
+if (any(shape(r_matrix_rows(real_matrix, [integer ::])) /= [0, 3])) &
+   error stop "empty selected rows failed"
 call assert_integer_matrix(r_matrix_row_filter(integer_matrix, [.true., .false.]), &
    reshape([1, 3, 4, 6, 7, 9], [2, 3]), "recycled row filter")
 call assert_real_matrix(r_matrix_col_filter(real_matrix, [.false., .true.]), &
@@ -67,8 +75,20 @@ if (size(integer_values) /= 2 .or. integer_values(1) /= 10 .or. &
    integer_values(2) /= -huge(0)) error stop "integer vector NA indexing failed"
 call assert_integer_vector(r_matrix_index([10, 20, 30, 40], [-2, -4]), [10, 30], &
    "negative integer vector indexing")
+call assert_real_vector(r_matrix_index([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [-2, 0, -4]), &
+   [1.0_dp, 3.0_dp], "negative real vector indexing")
+call assert_real_vector(r_matrix_index([1.0_dp, 2.0_dp, 3.0_dp], [3, 3, 0, 1]), &
+   [3.0_dp, 3.0_dp, 1.0_dp], "repeated real vector indexing")
 call assert_real_vector(r_matrix_index([1.0_dp, 2.0_dp, 3.0_dp], [.true., .false.]), &
    [1.0_dp, 3.0_dp], "logical real-vector indexing")
+if (size(r_matrix_index([1.0_dp, 2.0_dp], [logical ::])) /= 0) &
+   error stop "empty logical real-vector index failed"
+real_values = r_matrix_index([real(kind=dp) ::], [.true., .false.])
+if (size(real_values) /= 1 .or. .not. ieee_is_nan(real_values(1))) &
+   error stop "logical extension of empty real vector failed"
+integer_values = r_matrix_index([integer ::], [.true., .false.])
+if (size(integer_values) /= 1 .or. integer_values(1) /= -huge(0)) &
+   error stop "logical extension of empty integer vector failed"
 
 contains
 
@@ -103,4 +123,16 @@ character(len=*), intent(in) :: label
 if (any(shape(actual) /= shape(expected))) error stop trim(label) // " shape failed"
 if (any(abs(actual - expected) > 1.0e-12_dp)) error stop trim(label) // " values failed"
 end subroutine assert_real_matrix
+
+subroutine assert_real_matrix_with_na(actual, expected, expected_na, label)
+real(kind=dp), intent(in) :: actual(:,:), expected(:,:)
+logical, intent(in) :: expected_na(:,:)
+character(len=*), intent(in) :: label
+
+if (any(shape(actual) /= shape(expected)) .or. any(shape(actual) /= shape(expected_na))) &
+   error stop trim(label) // " shape failed"
+if (any(ieee_is_nan(actual) .neqv. expected_na)) error stop trim(label) // " NA positions failed"
+if (any(abs(actual - expected) > 1.0e-12_dp .and. .not. expected_na)) &
+   error stop trim(label) // " values failed"
+end subroutine assert_real_matrix_with_na
 end program test_matrix_indexing

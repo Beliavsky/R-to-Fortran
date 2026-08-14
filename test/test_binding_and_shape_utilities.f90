@@ -16,6 +16,10 @@ call assert_real_matrix(cbind([1.0_dp, 2.0_dp], [10.0_dp], [100.0_dp, 200.0_dp, 
    100.0_dp, 200.0_dp, 300.0_dp], [3, 3]), "three-column binding with recycling")
 call assert_real_matrix(cbind2([real(kind=dp) ::], [1.0_dp, 2.0_dp, 3.0_dp]), &
    reshape([1.0_dp, 2.0_dp, 3.0_dp], [3, 1]), "empty column omission")
+call assert_shape(cbind2([real(kind=dp) ::], [real(kind=dp) ::]), [0, 2], &
+   "two empty columns")
+call assert_shape(cbind([real(kind=dp) ::], [real(kind=dp) ::], [real(kind=dp) ::]), &
+   [0, 3], "three empty columns")
 
 call assert_real_matrix(rbind([1.0_dp, 2.0_dp, 3.0_dp], [10.0_dp, 11.0_dp]), &
    reshape([1.0_dp, 10.0_dp, 2.0_dp, 11.0_dp, 3.0_dp, 10.0_dp], [2, 3]), &
@@ -24,6 +28,9 @@ call assert_integer_matrix(rbind([1, 2, 3], [10, 11]), &
    reshape([1, 10, 2, 11, 3, 10], [2, 3]), "integer row binding with recycling")
 call assert_integer_matrix(rbind([integer ::], [1, 2, 3]), reshape([1, 2, 3], [1, 3]), &
    "empty row omission")
+call assert_shape(rbind([real(kind=dp) ::], [real(kind=dp) ::]), [2, 0], &
+   "two empty real rows")
+call assert_shape(rbind([integer ::], [integer ::]), [2, 0], "two empty integer rows")
 
 real_matrix = reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [2, 2])
 integer_matrix = reshape([1, 2, 3, 4], [2, 2])
@@ -39,6 +46,16 @@ call assert_real_matrix(rbind([real(kind=dp) ::], real_matrix), real_matrix, &
    "empty vector above matrix")
 call assert_integer_matrix(rbind(integer_matrix, [integer ::]), integer_matrix, &
    "empty vector below matrix")
+call assert_shape(rbind([1.0_dp, 2.0_dp], reshape([real(kind=dp) ::], [0, 0])), &
+   [1, 0], "vector above zero-column matrix")
+call assert_shape(rbind(reshape([real(kind=dp) ::], [0, 0]), [1.0_dp, 2.0_dp]), &
+   [1, 0], "vector below zero-column matrix")
+call assert_real_matrix(rbind([1.0_dp, 2.0_dp], reshape([real(kind=dp) ::], [0, 2])), &
+   reshape([1.0_dp, 2.0_dp], [1, 2]), "vector above zero-row matrix")
+call assert_real_matrix(rbind(reshape([real(kind=dp) ::], [0, 2]), [1.0_dp, 2.0_dp]), &
+   reshape([1.0_dp, 2.0_dp], [1, 2]), "vector below zero-row matrix")
+call assert_shape(rbind(reshape([real(kind=dp) ::], [2, 0]), &
+   reshape([real(kind=dp) ::], [3, 0])), [5, 0], "zero-column matrix row counts")
 
 shape_matrix = 0.0_dp
 call assert_logical_matrix(lower_tri(shape_matrix), reshape([.false., .true., .true., &
@@ -66,6 +83,14 @@ if (any(shape(grown) /= [2, 3]) .or. abs(grown(1, 2) - 7.0_dp) > 1.0e-12_dp) &
    error stop "in-place matrix assignment failed"
 
 contains
+
+subroutine assert_shape(actual, expected, label)
+class(*), intent(in) :: actual(:,:)
+integer, intent(in) :: expected(2)
+character(len=*), intent(in) :: label
+
+if (any(shape(actual) /= expected)) error stop trim(label) // " shape failed"
+end subroutine assert_shape
 
 subroutine assert_integer_vector(actual, expected, label)
 integer, intent(in) :: actual(:), expected(:)

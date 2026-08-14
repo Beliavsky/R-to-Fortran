@@ -10,6 +10,9 @@ call assert_integer_vector(match([2.5_dp, -1.0_dp], [-1.0_dp, 2.5_dp, 2.5_dp]), 
    "real matching")
 call assert_integer_vector(match([character(len=5) :: "beta", "none"], &
    [character(len=5) :: "alpha", "beta", "beta"]), [2, -huge(0)], "character matching")
+if (size(match([integer ::], [1, 2])) /= 0) error stop "empty match query failed"
+call assert_integer_vector(match([1, 2], [integer ::]), [-huge(0), -huge(0)], &
+   "empty match table")
 
 call assert_logical_vector(r_in([1, 2, 4], [2, 4]), [.false., .true., .true.], &
    "integer membership")
@@ -48,6 +51,10 @@ call assert_real_vector(replace([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], &
 
 call assert_integer_vector(replace([1, 2, 3, 4], [2, 4], 0), [1, 0, 3, 0], &
    "integer indexed replacement")
+call assert_integer_vector(replace([1, 2, 3], [2, 2], [8, 9]), [1, 9, 3], &
+   "duplicate indexed replacement")
+call assert_integer_vector(replace([1, 2, 3], [integer ::], [8]), [1, 2, 3], &
+   "empty indexed replacement")
 call assert_integer_vector(replace([1, 2, 3, 4], [.false., .true., .true., .false.], [8, 9]), &
    [1, 8, 9, 4], "integer mask replacement")
 call assert_real_vector(replace([1, 2, 3], [2], 2.5_dp), [1.0_dp, 2.5_dp, 3.0_dp], &

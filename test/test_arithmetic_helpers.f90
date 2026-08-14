@@ -8,6 +8,8 @@ complex(kind=dp) :: ac(2, 2), bc(2, 2)
 
 call assert_real_vector(r_add([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [10.0_dp, 20.0_dp]), &
    [11.0_dp, 22.0_dp, 13.0_dp, 24.0_dp], "recycled vector addition")
+call assert_real_vector(r_add([1.0_dp], [10.0_dp, 20.0_dp, 30.0_dp]), &
+   [11.0_dp, 21.0_dp, 31.0_dp], "left scalar-length recycling")
 call assert_real_vector(r_sub([1.0_dp, 2.0_dp, 3.0_dp], 1.0_dp), &
    [0.0_dp, 1.0_dp, 2.0_dp], "vector-scalar subtraction")
 call assert_real_vector(r_sub(10.0_dp, [1.0_dp, 2.0_dp, 3.0_dp]), &
@@ -38,6 +40,16 @@ call assert_real_matrix(r_div([12.0_dp, 24.0_dp], a), &
    "vector-matrix division")
 if (size(r_add(a, [real(kind=dp) ::])) /= 0) error stop "empty matrix addition failed"
 if (size(r_sub([real(kind=dp) ::], a)) /= 0) error stop "empty matrix subtraction failed"
+if (any(shape(r_add(reshape([real(kind=dp) ::], [0, 3]), [1.0_dp])) /= [0, 3])) &
+   error stop "zero-row matrix addition shape failed"
+if (any(shape(r_sub(reshape([real(kind=dp) ::], [2, 0]), [1.0_dp])) /= [2, 0])) &
+   error stop "zero-column matrix subtraction shape failed"
+if (any(shape(r_mul([1.0_dp], reshape([real(kind=dp) ::], [0, 3]))) /= [0, 3])) &
+   error stop "zero-row matrix multiplication shape failed"
+if (any(shape(r_div([1.0_dp], reshape([real(kind=dp) ::], [2, 0]))) /= [2, 0])) &
+   error stop "zero-column matrix division shape failed"
+if (any(shape(r_add(reshape([real(kind=dp) ::], [0, 3]), [real(kind=dp) ::])) /= [0, 3])) &
+   error stop "fully empty matrix-vector addition shape failed"
 
 if (abs(r_matmul([1.0_dp, 2.0_dp, 3.0_dp], [4.0_dp, 5.0_dp, 6.0_dp]) - 32.0_dp) &
    > 1.0e-12_dp) error stop "real dot product failed"

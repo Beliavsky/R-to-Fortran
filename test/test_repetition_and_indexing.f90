@@ -37,6 +37,14 @@ call assert_integer_vector(r_drop_indices([10, 20, 30, 40, 50], [2, 2, 4, 9]), &
 call assert_real_vector(r_drop_indices([1.0_dp, 2.0_dp, 3.0_dp], [1, 3]), [2.0_dp], &
    "drop real indices")
 if (size(r_drop_index([integer ::], 1)) /= 0) error stop "empty drop failed"
+call assert_integer_vector(r_drop_index([10, 20, 30], 0), [10, 20, 30], &
+   "zero scalar drop ignored")
+call assert_real_vector(r_drop_index([1.0_dp, 2.0_dp, 3.0_dp], 3), [1.0_dp, 2.0_dp], &
+   "drop final real index")
+call assert_integer_vector(r_drop_indices([10, 20, 30], [integer ::]), [10, 20, 30], &
+   "empty drop-index vector")
+if (size(r_drop_indices([1.0_dp, 2.0_dp], [1, 2])) /= 0) &
+   error stop "drop all real indices failed"
 
 call assert_integer_vector(r_head([1, 2, 3, 4], 2), [1, 2], "integer head")
 call assert_real_vector(r_head([1.0_dp, 2.0_dp], 8), [1.0_dp, 2.0_dp], "oversized head")
@@ -59,6 +67,14 @@ if (abs(indexed(1) - 10.0_dp) > 1.0e-12_dp .or. abs(indexed(2) - 20.0_dp) > 1.0e
    error stop "real-vector indexing values failed"
 if (.not. ieee_is_nan(indexed(3)) .or. .not. ieee_is_nan(indexed(4))) &
    error stop "real-vector indexing NA failed"
+call assert_real_vector(r_index_real([10, 20, 30, 40], [-2.9_dp, 0.0_dp, -4.0_dp]), &
+   [10.0_dp, 30.0_dp], "negative real-index exclusion")
+call assert_real_vector(r_index_real([10, 20, 30], [0.0_dp, 2.9_dp]), [20.0_dp], &
+   "zero real index omission")
+indexed(1:3) = r_index_real([10, 20, 30], [2.9_dp, &
+   ieee_value(0.0_dp, ieee_quiet_nan), 5.0_dp])
+if (abs(indexed(1) - 20.0_dp) > 1.0e-12_dp .or. .not. ieee_is_nan(indexed(2)) .or. &
+   .not. ieee_is_nan(indexed(3))) error stop "real-index NA and bounds failed"
 
 contains
 

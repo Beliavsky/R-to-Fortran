@@ -26,6 +26,9 @@ integer_combinations = combn([4, 5, 6], 0)
 if (any(shape(integer_combinations) /= [0, 1])) error stop "zero-size combination shape failed"
 integer_combinations = combn([integer ::], 0)
 if (any(shape(integer_combinations) /= [0, 1])) error stop "empty combination shape failed"
+integer_combinations = combn([4, 5, 6], 1)
+call assert_integer_matrix_equal(integer_combinations, reshape([4, 5, 6], [1, 3]), &
+   "singleton combinations")
 
 values = outer([1.0_dp, 2.0_dp], [10.0_dp, 20.0_dp, 30.0_dp])
 call assert_real_matrix_close(values, reshape([10.0_dp, 20.0_dp, 20.0_dp, 40.0_dp, &
@@ -45,6 +48,10 @@ call assert_real_matrix_close(values, reshape([1.0_dp, 1.0_dp, 4.0_dp, 9.0_dp, &
 
 values = outer([real(kind=dp) ::], [1.0_dp, 2.0_dp])
 if (any(shape(values) /= [0, 2])) error stop "empty outer-product shape failed"
+values = outer([1.0_dp, 2.0_dp], [real(kind=dp) ::])
+if (any(shape(values) /= [2, 0])) error stop "empty right outer-product shape failed"
+values = outer_plus([real(kind=dp) ::], [real(kind=dp) ::])
+if (any(shape(values) /= [0, 0])) error stop "fully empty outer-sum shape failed"
 
 contains
 

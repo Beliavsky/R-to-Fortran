@@ -33,6 +33,10 @@ call assert_real_vector_close(probabilities, [0.0_dp, 0.25_dp, 0.75_dp, 0.75_dp,
 bins = findInterval([-1.0_dp, 0.0_dp, 0.5_dp, 1.0_dp, 2.0_dp, 3.0_dp], &
    [0.0_dp, 1.0_dp, 2.0_dp])
 call assert_integer_vector_equal(bins, [0, 1, 1, 2, 3, 3], "interval lookup")
+call assert_integer_vector_equal(findInterval([-1.0_dp, 0.0_dp, 1.0_dp], &
+   [real(kind=dp) ::]), [0, 0, 0], "interval lookup with empty breakpoints")
+if (size(findInterval([real(kind=dp) ::], [0.0_dp, 1.0_dp])) /= 0) &
+   error stop "empty interval queries failed"
 
 bins = cut([0.0_dp, 1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], &
    [0.0_dp, 2.0_dp, 4.0_dp], include_lowest=.true., labels=.false.)
@@ -40,6 +44,9 @@ call assert_integer_vector_equal(bins, [1, 1, 1, 2, 2], "cut including lowest bo
 bins = cut([0.0_dp, 1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], &
    [0.0_dp, 2.0_dp, 4.0_dp], include_lowest=.false., labels=.false.)
 call assert_integer_vector_equal(bins, [0, 1, 1, 2, 2], "cut excluding lowest boundary")
+bins = cut([-1.0_dp, 0.0_dp, 1.0_dp, 2.0_dp, 3.0_dp], &
+   [0.0_dp, 2.0_dp], include_lowest=.true., labels=.false.)
+call assert_integer_vector_equal(bins, [0, 1, 1, 1, 0], "cut outside break range")
 bins = cut_n([0.0_dp, 1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], 2, labels=.false.)
 call assert_integer_vector_equal(bins, [1, 1, 1, 2, 2], "cut by bin count")
 

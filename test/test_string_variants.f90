@@ -9,10 +9,12 @@ character(len=:), allocatable :: pieces(:)
 if (nchar("") /= 0) error stop "empty character length failed"
 if (.not. char_ends_with("", "")) error stop "empty suffix on empty string failed"
 if (char_ends_with("", "x")) error stop "nonempty suffix on empty string failed"
+if (char_ends_with("ab", "abc")) error stop "oversized suffix failed"
 call assert_string(char_join([character(len=3) :: "a", "", "b"], "--"), &
    "a----b", "join with empty element")
 call assert_string(char_join([1], ","), "1", "singleton integer join")
 call assert_string(char_join([integer ::], ","), "", "empty integer join")
+call assert_string(char_join([character(len=1) ::], ","), "", "empty character join")
 
 call assert_string(r_substr("abcdef", 4, 3), "", "reversed substring range")
 call assert_string(r_substr("abcdef", 1, 99), "abcdef", "oversized substring end")
@@ -40,6 +42,8 @@ call assert_string(tolower("123-!?"), "123-!?", "nonletter lowercase conversion"
 call assert_string(casefold("MiXeD", upper=.false.), "mixed", "explicit lower casefold")
 call assert_string(trimws("     "), "", "all-blank trimming")
 call assert_string(trimws("  x  ", which="unknown"), "x", "unknown trim mode fallback")
+call assert_string(trimws("  x  ", which="left"), "x  ", "left trimming")
+call assert_string(trimws("  x  ", which="right"), "  x", "right trimming")
 
 call assert_string(replace_first_fixed("abc", "missing", "x"), "abc", &
    "missing first replacement")
@@ -62,6 +66,7 @@ call assert_string(urldecode("%41%42%43"), "ABC", "uppercase URL escapes")
 call assert_string(urldecode("%7e%2f"), "~/", "lowercase URL escapes")
 call assert_string(urldecode("a+b"), "a+b", "URL plus preservation")
 call assert_string(urldecode("tail%"), "tail%", "incomplete URL escape")
+call assert_string(urldecode("%GG"), "%GG", "invalid URL escape")
 
 contains
 
