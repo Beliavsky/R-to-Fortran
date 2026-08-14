@@ -23,6 +23,26 @@ DEFAULT_SESSION_FORTRAN = "xr2f_repl_session.f90"
 COMPILER_NAMES = {"gfortran", "ifx", "ofort"}
 
 
+_R_WORKSPACE_DRIVER = """local({
+args <- commandArgs(trailingOnly = TRUE)
+workspace <- args[[1]]
+source_path <- args[[2]]
+if (file.exists(workspace)) load(workspace, envir = .GlobalEnv)
+code <- paste(readLines(source_path, warn = FALSE), collapse = "\\n")
+ok <- tryCatch({
+  value <- withVisible(eval(parse(text = code), envir = .GlobalEnv))
+  if (value$visible) print(value$value)
+  TRUE
+}, error = function(e) {
+  message(conditionMessage(e))
+  FALSE
+})
+if (ok) save.image(file = workspace)
+quit(status = if (ok) 0L else 1L)
+})
+"""
+
+
 @dataclass
 class SessionResult:
     ok: bool
@@ -33,8 +53,63 @@ class SessionResult:
     seconds: float = 0.0
 
 
+class InteractiveRWorkspace:
+    """Small persistent R workspace implemented with save/load between Rscript calls."""
+
+    def __init__(self, rscript: str, timeout: float) -> None:
+        self.rscript = rscript
+        self.timeout = timeout
+        self._tmp = tempfile.TemporaryDirectory(prefix="xr2f_repl_state_")
+        self.root = Path(self._tmp.name)
+        self.workspace = self.root / "workspace.RData"
+        self.driver = self.root / "evaluate.R"
+        self.source = self.root / "input.R"
+        self.driver.write_text(_R_WORKSPACE_DRIVER, encoding="utf-8")
+
+    def close(self) -> None:
+        self._tmp.cleanup()
+
+    def clear(self) -> None:
+        self.workspace.unlink(missing_ok=True)
+
+    def evaluate(self, source: str) -> SessionResult:
+        self.source.write_text(source.rstrip() + "\n", encoding="utf-8")
+        cmd = [self.rscript, str(self.driver), str(self.workspace), str(self.source)]
+        t0 = time.perf_counter()
+        try:
+            cp = subprocess.run(cmd, text=True, capture_output=True, timeout=self.timeout)
+        except FileNotFoundError:
+            return SessionResult(False, message=f"{self.rscript} was not found")
+        except subprocess.TimeoutExpired as exc:
+            return SessionResult(False, message=f"{self.rscript} timed out after {exc.timeout} seconds")
+        seconds = time.perf_counter() - t0
+        message = "\n".join(part.rstrip() for part in (cp.stdout, cp.stderr) if part and part.strip())
+        return SessionResult(
+            cp.returncode == 0,
+            stdout=cp.stdout,
+            stderr=cp.stderr,
+            message=message if cp.returncode != 0 else "",
+            seconds=seconds,
+        )
+
+
+def is_simple_workspace_assignment(line: str) -> bool:
+    stripped = clean_input_line(line).strip()
+    if not stripped or "{" in stripped or "}" in stripped:
+        return False
+    return "<-" in stripped or re.match(r"^[A-Za-z.][\w.]*\s*=", stripped) is not None
+
+
+def is_immediate_output_call(line: str) -> bool:
+    stripped = clean_input_line(line).strip()
+    return re.match(r"^(print|cat|message|warning|stop)\s*\(", stripped) is not None
+
+
 def clean_input_line(line: str) -> str:
-    return line.lstrip("\ufeff").removeprefix("Ã¯Â»Â¿")
+    cleaned = line.lstrip("\ufeff\ufffd")
+    for prefix in ("\u00ef\u00bb\u00bf", "\u00c3\u00af\u00c2\u00bb\u00c2\u00bf"):
+        cleaned = cleaned.removeprefix(prefix)
+    return cleaned
 
 
 def is_setup_or_control_line(line: str) -> bool:
@@ -538,48 +613,82 @@ def run_repl(args: argparse.Namespace, initial_source: Path | None = None) -> in
     print("Commands: run, time, run-r, time-r, run-both, time-both, fortran, list, clear, quit")
     print("Run commands accept: [N] [verbose] [gfortran|ifx|ofort options...]")
     lines: list[str] = []
+    workspace = InteractiveRWorkspace(args.rscript, args.timeout)
+    workspace_synced = initial_source is None
     if initial_source is not None:
         lines = initial_source.read_text(encoding="utf-8-sig").splitlines()
         print(f"loaded {initial_source} ({len(lines)} lines)")
     last_fortran = ""
-    while True:
-        try:
-            line = input("xr2f> ")
-        except EOFError:
-            print()
-            break
-        line = clean_input_line(line)
-        raw_cmd = line.strip()
-        cmd = raw_cmd.lower()
-        if cmd in {"quit", "exit"}:
-            break
-        if cmd == "clear":
-            lines.clear()
-            last_fortran = ""
-            continue
-        if cmd == "list":
-            for i, saved in enumerate(lines, 1):
-                print(f"{i}: {saved}")
-            continue
-        if cmd == "fortran":
-            if last_fortran:
-                print(last_fortran, end="" if last_fortran.endswith("\n") else "\n")
-            continue
-        words = raw_cmd.split()
-        if words and words[0].lower() in {"run", "time", "run-r", "time-r", "run-both", "time-both"}:
-            run_cmd = words[0].lower()
-            repeat, verbose_runs, compiler_words, error = parse_repeat_verbose_and_compiler_words(words[1:])
-            if repeat is None:
-                print(f"xr2f_repl: {error}", file=sys.stderr)
+    try:
+        while True:
+            try:
+                line = input("xr2f> ")
+            except EOFError:
+                print()
+                break
+            line = clean_input_line(line)
+            raw_cmd = line.strip()
+            cmd = raw_cmd.lower()
+            if cmd in {"quit", "exit"}:
+                break
+            if cmd == "clear":
+                lines.clear()
+                last_fortran = ""
+                workspace.clear()
+                workspace_synced = True
                 continue
-            compilers, error = parse_compiler_words(compiler_words, allow=(run_cmd not in {"run-r", "time-r"}))
-            if compilers is None:
-                print(f"xr2f_repl: {error}", file=sys.stderr)
+            if cmd == "list":
+                for i, saved in enumerate(lines, 1):
+                    print(f"{i}: {saved}")
                 continue
-            result = run_session(lines, args, mode=run_cmd, compilers=compilers, repeat=repeat, verbose_runs=verbose_runs)
-            if args.time or run_cmd in {"time", "time-r"}:
+            if cmd == "fortran":
+                if last_fortran:
+                    print(last_fortran, end="" if last_fortran.endswith("\n") else "\n")
+                continue
+            words = raw_cmd.split()
+            if words and words[0].lower() in {"run", "time", "run-r", "time-r", "run-both", "time-both"}:
+                run_cmd = words[0].lower()
+                repeat, verbose_runs, compiler_words, error = parse_repeat_verbose_and_compiler_words(words[1:])
+                if repeat is None:
+                    print(f"xr2f_repl: {error}", file=sys.stderr)
+                    continue
+                compilers, error = parse_compiler_words(compiler_words, allow=(run_cmd not in {"run-r", "time-r"}))
+                if compilers is None:
+                    print(f"xr2f_repl: {error}", file=sys.stderr)
+                    continue
+                result = run_session(lines, args, mode=run_cmd, compilers=compilers, repeat=repeat, verbose_runs=verbose_runs)
+                if args.time or run_cmd in {"time", "time-r"}:
+                    print_timing(result)
+                if result.ok:
+                    if result.fortran:
+                        last_fortran = result.fortran
+                    if result.stdout:
+                        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+                    if result.stderr:
+                        print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+                else:
+                    print("xr2f_repl: session failed", file=sys.stderr)
+                    if result.message:
+                        print(result.message, file=sys.stderr)
+                continue
+            if is_setup_or_control_line(line) and not is_immediate_output_call(line):
+                lines.append(line)
+                if workspace_synced and is_simple_workspace_assignment(line):
+                    result = workspace.evaluate(line)
+                    if not result.ok:
+                        workspace_synced = False
+                else:
+                    workspace_synced = False
+                continue
+            if workspace_synced:
+                result = workspace.evaluate(line)
+            else:
+                result = run_session(lines + [line], args)
+            if args.time:
                 print_timing(result)
             if result.ok:
+                if is_immediate_output_call(line):
+                    lines.append(line)
                 if result.fortran:
                     last_fortran = result.fortran
                 if result.stdout:
@@ -587,34 +696,18 @@ def run_repl(args: argparse.Namespace, initial_source: Path | None = None) -> in
                 if result.stderr:
                     print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
             else:
-                print("xr2f_repl: session failed", file=sys.stderr)
+                print("xr2f_repl: line was not saved", file=sys.stderr)
                 if result.message:
                     print(result.message, file=sys.stderr)
-            continue
-        if is_setup_or_control_line(line):
-            lines.append(line)
-            continue
-        candidate = lines + [line]
-        result = run_session(candidate, args)
-        if args.time:
-            print_timing(result)
-        if result.ok:
-            last_fortran = result.fortran
-            if result.stdout:
-                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-            if result.stderr:
-                print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
-        else:
-            print("xr2f_repl: line was not saved", file=sys.stderr)
-            if result.message:
-                print(result.message, file=sys.stderr)
-    if lines and not args.no_save:
-        source = repl_source(lines)
-        Path(args.save_r).write_text(source, encoding="utf-8")
-        result = run_session(lines, args)
-        if result.ok:
-            Path(args.save_fortran).write_text(result.fortran, encoding="utf-8")
-            print(f"saved {args.save_r} and {args.save_fortran}")
+        if lines and not args.no_save:
+            source = repl_source(lines)
+            Path(args.save_r).write_text(source, encoding="utf-8")
+            result = run_session(lines, args)
+            if result.ok:
+                Path(args.save_fortran).write_text(result.fortran, encoding="utf-8")
+                print(f"saved {args.save_r} and {args.save_fortran}")
+    finally:
+        workspace.close()
     return 0
 
 
