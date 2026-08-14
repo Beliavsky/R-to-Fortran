@@ -1,14 +1,17 @@
 program test_statistical_edge_cases
-use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
-use r_mod, only: cor, cov, cov2cor, dp, median, quantile, sd, summary, var
+use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_positive_inf, ieee_quiet_nan, ieee_value
+use r_mod, only: cor, cov, cov2cor, dp, median, quantile, scale, sd, summary, var
 implicit none
 
 real(kind=dp), parameter :: tolerance = 1.0e-12_dp
 real(kind=dp), allocatable :: empty(:), values(:), matrix_result(:,:)
 real(kind=dp) :: one_row(1, 2), constant_column(4, 2), invalid_covariance(2, 2)
+real(kind=dp) :: scale_input(3, 2), singleton(1, 2)
 real(kind=dp) :: empty_matrix(0, 0)
+real(kind=dp) :: ordinary_nan
 
 allocate(empty(0))
+ordinary_nan = ieee_value(0.0_dp, ieee_quiet_nan)
 
 if (.not. ieee_is_nan(median(empty))) error stop "empty median should be NaN"
 if (.not. ieee_is_nan(sd(empty))) error stop "empty sd should be NaN"
@@ -18,14 +21,35 @@ if (.not. ieee_is_nan(var([1.0_dp]))) error stop "singleton variance should be N
 if (.not. ieee_is_nan(cov([1.0_dp], [2.0_dp]))) error stop "singleton covariance should be NaN"
 if (.not. ieee_is_nan(cor([1.0_dp, 1.0_dp], [2.0_dp, 3.0_dp]))) &
    error stop "constant-vector correlation should be NaN"
+if (.not. ieee_is_nan(median([1.0_dp, ordinary_nan, 3.0_dp]))) &
+   error stop "median should retain missing values by default"
+call assert_close(median([1.0_dp, ordinary_nan, 3.0_dp], na_rm=.true.), 2.0_dp, &
+   "missing-value-removed median")
 
 values = quantile(empty, [0.25_dp, 0.5_dp, 0.75_dp])
 if (size(values) /= 3 .or. .not. all(ieee_is_nan(values))) error stop "empty quantiles should be NaN"
 values = quantile([1.0_dp, 2.0_dp, 3.0_dp], [-1.0_dp, 0.5_dp, 2.0_dp])
 call assert_vector_close(values, [1.0_dp, 2.0_dp, 3.0_dp], "clamped quantiles")
+values = quantile([1.0_dp, ordinary_nan, 3.0_dp], [0.0_dp, 0.5_dp, 1.0_dp])
+if (.not. all(ieee_is_nan(values))) error stop "quantiles should retain missing values by default"
+values = quantile([1.0_dp, ordinary_nan, 3.0_dp], [0.0_dp, 0.5_dp, 1.0_dp], &
+   na_rm=.true.)
+call assert_vector_close(values, [1.0_dp, 2.0_dp, 3.0_dp], &
+   "missing-value-removed quantiles")
+values = quantile([1.0_dp, 3.0_dp, ieee_value(0.0_dp, ieee_positive_inf)], [0.5_dp])
+call assert_vector_close(values, [3.0_dp], "exact infinite-adjacent quantile")
+values = quantile([1.0_dp, 2.0_dp], [ordinary_nan])
+if (.not. ieee_is_nan(values(1))) error stop "missing probability quantile failed"
 
 values = summary(empty)
 if (size(values) /= 6 .or. .not. all(ieee_is_nan(values))) error stop "empty summary should be NaN"
+values = summary([1.0_dp, ordinary_nan, 3.0_dp])
+call assert_vector_close(values, [1.0_dp, 1.5_dp, 2.0_dp, 2.0_dp, 2.5_dp, 3.0_dp], &
+   "missing-value summary")
+values = summary([1.0_dp, 3.0_dp, ieee_value(0.0_dp, ieee_positive_inf)])
+if (any(values(1:3) /= [1.0_dp, 2.0_dp, 3.0_dp]) .or. &
+   any(values(4:6) /= ieee_value(0.0_dp, ieee_positive_inf))) &
+   error stop "infinite summary failed"
 
 one_row(1, :) = [1.0_dp, 2.0_dp]
 matrix_result = cov(one_row)
@@ -48,6 +72,24 @@ if (.not. ieee_is_nan(matrix_result(1, 2)) .or. .not. ieee_is_nan(matrix_result(
 
 matrix_result = cov2cor(empty_matrix)
 if (any(shape(matrix_result) /= [0, 0])) error stop "empty covariance conversion shape failed"
+
+scale_input(:, 1) = 5.0_dp
+scale_input(:, 2) = [1.0_dp, 2.0_dp, 3.0_dp]
+matrix_result = scale(scale_input)
+if (.not. all(ieee_is_nan(matrix_result(:, 1)))) &
+   error stop "centered constant-column scale should be NaN"
+call assert_vector_close(matrix_result(:, 2), [-1.0_dp, 0.0_dp, 1.0_dp], &
+   "variable column beside constant scale")
+
+scale_input(:, 1) = 0.0_dp
+matrix_result = scale(scale_input, center=.false., scale=.true.)
+if (.not. all(ieee_is_nan(matrix_result(:, 1)))) &
+   error stop "uncentered zero-column scale should be NaN"
+
+singleton(1, :) = [2.0_dp, -3.0_dp]
+matrix_result = scale(singleton)
+if (.not. all(ieee_is_nan(matrix_result))) &
+   error stop "singleton-column scale should be NaN"
 
 contains
 

@@ -7352,6 +7352,11 @@ character(len=16) :: buffer
 write(buffer, "(i0)") 3
 x = len_trim(buffer)
 end function internal_write
+
+pure function parsed_integer() result(x)
+integer :: x
+x = str_to_int("3")
+end function parsed_integer
 """.lstrip()
 
     result = xr2f.remove_pure_from_impure_call_graph_text(source)
@@ -7361,6 +7366,7 @@ end function internal_write
     assert re.search(r"^subroutine noisy_sub\(", result, re.MULTILINE)
     assert "elemental function noisy" not in result
     assert re.search(r"^pure function internal_write\(", result, re.MULTILINE)
+    assert re.search(r"^pure function parsed_integer\(", result, re.MULTILINE)
 
 
 def test_xr2f_function_list_chained_alias_vector_field_kinds_compile_and_run(tmp_path: Path) -> None:
@@ -10385,6 +10391,7 @@ def test_xr2f_happy_numbers_lifted_digit_helper_run(tmp_path: Path) -> None:
     assert "Run: PASS" in proc.stdout
     assert "integer, allocatable :: digits(:)" in out_text
     assert "str_to_int(strsplit_fixed" in out_text
+    assert "pure function is_happy_getdigits" in out_text
     assert "which([(is_happy(i_sw), i_sw=1,10)])" in " ".join(out_text.split())
 
 

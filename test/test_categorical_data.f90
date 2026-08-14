@@ -10,7 +10,7 @@ type(table_char_t) :: character_counts
 counts = tabulate([1, 2, 2, 4, 0, -1, 5], 4)
 call assert_integer_vector_equal(counts, [1, 2, 0, 1], "integer tabulation")
 counts = tabulate([1.0_dp, 1.9_dp, 2.1_dp, 3.0_dp], 3)
-call assert_integer_vector_equal(counts, [1, 2, 1], "real-label tabulation")
+call assert_integer_vector_equal(counts, [2, 1, 1], "real-label tabulation")
 
 contingency = table2([1, 1, 2, 2, 2, 3], [1, 2, 1, 2, 2, 1], 2, 2)
 call assert_integer_matrix_equal(contingency, reshape([1, 1, 1, 2], [2, 2]), "two-way table")

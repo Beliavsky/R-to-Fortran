@@ -49478,7 +49478,7 @@ def remove_pure_from_impure_call_graph_text(f90: str) -> str:
         "rweibull", "rcauchy", "rgeom", "rnbinom", "rhyper", "rwilcox",
         "rsignrank", "rmultinom", "rbinom", "rpois", "sample_int",
         "sample_int1", "read_csv_real_matrix", "write_csv_real_matrix",
-        "file_create", "file_remove", "dir_create", "str_to_real",
+        "file_create", "file_remove", "dir_create",
     }
 
     def directly_impure(block: str) -> bool:

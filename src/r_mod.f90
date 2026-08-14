@@ -1,7 +1,7 @@
 ﻿! helper functions for R-to-Fortran transpiler
 module r_mod
 use, intrinsic :: iso_fortran_env, only: real64, int64
-use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf, &
+use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf, ieee_negative_inf, &
    & ieee_is_finite
 #ifdef XR2F_USE_R_RNG
 use, intrinsic :: iso_c_binding, only: c_double, c_int
@@ -456,6 +456,10 @@ interface all_equal
    module procedure all_equal_int_scalar
    module procedure all_equal_int_vec
    module procedure all_equal_int_mat
+   module procedure all_equal_complex_scalar
+   module procedure all_equal_complex_vec
+   module procedure all_equal_complex_mat
+   module procedure all_equal_logical_scalar
    module procedure all_equal_logical_vec
    module procedure all_equal_logical_mat
    module procedure all_equal_char_scalar
@@ -1369,14 +1373,19 @@ end interface ARMAacf
 interface is_na
    module procedure is_na_real_scalar
    module procedure is_na_real_vec
+   module procedure is_na_real_mat
    module procedure is_na_int_scalar
    module procedure is_na_int_vec
+   module procedure is_na_int_mat
    module procedure is_na_logical_scalar
    module procedure is_na_logical_vec
+   module procedure is_na_logical_mat
    module procedure is_na_complex_scalar
    module procedure is_na_complex_vec
+   module procedure is_na_complex_mat
    module procedure is_na_char_scalar
    module procedure is_na_char_vec
+   module procedure is_na_char_mat
 end interface is_na
 
 interface which
@@ -2454,8 +2463,7 @@ case (1)
    if (t <= 0.0_dp) then
       tt = 0.0_dp
    else if (t >= 1.0_dp) then
-      out = 0.0_dp
-      return
+      tt = 1.0_dp - epsilon(1.0_dp)
    else
       tt = t
    end if
@@ -2463,8 +2471,7 @@ case (1)
    jac = 1.0_dp / (1.0_dp - tt)**2
 case (2)
    if (t <= 0.0_dp) then
-      out = 0.0_dp
-      return
+      tt = epsilon(1.0_dp)
    else if (t >= 1.0_dp) then
       tt = 1.0_dp
    else
@@ -2473,12 +2480,15 @@ case (2)
    x = b - (1.0_dp - tt) / tt
    jac = 1.0_dp / tt**2
 case default
-   if (t <= 0.0_dp .or. t >= 1.0_dp) then
-      out = 0.0_dp
-      return
+   if (t <= 0.0_dp) then
+      tt = epsilon(1.0_dp)
+   else if (t >= 1.0_dp) then
+      tt = 1.0_dp - epsilon(1.0_dp)
+   else
+      tt = t
    end if
-   x = tan(pi * (t - 0.5_dp))
-   jac = pi / cos(pi * (t - 0.5_dp))**2
+   x = tan(pi * (tt - 0.5_dp))
+   jac = pi / cos(pi * (tt - 0.5_dp))**2
 end select
 out = fn(x) * jac
 if (.not. ieee_is_finite(out)) out = 0.0_dp
@@ -2609,48 +2619,198 @@ close(u_in, status="delete")
 ok = .true.
 end function file_rename
 
-impure elemental function str_to_real(s) result(out)
+pure integer function hex_digit_value(ch) result(out)
+character(len=1), intent(in) :: ch
+select case (ch)
+case ("0":"9")
+   out = iachar(ch) - iachar("0")
+case ("a":"f")
+   out = iachar(ch) - iachar("a") + 10
+case ("A":"F")
+   out = iachar(ch) - iachar("A") + 10
+case default
+   out = -1
+end select
+end function hex_digit_value
+
+pure subroutine parse_hex_real(text, out, ok)
+character(len=*), intent(in) :: text
+real(kind=dp), intent(out) :: out
+logical, intent(out) :: ok
+integer :: i, n, digit, exponent_value, exponent_sign, signed_exponent
+real(kind=dp) :: value, fraction, sign_value
+logical :: have_digit, have_exponent_digit
+n = len(text)
+i = 1
+sign_value = 1.0_dp
+if (i <= n) then
+   if (text(i:i) == "+") then
+      i = i + 1
+   else if (text(i:i) == "-") then
+      sign_value = -1.0_dp
+      i = i + 1
+   end if
+end if
+ok = .false.
+out = ieee_value(0.0_dp, ieee_quiet_nan)
+if (i + 1 > n) return
+if (text(i:i) /= "0" .or. (text(i + 1:i + 1) /= "x" .and. text(i + 1:i + 1) /= "X")) return
+i = i + 2
+value = 0.0_dp
+have_digit = .false.
+do while (i <= n)
+   digit = hex_digit_value(text(i:i))
+   if (digit < 0) exit
+   value = 16.0_dp * value + real(digit, kind=dp)
+   have_digit = .true.
+   i = i + 1
+end do
+if (i <= n) then
+   if (text(i:i) == ".") then
+      i = i + 1
+      fraction = 1.0_dp / 16.0_dp
+      do while (i <= n)
+         digit = hex_digit_value(text(i:i))
+         if (digit < 0) exit
+         value = value + fraction * real(digit, kind=dp)
+         fraction = fraction / 16.0_dp
+         have_digit = .true.
+         i = i + 1
+      end do
+   end if
+end if
+if (.not. have_digit) return
+signed_exponent = 0
+if (i <= n) then
+   if (text(i:i) == "p" .or. text(i:i) == "P") then
+      i = i + 1
+      exponent_sign = 1
+      if (i <= n) then
+         if (text(i:i) == "+") then
+            i = i + 1
+         else if (text(i:i) == "-") then
+            exponent_sign = -1
+            i = i + 1
+         end if
+      end if
+      exponent_value = 0
+      have_exponent_digit = .false.
+      do while (i <= n)
+         if (text(i:i) < "0" .or. text(i:i) > "9") exit
+         exponent_value = min(100000, 10 * exponent_value + iachar(text(i:i)) - iachar("0"))
+         have_exponent_digit = .true.
+         i = i + 1
+      end do
+      if (.not. have_exponent_digit) return
+      signed_exponent = exponent_sign * exponent_value
+   end if
+end if
+if (i <= n) return
+if (signed_exponent > maxexponent(1.0_dp) + digits(1.0_dp)) then
+   if (value == 0.0_dp) then
+      out = sign_value * 0.0_dp
+   else
+      out = sign_value * ieee_value(0.0_dp, ieee_positive_inf)
+   end if
+else if (signed_exponent < minexponent(1.0_dp) - digits(1.0_dp)) then
+   out = sign_value * 0.0_dp
+else
+   out = sign_value * scale(value, signed_exponent)
+end if
+ok = .true.
+end subroutine parse_hex_real
+
+pure elemental function str_to_real(s) result(out)
 ! R-like as.numeric() of a character value: parse to real, NA(nan) on failure.
 character(len=*), intent(in) :: s
 real(kind=dp) :: out
-integer :: ios
-read(s, *, iostat=ios) out
+integer :: ios, i, n, sign_offset
+logical :: have_digit, parsed_hex
+character(len=:), allocatable :: text, lower
+text = trim(adjustl(s))
+lower = tolower(text)
+if (lower == "inf" .or. lower == "+inf" .or. lower == "infinity" .or. &
+   lower == "+infinity") then
+   out = ieee_value(0.0_dp, ieee_positive_inf)
+   return
+else if (lower == "-inf" .or. lower == "-infinity") then
+   out = ieee_value(0.0_dp, ieee_negative_inf)
+   return
+else if (lower == "nan" .or. lower == "+nan" .or. lower == "-nan") then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
+n = len(text)
+sign_offset = 0
+if (n > 0) then
+   if (text(1:1) == "+" .or. text(1:1) == "-") sign_offset = 1
+end if
+if (n >= sign_offset + 2) then
+   if (text(sign_offset + 1:sign_offset + 1) == "0" .and. &
+      (text(sign_offset + 2:sign_offset + 2) == "x" .or. &
+      text(sign_offset + 2:sign_offset + 2) == "X")) then
+      call parse_hex_real(text, out, parsed_hex)
+      if (.not. parsed_hex) out = ieee_value(0.0_dp, ieee_quiet_nan)
+      return
+   end if
+end if
+i = 1
+if (n > 0) then
+   if (text(i:i) == "+" .or. text(i:i) == "-") i = i + 1
+end if
+have_digit = .false.
+do while (i <= n)
+   if (text(i:i) < "0" .or. text(i:i) > "9") exit
+   have_digit = .true.
+   i = i + 1
+end do
+if (i <= n) then
+   if (text(i:i) == ".") then
+      i = i + 1
+      do while (i <= n)
+         if (text(i:i) < "0" .or. text(i:i) > "9") exit
+         have_digit = .true.
+         i = i + 1
+      end do
+   end if
+end if
+if (have_digit .and. i <= n) then
+   if (text(i:i) == "e" .or. text(i:i) == "E") then
+      i = i + 1
+      if (i <= n) then
+         if (text(i:i) == "+" .or. text(i:i) == "-") i = i + 1
+      end if
+      have_digit = .false.
+      do while (i <= n)
+         if (text(i:i) < "0" .or. text(i:i) > "9") exit
+         have_digit = .true.
+         i = i + 1
+      end do
+   end if
+end if
+if (.not. have_digit .or. i <= n) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
+read(text, *, iostat=ios) out
 if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
 end function str_to_real
 
 pure elemental integer function str_to_int(s) result(out)
 ! R-like as.integer() of a character value: parse to integer, NA on failure.
 character(len=*), intent(in) :: s
-integer :: i, digit, sign_value
-character(len=:), allocatable :: text
-text = trim(adjustl(s))
-out = 0
-sign_value = 1
-if (len(text) == 0) then
+real(kind=dp) :: parsed, truncated
+parsed = str_to_real(s)
+if (.not. ieee_is_finite(parsed)) then
    out = -huge(0)
    return
 end if
-i = 1
-if (text(1:1) == "-") then
-   sign_value = -1
-   i = 2
-else if (text(1:1) == "+") then
-   i = 2
-end if
-if (i > len(text)) then
+truncated = aint(parsed)
+if (truncated > real(huge(0), kind=dp) .or. truncated < -real(huge(0), kind=dp)) then
    out = -huge(0)
    return
 end if
-do while (i <= len(text))
-   digit = iachar(text(i:i)) - iachar("0")
-   if (digit < 0 .or. digit > 9) then
-      out = -huge(0)
-      return
-   end if
-   out = 10 * out + digit
-   i = i + 1
-end do
-out = sign_value * out
+out = int(truncated)
 end function str_to_int
 
 pure function inttobits(n) result(out)
@@ -2669,7 +2829,7 @@ function unlink_recursive(path) result(out)
 character(len=*), intent(in) :: path
 integer :: out
 integer :: stat
-if (file_exists(path)) then
+if (file_exists(path) .and. .not. dir_exists_scalar(path)) then
    if (file_remove(path)) then
       out = 0
    else
@@ -2999,6 +3159,7 @@ character(len=:), allocatable :: out(:)
 ! Deferred-length elements cannot grow independently after allocation.
 ! Reserve a practical width so later x[i] <- value assignments are retained.
 allocate(character(len=256) :: out(max(0, n)))
+out = ""
 end function r_character
 
 pure function r_drop_index_real(x, k) result(out)
@@ -3144,12 +3305,13 @@ else
    k = 0
    do i = 1, size(idx)
       if (idx(i) == 0) cycle
+      k = k + 1
       if (idx(i) >= 1 .and. idx(i) <= n) then
-         k = k + 1
          out(k) = x(mod(idx(i) - 1, size(x, 1)) + 1, ((idx(i) - 1) / size(x, 1)) + 1)
+      else
+         out(k) = r_na_real()
       end if
    end do
-   if (k < m) out = out(:k)
 end if
 end function r_matrix_index_real
 
@@ -3181,12 +3343,13 @@ else
    k = 0
    do i = 1, size(idx)
       if (idx(i) == 0) cycle
+      k = k + 1
       if (idx(i) >= 1 .and. idx(i) <= n) then
-         k = k + 1
          out(k) = x(mod(idx(i) - 1, size(x, 1)) + 1, ((idx(i) - 1) / size(x, 1)) + 1)
+      else
+         out(k) = -huge(0)
       end if
    end do
-   if (k < m) out = out(:k)
 end if
 end function r_matrix_index_int
 
@@ -3918,7 +4081,8 @@ use_hartigan = alg == "Hartigan-Wong" .or. alg == "hartigan-wong" .or. alg == "H
 allocate(c(k, p), c_new(k, p), sums(k, p), best_centers(k, p), withinss(k), best_withinss(k))
 allocate(cnt(k), size_tot(k), cl(n), cl_best(n), best_size(k), out%size(k), out%withinss(k))
 if (n <= 0 .or. p <= 0) then
-   out%centers = 0.0_dp
+   allocate(out%centers(k, p), source=0.0_dp)
+   cl = 0
    out%cluster = cl
    out%size = 0
    out%withinss = 0.0_dp
@@ -4563,9 +4727,13 @@ integer, allocatable :: out(:)
 integer :: i, b
 allocate(out(max(0, nbins)))
 if (size(out) > 0) out = 0
+if (size(out) <= 0) return
 do i = 1, size(x)
-   b = int(nint(x(i)))
-   if (b >= 1 .and. b <= size(out)) out(b) = out(b) + 1
+   if (x(i) /= x(i)) cycle
+   if (.not. ieee_is_finite(x(i))) cycle
+   if (x(i) < 1.0_dp .or. x(i) >= real(size(out) + 1, kind=dp)) cycle
+   b = int(x(i))
+   out(b) = out(b) + 1
 end do
 end function tabulate_real
 
@@ -5096,7 +5264,7 @@ allocate(out(size(x)))
 out = -huge(0)
 do i = 1, size(x)
    do j = 1, size(table)
-      if (x(i) == table(j)) then
+      if (real_values_equal(x(i), table(j))) then
          out(i) = j
          exit
       end if
@@ -5154,7 +5322,7 @@ logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = has_real_value(table, size(table), real(x(i), kind=dp))
+   out(i) = r_in_int_scalar_real(x(i), table)
 end do
 end function r_in_int_real
 
@@ -5166,7 +5334,7 @@ logical, allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = has_int_value(table, size(table), nint(x(i))) .and. x(i) == real(nint(x(i)), kind=dp)
+   out(i) = r_in_real_scalar_int(x(i), table)
 end do
 end function r_in_real_int
 
@@ -5191,7 +5359,11 @@ pure function r_in_int_scalar_real(x, table) result(out)
 integer, intent(in) :: x ! integer value to test
 real(kind=dp), intent(in) :: table(:) ! real candidate set
 logical :: out
-out = has_real_value(table, size(table), real(x, kind=dp))
+if (x == -huge(0)) then
+   out = has_real_value(table, size(table), r_na_real())
+else
+   out = has_real_value(table, size(table), real(x, kind=dp))
+end if
 end function r_in_int_scalar_real
 
 pure function r_in_real_scalar_int(x, table) result(out)
@@ -5199,7 +5371,18 @@ pure function r_in_real_scalar_int(x, table) result(out)
 real(kind=dp), intent(in) :: x ! real value to test
 integer, intent(in) :: table(:) ! integer candidate set
 logical :: out
-out = has_int_value(table, size(table), nint(x)) .and. x == real(nint(x), kind=dp)
+integer :: value
+if (r_is_na_payload(x)) then
+   out = has_int_value(table, size(table), -huge(0))
+else if (x /= x .or. .not. ieee_is_finite(x)) then
+   out = .false.
+else if (x < real(-huge(0) + 1, kind=dp) .or. x > real(huge(0), kind=dp)) then
+   out = .false.
+else
+   value = nint(x)
+   out = value /= -huge(0) .and. x == real(value, kind=dp)
+   if (out) out = has_int_value(table, size(table), value)
+end if
 end function r_in_real_scalar_int
 
 pure function r_in_char(x, table) result(out)
@@ -5249,12 +5432,24 @@ real(kind=dp), intent(in) :: value ! value to find
 integer :: i
 out = .false.
 do i = 1, min(n, size(x))
-   if (x(i) == value) then
+   if (real_values_equal(x(i), value)) then
       out = .true.
       return
    end if
 end do
 end function has_real_value
+
+pure elemental logical function real_values_equal(a, b) result(out)
+! R equality for set membership: NA and NaN are distinct repeatable values.
+real(kind=dp), intent(in) :: a, b
+if (r_is_na_payload(a) .or. r_is_na_payload(b)) then
+   out = r_is_na_payload(a) .and. r_is_na_payload(b)
+else if (a /= a .or. b /= b) then
+   out = (a /= a) .and. (b /= b)
+else
+   out = a == b
+end if
+end function real_values_equal
 
 pure logical function has_char_value(x, n, value) result(out)
 ! Test whether a vector contains the requested char value.
@@ -5309,19 +5504,11 @@ pure function unique_real(x) result(out)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), allocatable :: out(:)
 real(kind=dp), allocatable :: tmp(:)
-logical :: have_nonfinite
 integer :: i, n
 allocate(tmp(size(x)))
 n = 0
-have_nonfinite = .false.
 do i = 1, size(x)
-   if (.not. ieee_is_finite(x(i))) then
-      if (.not. have_nonfinite) then
-         n = n + 1
-         tmp(n) = x(i)
-         have_nonfinite = .true.
-      end if
-   else if (.not. has_real_value(tmp, n, x(i))) then
+   if (.not. has_real_value(tmp, n, x(i))) then
       n = n + 1
       tmp(n) = x(i)
    end if
@@ -5406,45 +5593,26 @@ logical, intent(in), optional :: fromLast
 logical, allocatable :: out(:)
 real(kind=dp), allocatable :: seen(:)
 integer :: i, n
-logical :: rev, have_nonfinite
+logical :: rev
 allocate(out(size(x)), seen(size(x)))
 out = .false.
 n = 0
-have_nonfinite = .false.
 rev = .false.
 if (present(fromLast)) rev = fromLast
 if (rev) then
    do i = size(x), 1, -1
-      if (.not. ieee_is_finite(x(i))) then
-         out(i) = have_nonfinite
-         if (.not. have_nonfinite) then
-            n = n + 1
-            seen(n) = x(i)
-            have_nonfinite = .true.
-         end if
-      else
-         out(i) = has_real_value(seen, n, x(i))
-         if (.not. out(i)) then
-            n = n + 1
-            seen(n) = x(i)
-         end if
+      out(i) = has_real_value(seen, n, x(i))
+      if (.not. out(i)) then
+         n = n + 1
+         seen(n) = x(i)
       end if
    end do
 else
    do i = 1, size(x)
-      if (.not. ieee_is_finite(x(i))) then
-         out(i) = have_nonfinite
-         if (.not. have_nonfinite) then
-            n = n + 1
-            seen(n) = x(i)
-            have_nonfinite = .true.
-         end if
-      else
-         out(i) = has_real_value(seen, n, x(i))
-         if (.not. out(i)) then
-            n = n + 1
-            seen(n) = x(i)
-         end if
+      out(i) = has_real_value(seen, n, x(i))
+      if (.not. out(i)) then
+         n = n + 1
+         seen(n) = x(i)
       end if
    end do
 end if
@@ -5791,12 +5959,19 @@ integer, intent(in) :: digits ! number of digits
 character(len=*), intent(in), optional :: sep
 character(len=:), allocatable :: out
 character(len=64) :: fmt, buf
-integer :: i, d
+integer :: i, d, nbuf
 d = max(0, min(30, digits))
 write(fmt, '("(f0.", i0, ")")') d
 out = ""
 do i = 1, size(x)
    write(buf, fmt) x(i)
+   buf = adjustl(buf)
+   if (d == 0) then
+      nbuf = len_trim(buf)
+      if (nbuf > 0) then
+         if (buf(nbuf:nbuf) == ".") buf(nbuf:nbuf) = " "
+      end if
+   end if
    if (i > 1) then
       if (present(sep)) then
          out = out // sep
@@ -5804,7 +5979,7 @@ do i = 1, size(x)
          out = out // " "
       end if
    end if
-   out = out // trim(adjustl(buf))
+   out = out // trim(buf)
 end do
 end function r_format_vec
 
@@ -6008,13 +6183,11 @@ write(*,"(a)", advance="no") "Levels: "
 call print_char_vector(levels)
 end subroutine print_factor
 
-impure elemental function r_as_real_char(x) result(out)
+pure elemental function r_as_real_char(x) result(out)
 ! Convert a character value to double precision, returning NaN on failure.
 character(len=*), intent(in) :: x
 real(kind=dp) :: out
-integer :: ios
-read(x, *, iostat=ios) out
-if (ios /= 0) out = ieee_value(0.0_dp, ieee_quiet_nan)
+out = str_to_real(x)
 end function r_as_real_char
 
 pure function r_ifelse_real(test, yes, no) result(out)
@@ -6821,6 +6994,14 @@ do i = 1, n
       y(k) = x(i)
    end do
 end do
+if (present(len_out)) then
+   need = max(0, len_out)
+   allocate(out(need))
+   do i = 1, need
+      out(i) = y(mod(i - 1, size(y)) + 1)
+   end do
+   return
+end if
 if (present(times_vec)) then
    m = size(y)
    c = 0
@@ -6853,21 +7034,7 @@ else
       end do
    end do
 end if
-if (present(len_out)) then
-   need = max(0, len_out)
-   if (need == 0) then
-      allocate(out(0))
-      return
-   end if
-   allocate(out(need))
-   if (size(z) > 0) then
-      do i = 1, need
-         out(i) = z(mod(i - 1, size(z)) + 1)
-      end do
-   end if
-else
-   out = z
-end if
+out = z
 end function r_rep_real
 
 pure function r_rep_char(x, times, each, len_out, times_vec) result(out)
@@ -6901,6 +7068,14 @@ do i = 1, n
       y(k) = x(i)
    end do
 end do
+if (present(len_out)) then
+   need = max(0, len_out)
+   allocate(character(len=item_len) :: out(need))
+   do i = 1, need
+      out(i) = y(mod(i - 1, size(y)) + 1)
+   end do
+   return
+end if
 if (present(times_vec)) then
    m = size(y)
    c = 0
@@ -6933,21 +7108,7 @@ else
       end do
    end do
 end if
-if (present(len_out)) then
-   need = max(0, len_out)
-   if (need == 0) then
-      allocate(character(len=item_len) :: out(0))
-      return
-   end if
-   allocate(character(len=item_len) :: out(need))
-   if (size(z) > 0) then
-      do i = 1, need
-         out(i) = z(mod(i - 1, size(z)) + 1)
-      end do
-   end if
-else
-   out = z
-end if
+out = z
 end function r_rep_char
 
 pure function r_rep_int(x, times, each, len_out, times_vec) result(out)
@@ -6979,6 +7140,14 @@ do i = 1, n
       y(k) = x(i)
    end do
 end do
+if (present(len_out)) then
+   need = max(0, len_out)
+   allocate(out(need))
+   do i = 1, need
+      out(i) = y(mod(i - 1, size(y)) + 1)
+   end do
+   return
+end if
 if (present(times_vec)) then
    m = size(y)
    c = 0
@@ -7011,21 +7180,7 @@ else
       end do
    end do
 end if
-if (present(len_out)) then
-   need = max(0, len_out)
-   if (need == 0) then
-      allocate(out(0))
-      return
-   end if
-   allocate(out(need))
-   if (size(z) > 0) then
-      do i = 1, need
-         out(i) = z(mod(i - 1, size(z)) + 1)
-      end do
-   end if
-else
-   out = z
-end if
+out = z
 end function r_rep_int
 
 function runif1() result(u)
@@ -7107,6 +7262,14 @@ if (n <= 0) then
    allocate(x(0))
    return
 end if
+if (df <= 0.0_dp .or. df /= df) then
+   allocate(x(n))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+else if (.not. ieee_is_finite(df)) then
+   x = rnorm_vec(n)
+   return
+end if
 z = rnorm_vec(n)
 u = runif_vec(n)
 chi = qchisq(u, df)
@@ -7121,8 +7284,16 @@ real(kind=dp), allocatable :: x(:)
 real(kind=dp) :: rt
 rt = 1.0_dp
 if (present(rate)) rt = rate
-rt = max(rt, tiny(1.0_dp))
-x = -log(max(tiny(1.0_dp), 1.0_dp - runif_vec(max(0, n)))) / rt
+allocate(x(max(0, n)))
+if (rt /= rt) then
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (.not. ieee_is_finite(rt)) then
+   x = 0.0_dp
+else if (rt <= 0.0_dp) then
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   x = -log(max(tiny(1.0_dp), 1.0_dp - runif_vec(size(x)))) / rt
+end if
 end function rexp_rng
 
 recursive function rgamma_one(shape, rate) result(x)
@@ -7133,9 +7304,21 @@ real(kind=dp), intent(in) :: shape, rate
 real(kind=dp) :: x
 real(kind=dp) :: a, rt, d, c, u, v, z
 a = shape
-rt = max(rate, tiny(1.0_dp))
-if (a <= 0.0_dp) then
+rt = rate
+if (a == 0.0_dp) then
+   x = 0.0_dp
+   return
+else if (a < 0.0_dp .or. a /= a .or. rt < 0.0_dp .or. rt /= rt) then
    x = ieee_value(1.0_dp, ieee_quiet_nan)
+   return
+else if (rt == 0.0_dp) then
+   x = ieee_value(0.0_dp, ieee_positive_inf)
+   return
+else if (.not. ieee_is_finite(rt)) then
+   x = 0.0_dp
+   return
+else if (.not. ieee_is_finite(a)) then
+   x = ieee_value(0.0_dp, ieee_positive_inf)
    return
 end if
 if (a < 1.0_dp) then
@@ -7168,8 +7351,22 @@ integer :: i
 real(kind=dp) :: rt
 rt = 1.0_dp
 if (present(rate)) rt = rate
-if (present(scale)) rt = 1.0_dp / max(scale, tiny(1.0_dp))
 allocate(x(max(0, n)))
+if (shape == 0.0_dp) then
+   x = 0.0_dp
+   return
+end if
+if (present(scale)) then
+   if (scale < 0.0_dp .or. scale /= scale) then
+      x = ieee_value(0.0_dp, ieee_quiet_nan)
+      return
+   else if (scale == 0.0_dp) then
+      x = 0.0_dp
+      return
+   else
+      rt = 1.0_dp / scale
+   end if
+end if
 do i = 1, size(x)
    x(i) = rgamma_one(shape, rt)
 end do
@@ -7183,6 +7380,28 @@ real(kind=dp), allocatable :: x(:)
 integer :: i
 real(kind=dp) :: a, b
 allocate(x(max(0, n)))
+if (shape1 < 0.0_dp .or. shape2 < 0.0_dp .or. shape1 /= shape1 .or. shape2 /= shape2) then
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+else if (.not. ieee_is_finite(shape1) .and. .not. ieee_is_finite(shape2)) then
+   x = 0.5_dp
+   return
+else if (.not. ieee_is_finite(shape1)) then
+   x = 1.0_dp
+   return
+else if (.not. ieee_is_finite(shape2)) then
+   x = 0.0_dp
+   return
+else if (shape1 == 0.0_dp .and. shape2 > 0.0_dp) then
+   x = 0.0_dp
+   return
+else if (shape2 == 0.0_dp .and. shape1 > 0.0_dp) then
+   x = 1.0_dp
+   return
+else if (shape1 == 0.0_dp .and. shape2 == 0.0_dp) then
+   x = merge(0.0_dp, 1.0_dp, runif_vec(size(x)) < 0.5_dp)
+   return
+end if
 do i = 1, size(x)
    a = rgamma_one(shape1, 1.0_dp)
    b = rgamma_one(shape2, 1.0_dp)
@@ -7195,7 +7414,14 @@ function rchisq_rng(n, df) result(x)
 integer, intent(in) :: n
 real(kind=dp), intent(in) :: df
 real(kind=dp), allocatable :: x(:)
-x = rgamma(n, shape=0.5_dp * df, rate=0.5_dp)
+allocate(x(max(0, n)))
+if (df < 0.0_dp .or. df /= df .or. .not. ieee_is_finite(df)) then
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (df == 0.0_dp) then
+   x = 0.0_dp
+else
+   x = rgamma(n, shape=0.5_dp * df, rate=0.5_dp)
+end if
 end function rchisq_rng
 
 function rf_rng_vec(n, df1, df2) result(x)
@@ -7204,6 +7430,22 @@ integer, intent(in) :: n
 real(kind=dp), intent(in) :: df1, df2
 real(kind=dp), allocatable :: x(:)
 real(kind=dp), allocatable :: a(:), b(:)
+if (df1 <= 0.0_dp .or. df2 <= 0.0_dp .or. df1 /= df1 .or. df2 /= df2) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+else if (.not. ieee_is_finite(df1) .and. .not. ieee_is_finite(df2)) then
+   allocate(x(max(0, n)))
+   x = 1.0_dp
+   return
+else if (.not. ieee_is_finite(df1)) then
+   b = rchisq(n, df2) / df2
+   x = 1.0_dp / max(tiny(1.0_dp), b)
+   return
+else if (.not. ieee_is_finite(df2)) then
+   x = rchisq(n, df1) / df1
+   return
+end if
 a = rchisq(n, df1) / max(tiny(1.0_dp), df1)
 b = rchisq(n, df2) / max(tiny(1.0_dp), df2)
 x = a / max(tiny(1.0_dp), b)
@@ -7214,12 +7456,29 @@ function rlogis_rng(n, location, scale) result(x)
 integer, intent(in) :: n
 real(kind=dp), intent(in), optional :: location, scale
 real(kind=dp), allocatable :: x(:)
+real(kind=dp), allocatable :: u(:)
 real(kind=dp) :: loc, sc
 loc = 0.0_dp
 sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
-x = qlogis(runif_vec(max(0, n)), location=loc, scale=sc)
+if (sc /= sc .or. loc /= loc) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (.not. ieee_is_finite(loc)) then
+   allocate(x(max(0, n)))
+   if (ieee_is_finite(sc)) then
+      x = loc
+   else
+      x = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+else if (sc == 0.0_dp) then
+   allocate(x(max(0, n)))
+   x = loc
+else
+   u = runif_vec(max(0, n))
+   x = loc + sc * log(max(tiny(1.0_dp), u) / max(tiny(1.0_dp), 1.0_dp - u))
+end if
 end function rlogis_rng
 
 function rlnorm_rng(n, meanlog, sdlog) result(x)
@@ -7232,7 +7491,25 @@ mu = 0.0_dp
 sig = 1.0_dp
 if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
-x = exp(mu + sig * rnorm_vec(max(0, n)))
+if (sig < 0.0_dp .or. sig /= sig) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (mu /= mu) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (.not. ieee_is_finite(mu)) then
+   allocate(x(max(0, n)))
+   if (ieee_is_finite(sig)) then
+      x = exp(mu)
+   else
+      x = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+else if (sig == 0.0_dp) then
+   allocate(x(max(0, n)))
+   x = exp(mu)
+else
+   x = exp(mu + sig * rnorm_vec(max(0, n)))
+end if
 end function rlnorm_rng
 
 function rweibull_rng(n, shape, scale) result(x)
@@ -7244,7 +7521,16 @@ real(kind=dp), allocatable :: x(:)
 real(kind=dp) :: sc
 sc = 1.0_dp
 if (present(scale)) sc = scale
-x = qweibull(runif_vec(max(0, n)), shape=shape, scale=sc)
+if (sc == 0.0_dp) then
+   allocate(x(max(0, n)))
+   x = 0.0_dp
+else if (shape <= 0.0_dp .or. shape /= shape .or. .not. ieee_is_finite(shape) .or. &
+         sc < 0.0_dp .or. sc /= sc .or. .not. ieee_is_finite(sc)) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   x = qweibull(runif_vec(max(0, n)), shape=shape, scale=sc)
+end if
 end function rweibull_rng
 
 function rcauchy_rng(n, location, scale) result(x)
@@ -7257,7 +7543,25 @@ loc = 0.0_dp
 sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
-x = qcauchy(runif_vec(max(0, n)), location=loc, scale=sc)
+if (sc < 0.0_dp .or. sc /= sc) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (loc /= loc) then
+   allocate(x(max(0, n)))
+   x = ieee_value(0.0_dp, ieee_quiet_nan)
+else if (.not. ieee_is_finite(loc)) then
+   allocate(x(max(0, n)))
+   if (ieee_is_finite(sc)) then
+      x = loc
+   else
+      x = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+else if (sc == 0.0_dp) then
+   allocate(x(max(0, n)))
+   x = loc
+else
+   x = qcauchy(runif_vec(max(0, n)), location=loc, scale=sc)
+end if
 end function rcauchy_rng
 
 function rgeom_rng(n, prob) result(x)
@@ -7265,7 +7569,12 @@ function rgeom_rng(n, prob) result(x)
 integer, intent(in) :: n
 real(kind=dp), intent(in) :: prob
 integer, allocatable :: x(:)
-x = int(qgeom(runif_vec(max(0, n)), prob=prob))
+if (prob <= 0.0_dp .or. prob > 1.0_dp .or. prob /= prob) then
+   allocate(x(max(0, n)))
+   x = -huge(0)
+else
+   x = int(qgeom(runif_vec(max(0, n)), prob=prob))
+end if
 end function rgeom_rng
 
 function rnbinom_rng(n, size_, prob, mu) result(x)
@@ -7277,6 +7586,27 @@ integer, allocatable :: x(:)
 integer :: i
 real(kind=dp) :: p, m, lambda
 allocate(x(max(0, n)))
+if (size_ <= 0.0_dp .or. size_ /= size_) then
+   x = -huge(0)
+   return
+end if
+if (present(mu)) then
+   if (mu < 0.0_dp .or. mu /= mu) then
+      x = -huge(0)
+      return
+   else if (mu == 0.0_dp) then
+      x = 0
+      return
+   end if
+else if (present(prob)) then
+   if (prob <= 0.0_dp .or. prob > 1.0_dp .or. prob /= prob) then
+      x = -huge(0)
+      return
+   else if (prob == 1.0_dp) then
+      x = 0
+      return
+   end if
+end if
 p = 0.5_dp
 if (present(prob)) p = max(tiny(1.0_dp), min(1.0_dp - tiny(1.0_dp), prob))
 do i = 1, size(x)
@@ -7294,6 +7624,19 @@ function rhyper_rng(n, m, nwhite, k) result(x)
 ! Return n hypergeometric variates.
 integer, intent(in) :: n, m, nwhite, k
 integer, allocatable :: x(:)
+integer :: lower, upper
+if (m < 0 .or. nwhite < 0 .or. k < 0 .or. k > m + nwhite) then
+   allocate(x(max(0, n)))
+   x = -huge(0)
+   return
+end if
+lower = max(0, k - nwhite)
+upper = min(k, m)
+if (lower == upper) then
+   allocate(x(max(0, n)))
+   x = lower
+   return
+end if
 x = int(qhyper(runif_vec(max(0, n)), m=m, n=nwhite, k=k))
 end function rhyper_rng
 
@@ -7301,14 +7644,30 @@ function rwilcox_rng(n, m, n2) result(x)
 ! Return n Wilcoxon rank-sum variates.
 integer, intent(in) :: n, m, n2
 integer, allocatable :: x(:)
-x = int(qwilcox(runif_vec(max(0, n)), m=m, n=n2))
+if (m < 0 .or. n2 < 0) then
+   allocate(x(max(0, n)))
+   x = -huge(0)
+else if (m == 0 .or. n2 == 0) then
+   allocate(x(max(0, n)))
+   x = 0
+else
+   x = int(qwilcox(runif_vec(max(0, n)), m=m, n=n2))
+end if
 end function rwilcox_rng
 
 function rsignrank_rng(n, n_obs) result(x)
 ! Return n Wilcoxon signed-rank variates.
 integer, intent(in) :: n, n_obs
 integer, allocatable :: x(:)
-x = int(qsignrank(runif_vec(max(0, n)), n=n_obs))
+if (n_obs < 0) then
+   allocate(x(max(0, n)))
+   x = -huge(0)
+else if (n_obs == 0) then
+   allocate(x(max(0, n)))
+   x = 0
+else
+   x = int(qsignrank(runif_vec(max(0, n)), n=n_obs))
+end if
 end function rsignrank_rng
 
 function rmultinom_rng(n, size_, prob) result(x)
@@ -7330,6 +7689,11 @@ allocate(cp(k))
 cp = cumsum(p)
 cp(k) = 1.0_dp
 x = 0
+if (count(p > 0.0_dp) == 1) then
+   cat = maxloc(p, dim=1)
+   x(cat, :) = max(0, size_)
+   return
+end if
 do j = 1, size(x, 2)
    do i = 1, max(0, size_)
       u = runif1()
@@ -7755,8 +8119,15 @@ real(kind=dp) :: den, alpha, beta, gamma, det, b0, b1, b2
 real(kind=dp) :: m00, m01, m02, m11, m12, m22
 integer :: i, j, n, ns, deg
 allocate(yhat(size(xnew)))
+if (.not. allocated(fit%x) .or. .not. allocated(fit%y)) then
+   yhat = ieee_value(1.0_dp, ieee_quiet_nan)
+   return
+end if
 n = min(size(fit%x), size(fit%y))
-if (n <= 0) return
+if (n <= 0) then
+   yhat = ieee_value(1.0_dp, ieee_quiet_nan)
+   return
+end if
 ns = max(2, min(n, int(fit%span * real(n, kind=dp))))
 deg = max(0, min(2, fit%degree))
 allocate(dist(n), dist_sorted(n))
@@ -7887,7 +8258,11 @@ real(kind=dp) :: t
 out%x = xnew
 out%df = fit%df
 allocate(out%y(size(xnew)))
-if (size(fit%x) <= 0) then
+if (.not. allocated(fit%x) .or. .not. allocated(fit%y)) then
+   out%y = ieee_value(1.0_dp, ieee_quiet_nan)
+   return
+end if
+if (size(fit%x) <= 0 .or. size(fit%y) <= 0) then
    out%y = ieee_value(1.0_dp, ieee_quiet_nan)
    return
 end if
@@ -7916,8 +8291,19 @@ integer, allocatable :: x(:)
 integer :: i, j, s
 real(kind=dp) :: u, p
 allocate(x(max(0, n)))
-p = max(0.0_dp, min(1.0_dp, prob))
+if (size_ < 0 .or. prob < 0.0_dp .or. prob > 1.0_dp .or. prob /= prob) then
+   x = -huge(0)
+   return
+end if
+p = prob
 do i = 1, size(x)
+   if (size_ <= 0 .or. p <= 0.0_dp) then
+      x(i) = 0
+      cycle
+   else if (p >= 1.0_dp) then
+      x(i) = size_
+      cycle
+   end if
    s = 0
    do j = 1, max(0, size_)
    u = runif1()
@@ -7936,11 +8322,26 @@ integer, allocatable :: x(:)
 integer :: i, j, s
 real(kind=dp) :: u, p
 allocate(x(max(0, n)))
+if (size_ < 0) then
+   x = -huge(0)
+   return
+end if
 do i = 1, size(x)
    if (size(prob) > 0) then
-      p = max(0.0_dp, min(1.0_dp, prob(min(i, size(prob)))))
+      p = prob(min(i, size(prob)))
    else
       p = 0.0_dp
+   end if
+   if (p < 0.0_dp .or. p > 1.0_dp .or. p /= p) then
+      x(i) = -huge(0)
+      cycle
+   end if
+   if (size_ <= 0 .or. p <= 0.0_dp) then
+      x(i) = 0
+      cycle
+   else if (p >= 1.0_dp) then
+      x(i) = size_
+      cycle
    end if
    s = 0
    do j = 1, max(0, size_)
@@ -7959,7 +8360,7 @@ integer, allocatable :: x(:)
 integer :: i
 allocate(x(max(0, n)))
 do i = 1, size(x)
-   x(i) = rpois_one(max(0.0_dp, lambda))
+   x(i) = rpois_one(lambda)
 end do
 end function rpois_scalar
 
@@ -7972,7 +8373,7 @@ integer :: i
 allocate(x(max(0, n)))
 do i = 1, size(x)
    if (size(lambda) > 0) then
-      x(i) = rpois_one(max(0.0_dp, lambda(min(i, size(lambda)))))
+      x(i) = rpois_one(lambda(min(i, size(lambda))))
    else
       x(i) = 0
    end if
@@ -7984,7 +8385,10 @@ function rpois_one(lambda) result(k)
 real(kind=dp), intent(in) :: lambda
 integer :: k
 real(kind=dp) :: lprob, p, u, z
-if (lambda <= 0.0_dp) then
+if (lambda < 0.0_dp .or. lambda /= lambda .or. .not. ieee_is_finite(lambda)) then
+   k = -huge(0)
+   return
+else if (lambda == 0.0_dp) then
    k = 0
    return
 end if
@@ -8235,8 +8639,12 @@ real(kind=dp) :: out(5)
 real(kind=dp), allocatable :: xs(:)
 real(kind=dp) :: n4, d(5), rn
 integer :: n, k
-n = size(x)
-xs = x
+xs = pack(x, x == x)
+n = size(xs)
+if (n == 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 call sort_increasing(xs)
 rn = real(n, kind=dp)
 n4 = floor((rn + 3.0_dp) / 2.0_dp) / 2.0_dp
@@ -8264,6 +8672,34 @@ do i = 2, size(x)
 end do
 end subroutine sort_increasing
 
+pure logical function real_order_precedes(a, b, decreasing) result(out)
+! Compare real values using R's stable ordering, with all missing values at the end.
+real(kind=dp), intent(in) :: a, b
+logical, intent(in) :: decreasing
+integer :: a_missing, b_missing
+
+if (a == a) then
+   a_missing = 0
+else
+   a_missing = 1
+end if
+if (b == b) then
+   b_missing = 0
+else
+   b_missing = 1
+end if
+
+if (a_missing /= b_missing) then
+   out = a_missing < b_missing
+else if (a_missing /= 0) then
+   out = .false.
+else if (decreasing) then
+   out = a > b
+else
+   out = a < b
+end if
+end function real_order_precedes
+
 pure subroutine sort_increasing_int(x)
 ! Sort an integer vector in increasing order (insertion sort).
 integer, intent(inout) :: x(:) ! input vector
@@ -8281,36 +8717,53 @@ do i = 2, size(x)
 end do
 end subroutine sort_increasing_int
 
+pure logical function int_order_precedes(a, b, decreasing) result(out)
+! Compare integer values using R's stable ordering, with integer NA at the end.
+integer, intent(in) :: a, b
+logical, intent(in) :: decreasing
+logical :: a_missing, b_missing
+
+a_missing = a == -huge(0)
+b_missing = b == -huge(0)
+if (a_missing .neqv. b_missing) then
+   out = .not. a_missing
+else if (a_missing) then
+   out = .false.
+else if (decreasing) then
+   out = a > b
+else
+   out = a < b
+end if
+end function int_order_precedes
+
 pure function sort_real(x, decreasing) result(out)
-! Return a sorted copy of a real vector.
+! Return a sorted copy of a real vector, omitting missing values like R sort().
 real(kind=dp), intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 real(kind=dp), allocatable :: out(:)
-integer :: i, n
-out = x
-call sort_increasing(out)
-if (present(decreasing)) then
-   if (decreasing) then
-      n = size(out)
-      out = out([(i, i = n, 1, -1)])
-   end if
-end if
+integer, allocatable :: idx(:)
+logical :: dec
+
+dec = .false.
+if (present(decreasing)) dec = decreasing
+out = pack(x, x == x)
+idx = sort_list_real(out, dec)
+out = out(idx)
 end function sort_real
 
 pure function sort_int(x, decreasing) result(out)
-! Return a sorted copy of an integer vector.
+! Return a sorted copy of an integer vector, omitting integer NA like R sort().
 integer, intent(in) :: x(:) ! input vector
 logical, intent(in), optional :: decreasing
 integer, allocatable :: out(:)
-integer :: i, n
-out = x
-call sort_increasing_int(out)
-if (present(decreasing)) then
-   if (decreasing) then
-      n = size(out)
-      out = out([(i, i = n, 1, -1)])
-   end if
-end if
+integer, allocatable :: idx(:)
+logical :: dec
+
+dec = .false.
+if (present(decreasing)) dec = decreasing
+out = pack(x, x /= -huge(0))
+idx = sort_list_int(out, dec)
+out = out(idx)
 end function sort_int
 
 pure function sort_char(x, decreasing) result(out)
@@ -8340,21 +8793,12 @@ if (present(decreasing)) dec = decreasing
 do i = 2, size(idx)
    t = idx(i)
    j = i - 1
-   if (dec) then
-      do
-         if (j < 1) exit
-         if (x(idx(j)) >= x(t)) exit
-         idx(j + 1) = idx(j)
-         j = j - 1
-      end do
-   else
-      do
-         if (j < 1) exit
-         if (x(idx(j)) <= x(t)) exit
-         idx(j + 1) = idx(j)
-         j = j - 1
-      end do
-   end if
+   do
+      if (j < 1) exit
+      if (.not. real_order_precedes(x(t), x(idx(j)), dec)) exit
+      idx(j + 1) = idx(j)
+      j = j - 1
+   end do
    idx(j + 1) = t
 end do
 end function sort_list_real
@@ -8375,21 +8819,12 @@ if (present(decreasing)) dec = decreasing
 do i = 2, size(idx)
    t = idx(i)
    j = i - 1
-   if (dec) then
-      do
-         if (j < 1) exit
-         if (x(idx(j)) >= x(t)) exit
-         idx(j + 1) = idx(j)
-         j = j - 1
-      end do
-   else
-      do
-         if (j < 1) exit
-         if (x(idx(j)) <= x(t)) exit
-         idx(j + 1) = idx(j)
-         j = j - 1
-      end do
-   end if
+   do
+      if (j < 1) exit
+      if (.not. int_order_precedes(x(t), x(idx(j)), dec)) exit
+      idx(j + 1) = idx(j)
+      j = j - 1
+   end do
    idx(j + 1) = t
 end do
 end function sort_list_int
@@ -8435,7 +8870,11 @@ real(kind=dp), intent(in) :: x(:) ! input vector
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:)
 integer :: m
-m = max(0, min(n, size(x)))
+if (n < 0) then
+   m = max(0, size(x) + n)
+else
+   m = min(n, size(x))
+end if
 allocate(out(m))
 if (m > 0) out = x(1:m)
 end function r_head_real
@@ -8446,7 +8885,11 @@ integer, intent(in) :: x(:) ! input vector
 integer, intent(in) :: n
 integer, allocatable :: out(:)
 integer :: m
-m = max(0, min(n, size(x)))
+if (n < 0) then
+   m = max(0, size(x) + n)
+else
+   m = min(n, size(x))
+end if
 allocate(out(m))
 if (m > 0) out = x(1:m)
 end function r_head_int
@@ -8457,7 +8900,11 @@ real(kind=dp), intent(in) :: x(:,:) ! input matrix
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:,:)
 integer :: m
-m = max(0, min(n, size(x, 1)))
+if (n < 0) then
+   m = max(0, size(x, 1) + n)
+else
+   m = min(n, size(x, 1))
+end if
 allocate(out(m, max(0, size(x, 2))))
 if (m > 0) out = x(1:m, :)
 end function r_head_real_mat
@@ -8468,7 +8915,11 @@ integer, intent(in) :: x(:,:) ! input matrix
 integer, intent(in) :: n
 integer, allocatable :: out(:,:)
 integer :: m
-m = max(0, min(n, size(x, 1)))
+if (n < 0) then
+   m = max(0, size(x, 1) + n)
+else
+   m = min(n, size(x, 1))
+end if
 allocate(out(m, max(0, size(x, 2))))
 if (m > 0) out = x(1:m, :)
 end function r_head_int_mat
@@ -8477,23 +8928,7 @@ pure function order_real(x) result(idx)
 ! Return 1-based order indices that sort a real vector increasingly.
 real(kind=dp), intent(in) :: x(:)
 integer, allocatable :: idx(:)
-integer :: i, j, t
-allocate(idx(size(x)))
-if (size(x) <= 0) return
-do i = 1, size(x)
-   idx(i) = i
-end do
-do i = 2, size(idx)
-   t = idx(i)
-   j = i - 1
-   do
-      if (j < 1) exit
-      if (x(idx(j)) <= x(t)) exit
-      idx(j + 1) = idx(j)
-      j = j - 1
-   end do
-   idx(j + 1) = t
-end do
+idx = sort_list_real(x)
 end function order_real
 
 pure function rank_first(x) result(out)
@@ -8515,17 +8950,18 @@ pure function rank_average(x) result(out)
 real(kind=dp), intent(in) :: x(:)
 real(kind=dp), allocatable :: out(:)
 integer, allocatable :: ord(:)
-integer :: first, i, last
+integer :: first, i, last, nvalid
 real(kind=dp) :: r
 allocate(out(size(x)))
 if (size(x) <= 0) return
 ord = order_real(x)
+nvalid = count(x == x)
 first = 1
-do while (first <= size(ord))
+do while (first <= nvalid)
    last = first
    do
-      if (last >= size(ord)) exit
-      if (x(ord(last + 1)) /= x(ord(first))) exit
+      if (last >= nvalid) exit
+      if (.not. real_values_equal(x(ord(last + 1)), x(ord(first)))) exit
       last = last + 1
    end do
    r = 0.5_dp * real(first + last, kind=dp)
@@ -8533,6 +8969,9 @@ do while (first <= size(ord))
       out(ord(i)) = r
    end do
    first = last + 1
+end do
+do i = nvalid + 1, size(ord)
+   out(ord(i)) = real(i, kind=dp)
 end do
 end function rank_average
 
@@ -9261,11 +9700,14 @@ real(kind=dp) :: resid(size(x)), best_resid(size(x))
 real(kind=dp), allocatable :: design(:,:), y(:), beta(:), xtx(:,:), xty(:), params(:), trial(:)
 real(kind=dp) :: rss, best_rss, step, intercept, candidate, trial_rss
 integer :: n, k, i, pass, p_eff, q_eff, n_eff, j, coord, sgn, max_lag
+logical :: include_mean_use
 n = size(x)
 fit%p = merge(order(1), 0, size(order) >= 1)
 fit%d = merge(order(2), 0, size(order) >= 2)
 fit%q = merge(order(3), 0, size(order) >= 3)
-allocate(fit%coef(max(1, fit%p + fit%q + merge(1, 0, present(include_mean) .and. include_mean))), source=0.0_dp)
+include_mean_use = .false.
+if (present(include_mean)) include_mean_use = include_mean
+allocate(fit%coef(max(1, fit%p + fit%q + merge(1, 0, include_mean_use))), source=0.0_dp)
 if (n <= 0) return
 fit%mean = sum(x) / real(n, kind=dp)
 if (fit%q == 0) then
@@ -9274,9 +9716,7 @@ if (fit%q == 0) then
    if (p_eff == 0) then
       resid = x - fit%mean
       rss = sum(resid * resid)
-      if (present(include_mean)) then
-         if (include_mean) fit%coef(size(fit%coef)) = fit%mean
-      end if
+      if (include_mean_use) fit%coef(size(fit%coef)) = fit%mean
    else
       allocate(design(n_eff, p_eff + 1), source=1.0_dp)
       allocate(y(n_eff), source=0.0_dp)
@@ -9299,9 +9739,7 @@ if (fit%q == 0) then
       else
          fit%mean = sum(x) / real(n, kind=dp)
       end if
-      if (present(include_mean)) then
-         if (include_mean .and. size(fit%coef) >= p_eff + 1) fit%coef(p_eff + 1) = fit%mean
-      end if
+      if (include_mean_use .and. size(fit%coef) >= p_eff + 1) fit%coef(p_eff + 1) = fit%mean
       resid = 0.0_dp
       do i = p_eff + 1, n
          resid(i) = x(i) - intercept
@@ -9315,7 +9753,7 @@ if (fit%q == 0) then
    fit%last_x = x(n)
    fit%last_resid = resid(n)
    fit%sigma2 = max(rss / real(n_eff, kind=dp), tiny(1.0_dp))
-   k = fit%p + merge(1, 0, present(include_mean) .and. include_mean)
+   k = fit%p + merge(1, 0, include_mean_use)
    fit%aic = real(n_eff, kind=dp) * log(fit%sigma2) + 2.0_dp * real(k, kind=dp)
    return
 end if
@@ -9356,9 +9794,7 @@ do pass = 1, 10
 end do
 if (p_eff > 0) fit%coef(1:p_eff) = params(1:p_eff)
 if (q_eff > 0 .and. size(fit%coef) >= p_eff + q_eff) fit%coef(p_eff + 1:p_eff + q_eff) = params(p_eff + 1:p_eff + q_eff)
-if (present(include_mean)) then
-   if (include_mean) fit%coef(size(fit%coef)) = fit%mean
-end if
+if (include_mean_use) fit%coef(size(fit%coef)) = fit%mean
 fit%resid = best_resid
 fit%last_x = x(n)
 fit%last_resid = best_resid(n)
@@ -9749,19 +10185,18 @@ real(kind=dp), intent(in) :: x, nu
 real(kind=dp) :: out, term, ax
 integer :: k, n
 ax = abs(x)
-if (abs(nu - real(nint(nu), kind=dp)) <= 100.0_dp * epsilon(1.0_dp) .and. nu >= 0.0_dp) then
-   n = nint(nu)
+if (abs(nu - real(nint(nu), kind=dp)) <= 100.0_dp * epsilon(1.0_dp)) then
+   n = abs(nint(nu))
    select case (n)
    case (0)
       out = bessel_j0(x)
-      return
    case (1)
       out = bessel_j1(x)
-      return
    case default
       out = bessel_jn(n, x)
-      return
    end select
+   if (nu < 0.0_dp .and. mod(n, 2) /= 0) out = -out
+   return
 end if
 if (ax == 0.0_dp) then
    out = merge(1.0_dp, 0.0_dp, abs(nu) <= 100.0_dp * epsilon(1.0_dp))
@@ -9782,17 +10217,19 @@ pure function besselI_core(x, nu, scaled) result(out)
 real(kind=dp), intent(in) :: x ! input values
 real(kind=dp), intent(in) :: nu ! input value
 logical, intent(in) :: scaled
-real(kind=dp) :: out, term, ax
+real(kind=dp) :: out, term, ax, nuf
 integer :: k
 ax = abs(x)
+nuf = nu
+if (abs(nu - real(nint(nu), kind=dp)) <= 100.0_dp * epsilon(1.0_dp)) nuf = abs(nu)
 if (ax == 0.0_dp) then
-   out = merge(1.0_dp, 0.0_dp, abs(nu) <= 100.0_dp * epsilon(1.0_dp))
+   out = merge(1.0_dp, 0.0_dp, abs(nuf) <= 100.0_dp * epsilon(1.0_dp))
    return
 end if
-term = exp(nu * log(0.5_dp * ax) - log_gamma(nu + 1.0_dp))
+term = exp(nuf * log(0.5_dp * ax) - log_gamma(nuf + 1.0_dp))
 out = term
 do k = 1, 300
-   term = term * (0.25_dp * ax * ax) / (real(k, kind=dp) * (real(k, kind=dp) + nu))
+   term = term * (0.25_dp * ax * ax) / (real(k, kind=dp) * (real(k, kind=dp) + nuf))
    out = out + term
    if (abs(term) <= 1.0e-15_dp * max(1.0_dp, abs(out))) exit
 end do
@@ -9808,19 +10245,18 @@ if (x <= 0.0_dp) then
    out = -huge(1.0_dp)
    return
 end if
-if (abs(nu - real(nint(nu), kind=dp)) <= 100.0_dp * epsilon(1.0_dp) .and. nu >= 0.0_dp) then
-   n = nint(nu)
+if (abs(nu - real(nint(nu), kind=dp)) <= 100.0_dp * epsilon(1.0_dp)) then
+   n = abs(nint(nu))
    select case (n)
    case (0)
       out = bessel_y0(x)
-      return
    case (1)
       out = bessel_y1(x)
-      return
    case default
       out = bessel_yn(n, x)
-      return
    end select
+   if (nu < 0.0_dp .and. mod(n, 2) /= 0) out = -out
+   return
 end if
 eps = 1.0e-6_dp
 nuf = nu
@@ -10356,8 +10792,10 @@ integer :: i
 allocate(out(size(x)))
 if (size(x) <= 0) return
 out(1) = x(1)
+if (out(1) == 0.0_dp) out(1) = 0.0_dp
 do i = 2, size(x)
    out(i) = out(i - 1) + x(i)
+   if (out(i) == 0.0_dp) out(i) = 0.0_dp
 end do
 end function cumsum_real
 
@@ -10415,6 +10853,10 @@ integer, allocatable :: out(:)
 integer :: i, j
 allocate(out(size(x)))
 do i = 1, size(x)
+   if (x(i) /= x(i)) then
+      out(i) = -huge(0)
+      cycle
+   end if
    out(i) = 0
    do j = 1, size(vec)
       if (x(i) >= vec(j)) out(i) = j
@@ -10464,6 +10906,10 @@ integer, allocatable :: out(:)
 real(kind=dp), allocatable :: edges(:)
 real(kind=dp) :: dx, lo, hi
 integer :: i
+if (size(x) <= 0) then
+   allocate(out(0))
+   return
+end if
 if (breaks < 1) then
    allocate(out(size(x)), source=0)
    return
@@ -10603,22 +11049,45 @@ pure function diff_real(x) result(out)
 ! First differences of a real vector.
 real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), allocatable :: out(:)
-integer :: n
+integer :: i, n
 n = size(x)
 allocate(out(max(0, n - 1)))
-if (n > 1) out = x(2:n) - x(1:n - 1)
+do i = 1, n - 1
+   out(i) = diff_subtract_real(x(i + 1), x(i))
+end do
 end function diff_real
 
 pure function diff_mat_real(x) result(out)
 ! First row differences of a real matrix, matching R diff() on matrices.
 real(kind=dp), intent(in) :: x(:,:) ! input matrix
 real(kind=dp), allocatable :: out(:,:)
-integer :: n, p
+integer :: i, j, n, p
 n = size(x, 1)
 p = size(x, 2)
 allocate(out(max(0, n - 1), p))
-if (n > 1) out = x(2:n, :) - x(1:n - 1, :)
+do j = 1, p
+   do i = 1, n - 1
+      out(i, j) = diff_subtract_real(x(i + 1, j), x(i, j))
+   end do
+end do
 end function diff_mat_real
+
+pure elemental function diff_subtract_real(a, b) result(out)
+! Subtract while preserving R's distinction between NA and ordinary NaN.
+real(kind=dp), intent(in) :: a, b
+real(kind=dp) :: out
+if (r_is_na_payload(a)) then
+   out = r_na_real()
+else if (a /= a) then
+   out = a
+else if (r_is_na_payload(b)) then
+   out = r_na_real()
+else if (b /= b) then
+   out = b
+else
+   out = a - b
+end if
+end function diff_subtract_real
 
 pure function diff_int(x) result(out)
 ! First differences of an integer vector.
@@ -10656,11 +11125,18 @@ end do
 end function diag_vec_real
 
 pure function diag_vec_real_n(v, n) result(out)
-! Create diagonal real matrix from a real vector; n is accepted for R compatibility.
+! Create an n by n diagonal real matrix, recycling the input vector.
 real(kind=dp), intent(in) :: v(:)
 integer, intent(in) :: n
 real(kind=dp), allocatable :: out(:,:)
-out = diag_vec_real(v)
+integer :: i, nn
+nn = max(0, n)
+allocate(out(nn, nn))
+out = 0.0_dp
+if (size(v) <= 0) return
+do i = 1, nn
+   out(i, i) = v(modulo(i - 1, size(v)) + 1)
+end do
 end function diag_vec_real_n
 
 pure function diag_mat_complex(a) result(out)
@@ -10689,11 +11165,18 @@ end do
 end function diag_vec_complex
 
 pure function diag_vec_complex_n(v, n) result(out)
-! Create diagonal complex matrix from a complex vector; n is accepted for R compatibility.
+! Create an n by n diagonal complex matrix, recycling the input vector.
 complex(kind=dp), intent(in) :: v(:)
 integer, intent(in) :: n
 complex(kind=dp), allocatable :: out(:,:)
-out = diag_vec_complex(v)
+integer :: i, nn
+nn = max(0, n)
+allocate(out(nn, nn))
+out = cmplx(0.0_dp, 0.0_dp, kind=dp)
+if (size(v) <= 0) return
+do i = 1, nn
+   out(i, i) = v(modulo(i - 1, size(v)) + 1)
+end do
 end function diag_vec_complex_n
 
 pure function diag_mat_int(a) result(out)
@@ -10722,11 +11205,18 @@ end do
 end function diag_vec_int
 
 pure function diag_vec_int_n(v, n) result(out)
-! Create diagonal integer matrix from an integer vector; n is accepted for R compatibility.
+! Create an n by n diagonal integer matrix, recycling the input vector.
 integer, intent(in) :: v(:)
 integer, intent(in) :: n
 integer, allocatable :: out(:,:)
-out = diag_vec_int(v)
+integer :: i, nn
+nn = max(0, n)
+allocate(out(nn, nn))
+out = 0
+if (size(v) <= 0) return
+do i = 1, nn
+   out(i, i) = v(modulo(i - 1, size(v)) + 1)
+end do
 end function diag_vec_int_n
 
 pure function diag_scalar_int(n) result(out)
@@ -11550,6 +12040,8 @@ do
          else
             maxlen = max(maxlen, len_trim(line))
          end if
+      else if (recur) then
+         maxlen = max(maxlen, len_trim(line))
       else
          maxlen = max(maxlen, len_trim(base))
       end if
@@ -11631,7 +12123,9 @@ character(len=128) :: buf
 character(len=32) :: fmt
 write(fmt, '("(f0.", i0, ")")') max(0, digits)
 write(buf, fmt) x
-out = trim(buf)
+out = trim(adjustl(buf))
+if (len(out) >= 1 .and. out(1:1) == ".") out = "0" // out
+if (len(out) >= 2 .and. out(1:2) == "-.") out = "-0" // out(2:)
 end function real_to_string_f
 
 pure function real_to_string_g_scalar(x, digits) result(out)
@@ -11982,6 +12476,10 @@ character(len=*), intent(in) :: new ! replacement text
 character(len=:), allocatable :: out
 character(len=:), allocatable :: rest
 integer :: pos
+if (len(old) == 0) then
+   out = s
+   return
+end if
 out = ""
 rest = s
 do
@@ -12188,6 +12686,14 @@ allocate(out(size(x)))
 out = (x /= x)
 end function is_na_real_vec
 
+pure function is_na_real_mat(x) result(out)
+! Elementwise NA test for a real matrix.
+real(kind=dp), intent(in) :: x(:,:)
+logical, allocatable :: out(:,:)
+allocate(out(size(x, 1), size(x, 2)))
+out = (x /= x)
+end function is_na_real_mat
+
 pure elemental logical function is_na_int_scalar(x) result(out)
 ! True when integer scalar uses NA sentinel.
 integer, intent(in) :: x ! value to test
@@ -12201,6 +12707,14 @@ logical, allocatable :: out(:)
 allocate(out(size(x)))
 out = (x == -huge(0))
 end function is_na_int_vec
+
+pure function is_na_int_mat(x) result(out)
+! Elementwise NA test for an integer matrix.
+integer, intent(in) :: x(:,:)
+logical, allocatable :: out(:,:)
+allocate(out(size(x, 1), size(x, 2)))
+out = (x == -huge(0))
+end function is_na_int_mat
 
 pure elemental logical function is_na_logical_scalar(x) result(out)
 ! Logical values have no NA sentinel in this subset.
@@ -12216,6 +12730,14 @@ allocate(out(size(x)))
 out = .false.
 end function is_na_logical_vec
 
+pure function is_na_logical_mat(x) result(out)
+! Elementwise NA test for a logical matrix.
+logical, intent(in) :: x(:,:)
+logical, allocatable :: out(:,:)
+allocate(out(size(x, 1), size(x, 2)))
+out = .false.
+end function is_na_logical_mat
+
 pure elemental logical function is_na_complex_scalar(x) result(out)
 ! True when either complex component is NA/NaN.
 complex(kind=dp), intent(in) :: x ! value to test
@@ -12229,6 +12751,14 @@ logical, allocatable :: out(:)
 allocate(out(size(x)))
 out = (real(x, kind=dp) /= real(x, kind=dp)) .or. (aimag(x) /= aimag(x))
 end function is_na_complex_vec
+
+pure function is_na_complex_mat(x) result(out)
+! Elementwise NA test for a complex matrix.
+complex(kind=dp), intent(in) :: x(:,:)
+logical, allocatable :: out(:,:)
+allocate(out(size(x, 1), size(x, 2)))
+out = (real(x, kind=dp) /= real(x, kind=dp)) .or. (aimag(x) /= aimag(x))
+end function is_na_complex_mat
 
 pure elemental logical function is_na_char_scalar(x) result(out)
 ! True when character scalar uses NA sentinel in this subset.
@@ -12246,6 +12776,14 @@ do i = 1, size(x)
    out(i) = (x(i) == "")
 end do
 end function is_na_char_vec
+
+pure function is_na_char_mat(x) result(out)
+! Elementwise NA test for a character matrix.
+character(len=*), intent(in) :: x(:,:)
+logical, allocatable :: out(:,:)
+allocate(out(size(x, 1), size(x, 2)))
+out = (x == "")
+end function is_na_char_mat
 
 pure function which_logical(x) result(out)
 ! Runtime helper for R-compatible which logical.
@@ -12572,6 +13110,12 @@ do i = 2, size(x)
 end do
 end function rle_real
 
+pure elemental logical function rle_int_values_equal(a, b) result(out)
+! Integer NA never continues an rle() run, including another integer NA.
+integer, intent(in) :: a, b
+out = a == b .and. a /= -huge(0)
+end function rle_int_values_equal
+
 pure function rle_int(x) result(out)
 ! Compute run-length encoding for int input.
 integer, intent(in) :: x(:) ! values to encode
@@ -12581,7 +13125,7 @@ nr = 0
 if (size(x) > 0) then
    nr = 1
    do i = 2, size(x)
-      if (x(i) /= x(i - 1)) nr = nr + 1
+      if (.not. rle_int_values_equal(x(i), x(i - 1))) nr = nr + 1
    end do
 end if
 allocate(out%lengths(nr), out%values(nr))
@@ -12590,7 +13134,7 @@ j = 1
 out%lengths(1) = 1
 out%values(1) = x(1)
 do i = 2, size(x)
-   if (x(i) == x(i - 1)) then
+   if (rle_int_values_equal(x(i), x(i - 1))) then
       out%lengths(j) = out%lengths(j) + 1
    else
       j = j + 1
@@ -12919,7 +13463,7 @@ do i = 1, nb
    out%mids(i) = 0.5_dp * (out%breaks(i) + out%breaks(i + 1))
 end do
 do i = 1, size(x)
-   if (x(i) <= out%breaks(1) .or. x(i) > out%breaks(nb + 1)) cycle
+   if (x(i) < out%breaks(1) .or. x(i) > out%breaks(nb + 1)) cycle
    j = ceiling((x(i) - out%breaks(1)) / width)
    if (j < 1) j = 1
    if (j > nb) j = nb
@@ -12985,25 +13529,41 @@ write(*,'(a)') "$mids"
 call print_real_vector(h%mids)
 end subroutine print_hist
 
-pure function quantile(x, probs, names, type) result(out)
+pure function quantile(x, probs, names, type, na_rm) result(out)
 ! Compute Type-7 quantiles for a numeric vector.
 ! names and type are accepted for API compatibility; this subset always uses Type 7.
 real(kind=dp), intent(in) :: x(:) ! sample values
 real(kind=dp), intent(in) :: probs(:) ! probabilities, clamped to [0,1]
 logical, intent(in), optional :: names ! accepted for compatibility; ignored
 integer, intent(in), optional :: type ! accepted for compatibility; ignored
+logical, intent(in), optional :: na_rm ! remove missing values before calculation
 real(kind=dp), allocatable :: out(:), xs(:)
 integer :: n, i, j
 real(kind=dp) :: p, h, g
-n = size(x)
+logical :: remove_missing
 allocate(out(size(probs)))
+remove_missing = .false.
+if (present(na_rm)) remove_missing = na_rm
+if (.not. remove_missing .and. any(x /= x)) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
+if (remove_missing) then
+   xs = pack(x, x == x)
+else
+   xs = x
+end if
+n = size(xs)
 if (n <= 0) then
    out = ieee_value(0.0_dp, ieee_quiet_nan)
    return
 end if
-xs = x
 call sort_increasing(xs)
 do i = 1, size(probs)
+   if (probs(i) /= probs(i)) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   end if
    p = min(1.0_dp, max(0.0_dp, probs(i)))
    h = (n - 1) * p + 1.0_dp
    j = int(floor(h))
@@ -13012,6 +13572,8 @@ do i = 1, size(probs)
       out(i) = xs(1)
    else if (j >= n) then
       out(i) = xs(n)
+   else if (g == 0.0_dp) then
+      out(i) = xs(j)
    else
       out(i) = (1.0_dp - g) * xs(j) + g * xs(j + 1)
    end if
@@ -13021,18 +13583,30 @@ if (present(names)) continue
 if (present(type)) continue
 end function quantile
 
-pure function median(x) result(out)
+pure function median(x, na_rm) result(out)
 ! Compute the median of a numeric vector.
 real(kind=dp), intent(in) :: x(:) ! sample values
+logical, intent(in), optional :: na_rm ! remove missing values before calculation
 real(kind=dp) :: out
 real(kind=dp), allocatable :: xs(:)
 integer :: n, mid
-n = size(x)
+logical :: remove_missing
+remove_missing = .false.
+if (present(na_rm)) remove_missing = na_rm
+if (.not. remove_missing .and. any(x /= x)) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
+if (remove_missing) then
+   xs = pack(x, x == x)
+else
+   xs = x
+end if
+n = size(xs)
 if (n <= 0) then
    out = ieee_value(0.0_dp, ieee_quiet_nan)
    return
 end if
-xs = x
 call sort_increasing(xs)
 mid = (n + 1) / 2
 if (mod(n, 2) == 1) then
@@ -13045,16 +13619,17 @@ end function median
 pure function summary_vec(x) result(out)
 ! Return R-like numeric summary: Min, 1st Qu., Median, Mean, 3rd Qu., Max.
 real(kind=dp), intent(in) :: x(:) ! sample values
-real(kind=dp), allocatable :: out(:), qs(:)
+real(kind=dp), allocatable :: out(:), qs(:), clean(:)
 integer :: n
-n = size(x)
+clean = pack(x, x == x)
+n = size(clean)
 allocate(out(6))
 if (n <= 0) then
    out = ieee_value(0.0_dp, ieee_quiet_nan)
    return
 end if
-qs = quantile(x, [0.0_dp, 0.25_dp, 0.5_dp, 0.75_dp, 1.0_dp], .false., 7)
-out = [qs(1), qs(2), qs(3), sum(x) / real(n, kind=dp), qs(4), qs(5)]
+qs = quantile(clean, [0.0_dp, 0.25_dp, 0.5_dp, 0.75_dp, 1.0_dp], .false., 7)
+out = [qs(1), qs(2), qs(3), sum(clean) / real(n, kind=dp), qs(4), qs(5)]
 end function summary_vec
 
 pure function summary_mat(x) result(out)
@@ -13126,7 +13701,11 @@ integer, intent(in) :: n ! requested tail length, clamped to vector length
 real(kind=dp), allocatable :: out(:)
 integer :: m, n0
 n0 = size(x)
-m = max(0, min(n, n0))
+if (n < 0) then
+   m = max(0, n0 + n)
+else
+   m = min(n, n0)
+end if
 allocate(out(m))
 if (m > 0) out = x(n0 - m + 1:n0)
 end function tail
@@ -13136,12 +13715,22 @@ pure function cbind2(a, b) result(out)
 real(kind=dp), intent(in) :: a(:) ! first column source
 real(kind=dp), intent(in) :: b(:) ! second column source
 real(kind=dp), allocatable :: out(:,:)
-integer :: n
-n = min(size(a), size(b))
-allocate(out(n, 2))
-if (n > 0) then
-   out(:,1) = a(1:n)
-   out(:,2) = b(1:n)
+integer :: i, j, n, nc
+n = max(size(a), size(b))
+nc = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+allocate(out(n, nc))
+j = 0
+if (size(a) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(i, j) = a(modulo(i - 1, size(a)) + 1)
+   end do
+end if
+if (size(b) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(i, j) = b(modulo(i - 1, size(b)) + 1)
+   end do
 end if
 end function cbind2
 
@@ -13151,17 +13740,32 @@ real(kind=dp), intent(in) :: r1(:) ! first column source
 real(kind=dp), intent(in) :: r2(:) ! second column source
 real(kind=dp), intent(in), optional :: r3(:) ! optional third column source
 real(kind=dp), allocatable :: out(:,:)
-integer :: n
+integer :: i, j, n, nc
 if (.not. present(r3)) then
    out = cbind2(r1, r2)
    return
 end if
-n = min(size(r1), min(size(r2), size(r3)))
-allocate(out(n, 3))
-if (n > 0) then
-   out(:,1) = r1(1:n)
-   out(:,2) = r2(1:n)
-   out(:,3) = r3(1:n)
+n = max(size(r1), max(size(r2), size(r3)))
+nc = merge(1, 0, size(r1) > 0) + merge(1, 0, size(r2) > 0) + merge(1, 0, size(r3) > 0)
+allocate(out(n, nc))
+j = 0
+if (size(r1) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(i, j) = r1(modulo(i - 1, size(r1)) + 1)
+   end do
+end if
+if (size(r2) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(i, j) = r2(modulo(i - 1, size(r2)) + 1)
+   end do
+end if
+if (size(r3) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(i, j) = r3(modulo(i - 1, size(r3)) + 1)
+   end do
 end if
 end function cbind
 
@@ -13170,10 +13774,23 @@ pure function rbind_vec(a, b) result(out)
 real(kind=dp), intent(in) :: a(:) ! first row source
 real(kind=dp), intent(in) :: b(:) ! second row source
 real(kind=dp), allocatable :: out(:,:)
-integer :: n
-n = min(size(a), size(b))
-allocate(out(2, n))
-if (n > 0) out = transpose(reshape([a(1:n), b(1:n)], [n, 2]))
+integer :: i, j, n, nr
+n = max(size(a), size(b))
+nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+allocate(out(nr, n))
+j = 0
+if (size(a) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(j, i) = a(modulo(i - 1, size(a)) + 1)
+   end do
+end if
+if (size(b) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(j, i) = b(modulo(i - 1, size(b)) + 1)
+   end do
+end if
 end function rbind_vec
 
 pure function rbind_mat(a, b) result(out)
@@ -13196,12 +13813,18 @@ pure function rbind_vec_mat(a, b) result(out)
 real(kind=dp), intent(in) :: a(:) ! top row source
 real(kind=dp), intent(in) :: b(:,:) ! rows appended below
 real(kind=dp), allocatable :: out(:,:)
-integer :: ncol, nrow
-ncol = min(size(a), size(b, 2))
+integer :: i, ncol, nrow
+ncol = size(b, 2)
 nrow = size(b, 1)
+if (size(a) <= 0) then
+   out = b
+   return
+end if
 allocate(out(nrow + 1, ncol))
 if (ncol == 0) return
-out(1, 1:ncol) = a(1:ncol)
+do i = 1, ncol
+   out(1, i) = a(modulo(i - 1, size(a)) + 1)
+end do
 if (nrow > 0) out(2:, 1:ncol) = b(:, 1:ncol)
 end function rbind_vec_mat
 
@@ -13210,13 +13833,19 @@ pure function rbind_mat_vec(a, b) result(out)
 real(kind=dp), intent(in) :: a(:,:) ! rows kept above
 real(kind=dp), intent(in) :: b(:) ! bottom row source
 real(kind=dp), allocatable :: out(:,:)
-integer :: ncol, nrow
-ncol = min(size(a, 2), size(b))
+integer :: i, ncol, nrow
+ncol = size(a, 2)
 nrow = size(a, 1)
+if (size(b) <= 0) then
+   out = a
+   return
+end if
 allocate(out(nrow + 1, ncol))
 if (ncol == 0) return
 if (nrow > 0) out(1:nrow, 1:ncol) = a(:, 1:ncol)
-out(nrow + 1, 1:ncol) = b(1:ncol)
+do i = 1, ncol
+   out(nrow + 1, i) = b(modulo(i - 1, size(b)) + 1)
+end do
 end function rbind_mat_vec
 
 pure function rbind_int_vec(a, b) result(out)
@@ -13224,10 +13853,23 @@ pure function rbind_int_vec(a, b) result(out)
 integer, intent(in) :: a(:)
 integer, intent(in) :: b(:)
 integer, allocatable :: out(:,:)
-integer :: n
-n = min(size(a), size(b))
-allocate(out(2, n))
-if (n > 0) out = transpose(reshape([a(1:n), b(1:n)], [n, 2]))
+integer :: i, j, n, nr
+n = max(size(a), size(b))
+nr = merge(1, 0, size(a) > 0) + merge(1, 0, size(b) > 0)
+allocate(out(nr, n))
+j = 0
+if (size(a) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(j, i) = a(modulo(i - 1, size(a)) + 1)
+   end do
+end if
+if (size(b) > 0) then
+   j = j + 1
+   do i = 1, n
+      out(j, i) = b(modulo(i - 1, size(b)) + 1)
+   end do
+end if
 end function rbind_int_vec
 
 pure function rbind_int_mat(a, b) result(out)
@@ -13250,12 +13892,18 @@ pure function rbind_int_vec_mat(a, b) result(out)
 integer, intent(in) :: a(:)
 integer, intent(in) :: b(:,:)
 integer, allocatable :: out(:,:)
-integer :: ncol, nrow
-ncol = min(size(a), size(b, 2))
+integer :: i, ncol, nrow
+ncol = size(b, 2)
 nrow = size(b, 1)
+if (size(a) <= 0) then
+   out = b
+   return
+end if
 allocate(out(nrow + 1, ncol))
 if (ncol == 0) return
-out(1, 1:ncol) = a(1:ncol)
+do i = 1, ncol
+   out(1, i) = a(modulo(i - 1, size(a)) + 1)
+end do
 if (nrow > 0) out(2:, 1:ncol) = b(:, 1:ncol)
 end function rbind_int_vec_mat
 
@@ -13264,13 +13912,19 @@ pure function rbind_int_mat_vec(a, b) result(out)
 integer, intent(in) :: a(:,:)
 integer, intent(in) :: b(:)
 integer, allocatable :: out(:,:)
-integer :: ncol, nrow
-ncol = min(size(a, 2), size(b))
+integer :: i, ncol, nrow
+ncol = size(a, 2)
 nrow = size(a, 1)
+if (size(b) <= 0) then
+   out = a
+   return
+end if
 allocate(out(nrow + 1, ncol))
 if (ncol == 0) return
 if (nrow > 0) out(1:nrow, 1:ncol) = a(:, 1:ncol)
-out(nrow + 1, 1:ncol) = b(1:ncol)
+do i = 1, ncol
+   out(nrow + 1, i) = b(modulo(i - 1, size(b)) + 1)
+end do
 end function rbind_int_mat_vec
 
 pure function matrix_real(x, nrow, ncol) result(out)
@@ -13300,7 +13954,7 @@ if (need_n <= 0) then
 end if
 if (nx <= 0) then
    allocate(out(nrow, nc))
-   out = 0.0_dp
+   out = r_na_real()
    return
 end if
 allocate(buf(need_n))
@@ -13337,7 +13991,7 @@ if (need_n <= 0) then
 end if
 if (nx <= 0) then
    allocate(out(nrow, nc))
-   out = 0
+   out = -huge(0)
    return
 end if
 allocate(buf(need_n))
@@ -13549,9 +14203,12 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, n, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0))
+   return
+end if
 n = max(na, nb)
 allocate(out(n))
-if (n <= 0) return
 call maybe_warn_recycle("x + y", na, nb)
 do i = 1, n
    out(i) = a(modulo(i - 1, na) + 1) + b(modulo(i - 1, nb) + 1)
@@ -13588,9 +14245,12 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, n, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0))
+   return
+end if
 n = max(na, nb)
 allocate(out(n))
-if (n <= 0) return
 call maybe_warn_recycle("x - y", na, nb)
 do i = 1, n
    out(i) = a(modulo(i - 1, na) + 1) - b(modulo(i - 1, nb) + 1)
@@ -13627,9 +14287,12 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, n, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0))
+   return
+end if
 n = max(na, nb)
 allocate(out(n))
-if (n <= 0) return
 call maybe_warn_recycle("x * y", na, nb)
 do i = 1, n
    out(i) = a(modulo(i - 1, na) + 1) * b(modulo(i - 1, nb) + 1)
@@ -13666,9 +14329,12 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, n, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0))
+   return
+end if
 n = max(na, nb)
 allocate(out(n))
-if (n <= 0) return
 call maybe_warn_recycle("x / y", na, nb)
 do i = 1, n
    out(i) = a(modulo(i - 1, na) + 1) / b(modulo(i - 1, nb) + 1)
@@ -13705,8 +14371,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(a, 1), size(a, 2)))
-if (na <= 0) return
 call maybe_warn_recycle("x + y", na, nb)
 do i = 1, na
    out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
@@ -13730,8 +14399,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(a, 1), size(a, 2)))
-if (na <= 0) return
 call maybe_warn_recycle("x - y", na, nb)
 do i = 1, na
    out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
@@ -13747,8 +14419,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, nb, na
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(b, 1), size(b, 2)))
-if (nb <= 0) return
 call maybe_warn_recycle("x - y", na, nb)
 do i = 1, nb
    out(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1) = &
@@ -13764,8 +14439,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(a, 1), size(a, 2)))
-if (na <= 0) return
 call maybe_warn_recycle("x * y", na, nb)
 do i = 1, na
    out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
@@ -13789,8 +14467,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, na, nb
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(a, 1), size(a, 2)))
-if (na <= 0) return
 call maybe_warn_recycle("x / y", na, nb)
 do i = 1, na
    out(modulo(i - 1, size(a, 1)) + 1, ((i - 1) / size(a, 1)) + 1) = &
@@ -13806,8 +14487,11 @@ real(kind=dp), allocatable :: out(:,:)
 integer :: i, nb, na
 na = size(a)
 nb = size(b)
+if (na <= 0 .or. nb <= 0) then
+   allocate(out(0, 0))
+   return
+end if
 allocate(out(size(b, 1), size(b, 2)))
-if (nb <= 0) return
 call maybe_warn_recycle("x / y", na, nb)
 do i = 1, nb
    out(modulo(i - 1, size(b, 1)) + 1, ((i - 1) / size(b, 1)) + 1) = &
@@ -13840,7 +14524,7 @@ if (need_n <= 0) then
 end if
 if (nx <= 0) then
    allocate(out(nrow, ncol))
-   out = 0.0_dp
+   out = r_na_real()
    return
 end if
 allocate(buf(need_n))
@@ -13875,7 +14559,7 @@ if (need_n <= 0) then
 end if
 if (nx <= 0) then
    allocate(out(nrow, ncol))
-   out = 0
+   out = -huge(0)
    return
 end if
 allocate(buf(need_n))
@@ -13935,17 +14619,52 @@ pure elemental function pmax(a, b) result(out)
 real(kind=dp), intent(in) :: a ! first value
 real(kind=dp), intent(in) :: b ! second value
 real(kind=dp) :: out
-out = max(a, b)
+if (b /= b) then
+   out = b
+else if (a /= a) then
+   out = a
+else if (b > a) then
+   out = b
+else
+   out = a
+end if
 end function pmax
 
 pure elemental function r_round(x, digits) result(out)
-! Round to the requested number of decimal digits using xr2f's current semantics.
+! Round to the requested number of decimal digits using R's ties-to-even rule.
 real(kind=dp), intent(in) :: x
 integer, intent(in) :: digits
 real(kind=dp) :: out
-real(kind=dp) :: scale
+real(kind=dp) :: base, frac, rounded, scale, scaled
+if (.not. ieee_is_finite(x)) then
+   out = x
+   return
+end if
 scale = 10.0_dp ** digits
-out = anint(x * scale) / scale
+if (.not. ieee_is_finite(scale)) then
+   out = x
+   return
+else if (scale == 0.0_dp) then
+   out = 0.0_dp
+   return
+end if
+scaled = abs(x * scale)
+if (.not. ieee_is_finite(scaled)) then
+   out = x
+   return
+end if
+base = aint(scaled)
+frac = scaled - base
+if (frac < 0.5_dp) then
+   rounded = base
+else if (frac > 0.5_dp) then
+   rounded = base + 1.0_dp
+else if (modulo(base, 2.0_dp) == 0.0_dp) then
+   rounded = base
+else
+   rounded = base + 1.0_dp
+end if
+out = sign(rounded / scale, x)
 end function r_round
 
 pure function sd_vec(x) result(out)
@@ -14032,10 +14751,18 @@ pure elemental function r_choose(n, k) result(out)
 real(kind=dp), intent(in) :: n ! number of items
 real(kind=dp), intent(in) :: k ! number chosen
 real(kind=dp) :: out
-if (n < 0.0_dp .or. k < 0.0_dp .or. k > n) then
+integer :: i, kk
+real(kind=dp) :: fraction
+if (k < 0.0_dp) then
    out = 0.0_dp
 else
-   out = exp(log_gamma(n + 1.0_dp) - log_gamma(k + 1.0_dp) - log_gamma(n - k + 1.0_dp))
+   kk = floor(k)
+   fraction = k - real(kk, kind=dp)
+   if (fraction > 0.5_dp .or. (fraction == 0.5_dp .and. mod(kk, 2) /= 0)) kk = kk + 1
+   out = 1.0_dp
+   do i = 1, kk
+      out = out * (n - real(i - 1, kind=dp)) / real(i, kind=dp)
+   end do
 end if
 end function r_choose
 
@@ -14044,10 +14771,23 @@ pure elemental function r_lchoose(n, k) result(out)
 real(kind=dp), intent(in) :: n ! number of items
 real(kind=dp), intent(in) :: k ! number chosen
 real(kind=dp) :: out
-if (n < 0.0_dp .or. k < 0.0_dp .or. k > n) then
-   out = ieee_value(0.0_dp, ieee_quiet_nan)
+integer :: i, kk
+real(kind=dp) :: factor, fraction
+if (k < 0.0_dp) then
+   out = -ieee_value(0.0_dp, ieee_positive_inf)
 else
-   out = log_gamma(n + 1.0_dp) - log_gamma(k + 1.0_dp) - log_gamma(n - k + 1.0_dp)
+   kk = floor(k)
+   fraction = k - real(kk, kind=dp)
+   if (fraction > 0.5_dp .or. (fraction == 0.5_dp .and. mod(kk, 2) /= 0)) kk = kk + 1
+   out = 0.0_dp
+   do i = 1, kk
+      factor = abs(n - real(i - 1, kind=dp)) / real(i, kind=dp)
+      if (factor == 0.0_dp) then
+         out = -ieee_value(0.0_dp, ieee_positive_inf)
+         return
+      end if
+      out = out + log(factor)
+   end do
 end if
 end function r_lchoose
 
@@ -14055,7 +14795,11 @@ pure elemental function r_factorial(x) result(out)
 ! Elementwise factorial using gamma(x + 1) for compatibility.
 real(kind=dp), intent(in) :: x ! function argument
 real(kind=dp) :: out
-out = r_gamma(x + 1.0_dp)
+if (x < 0.0_dp .and. x == floor(x)) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   out = r_gamma(x + 1.0_dp)
+end if
 end function r_factorial
 
 pure elemental function r_lfactorial(x) result(out)
@@ -14079,35 +14823,106 @@ do
 end do
 end function r_digit_power_sum
 
-pure elemental function r_digamma(x) result(out)
-! Elementwise digamma approximation via finite differences of log_gamma.
+recursive pure elemental function r_digamma(x) result(out)
+! Elementwise digamma using recurrence, reflection, and an asymptotic series.
 real(kind=dp), intent(in) :: x ! function argument
-real(kind=dp) :: out
-real(kind=dp), parameter :: h = 1.0e-4_dp
-out = (log_gamma(x + h) - log_gamma(x - h)) / (2.0_dp * h)
+real(kind=dp) :: out, inv, inv2, y
+real(kind=dp), parameter :: pi = acos(-1.0_dp)
+if (.not. ieee_is_finite(x)) then
+   if (x > 0.0_dp) then
+      out = x
+   else
+      out = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+   return
+end if
+if (x <= 0.0_dp) then
+   if (x == anint(x)) then
+      out = ieee_value(0.0_dp, ieee_quiet_nan)
+   else
+      out = r_digamma(1.0_dp - x) - pi / tan(pi * x)
+   end if
+   return
+end if
+out = 0.0_dp
+y = x
+do while (y < 8.0_dp)
+   out = out - 1.0_dp / y
+   y = y + 1.0_dp
+end do
+inv = 1.0_dp / y
+inv2 = inv * inv
+out = out + log(y) - 0.5_dp * inv - inv2 * (1.0_dp / 12.0_dp - &
+   inv2 * (1.0_dp / 120.0_dp - inv2 * (1.0_dp / 252.0_dp - &
+   inv2 * (1.0_dp / 240.0_dp - inv2 * (1.0_dp / 132.0_dp)))))
 end function r_digamma
 
-pure elemental function r_trigamma(x) result(out)
-! Elementwise trigamma approximation via finite differences.
+recursive pure elemental function r_trigamma(x) result(out)
+! Elementwise trigamma using recurrence, reflection, and an asymptotic series.
 real(kind=dp), intent(in) :: x ! function argument
-real(kind=dp) :: out
-real(kind=dp), parameter :: h = 1.0e-4_dp
-out = (log_gamma(x + h) - 2.0_dp * log_gamma(x) + log_gamma(x - h)) / (h * h)
+real(kind=dp) :: out, inv, inv2, y
+real(kind=dp), parameter :: pi = acos(-1.0_dp)
+if (.not. ieee_is_finite(x)) then
+   if (x > 0.0_dp) then
+      out = 0.0_dp
+   else
+      out = ieee_value(0.0_dp, ieee_quiet_nan)
+   end if
+   return
+end if
+if (x <= 0.0_dp) then
+   if (x == anint(x)) then
+      out = ieee_value(0.0_dp, ieee_quiet_nan)
+   else
+      out = (pi / sin(pi * x))**2 - r_trigamma(1.0_dp - x)
+   end if
+   return
+end if
+out = 0.0_dp
+y = x
+do while (y < 8.0_dp)
+   out = out + 1.0_dp / (y * y)
+   y = y + 1.0_dp
+end do
+inv = 1.0_dp / y
+inv2 = inv * inv
+out = out + inv + 0.5_dp * inv2 + inv * inv2 * (1.0_dp / 6.0_dp - &
+   inv2 * (1.0_dp / 30.0_dp - inv2 * (1.0_dp / 42.0_dp - &
+   inv2 * (1.0_dp / 30.0_dp - inv2 * (5.0_dp / 66.0_dp)))))
 end function r_trigamma
 
 pure elemental function r_psigamma(x, deriv) result(out)
 ! Elementwise poly-gamma approximation.
-! deriv=0 returns digamma, deriv=1 returns trigamma, larger values use finite differences.
+! deriv=0 returns digamma; positive orders use a convergent Hurwitz-zeta series.
 real(kind=dp), intent(in) :: x ! function argument
 integer, intent(in) :: deriv ! derivative order
 real(kind=dp) :: out
-real(kind=dp), parameter :: h = 1.0e-4_dp
-if (deriv <= 0) then
+integer :: i, p
+real(kind=dp) :: factorial, series, sign, y
+if (deriv < 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+elseif (deriv == 0) then
    out = r_digamma(x)
 elseif (deriv == 1) then
    out = r_trigamma(x)
+elseif (x <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
 else
-   out = (r_trigamma(x + h) - r_trigamma(x - h)) / (2.0_dp * h)
+   p = deriv + 1
+   factorial = 1.0_dp
+   do i = 2, deriv
+      factorial = factorial * real(i, kind=dp)
+   end do
+   series = 0.0_dp
+   do i = 0, 31
+      series = series + 1.0_dp / (x + real(i, kind=dp))**p
+   end do
+   y = x + 32.0_dp
+   series = series + y**(1 - p) / real(p - 1, kind=dp) + 0.5_dp * y**(-p) + &
+      real(p, kind=dp) * y**(-p - 1) / 12.0_dp - &
+      real(p * (p + 1) * (p + 2), kind=dp) * y**(-p - 3) / 720.0_dp
+   sign = merge(1.0_dp, -1.0_dp, mod(deriv, 2) == 1)
+   out = sign * factorial * series
 end if
 end function r_psigamma
 
@@ -14242,7 +15057,11 @@ if (do_scale) then
       else
          sig(j) = 0.0_dp
       end if
-      if (sig(j) > 0.0_dp) out(:, j) = out(:, j) / sig(j)
+      if (sig(j) > 0.0_dp) then
+         out(:, j) = out(:, j) / sig(j)
+      else
+         out(:, j) = ieee_value(0.0_dp, ieee_quiet_nan)
+      end if
    end do
 end if
 end function scale_mat
@@ -14257,8 +15076,14 @@ logical :: out
 real(kind=dp) :: tol, scale_ab
 tol = sqrt(epsilon(1.0_dp))
 if (present(tolerance)) tol = tolerance
-scale_ab = max(1.0_dp, abs(a), abs(b))
-out = abs(a - b) <= tol * scale_ab
+if (a /= a .or. b /= b) then
+   out = (a /= a) .and. (b /= b)
+else if (.not. ieee_is_finite(a) .or. .not. ieee_is_finite(b)) then
+   out = a == b
+else
+   scale_ab = max(1.0_dp, abs(a), abs(b))
+   out = abs(a - b) <= tol * scale_ab
+end if
 end function all_equal_real_scalar
 
 pure function all_equal_real_vec(a, b, tolerance) result(out)
@@ -14269,14 +15094,19 @@ real(kind=dp), intent(in) :: b(:) ! second values
 real(kind=dp), intent(in), optional :: tolerance ! relative comparison tolerance
 logical :: out
 real(kind=dp) :: tol
+integer :: i
 tol = sqrt(epsilon(1.0_dp))
 if (present(tolerance)) tol = tolerance
 if (size(a) /= size(b)) then
    out = .false.
-else if (size(a) == 0) then
-   out = .true.
 else
-   out = all(abs(a - b) <= tol * max(1.0_dp, max(maxval(abs(a)), maxval(abs(b)))))
+   out = .true.
+   do i = 1, size(a)
+      if (.not. all_equal_real_scalar(a(i), b(i), tolerance=tol)) then
+         out = .false.
+         exit
+      end if
+   end do
 end if
 end function all_equal_real_vec
 
@@ -14288,14 +15118,21 @@ real(kind=dp), intent(in) :: b(:,:) ! second matrix
 real(kind=dp), intent(in), optional :: tolerance ! relative comparison tolerance
 logical :: out
 real(kind=dp) :: tol
+integer :: i, j
 tol = sqrt(epsilon(1.0_dp))
 if (present(tolerance)) tol = tolerance
 if (any(shape(a) /= shape(b))) then
    out = .false.
-else if (size(a) == 0) then
-   out = .true.
 else
-   out = all(abs(a - b) <= tol * max(1.0_dp, max(maxval(abs(a)), maxval(abs(b)))))
+   out = .true.
+   do j = 1, size(a, 2)
+      do i = 1, size(a, 1)
+         if (.not. all_equal_real_scalar(a(i, j), b(i, j), tolerance=tol)) then
+            out = .false.
+            return
+         end if
+      end do
+   end do
 end if
 end function all_equal_real_mat
 
@@ -14325,6 +15162,64 @@ real(kind=dp), intent(in), optional :: tolerance ! relative comparison tolerance
 logical :: out
 out = all_equal_real_mat(real(a, kind=dp), real(b, kind=dp), tolerance=tolerance)
 end function all_equal_int_mat
+
+pure function all_equal_complex_scalar(a, b, tolerance) result(out)
+! Compare complex scalars componentwise with R all.equal-style tolerance.
+complex(kind=dp), intent(in) :: a, b
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+out = all_equal_real_scalar(real(a, kind=dp), real(b, kind=dp), tolerance=tolerance) .and. &
+   all_equal_real_scalar(aimag(a), aimag(b), tolerance=tolerance)
+end function all_equal_complex_scalar
+
+pure function all_equal_complex_vec(a, b, tolerance) result(out)
+! Compare complex vectors componentwise with R all.equal-style tolerance.
+complex(kind=dp), intent(in) :: a(:), b(:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+integer :: i
+if (size(a) /= size(b)) then
+   out = .false.
+   return
+end if
+out = .true.
+do i = 1, size(a)
+   if (.not. all_equal_complex_scalar(a(i), b(i), tolerance=tolerance)) then
+      out = .false.
+      exit
+   end if
+end do
+end function all_equal_complex_vec
+
+pure function all_equal_complex_mat(a, b, tolerance) result(out)
+! Compare complex matrices componentwise with R all.equal-style tolerance.
+complex(kind=dp), intent(in) :: a(:,:), b(:,:)
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+integer :: i, j
+if (any(shape(a) /= shape(b))) then
+   out = .false.
+   return
+end if
+out = .true.
+do j = 1, size(a, 2)
+   do i = 1, size(a, 1)
+      if (.not. all_equal_complex_scalar(a(i, j), b(i, j), tolerance=tolerance)) then
+         out = .false.
+         return
+      end if
+   end do
+end do
+end function all_equal_complex_mat
+
+pure function all_equal_logical_scalar(a, b, tolerance) result(out)
+! Compare logical scalars; tolerance is accepted for API compatibility.
+logical, intent(in) :: a, b
+real(kind=dp), intent(in), optional :: tolerance
+logical :: out
+if (present(tolerance)) continue
+out = a .eqv. b
+end function all_equal_logical_scalar
 
 pure function all_equal_logical_vec(a, b, tolerance) result(out)
 ! Compare logical vec inputs with R all.equal-style semantics.
@@ -14380,7 +15275,11 @@ elemental function r_log_scalar(x) result(out)
 ! Apply R-like log handling to scalar input.
 real(kind=dp), intent(in) :: x ! value whose natural logarithm is requested
 real(kind=dp) :: out
-if (x < 0.0_dp) then
+if (r_is_na_payload(x)) then
+   out = r_na_real()
+else if (x /= x) then
+   out = x
+else if (x < 0.0_dp) then
    out = ieee_value(0.0_dp, ieee_quiet_nan)
 else
    out = log(x)
@@ -16243,8 +17142,23 @@ real(kind=dp), intent(in), optional :: ncp
 real(kind=dp) :: p
 real(kind=dp) :: half_ncp, weight, sumw, term
 integer :: j
+if (x /= x .or. df <= 0.0_dp) then
+   p = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 if (present(ncp)) then
+   if (ncp /= ncp .or. ncp < 0.0_dp .or. .not. ieee_is_finite(ncp)) then
+      p = ieee_value(0.0_dp, ieee_quiet_nan)
+      return
+   end if
    if (ncp > 0.0_dp) then
+      if (x <= 0.0_dp) then
+         p = 0.0_dp
+         return
+      else if (.not. ieee_is_finite(x)) then
+         p = 1.0_dp
+         return
+      end if
       half_ncp = 0.5_dp * ncp
       weight = exp(-half_ncp)
       p = weight * (1.0_dp - chisq_upper_tail_approx(x, df))
@@ -16283,12 +17197,16 @@ if (present(sd)) sig = sd
 if (present(lower_tail)) lower = lower_tail
 allocate(out(size(pv)))
 do i = 1, size(pv)
-   prob = max(0.0_dp, min(1.0_dp, pv(i)))
+   if (pv(i) /= pv(i) .or. pv(i) < 0.0_dp .or. pv(i) > 1.0_dp .or. sig < 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   end if
+   prob = pv(i)
    if (.not. lower) prob = 1.0_dp - prob
    if (prob <= 0.0_dp) then
-      out(i) = -huge(1.0_dp)
+      out(i) = -ieee_value(0.0_dp, ieee_positive_inf)
    else if (prob >= 1.0_dp) then
-      out(i) = huge(1.0_dp)
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
    else
       lo = -8.0_dp
       hi = 8.0_dp
@@ -16323,8 +17241,12 @@ allocate(out(size(q)))
 do i = 1, size(q)
    if (lam < 0.0_dp) then
       out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (q(i) /= q(i)) then
+      out(i) = q(i)
    else if (q(i) < 0.0_dp) then
       out(i) = merge(0.0_dp, 1.0_dp, lower)
+   else if (.not. ieee_is_finite(q(i))) then
+      out(i) = merge(1.0_dp, 0.0_dp, lower)
    else
       kk = int(floor(q(i)))
       term = exp(-lam)
@@ -16355,10 +17277,16 @@ if (present(lambda)) lam = lambda
 if (present(lower_tail)) lower = lower_tail
 allocate(out(size(pv)))
 do i = 1, size(pv)
-   prob = max(0.0_dp, min(1.0_dp, pv(i)))
-   if (.not. lower) prob = 1.0_dp - prob
-   if (lam < 0.0_dp) then
+   if (lam < 0.0_dp .or. pv(i) /= pv(i) .or. pv(i) < 0.0_dp .or. pv(i) > 1.0_dp) then
       out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   end if
+   prob = pv(i)
+   if (.not. lower) prob = 1.0_dp - prob
+   if (prob >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else if (prob <= 0.0_dp) then
+      out(i) = 0.0_dp
    else
       term = exp(-lam)
       cdf = term
@@ -16447,12 +17375,24 @@ real(kind=dp), intent(in), optional :: min, max
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: lo, hi
+integer :: i
 lo = 0.0_dp; hi = 1.0_dp
 if (present(min)) lo = min
 if (present(max)) hi = max
 allocate(out(size(x)))
-out = 0.0_dp
-if (hi > lo) where (x >= lo .and. x <= hi) out = 1.0_dp / (hi - lo)
+if (hi <= lo) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) >= lo .and. x(i) <= hi) then
+         out(i) = 1.0_dp / (hi - lo)
+      else
+         out(i) = 0.0_dp
+      end if
+   end do
+end if
 call maybe_log_density(out, log_)
 end function dunif_vec
 
@@ -16481,14 +17421,18 @@ real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: min, max
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: lo, hi
+integer :: i
 lo = 0.0_dp; hi = 1.0_dp
 if (present(min)) lo = min
 if (present(max)) hi = max
 allocate(out(size(p)))
-out = p
-where (out < 0.0_dp) out = 0.0_dp
-where (out > 1.0_dp) out = 1.0_dp
-out = lo + out * (hi - lo)
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. hi < lo) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else
+      out(i) = lo + p(i) * (hi - lo)
+   end if
+end do
 end function qunif_vec
 
 pure function dexp_vec(x, rate, log_) result(out)
@@ -16499,14 +17443,21 @@ logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: r
 logical :: l
+integer :: i
 r = 1.0_dp; if (present(rate)) r = rate
 l = .false.; if (present(log_)) l = log_
 allocate(out(size(x)))
-if (l) then
-   out = merge(log(r) - r * x, -huge(1.0_dp), x >= 0.0_dp .and. r > 0.0_dp)
-else
-   out = merge(r * exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
-end if
+do i = 1, size(x)
+   if (x(i) /= x(i) .or. r < 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) < 0.0_dp) then
+      out(i) = merge(-ieee_value(0.0_dp, ieee_positive_inf), 0.0_dp, l)
+   else if (l) then
+      out(i) = log(r) - r * x(i)
+   else
+      out(i) = r * exp(-r * x(i))
+   end if
+end do
 end function dexp_vec
 
 pure function pexp_vec(x, rate) result(out)
@@ -16515,9 +17466,18 @@ real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: rate
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: r
+integer :: i
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(x)))
-out = merge(1.0_dp - exp(-r * x), 0.0_dp, x >= 0.0_dp .and. r > 0.0_dp)
+do i = 1, size(x)
+   if (x(i) /= x(i) .or. r < 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else
+      out(i) = 1.0_dp - exp(-r * x(i))
+   end if
+end do
 end function pexp_vec
 
 pure function qexp_vec(p, rate) result(out)
@@ -16526,9 +17486,18 @@ real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: rate
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: r
+integer :: i
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(p)))
-out = -log(max(0.0_dp, 1.0_dp - max(0.0_dp, min(1.0_dp, p)))) / r
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. r <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      out(i) = -log(1.0_dp - p(i)) / r
+   end if
+end do
 end function qexp_vec
 
 pure function dgamma_vec(x, shape, rate, log_) result(out)
@@ -16539,13 +17508,28 @@ real(kind=dp), intent(in), optional :: rate
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: r, logc
+integer :: i
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(x)))
 if (shape <= 0.0_dp .or. r <= 0.0_dp) then
    out = ieee_value(0.0_dp, ieee_quiet_nan)
 else
    logc = shape * log(r) - log_gamma(shape)
-   out = merge(exp(logc + (shape - 1.0_dp) * log(max(x, tiny(1.0_dp))) - r * x), 0.0_dp, x >= 0.0_dp)
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) < 0.0_dp .or. .not. ieee_is_finite(x(i))) then
+         out(i) = 0.0_dp
+      else if (x(i) == 0.0_dp .and. shape < 1.0_dp) then
+         out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      else if (x(i) == 0.0_dp .and. shape == 1.0_dp) then
+         out(i) = r
+      else if (x(i) == 0.0_dp) then
+         out(i) = 0.0_dp
+      else
+         out(i) = exp(logc + (shape - 1.0_dp) * log(x(i)) - r * x(i))
+      end if
+   end do
 end if
 call maybe_log_density(out, log_)
 end function dgamma_vec
@@ -16561,7 +17545,15 @@ integer :: i
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = merge(gamma_p(shape, r * x(i)), 0.0_dp, x(i) >= 0.0_dp .and. shape > 0.0_dp .and. r > 0.0_dp)
+   if (x(i) /= x(i) .or. shape <= 0.0_dp .or. r <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
+   else
+      out(i) = gamma_p(shape, r * x(i))
+   end if
 end do
 end function pgamma_vec
 
@@ -16576,6 +17568,17 @@ integer :: i, it
 r = 1.0_dp; if (present(rate)) r = rate
 allocate(out(size(p)))
 do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. &
+      shape <= 0.0_dp .or. r <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   else if (p(i) == 0.0_dp) then
+      out(i) = 0.0_dp
+      cycle
+   else if (p(i) == 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      cycle
+   end if
    lo = 0.0_dp; hi = max(1.0_dp, shape / r * 10.0_dp)
    do while (gamma_p(shape, r * hi) < p(i))
       hi = hi * 2.0_dp
@@ -16598,9 +17601,35 @@ real(kind=dp), intent(in) :: shape2 ! second shape parameter
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: logc
+integer :: i
 allocate(out(size(x)))
-logc = log_gamma(shape1 + shape2) - log_gamma(shape1) - log_gamma(shape2)
-out = merge(exp(logc + (shape1 - 1.0_dp) * log(max(x, tiny(1.0_dp))) + (shape2 - 1.0_dp) * log(max(1.0_dp - x, tiny(1.0_dp)))), 0.0_dp, x > 0.0_dp .and. x < 1.0_dp)
+if (shape1 <= 0.0_dp .or. shape2 <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   logc = log_gamma(shape1 + shape2) - log_gamma(shape1) - log_gamma(shape2)
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) < 0.0_dp .or. x(i) > 1.0_dp) then
+         out(i) = 0.0_dp
+      else if (x(i) == 0.0_dp .and. shape1 < 1.0_dp) then
+         out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      else if (x(i) == 0.0_dp .and. shape1 == 1.0_dp) then
+         out(i) = shape2
+      else if (x(i) == 0.0_dp) then
+         out(i) = 0.0_dp
+      else if (x(i) == 1.0_dp .and. shape2 < 1.0_dp) then
+         out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      else if (x(i) == 1.0_dp .and. shape2 == 1.0_dp) then
+         out(i) = shape1
+      else if (x(i) == 1.0_dp) then
+         out(i) = 0.0_dp
+      else
+         out(i) = exp(logc + (shape1 - 1.0_dp) * log(x(i)) + &
+            (shape2 - 1.0_dp) * log(1.0_dp - x(i)))
+      end if
+   end do
+end if
 call maybe_log_density(out, log_)
 end function dbeta_vec
 
@@ -16613,7 +17642,15 @@ real(kind=dp), allocatable :: out(:)
 integer :: i
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = merge(0.0_dp, merge(1.0_dp, regularized_beta(x(i), shape1, shape2), x(i) >= 1.0_dp), x(i) <= 0.0_dp)
+   if (x(i) /= x(i) .or. shape1 <= 0.0_dp .or. shape2 <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (x(i) >= 1.0_dp) then
+      out(i) = 1.0_dp
+   else
+      out(i) = regularized_beta(x(i), shape1, shape2)
+   end if
 end do
 end function pbeta_vec
 
@@ -16627,6 +17664,17 @@ real(kind=dp) :: lo, hi, mid
 integer :: i, it
 allocate(out(size(p)))
 do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. &
+      shape1 <= 0.0_dp .or. shape2 <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   else if (p(i) == 0.0_dp) then
+      out(i) = 0.0_dp
+      cycle
+   else if (p(i) == 1.0_dp) then
+      out(i) = 1.0_dp
+      cycle
+   end if
    lo = 0.0_dp; hi = 1.0_dp
    do it = 1, 70
       mid = 0.5_dp * (lo + hi)
@@ -16699,6 +17747,10 @@ real(kind=dp) :: logc
 logical :: l
 allocate(out(size(x)))
 l = .false.; if (present(log_)) l = log_
+if (df <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 logc = log_gamma(0.5_dp * (df + 1.0_dp)) - log_gamma(0.5_dp * df) - 0.5_dp * log(df * acos(-1.0_dp))
 out = exp(logc - 0.5_dp * (df + 1.0_dp) * log(1.0_dp + x * x / df))
 if (l) out = log(max(tiny(1.0_dp), out))
@@ -16713,6 +17765,13 @@ real(kind=dp) :: z
 integer :: i
 allocate(out(size(x)))
 do i = 1, size(x)
+   if (x(i) /= x(i) .or. df <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(1.0_dp, 0.0_dp, x(i) > 0.0_dp)
+      cycle
+   end if
    z = df / (df + x(i) * x(i))
    if (x(i) >= 0.0_dp) then
       out(i) = 1.0_dp - 0.5_dp * regularized_beta(z, 0.5_dp * df, 0.5_dp)
@@ -16731,6 +17790,19 @@ real(kind=dp) :: lo, hi, mid, pmid(1)
 integer :: i, it
 allocate(out(size(p)))
 do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. df <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   else if (p(i) == 0.0_dp) then
+      out(i) = -ieee_value(0.0_dp, ieee_positive_inf)
+      cycle
+   else if (p(i) == 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      cycle
+   else if (p(i) == 0.5_dp) then
+      out(i) = 0.0_dp
+      cycle
+   end if
    lo = -32.0_dp; hi = 32.0_dp
    do it = 1, 80
       mid = 0.5_dp * (lo + hi)
@@ -16750,10 +17822,30 @@ real(kind=dp), intent(in) :: df2 ! denominator degrees of freedom
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: a, b, logc
+integer :: i
 allocate(out(size(x)))
+if (df1 <= 0.0_dp .or. df2 <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 a = 0.5_dp * df1; b = 0.5_dp * df2
 logc = a * log(df1 / df2) - (log_gamma(a) + log_gamma(b) - log_gamma(a + b))
-out = merge(exp(logc + (a - 1.0_dp) * log(max(x, tiny(1.0_dp))) - (a + b) * log(1.0_dp + (df1 / df2) * x)), 0.0_dp, x > 0.0_dp)
+do i = 1, size(x)
+   if (x(i) /= x(i)) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) < 0.0_dp .or. .not. ieee_is_finite(x(i))) then
+      out(i) = 0.0_dp
+   else if (x(i) == 0.0_dp .and. a < 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else if (x(i) == 0.0_dp .and. a == 1.0_dp) then
+      out(i) = 1.0_dp
+   else if (x(i) == 0.0_dp) then
+      out(i) = 0.0_dp
+   else
+      out(i) = exp(logc + (a - 1.0_dp) * log(x(i)) - &
+         (a + b) * log(1.0_dp + (df1 / df2) * x(i)))
+   end if
+end do
 call maybe_log_density(out, log_)
 end function df_vec
 
@@ -16767,8 +17859,12 @@ real(kind=dp) :: z
 integer :: i
 allocate(out(size(x)))
 do i = 1, size(x)
-   if (x(i) <= 0.0_dp) then
+   if (x(i) /= x(i) .or. df1 <= 0.0_dp .or. df2 <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (x(i) <= 0.0_dp) then
       out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
    else
       z = (df1 * x(i)) / (df1 * x(i) + df2)
       out(i) = regularized_beta(z, 0.5_dp * df1, 0.5_dp * df2)
@@ -16786,6 +17882,17 @@ real(kind=dp) :: lo, hi, mid, tmp(1)
 integer :: i, it
 allocate(out(size(p)))
 do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. &
+      df1 <= 0.0_dp .or. df2 <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      cycle
+   else if (p(i) == 0.0_dp) then
+      out(i) = 0.0_dp
+      cycle
+   else if (p(i) == 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      cycle
+   end if
    lo = 0.0_dp; hi = 1.0_dp
    do
       tmp = pf([hi], df1, df2)
@@ -16809,13 +17916,21 @@ real(kind=dp), intent(in), optional :: location ! location parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
-real(kind=dp) :: loc, sc, z(size(x)), ez(size(x))
+real(kind=dp) :: loc, sc, z, ez
+integer :: i
 loc = 0.0_dp; sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
-z = (x - loc) / sc; ez = exp(-z)
-out = ez / (sc * (1.0_dp + ez)**2)
+if (sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      z = abs((x(i) - loc) / sc)
+      ez = exp(-z)
+      out(i) = ez / (sc * (1.0_dp + ez)**2)
+   end do
+end if
 call maybe_log_density(out, log_)
 end function dlogis_vec
 
@@ -16825,12 +17940,25 @@ real(kind=dp), intent(in) :: x(:) ! input vector
 real(kind=dp), intent(in), optional :: location ! location parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 real(kind=dp), allocatable :: out(:)
-real(kind=dp) :: loc, sc
+real(kind=dp) :: loc, sc, z, ez
+integer :: i
 loc = 0.0_dp; sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
-out = 1.0_dp / (1.0_dp + exp(-((x - loc) / sc)))
+if (sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      z = (x(i) - loc) / sc
+      if (z >= 0.0_dp) then
+         out(i) = 1.0_dp / (1.0_dp + exp(-z))
+      else
+         ez = exp(z)
+         out(i) = ez / (1.0_dp + ez)
+      end if
+   end do
+end if
 end function plogis_vec
 
 pure function qlogis_vec(p, location, scale) result(out)
@@ -16839,13 +17967,23 @@ real(kind=dp), intent(in) :: p(:) ! probability value
 real(kind=dp), intent(in), optional :: location ! location parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 real(kind=dp), allocatable :: out(:)
-real(kind=dp) :: loc, sc, pp(size(p))
+real(kind=dp) :: loc, sc
+integer :: i
 loc = 0.0_dp; sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(p)))
-pp = max(tiny(1.0_dp), min(1.0_dp - epsilon(1.0_dp), p))
-out = loc + sc * log(pp / (1.0_dp - pp))
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. sc <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = -ieee_value(0.0_dp, ieee_positive_inf)
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      out(i) = loc + sc * log(p(i) / (1.0_dp - p(i)))
+   end if
+end do
 end function qlogis_vec
 
 pure function dlnorm_vec(x, meanlog, sdlog, log_) result(out)
@@ -16856,11 +17994,25 @@ real(kind=dp), intent(in), optional :: sdlog ! standard deviation on log scale
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: mu, sig
+integer :: i
 mu = 0.0_dp; sig = 1.0_dp
 if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
 allocate(out(size(x)))
-out = merge(exp(-log(x * sig * sqrt(2.0_dp * acos(-1.0_dp))) - 0.5_dp * ((log(x) - mu) / sig)**2), 0.0_dp, x > 0.0_dp)
+if (sig <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) <= 0.0_dp .or. .not. ieee_is_finite(x(i))) then
+         out(i) = 0.0_dp
+      else
+         out(i) = exp(-log(x(i) * sig * sqrt(2.0_dp * acos(-1.0_dp))) - &
+            0.5_dp * ((log(x(i)) - mu) / sig)**2)
+      end if
+   end do
+end if
 call maybe_log_density(out, log_)
 end function dlnorm_vec
 
@@ -16871,11 +18023,24 @@ real(kind=dp), intent(in), optional :: meanlog ! mean on log scale
 real(kind=dp), intent(in), optional :: sdlog ! standard deviation on log scale
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: mu, sig
+integer :: i
 mu = 0.0_dp; sig = 1.0_dp
 if (present(meanlog)) mu = meanlog
 if (present(sdlog)) sig = sdlog
 allocate(out(size(x)))
-out = merge(normal_cdf((log(x) - mu) / sig), 0.0_dp, x > 0.0_dp)
+if (sig <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) <= 0.0_dp) then
+         out(i) = 0.0_dp
+      else
+         out(i) = normal_cdf((log(x(i)) - mu) / sig)
+      end if
+   end do
+end if
 end function plnorm_vec
 
 pure function qlnorm_vec(p, meanlog, sdlog) result(out)
@@ -16899,9 +18064,28 @@ real(kind=dp), intent(in), optional :: scale ! scale parameter
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: sc
+integer :: i
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(x)))
-out = merge((shape / sc) * (x / sc)**(shape - 1.0_dp) * exp(-(x / sc)**shape), 0.0_dp, x >= 0.0_dp)
+if (shape <= 0.0_dp .or. sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) < 0.0_dp .or. (x(i) > 0.0_dp .and. .not. ieee_is_finite(x(i)))) then
+         out(i) = 0.0_dp
+      else if (x(i) == 0.0_dp .and. shape < 1.0_dp) then
+         out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+      else if (x(i) == 0.0_dp .and. shape == 1.0_dp) then
+         out(i) = 1.0_dp / sc
+      else if (x(i) == 0.0_dp) then
+         out(i) = 0.0_dp
+      else
+         out(i) = (shape / sc) * (x(i) / sc)**(shape - 1.0_dp) * exp(-(x(i) / sc)**shape)
+      end if
+   end do
+end if
 call maybe_log_density(out, log_)
 end function dweibull_vec
 
@@ -16912,9 +18096,22 @@ real(kind=dp), intent(in) :: shape ! shape parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: sc
+integer :: i
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(x)))
-out = merge(1.0_dp - exp(-(x / sc)**shape), 0.0_dp, x >= 0.0_dp)
+if (shape <= 0.0_dp .or. sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do i = 1, size(x)
+      if (x(i) /= x(i)) then
+         out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+      else if (x(i) <= 0.0_dp) then
+         out(i) = 0.0_dp
+      else
+         out(i) = 1.0_dp - exp(-(x(i) / sc)**shape)
+      end if
+   end do
+end if
 end function pweibull_vec
 
 pure function qweibull_vec(p, shape, scale) result(out)
@@ -16924,9 +18121,19 @@ real(kind=dp), intent(in) :: shape ! shape parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: sc
+integer :: i
 sc = 1.0_dp; if (present(scale)) sc = scale
 allocate(out(size(p)))
-out = sc * (-log(max(tiny(1.0_dp), 1.0_dp - max(0.0_dp, min(1.0_dp, p)))))**(1.0_dp / shape)
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. &
+      shape <= 0.0_dp .or. sc <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      out(i) = sc * (-log(1.0_dp - p(i)))**(1.0_dp / shape)
+   end if
+end do
 end function qweibull_vec
 
 pure function dcauchy_vec(x, location, scale, log_) result(out)
@@ -16942,7 +18149,11 @@ if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
 z = (x - loc) / sc
-out = 1.0_dp / (acos(-1.0_dp) * sc * (1.0_dp + z * z))
+if (sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   out = 1.0_dp / (acos(-1.0_dp) * sc * (1.0_dp + z * z))
+end if
 call maybe_log_density(out, log_)
 end function dcauchy_vec
 
@@ -16957,7 +18168,11 @@ loc = 0.0_dp; sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(x)))
-out = 0.5_dp + atan((x - loc) / sc) / acos(-1.0_dp)
+if (sc <= 0.0_dp) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   out = 0.5_dp + atan((x - loc) / sc) / acos(-1.0_dp)
+end if
 end function pcauchy_vec
 
 pure function qcauchy_vec(p, location, scale) result(out)
@@ -16967,11 +18182,22 @@ real(kind=dp), intent(in), optional :: location ! location parameter
 real(kind=dp), intent(in), optional :: scale ! scale parameter
 real(kind=dp), allocatable :: out(:)
 real(kind=dp) :: loc, sc
+integer :: i
 loc = 0.0_dp; sc = 1.0_dp
 if (present(location)) loc = location
 if (present(scale)) sc = scale
 allocate(out(size(p)))
-out = loc + sc * tan(acos(-1.0_dp) * (p - 0.5_dp))
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp .or. sc <= 0.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = -ieee_value(0.0_dp, ieee_positive_inf)
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      out(i) = loc + sc * tan(acos(-1.0_dp) * (p(i) - 0.5_dp))
+   end if
+end do
 end function qcauchy_vec
 
 pure function dbinom_vec(x, nsize, prob, log_) result(out)
@@ -16984,8 +18210,13 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, k
 allocate(out(size(x)))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    k = int(x(i))
-   if (k < 0 .or. k > nsize .or. prob < 0.0_dp .or. prob > 1.0_dp) then
+   if (x(i) /= real(k, kind=dp) .or. k < 0 .or. k > nsize .or. &
+      prob < 0.0_dp .or. prob > 1.0_dp) then
       out(i) = 0.0_dp
    else
       out(i) = r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * prob**k * (1.0_dp - prob)**(nsize - k)
@@ -17003,10 +18234,19 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, k
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = 0.0_dp
-   do k = 0, min(nsize, int(floor(x(i))))
-      out(i) = out(i) + r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * prob**k * (1.0_dp - prob)**(nsize - k)
-   end do
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
+   else
+      out(i) = 0.0_dp
+      do k = 0, min(nsize, int(floor(x(i))))
+         out(i) = out(i) + r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * &
+            prob**k * (1.0_dp - prob)**(nsize - k)
+      end do
+   end if
 end do
 end function pbinom_vec
 
@@ -17020,12 +18260,21 @@ integer :: i, k
 real(kind=dp) :: cdf
 allocate(out(size(p)))
 do i = 1, size(p)
-   cdf = 0.0_dp
-   do k = 0, nsize
-      cdf = cdf + r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * prob**k * (1.0_dp - prob)**(nsize - k)
-      if (cdf >= p(i)) exit
-   end do
-   out(i) = real(k, kind=dp)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (p(i) >= 1.0_dp) then
+      out(i) = real(nsize, kind=dp)
+   else
+      cdf = 0.0_dp
+      do k = 0, nsize
+         cdf = cdf + r_choose_real(real(nsize, kind=dp), real(k, kind=dp)) * &
+            prob**k * (1.0_dp - prob)**(nsize - k)
+         if (cdf >= p(i)) exit
+      end do
+      out(i) = real(k, kind=dp)
+   end if
 end do
 end function qbinom_vec
 
@@ -17040,8 +18289,16 @@ integer :: i, k
 lam = 1.0_dp; if (present(lambda)) lam = lambda
 allocate(out(size(x)))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    k = int(x(i))
-   out(i) = merge(exp(-lam + real(k, kind=dp) * log(lam) - log_gamma(real(k + 1, kind=dp))), 0.0_dp, k >= 0)
+   if (x(i) /= real(k, kind=dp) .or. k < 0) then
+      out(i) = 0.0_dp
+   else
+      out(i) = exp(-lam + real(k, kind=dp) * log(lam) - log_gamma(real(k + 1, kind=dp)))
+   end if
 end do
 call maybe_log_density(out, log_)
 end function dpois_vec
@@ -17052,8 +18309,20 @@ real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
 logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:)
+integer :: i, k
 allocate(out(size(x)))
-out = merge(prob * (1.0_dp - prob)**int(x), 0.0_dp, x >= 0.0_dp)
+do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
+   k = int(x(i))
+   if (x(i) /= real(k, kind=dp) .or. k < 0) then
+      out(i) = 0.0_dp
+   else
+      out(i) = prob * (1.0_dp - prob)**k
+   end if
+end do
 call maybe_log_density(out, log_)
 end function dgeom_vec
 
@@ -17062,8 +18331,19 @@ pure function pgeom_vec(x, prob) result(out)
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: prob ! success probability
 real(kind=dp), allocatable :: out(:)
+integer :: i
 allocate(out(size(x)))
-out = merge(1.0_dp - (1.0_dp - prob)**(int(x) + 1), 0.0_dp, x >= 0.0_dp)
+do i = 1, size(x)
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
+   else
+      out(i) = 1.0_dp - (1.0_dp - prob)**(int(floor(x(i))) + 1)
+   end if
+end do
 end function pgeom_vec
 
 pure function qgeom_vec(p, prob) result(out)
@@ -17071,9 +18351,20 @@ pure function qgeom_vec(p, prob) result(out)
 real(kind=dp), intent(in) :: p(:) ! probabilities, clamped to [0,1]
 real(kind=dp), intent(in) :: prob ! success probability
 real(kind=dp), allocatable :: out(:)
+integer :: i
 allocate(out(size(p)))
-out = ceiling(log(max(tiny(1.0_dp), 1.0_dp - p)) / log(1.0_dp - prob) - 1.0_dp)
-where (out < 0.0_dp) out = 0.0_dp
+do i = 1, size(p)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      out(i) = max(0.0_dp, real(ceiling(log(1.0_dp - p(i)) / &
+         log(1.0_dp - prob) - 1.0_dp), kind=dp))
+   end if
+end do
 end function qgeom_vec
 
 pure function dnbinom_vec(x, nsize, prob, log_) result(out)
@@ -17086,8 +18377,17 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, k
 allocate(out(size(x)))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    k = int(x(i))
-   out(i) = merge(r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k, 0.0_dp, k >= 0)
+   if (x(i) /= real(k, kind=dp) .or. k < 0) then
+      out(i) = 0.0_dp
+   else
+      out(i) = r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * &
+         prob**nsize * (1.0_dp - prob)**k
+   end if
 end do
 call maybe_log_density(out, log_)
 end function dnbinom_vec
@@ -17101,10 +18401,19 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, k
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = 0.0_dp
-   do k = 0, int(floor(x(i)))
-      out(i) = out(i) + r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k
-   end do
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
+   else
+      out(i) = 0.0_dp
+      do k = 0, int(floor(x(i)))
+         out(i) = out(i) + r_choose_real(real(k + nsize - 1, kind=dp), &
+            real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k
+      end do
+   end if
 end do
 end function pnbinom_vec
 
@@ -17118,13 +18427,22 @@ integer :: i, k
 real(kind=dp) :: cdf
 allocate(out(size(p)))
 do i = 1, size(p)
-   cdf = 0.0_dp; k = 0
-   do while (cdf < p(i) .and. k < 100000)
-      cdf = cdf + r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * prob**nsize * (1.0_dp - prob)**k
-      if (cdf >= p(i)) exit
-      k = k + 1
-   end do
-   out(i) = real(k, kind=dp)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (p(i) >= 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_positive_inf)
+   else
+      cdf = 0.0_dp; k = 0
+      do while (cdf < p(i) .and. k < 100000)
+         cdf = cdf + r_choose_real(real(k + nsize - 1, kind=dp), real(k, kind=dp)) * &
+            prob**nsize * (1.0_dp - prob)**k
+         if (cdf >= p(i)) exit
+         k = k + 1
+      end do
+      out(i) = real(k, kind=dp)
+   end if
 end do
 end function qnbinom_vec
 
@@ -17141,9 +18459,17 @@ real(kind=dp) :: den
 allocate(out(size(x)))
 den = r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    xx = int(x(i))
-   out(i) = r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
-      & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / den
+   if (x(i) /= real(xx, kind=dp)) then
+      out(i) = 0.0_dp
+   else
+      out(i) = r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
+         & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / den
+   end if
 end do
 call maybe_log_density(out, log_)
 end function dhyper_vec
@@ -17158,12 +18484,20 @@ real(kind=dp), allocatable :: out(:)
 integer :: i, xx
 allocate(out(size(x)))
 do i = 1, size(x)
-   out(i) = 0.0_dp
-   do xx = 0, int(floor(x(i)))
-      out(i) = out(i) + r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
-         & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / &
-         & r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
-   end do
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (.not. ieee_is_finite(x(i))) then
+      out(i) = 1.0_dp
+   else
+      out(i) = 0.0_dp
+      do xx = 0, int(floor(x(i)))
+         out(i) = out(i) + r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
+            & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / &
+            & r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
+      end do
+   end if
 end do
 end function phyper_vec
 
@@ -17178,14 +18512,22 @@ integer :: i, xx
 real(kind=dp) :: cdf
 allocate(out(size(p)))
 do i = 1, size(p)
-   cdf = 0.0_dp
-   do xx = 0, k
-      cdf = cdf + r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
-         & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / &
-         & r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
-      if (cdf >= p(i)) exit
-   end do
-   out(i) = real(xx, kind=dp)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = real(max(0, k - n), kind=dp)
+   else if (p(i) >= 1.0_dp) then
+      out(i) = real(min(k, m), kind=dp)
+   else
+      cdf = 0.0_dp
+      do xx = max(0, k - n), min(k, m)
+         cdf = cdf + r_choose_real(real(m, kind=dp), real(xx, kind=dp)) * &
+            & r_choose_real(real(n, kind=dp), real(k - xx, kind=dp)) / &
+            & r_choose_real(real(m + n, kind=dp), real(k, kind=dp))
+         if (cdf >= p(i)) exit
+      end do
+      out(i) = real(xx, kind=dp)
+   end if
 end do
 end function qhyper_vec
 
@@ -17225,13 +18567,21 @@ logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:), counts(:)
 integer :: i, xx, offset
 real(kind=dp) :: den
+allocate(out(size(x)))
+if (m <= 0 .or. n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 counts = wilcox_counts(m, n)
 offset = m * (m + 1) / 2
 den = r_choose_real(real(m + n, kind=dp), real(m, kind=dp))
-allocate(out(size(x)))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    xx = int(x(i))
-   if (xx >= 0 .and. xx <= m * n) then
+   if (x(i) == real(xx, kind=dp) .and. xx >= 0 .and. xx <= m * n) then
       out(i) = counts(xx + 1) / den
    else
       out(i) = 0.0_dp
@@ -17248,9 +18598,15 @@ integer, intent(in) :: n ! black ball count or sample size
 real(kind=dp), allocatable :: out(:), d(:)
 integer :: i, xx
 allocate(out(size(x)))
+if (m <= 0 .or. n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 d = dwilcox([(real(xx, kind=dp), xx = 0, m * n)], m, n)
 do i = 1, size(x)
-   if (x(i) < 0.0_dp) then
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
       out(i) = 0.0_dp
    else if (x(i) >= real(m * n, kind=dp)) then
       out(i) = 1.0_dp
@@ -17270,14 +18626,26 @@ real(kind=dp), allocatable :: out(:), d(:)
 integer :: i, xx
 real(kind=dp) :: cdf
 allocate(out(size(p)))
+if (m <= 0 .or. n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 d = dwilcox([(real(xx, kind=dp), xx = 0, m * n)], m, n)
 do i = 1, size(p)
-   cdf = 0.0_dp
-   do xx = 0, m * n
-      cdf = cdf + d(xx + 1)
-      if (cdf >= p(i)) exit
-   end do
-   out(i) = real(xx, kind=dp)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (p(i) >= 1.0_dp) then
+      out(i) = real(m * n, kind=dp)
+   else
+      cdf = 0.0_dp
+      do xx = 0, m * n
+         cdf = cdf + d(xx + 1)
+         if (cdf >= p(i)) exit
+      end do
+      out(i) = real(xx, kind=dp)
+   end if
 end do
 end function qwilcox_vec
 
@@ -17305,12 +18673,20 @@ logical, intent(in), optional :: log_
 real(kind=dp), allocatable :: out(:), counts(:)
 integer :: i, xx
 real(kind=dp) :: den
+allocate(out(size(x)))
+if (n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 counts = signrank_counts(n)
 den = 2.0_dp**n
-allocate(out(size(x)))
 do i = 1, size(x)
+   if (.not. ieee_is_finite(x(i))) then
+      out(i) = merge(x(i), 0.0_dp, x(i) /= x(i))
+      cycle
+   end if
    xx = int(x(i))
-   if (xx >= 0 .and. xx <= n * (n + 1) / 2) then
+   if (x(i) == real(xx, kind=dp) .and. xx >= 0 .and. xx <= n * (n + 1) / 2) then
       out(i) = counts(xx + 1) / den
    else
       out(i) = 0.0_dp
@@ -17327,9 +18703,15 @@ real(kind=dp), allocatable :: out(:), d(:)
 integer :: i, xx, maxs
 maxs = n * (n + 1) / 2
 allocate(out(size(x)))
+if (n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 d = dsignrank([(real(xx, kind=dp), xx = 0, maxs)], n)
 do i = 1, size(x)
-   if (x(i) < 0.0_dp) then
+   if (x(i) /= x(i)) then
+      out(i) = x(i)
+   else if (x(i) < 0.0_dp) then
       out(i) = 0.0_dp
    else if (x(i) >= real(maxs, kind=dp)) then
       out(i) = 1.0_dp
@@ -17349,14 +18731,26 @@ integer :: i, xx, maxs
 real(kind=dp) :: cdf
 maxs = n * (n + 1) / 2
 allocate(out(size(p)))
+if (n <= 0) then
+   out = ieee_value(0.0_dp, ieee_quiet_nan)
+   return
+end if
 d = dsignrank([(real(xx, kind=dp), xx = 0, maxs)], n)
 do i = 1, size(p)
-   cdf = 0.0_dp
-   do xx = 0, maxs
-      cdf = cdf + d(xx + 1)
-      if (cdf >= p(i)) exit
-   end do
-   out(i) = real(xx, kind=dp)
+   if (p(i) /= p(i) .or. p(i) < 0.0_dp .or. p(i) > 1.0_dp) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else if (p(i) <= 0.0_dp) then
+      out(i) = 0.0_dp
+   else if (p(i) >= 1.0_dp) then
+      out(i) = real(maxs, kind=dp)
+   else
+      cdf = 0.0_dp
+      do xx = 0, maxs
+         cdf = cdf + d(xx + 1)
+         if (cdf >= p(i)) exit
+      end do
+      out(i) = real(xx, kind=dp)
+   end if
 end do
 end function qsignrank_vec
 
@@ -18091,10 +19485,28 @@ pure function ecdf_eval(x, q) result(out)
 real(kind=dp), intent(in) :: x(:) ! quantiles or observed values
 real(kind=dp), intent(in) :: q(:) ! quantiles
 real(kind=dp), allocatable :: out(:)
-integer :: i
+integer :: i, j, n_le, n_valid
 allocate(out(size(q)))
+n_valid = 0
+do j = 1, size(x)
+   if (x(j) == x(j)) n_valid = n_valid + 1
+end do
 do i = 1, size(q)
-   out(i) = real(count(x <= q(i)), kind=dp) / real(size(x), kind=dp)
+   if (r_is_na_payload(q(i))) then
+      out(i) = r_na_real()
+   else if (q(i) /= q(i)) then
+      out(i) = q(i)
+   else if (n_valid <= 0) then
+      out(i) = ieee_value(0.0_dp, ieee_quiet_nan)
+   else
+      n_le = 0
+      do j = 1, size(x)
+         if (x(j) == x(j)) then
+            if (x(j) <= q(i)) n_le = n_le + 1
+         end if
+      end do
+      out(i) = real(n_le, kind=dp) / real(n_valid, kind=dp)
+   end if
 end do
 end function ecdf_eval
 
