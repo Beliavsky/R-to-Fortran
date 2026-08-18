@@ -22034,6 +22034,28 @@ def emit_stmts(
                 continue
             if _emit_optim_bfgs_assignment(o, st.name, rhs, st.comment, helper_ctx):
                 continue
+            rhs_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", rhs)
+            c_as_tibble = parse_call_text(rhs_no_ns)
+            if c_as_tibble is not None and c_as_tibble[0].lower() == "as_tibble":
+                inner_tibble = (
+                    c_as_tibble[1][0].strip()
+                    if c_as_tibble[1]
+                    else c_as_tibble[2].get("x", "").strip()
+                )
+                c_tibble_csv = parse_call_text(inner_tibble)
+                if c_tibble_csv is not None and c_tibble_csv[0].lower() == "read.csv":
+                    path_src = (
+                        c_tibble_csv[1][0]
+                        if c_tibble_csv[1]
+                        else c_tibble_csv[2].get("file", '""')
+                    )
+                    _CSV_HEADER_SOURCES[st.name.lower()] = path_src
+                    need_r_mod.update({"read_csv_tibble_real", "r_tibble_real_t"})
+                    _wstmt(
+                        f"{st.name} = read_csv_tibble_real({r_expr_to_fortran(path_src)})",
+                        st.comment,
+                    )
+                    continue
             c_read_csv = parse_call_text(rhs)
             if c_read_csv is not None and c_read_csv[0].lower() == "read.csv":
                 path_src = c_read_csv[1][0] if c_read_csv[1] else c_read_csv[2].get("file", '""')
@@ -37603,6 +37625,7 @@ def transpile_r_to_fortran(
     qr_vars: set[str] = set()
     nlm_vars: set[str] = set()
     t_test_vars: set[str] = set()
+    tibble_vars: set[str] = set()
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
     call_pat = re.compile(r"^([A-Za-z]\w*)\s*\(")
@@ -37704,7 +37727,8 @@ def transpile_r_to_fortran(
             if fields_main is not None:
                 _register_main_list_fields(st.name, fields_main)
                 continue
-            c_fit_main = parse_call_text(st.expr.strip())
+            expr_main_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", st.expr.strip())
+            c_fit_main = parse_call_text(expr_main_no_ns)
             c_fit_primary_src = _trycatch_primary_expr(st.expr.strip())
             if c_fit_primary_src is not None:
                 c_fit_main = parse_call_text(c_fit_primary_src)
@@ -37790,6 +37814,9 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "integrate":
                 list_vars[st.name] = "integrate_result_t"
                 helper_ctx_main["need_r_mod"].update({"integrate", "integrate_result_t", "print_integrate_result"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "as_tibble":
+                tibble_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].update({"r_tibble_real_t", "read_csv_tibble_real"})
             if c_fit_main is not None and c_fit_main[0].lower() == "aggregate":
                 list_vars[st.name] = "aggregate_result_t"
                 helper_ctx_main["need_r_mod"].update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
@@ -38718,7 +38745,7 @@ def transpile_r_to_fortran(
     helper_ctx_main["date_scalar_vars"] = set(_KNOWN_DATE_NAMES)
     helper_ctx_main["posixct_vars"] = set(_KNOWN_POSIXCT_NAMES)
 
-    for nm in set(list_vars) | set(main_object_list_vars) | set(hist_vars) | set(file_info_vars):
+    for nm in set(list_vars) | set(main_object_list_vars) | set(hist_vars) | set(file_info_vars) | tibble_vars:
         ints.discard(nm)
         int_arrays.discard(nm)
         real_arrays.discard(nm)
@@ -38926,6 +38953,8 @@ def transpile_r_to_fortran(
         pbody.w("complex(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(complex_matrices)))
     if t_test_vars:
         pbody.w("type(t_test_result_t) :: " + ", ".join(sorted(t_test_vars)))
+    if tibble_vars:
+        pbody.w("type(r_tibble_real_t) :: " + ", ".join(sorted(tibble_vars)))
     if char_scalars:
         pbody.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars)))
     if char_arrays:

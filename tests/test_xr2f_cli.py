@@ -4431,6 +4431,30 @@ def test_xr2f_io_and_difftime_keyword_args_compile(tmp_path: Path) -> None:
     assert "/ 60.0_dp" in out_text
 
 
+def test_xr2f_as_tibble_read_csv_compile(tmp_path: Path) -> None:
+    (tmp_path / "csv_in.csv").write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    local_input = tmp_path / "xtibble_csv.r"
+    local_input.write_text(
+        'tbl <- tibble::as_tibble(read.csv("csv_in.csv", check.names = FALSE))\n',
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xtibble_csv.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "type(r_tibble_real_t) :: tbl" in out_text
+    assert 'tbl = read_csv_tibble_real("csv_in.csv")' in out_text
+
+
 def test_xr2f_string_helper_keyword_args_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xstring_keywords.r"
     local_input.write_text(

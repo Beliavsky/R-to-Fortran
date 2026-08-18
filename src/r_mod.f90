@@ -57,6 +57,9 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & sys_getenv, file_rename, unlink_recursive
 public :: as_octmode, as_hexmode, as_roman, inttobits, str_to_int, str_to_real, fivenum
 public :: r_dataframe_t, table_char_t, table_char, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
+public :: r_tibble_real_t, tibble_real, tibble_nrow, tibble_ncol, tibble_real_col, &
+   & tibble_real_filter, tibble_real_select, tibble_real_drop, tibble_real_mutate, &
+   & tibble_real_log_returns, tibble_real_stats, read_csv_tibble_real, print_tibble
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -96,6 +99,19 @@ type :: r_dataframe_t
    character(len=:), allocatable :: names(:)
    real(kind=dp), allocatable :: real_cols(:,:)
 end type r_dataframe_t
+
+type :: r_tibble_real_t
+! Real-only columnar table used by the initial restricted tibble API.
+   character(len=:), allocatable :: names(:)
+   character(len=:), allocatable :: row_labels(:)
+   character(len=:), allocatable :: row_label_name
+   real(kind=dp), allocatable :: real_cols(:,:)
+end type r_tibble_real_t
+
+interface tibble_real_mutate
+   module procedure tibble_real_mutate_vector
+   module procedure tibble_real_mutate_scalar
+end interface tibble_real_mutate
 
 type :: table_char_t
    character(len=:), allocatable :: gene(:)
@@ -15603,13 +15619,27 @@ end do
 close(fp)
 end subroutine read_table_real_matrix
 
-subroutine read_csv_real_matrix(file_path, x)
+subroutine read_csv_real_matrix(file_path, x, max_rows, max_cols)
 ! Read a comma-delimited numeric CSV with one header row into a matrix.
 character(len=*), intent(in) :: file_path ! input CSV file path
 real(kind=dp), allocatable, intent(out) :: x(:,:) ! numeric data rows
+integer, intent(in), optional :: max_rows ! maximum number of data rows to read
+integer, intent(in), optional :: max_cols ! maximum number of leading columns to read
 character(len=4096) :: line
 character(len=256) :: token
 integer :: fp, ios, nrow, ncol, i, j, k, start, stop, yy, mm, dd
+integer :: row_limit, col_limit
+
+row_limit = huge(1)
+col_limit = huge(1)
+if (present(max_rows)) then
+   if (max_rows < 0) error stop "read_csv_real_matrix: max_rows must be nonnegative"
+   row_limit = max_rows
+end if
+if (present(max_cols)) then
+   if (max_cols < 0) error stop "read_csv_real_matrix: max_cols must be nonnegative"
+   col_limit = max_cols
+end if
 nrow = 0
 ncol = 0
 open(newunit=fp, file=file_path, status="old", action="read")
@@ -15623,14 +15653,16 @@ ncol = 1
 do k = 1, len_trim(line)
    if (line(k:k) == ",") ncol = ncol + 1
 end do
+ncol = min(ncol, col_limit)
 do
+   if (nrow >= row_limit) exit
    read(fp, "(A)", iostat=ios) line
    if (ios /= 0) exit
    if (len_trim(line) == 0) cycle
    nrow = nrow + 1
 end do
 if (nrow <= 0 .or. ncol <= 0) then
-   allocate(x(0,0))
+   allocate(x(nrow, ncol))
    close(fp)
    return
 end if
@@ -15642,6 +15674,7 @@ do
    read(fp, "(A)", iostat=ios) line
    if (ios /= 0) exit
    if (len_trim(line) == 0) cycle
+   if (i >= nrow) exit
    i = i + 1
    start = 1
    do j = 1, ncol
@@ -15673,6 +15706,94 @@ do
 end do
 close(fp)
 end subroutine read_csv_real_matrix
+
+function read_csv_text_column(file_path, column, max_rows) result(values)
+! Read one CSV column as text, excluding the header row.
+character(len=*), intent(in) :: file_path
+integer, intent(in) :: column
+integer, intent(in), optional :: max_rows
+character(len=:), allocatable :: values(:)
+character(len=4096) :: line
+integer :: fp, ios, nrow, i, row_limit
+
+if (column < 1) error stop "read_csv_text_column: column must be positive"
+row_limit = huge(1)
+if (present(max_rows)) then
+   if (max_rows < 0) error stop "read_csv_text_column: max_rows must be nonnegative"
+   row_limit = max_rows
+end if
+open(newunit=fp, file=file_path, status="old", action="read")
+read(fp, "(A)", iostat=ios) line
+nrow = 0
+do
+   if (nrow >= row_limit) exit
+   read(fp, "(A)", iostat=ios) line
+   if (ios /= 0) exit
+   if (len_trim(line) == 0) cycle
+   nrow = nrow + 1
+end do
+allocate(character(len=4096) :: values(nrow))
+rewind(fp)
+read(fp, "(A)", iostat=ios) line
+i = 0
+do while (i < nrow)
+   read(fp, "(A)", iostat=ios) line
+   if (ios /= 0) exit
+   if (len_trim(line) == 0) cycle
+   i = i + 1
+   values(i) = csv_text_field(line, column)
+end do
+close(fp)
+end function read_csv_text_column
+
+function csv_text_field(line, column) result(value)
+! Extract one field from a CSV record, respecting simple quoted fields.
+character(len=*), intent(in) :: line
+integer, intent(in) :: column
+character(len=:), allocatable :: value
+character(len=1) :: ch, quote
+integer :: current, i, start, line_len, value_len
+logical :: in_quotes
+
+value = ""
+current = 1
+start = 1
+line_len = len_trim(line)
+in_quotes = .false.
+quote = " "
+do i = 1, line_len + 1
+   if (i <= line_len) then
+      ch = line(i:i)
+   else
+      ch = ","
+   end if
+   if (in_quotes) then
+      if (ch == quote) in_quotes = .false.
+   else if (ch == achar(34) .or. ch == achar(39)) then
+      in_quotes = .true.
+      quote = ch
+   else if (ch == ",") then
+      if (current == column) then
+         if (i > start) value = trim(adjustl(line(start:i - 1)))
+         value_len = len(value)
+         if (value_len >= 2) then
+            if ((value(1:1) == achar(34) .and. value(value_len:value_len) == achar(34)) .or. &
+                (value(1:1) == achar(39) .and. value(value_len:value_len) == achar(39))) then
+               if (value_len > 2) then
+                  value = value(2:value_len - 1)
+               else
+                  value = ""
+               end if
+            end if
+         end if
+         return
+      end if
+      current = current + 1
+      start = i + 1
+   end if
+end do
+error stop "csv_text_field: column not found"
+end function csv_text_field
 
 function read_csv_header_names(file_path) result(names)
 ! Read the first CSV row as a character vector of header names.
@@ -20164,6 +20285,433 @@ allocate(character(len=name_len) :: df%names(size(names)))
 df%names = names
 df%real_cols = cols
 end function data_frame_real
+
+function tibble_real(names, cols, row_labels, row_label_name) result(tbl)
+character(len=*), intent(in) :: names(:)
+real(kind=dp), intent(in) :: cols(:,:)
+character(len=*), intent(in), optional :: row_labels(:)
+character(len=*), intent(in), optional :: row_label_name
+type(r_tibble_real_t) :: tbl
+integer :: j, k, name_len, row_label_len
+
+if (size(names) /= size(cols, 2)) &
+   error stop "tibble_real: number of names must match number of columns"
+do j = 1, size(names)
+   if (len_trim(names(j)) == 0) error stop "tibble_real: column names must not be empty"
+   do k = 1, j - 1
+      if (trim(names(j)) == trim(names(k))) error stop "tibble_real: duplicate column name"
+   end do
+end do
+
+name_len = 1
+do j = 1, size(names)
+   name_len = max(name_len, len_trim(names(j)))
+end do
+allocate(character(len=name_len) :: tbl%names(size(names)))
+tbl%names = names
+tbl%real_cols = cols
+if (present(row_labels)) then
+   if (size(row_labels) /= size(cols, 1)) &
+      error stop "tibble_real: number of row labels must match number of rows"
+   row_label_len = 1
+   do j = 1, size(row_labels)
+      row_label_len = max(row_label_len, len_trim(row_labels(j)))
+   end do
+   allocate(character(len=row_label_len) :: tbl%row_labels(size(row_labels)))
+   tbl%row_labels = row_labels
+   if (present(row_label_name)) then
+      if (len_trim(row_label_name) == 0) &
+         error stop "tibble_real: row label name must not be empty"
+      tbl%row_label_name = trim(row_label_name)
+   end if
+else if (present(row_label_name)) then
+   error stop "tibble_real: row label name requires row labels"
+end if
+end function tibble_real
+
+pure integer function tibble_nrow(tbl) result(n)
+type(r_tibble_real_t), intent(in) :: tbl
+
+n = 0
+if (allocated(tbl%real_cols)) n = size(tbl%real_cols, 1)
+end function tibble_nrow
+
+pure integer function tibble_ncol(tbl) result(n)
+type(r_tibble_real_t), intent(in) :: tbl
+
+n = 0
+if (allocated(tbl%real_cols)) n = size(tbl%real_cols, 2)
+end function tibble_ncol
+
+function tibble_real_col(tbl, name) result(col)
+type(r_tibble_real_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+real(kind=dp), allocatable :: col(:)
+integer :: j
+
+do j = 1, tibble_ncol(tbl)
+   if (trim(tbl%names(j)) == trim(name)) then
+      col = tbl%real_cols(:, j)
+      return
+   end if
+end do
+error stop "tibble_real_col: column not found"
+end function tibble_real_col
+
+function tibble_real_filter(tbl, keep) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+logical, intent(in) :: keep(:)
+type(r_tibble_real_t) :: out
+real(kind=dp), allocatable :: cols(:,:)
+integer :: j
+
+if (size(keep) /= tibble_nrow(tbl)) &
+   error stop "tibble_real_filter: mask length must match number of rows"
+allocate(cols(count(keep), tibble_ncol(tbl)))
+do j = 1, tibble_ncol(tbl)
+   cols(:, j) = pack(tbl%real_cols(:, j), keep)
+end do
+if (allocated(tbl%row_labels)) then
+   out = tibble_real(tbl%names, cols, pack(tbl%row_labels, keep))
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_real(tbl%names, cols)
+end if
+end function tibble_real_filter
+
+function tibble_real_select(tbl, selected_names) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+character(len=*), intent(in) :: selected_names(:)
+type(r_tibble_real_t) :: out
+real(kind=dp), allocatable :: cols(:,:)
+integer :: i, j
+logical :: found
+
+allocate(cols(tibble_nrow(tbl), size(selected_names)))
+do i = 1, size(selected_names)
+   found = .false.
+   do j = 1, tibble_ncol(tbl)
+      if (trim(tbl%names(j)) == trim(selected_names(i))) then
+         cols(:, i) = tbl%real_cols(:, j)
+         found = .true.
+         exit
+      end if
+   end do
+   if (.not. found) error stop "tibble_real_select: column not found"
+end do
+if (allocated(tbl%row_labels)) then
+   out = tibble_real(selected_names, cols, tbl%row_labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_real(selected_names, cols)
+end if
+end function tibble_real_select
+
+function tibble_real_drop(tbl, dropped_names) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+character(len=*), intent(in) :: dropped_names(:)
+type(r_tibble_real_t) :: out
+character(len=:), allocatable :: kept_names(:)
+logical, allocatable :: keep(:)
+integer :: i, j, name_len
+
+allocate(keep(tibble_ncol(tbl)), source=.true.)
+do i = 1, size(dropped_names)
+   do j = 1, tibble_ncol(tbl)
+      if (trim(tbl%names(j)) == trim(dropped_names(i))) keep(j) = .false.
+   end do
+end do
+name_len = 1
+if (allocated(tbl%names)) name_len = max(name_len, len(tbl%names))
+allocate(character(len=name_len) :: kept_names(count(keep)))
+kept_names = pack(tbl%names, keep)
+out = tibble_real_select(tbl, kept_names)
+end function tibble_real_drop
+
+function tibble_real_mutate_vector(tbl, name, values) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+real(kind=dp), intent(in) :: values(:)
+type(r_tibble_real_t) :: out
+character(len=:), allocatable :: names(:)
+real(kind=dp), allocatable :: cols(:,:)
+integer :: j, name_len, target
+
+if (size(values) /= tibble_nrow(tbl)) &
+   error stop "tibble_real_mutate: column length must match number of rows"
+if (len_trim(name) == 0) error stop "tibble_real_mutate: column name must not be empty"
+
+target = 0
+do j = 1, tibble_ncol(tbl)
+   if (trim(tbl%names(j)) == trim(name)) then
+      target = j
+      exit
+   end if
+end do
+if (target > 0) then
+   out = tbl
+   out%real_cols(:, target) = values
+   return
+end if
+
+name_len = max(1, len_trim(name))
+if (allocated(tbl%names)) name_len = max(name_len, len(tbl%names))
+allocate(character(len=name_len) :: names(tibble_ncol(tbl) + 1))
+if (tibble_ncol(tbl) > 0) names(:tibble_ncol(tbl)) = tbl%names
+names(size(names)) = name
+allocate(cols(tibble_nrow(tbl), tibble_ncol(tbl) + 1))
+if (tibble_ncol(tbl) > 0) cols(:, :tibble_ncol(tbl)) = tbl%real_cols
+cols(:, size(cols, 2)) = values
+if (allocated(tbl%row_labels)) then
+   out = tibble_real(names, cols, tbl%row_labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_real(names, cols)
+end if
+end function tibble_real_mutate_vector
+
+function tibble_real_mutate_scalar(tbl, name, value) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+real(kind=dp), intent(in) :: value
+type(r_tibble_real_t) :: out
+real(kind=dp), allocatable :: values(:)
+
+allocate(values(tibble_nrow(tbl)), source=value)
+out = tibble_real_mutate_vector(tbl, name, values)
+end function tibble_real_mutate_scalar
+
+function read_csv_tibble_real(file_path, max_rows, max_cols, index_col) result(tbl)
+character(len=*), intent(in) :: file_path
+integer, intent(in), optional :: max_rows
+integer, intent(in), optional :: max_cols
+character(len=*), intent(in), optional :: index_col
+type(r_tibble_real_t) :: tbl
+character(len=:), allocatable :: names(:), selected_names(:), row_labels(:)
+real(kind=dp), allocatable :: cols(:,:), selected_cols(:,:)
+integer, allocatable :: selected_indices(:)
+integer :: data_limit, i, index_pos, j, ncol, required_cols
+
+if (present(max_rows)) then
+   if (max_rows < 0) error stop "read_csv_tibble_real: max_rows must be nonnegative"
+end if
+if (present(max_cols)) then
+   if (max_cols < 0) error stop "read_csv_tibble_real: max_cols must be nonnegative"
+end if
+names = read_csv_header_names(file_path)
+if (.not. present(index_col)) then
+   call read_csv_real_matrix(file_path, cols, max_rows=max_rows, max_cols=max_cols)
+   ncol = size(cols, 2)
+   if (ncol > size(names)) &
+      error stop "read_csv_tibble_real: header and data column counts differ"
+   allocate(character(len=len(names)) :: selected_names(ncol))
+   if (ncol > 0) selected_names = names(:ncol)
+   tbl = tibble_real(selected_names, cols)
+   return
+end if
+
+index_pos = 0
+do i = 1, size(names)
+   if (trim(names(i)) == trim(index_col)) then
+      index_pos = i
+      exit
+   end if
+end do
+if (index_pos == 0) error stop "read_csv_tibble_real: index column not found"
+data_limit = size(names) - 1
+if (present(max_cols)) data_limit = min(data_limit, max_cols)
+allocate(selected_indices(data_limit))
+j = 0
+do i = 1, size(names)
+   if (i == index_pos) cycle
+   if (j >= data_limit) exit
+   j = j + 1
+   selected_indices(j) = i
+end do
+required_cols = index_pos
+if (data_limit > 0) required_cols = max(required_cols, maxval(selected_indices))
+call read_csv_real_matrix(file_path, cols, max_rows=max_rows, max_cols=required_cols)
+allocate(character(len=len(names)) :: selected_names(data_limit))
+allocate(selected_cols(size(cols, 1), data_limit))
+do j = 1, data_limit
+   selected_names(j) = names(selected_indices(j))
+   selected_cols(:, j) = cols(:, selected_indices(j))
+end do
+row_labels = read_csv_text_column(file_path, index_pos, max_rows=max_rows)
+if (size(row_labels) /= size(selected_cols, 1)) &
+   error stop "read_csv_tibble_real: index and data row counts differ"
+tbl = tibble_real(selected_names, selected_cols, row_labels, row_label_name=trim(index_col))
+end function read_csv_tibble_real
+
+function tibble_real_log_returns(tbl, scale) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+real(kind=dp), intent(in), optional :: scale
+type(r_tibble_real_t) :: out
+real(kind=dp) :: multiplier
+real(kind=dp), allocatable :: values(:,:)
+character(len=:), allocatable :: labels(:)
+logical, allocatable :: keep(:)
+integer :: i, k
+
+multiplier = 1.0_dp
+if (present(scale)) multiplier = scale
+if (tibble_nrow(tbl) < 2) then
+   allocate(values(0, tibble_ncol(tbl)))
+   if (allocated(tbl%row_labels)) then
+      allocate(character(len=len(tbl%row_labels)) :: labels(0))
+      out = tibble_real(tbl%names, values, labels)
+      if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+   else
+      out = tibble_real(tbl%names, values)
+   end if
+   return
+end if
+allocate(keep(tibble_nrow(tbl) - 1))
+do i = 1, size(keep)
+   keep(i) = all(ieee_is_finite(tbl%real_cols(i:i + 1, :))) .and. &
+      all(tbl%real_cols(i:i + 1, :) > 0.0_dp)
+end do
+allocate(values(count(keep), tibble_ncol(tbl)))
+if (allocated(tbl%row_labels)) &
+   allocate(character(len=len(tbl%row_labels)) :: labels(count(keep)))
+k = 0
+do i = 1, size(keep)
+   if (.not. keep(i)) cycle
+   k = k + 1
+   values(k, :) = multiplier * log(tbl%real_cols(i + 1, :) / tbl%real_cols(i, :))
+   if (allocated(tbl%row_labels)) labels(k) = tbl%row_labels(i + 1)
+end do
+if (allocated(tbl%row_labels)) then
+   out = tibble_real(tbl%names, values, labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_real(tbl%names, values)
+end if
+end function tibble_real_log_returns
+
+function tibble_real_stats(tbl) result(out)
+type(r_tibble_real_t), intent(in) :: tbl
+type(r_tibble_real_t) :: out
+real(kind=dp), allocatable :: values(:,:)
+integer :: j
+
+allocate(values(5, tibble_ncol(tbl)))
+values(1, :) = real(tibble_nrow(tbl), kind=dp)
+if (tibble_nrow(tbl) == 0) then
+   values(2:5, :) = ieee_value(0.0_dp, ieee_quiet_nan)
+else
+   do j = 1, tibble_ncol(tbl)
+      values(2, j) = sum(tbl%real_cols(:, j)) / real(tibble_nrow(tbl), kind=dp)
+      values(3, j) = sd(tbl%real_cols(:, j))
+      values(4, j) = minval(tbl%real_cols(:, j))
+      values(5, j) = maxval(tbl%real_cols(:, j))
+   end do
+end if
+out = tibble_real(tbl%names, values, &
+   [character(len=7) :: "n", "mean", "sd", "minimum", "maximum"], &
+   row_label_name="statistic")
+end function tibble_real_stats
+
+subroutine print_tibble(tbl, n, integer_row_labels, decimal_places, row_numbers)
+type(r_tibble_real_t), intent(in) :: tbl
+integer, intent(in), optional :: n
+character(len=*), intent(in), optional :: integer_row_labels(:)
+integer, intent(in), optional :: decimal_places
+logical, intent(in), optional :: row_numbers
+integer :: digits, field_width, i, j, k, nshow
+logical :: found, print_row_numbers, show_row_labels
+logical, allocatable :: integer_format(:), scientific_format(:)
+real(kind=dp) :: value
+character(len=32) :: fixed_fmt, header_fmt, integer_fmt, scientific_fmt
+
+nshow = min(10, tibble_nrow(tbl))
+if (present(n)) nshow = min(tibble_nrow(tbl), max(0, n))
+print_row_numbers = .true.
+if (present(row_numbers)) print_row_numbers = row_numbers
+digits = 6
+if (present(decimal_places)) digits = decimal_places
+if (digits < 0 .or. digits > 15) &
+   error stop "print_tibble: decimal_places must be between 0 and 15"
+field_width = max(12, digits + 8)
+write(header_fmt, '("(1x,a",i0,")")') field_width
+write(integer_fmt, '("(1x,i",i0,")")') field_width
+write(fixed_fmt, '("(1x,f",i0,".",i0,")")') field_width, digits
+write(scientific_fmt, '("(1x,es",i0,".",i0,")")') field_width, digits
+show_row_labels = allocated(tbl%row_labels)
+allocate(integer_format(tibble_nrow(tbl)), source=.false.)
+if (present(integer_row_labels)) then
+   if (.not. show_row_labels .and. size(integer_row_labels) > 0) &
+      error stop "print_tibble: integer row labels require tibble row labels"
+   do k = 1, size(integer_row_labels)
+      found = .false.
+      do i = 1, tibble_nrow(tbl)
+         if (trim(tbl%row_labels(i)) == trim(integer_row_labels(k))) then
+            found = .true.
+            integer_format(i) = .true.
+         end if
+      end do
+      if (.not. found) error stop "print_tibble: integer row label not found"
+   end do
+end if
+do i = 1, tibble_nrow(tbl)
+   if (.not. integer_format(i)) cycle
+   do j = 1, tibble_ncol(tbl)
+      value = tbl%real_cols(i, j)
+      if (.not. ieee_is_finite(value) .or. &
+          abs(value - anint(value)) > 100.0_dp * epsilon(value) * max(1.0_dp, abs(value)) .or. &
+          abs(value) > real(huge(0), kind=dp)) &
+         error stop "print_tibble: integer-formatted row contains a non-integer value"
+   end do
+end do
+allocate(scientific_format(tibble_ncol(tbl)), source=.false.)
+do j = 1, tibble_ncol(tbl)
+   do i = 1, nshow
+      if (integer_format(i)) cycle
+      value = tbl%real_cols(i, j)
+      if (ieee_is_finite(value) .and. value /= 0.0_dp) then
+         if (abs(value) < 1.0e-4_dp .or. abs(value) >= 1.0e4_dp) &
+            scientific_format(j) = .true.
+      end if
+   end do
+end do
+write(*, '(a, i0, a, i0)') "# A tibble: ", tibble_nrow(tbl), " x ", tibble_ncol(tbl)
+if (tibble_ncol(tbl) == 0) return
+if (print_row_numbers) write(*, '(6x)', advance='no')
+if (show_row_labels) then
+   if (allocated(tbl%row_label_name)) then
+      write(*, '(1x, a12)', advance='no') trim(tbl%row_label_name)
+   else
+      write(*, '(1x, a12)', advance='no') ".row"
+   end if
+end if
+do j = 1, tibble_ncol(tbl)
+   write(*, header_fmt, advance='no') trim(tbl%names(j))
+end do
+write(*, *)
+if (print_row_numbers) write(*, '(6x)', advance='no')
+if (show_row_labels) write(*, '(1x, a12)', advance='no') ""
+do j = 1, tibble_ncol(tbl)
+   write(*, header_fmt, advance='no') '<dbl>'
+end do
+write(*, *)
+do i = 1, nshow
+   if (print_row_numbers) write(*, '(i6)', advance='no') i
+   if (show_row_labels) write(*, '(1x, a12)', advance='no') trim(tbl%row_labels(i))
+   do j = 1, tibble_ncol(tbl)
+      value = tbl%real_cols(i, j)
+      if (integer_format(i)) then
+         write(*, integer_fmt, advance='no') nint(value)
+      else if (scientific_format(j)) then
+         write(*, scientific_fmt, advance='no') value
+      else
+         write(*, fixed_fmt, advance='no') value
+      end if
+   end do
+   write(*, *)
+end do
+if (nshow < tibble_nrow(tbl)) &
+   write(*, '(a, i0, a)') "# ... with ", tibble_nrow(tbl) - nshow, " more rows"
+end subroutine print_tibble
 
 function dataframe_real_col(df, name) result(col)
 type(r_dataframe_t), intent(in) :: df

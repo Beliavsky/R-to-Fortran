@@ -228,6 +228,44 @@ Available helpers:
 
 Limitation: `r_dataframe_t` currently represents real-valued columns.  Mixed typed data-frame semantics are not a stable public runtime API yet.
 
+### Real-only tibbles
+
+`r_tibble_real_t` is an additive, direct-Fortran API for experimenting with a
+restricted tibble representation.  Every column is `real(kind=dp)`, column
+names must be nonempty and unique, and all columns share one row count.
+Optional character row labels provide display metadata without introducing a
+heterogeneous data column.
+
+```fortran
+type(r_tibble_real_t) :: tbl, positive
+real(kind=dp) :: cols(3, 2)
+
+cols(:, 1) = [1.0_dp, 2.0_dp, 3.0_dp]
+cols(:, 2) = [-1.0_dp, 4.0_dp, 9.0_dp]
+tbl = tibble_real([character(len=5) :: "id", "value"], cols)
+positive = tibble_real_filter(tbl, tibble_real_col(tbl, "value") > 0.0_dp)
+positive = tibble_real_mutate(positive, "constant", 1.0_dp)
+call print_tibble(positive)
+```
+
+| Helper | Purpose |
+|---|---|
+| `tibble_real(names, cols[, row_labels, row_label_name])` | Construct a real-only tibble from a matrix whose columns correspond to `names`, optionally with row labels and a descriptive row-label heading. |
+| `read_csv_tibble_real(file_path[, max_rows, max_cols, index_col])` | Read a numeric CSV with a header into a real-only tibble. `index_col` stores the original text values as row labels, uses the column name as their heading, and excludes that column from numeric data; with an index, `max_cols` counts retained data columns. |
+| `tibble_nrow`, `tibble_ncol` | Return tibble dimensions. |
+| `tibble_real_col` | Extract a named real column. |
+| `tibble_real_filter` | Select rows using a logical mask. |
+| `tibble_real_select` | Select and reorder explicitly named columns. |
+| `tibble_real_drop` | Remove explicitly named columns. |
+| `tibble_real_mutate` | Add or replace a real column; scalar values are recycled to all rows. |
+| `tibble_real_log_returns` | Compute adjacent-row log returns, preserving column names and omitting row pairs with nonfinite or nonpositive values. |
+| `tibble_real_stats` | Summarize each column as `n`, `mean`, `sd`, `minimum`, and `maximum` rows while preserving the input column names and labeling the row field `statistic`. |
+| `print_tibble` | Print a compact tibble-style preview. Ordinary values use aligned fixed-point formatting; scientific notation is reserved for very small or large magnitudes. `decimal_places` controls displayed precision (default 6), `integer_row_labels` displays named, integer-valued rows without decimal notation, and `row_numbers` controls the leading ordinal column (default `.true.`). |
+
+This API does not yet imply support for translating R `tibble()` or dplyr
+calls.  Character, logical, factor, date, list, and other heterogeneous
+columns remain outside this initial representation.
+
 ## Model and Test Result Types
 
 These derived types preserve R-like result structure for generated code and LLM repairs:

@@ -343,12 +343,25 @@ fpm run --example hypothesis_tests
 fpm run --example linear_models
 fpm run --example time_series
 fpm run --example data_and_strings
+fpm run --example tibble_etf_returns -- asset_class_etf_prices.csv
 ```
 
 The examples progress from descriptive statistics to probability distributions,
 linear algebra, hypothesis tests, linear models, time-series helpers, and numeric
-data frames with string utilities.  Each is self-contained and uses deterministic
-inputs; the random-number example sets an explicit seed.
+data frames with string utilities.  The introductory examples are self-contained
+and use deterministic inputs; the random-number example sets an explicit seed.
+
+`tibble_etf_returns` is an integration example for the real-only tibble API.
+It reads a price CSV directly into a tibble, uses its `Date` column as the named
+row index, computes a returns tibble, and produces a statistics tibble through
+table-level operations.  Return rows retain their dates and the `Date` heading;
+the statistics retain the asset columns and use `statistic` as the row heading.
+The repository does not track `asset_class_etf_prices.csv`, so pass the path to
+your local copy after `--`.  If no argument is supplied, the example looks for
+that filename in the current directory and exits successfully when it is absent.
+The companion `example/tibble_etf_returns.R` implements the same workflow with
+R tibbles and serves as the initial translation target for restricted tibble
+support. Run it with `Rscript example/tibble_etf_returns.R <csv-path>`.
 
 As an fpm dependency, add the repository to the consuming package's manifest and import only the routines needed by the program:
 
