@@ -20612,14 +20612,15 @@ out = tibble_real(tbl%names, values, &
    row_label_name="statistic")
 end function tibble_real_stats
 
-subroutine print_tibble(tbl, n, integer_row_labels, decimal_places, row_numbers)
+subroutine print_tibble(tbl, n, integer_row_labels, decimal_places, row_numbers, tibble_style)
 type(r_tibble_real_t), intent(in) :: tbl
 integer, intent(in), optional :: n
 character(len=*), intent(in), optional :: integer_row_labels(:)
 integer, intent(in), optional :: decimal_places
 logical, intent(in), optional :: row_numbers
+logical, intent(in), optional :: tibble_style
 integer :: digits, field_width, i, j, k, nshow
-logical :: found, print_row_numbers, show_row_labels
+logical :: found, print_row_numbers, show_row_labels, use_tibble_style
 logical, allocatable :: integer_format(:), scientific_format(:)
 real(kind=dp) :: value
 character(len=32) :: fixed_fmt, header_fmt, integer_fmt, scientific_fmt
@@ -20628,6 +20629,8 @@ nshow = min(10, tibble_nrow(tbl))
 if (present(n)) nshow = min(tibble_nrow(tbl), max(0, n))
 print_row_numbers = .true.
 if (present(row_numbers)) print_row_numbers = row_numbers
+use_tibble_style = .true.
+if (present(tibble_style)) use_tibble_style = tibble_style
 digits = 6
 if (present(decimal_places)) digits = decimal_places
 if (digits < 0 .or. digits > 15) &
@@ -20674,7 +20677,8 @@ do j = 1, tibble_ncol(tbl)
       end if
    end do
 end do
-write(*, '(a, i0, a, i0)') "# A tibble: ", tibble_nrow(tbl), " x ", tibble_ncol(tbl)
+if (use_tibble_style) &
+   write(*, '(a, i0, a, i0)') "# A tibble: ", tibble_nrow(tbl), " x ", tibble_ncol(tbl)
 if (tibble_ncol(tbl) == 0) return
 if (print_row_numbers) write(*, '(6x)', advance='no')
 if (show_row_labels) then
@@ -20688,12 +20692,14 @@ do j = 1, tibble_ncol(tbl)
    write(*, header_fmt, advance='no') trim(tbl%names(j))
 end do
 write(*, *)
-if (print_row_numbers) write(*, '(6x)', advance='no')
-if (show_row_labels) write(*, '(1x, a12)', advance='no') ""
-do j = 1, tibble_ncol(tbl)
-   write(*, header_fmt, advance='no') '<dbl>'
-end do
-write(*, *)
+if (use_tibble_style) then
+   if (print_row_numbers) write(*, '(6x)', advance='no')
+   if (show_row_labels) write(*, '(1x, a12)', advance='no') ""
+   do j = 1, tibble_ncol(tbl)
+      write(*, header_fmt, advance='no') '<dbl>'
+   end do
+   write(*, *)
+end if
 do i = 1, nshow
    if (print_row_numbers) write(*, '(i6)', advance='no') i
    if (show_row_labels) write(*, '(1x, a12)', advance='no') trim(tbl%row_labels(i))
@@ -20709,7 +20715,7 @@ do i = 1, nshow
    end do
    write(*, *)
 end do
-if (nshow < tibble_nrow(tbl)) &
+if (use_tibble_style .and. nshow < tibble_nrow(tbl)) &
    write(*, '(a, i0, a)') "# ... with ", tibble_nrow(tbl) - nshow, " more rows"
 end subroutine print_tibble
 

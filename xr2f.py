@@ -21904,6 +21904,28 @@ def emit_stmts(
             c_df = parse_call_text(st.expr.strip())
             if c_df is not None and c_df[0].lower() == "data.frame":
                 _df_nm, pos_df, kw_df = c_df
+                if st.name.lower() in _KNOWN_TIBBLE_NAMES:
+                    matrix_src = pos_df[0].strip() if pos_df else ""
+                    label_name = next(
+                        (key for key in kw_df if key.lower() in {"date", "statistic"}),
+                        "",
+                    )
+                    label_src = kw_df.get(label_name, "").strip() if label_name else ""
+                    names_src = _LAST_COLNAME_SOURCES.get(matrix_src.lower())
+                    if not matrix_src or not label_src or not isinstance(names_src, str) or not names_src.strip():
+                        raise NotImplementedError(
+                            "mixed data.frame() translation requires one character index column, "
+                            "one numeric matrix, and known matrix column names"
+                        )
+                    need_r_mod.update({"tibble_real", "r_tibble_real_t"})
+                    _wstmt(
+                        f"{st.name} = tibble_real({r_expr_to_fortran(names_src)}, "
+                        f"real({r_expr_to_fortran(matrix_src)}, kind=dp), "
+                        f"{r_expr_to_fortran(label_src)}, "
+                        f"row_label_name={_fortran_str_literal(label_name)})",
+                        st.comment,
+                    )
+                    continue
                 y_src = kw_df.get("y")
                 predictors = [p.strip() for p in pos_df if p.strip()]
                 predictors.extend(v.strip() for k, v in kw_df.items() if k != "y" and v.strip())
@@ -22143,6 +22165,13 @@ def emit_stmts(
                 path_src = c_read_csv[1][0] if c_read_csv[1] else c_read_csv[2].get("file", '""')
                 _CSV_HEADER_SOURCES[st.name.lower()] = path_src
                 path_f = r_expr_to_fortran(path_src)
+                if st.name.lower() in _KNOWN_TIBBLE_NAMES:
+                    need_r_mod.update({"read_csv_tibble_real", "r_tibble_real_t"})
+                    _wstmt(
+                        f'{st.name} = read_csv_tibble_real({path_f}, index_col="Date")',
+                        st.comment,
+                    )
+                    continue
                 if has_r_mod:
                     need_r_mod.add("read_csv_real_matrix")
                     _wstmt(f"call read_csv_real_matrix({path_f}, {st.name})", st.comment)
@@ -23495,7 +23524,9 @@ def emit_stmts(
                     one = st.args[0].strip()
                     one_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", one)
                     if one_no_ns.lower() in _KNOWN_TIBBLE_NAMES:
-                        _wstmt(f"call print_tibble({one_no_ns})", st.comment)
+                        base_df_vars = helper_ctx.get("base_data_frame_vars", set()) if helper_ctx is not None else set()
+                        style_arg = ", tibble_style=.false." if one_no_ns.lower() in base_df_vars else ""
+                        _wstmt(f"call print_tibble({one_no_ns}{style_arg})", st.comment)
                         need_r_mod.add("print_tibble")
                         continue
                     c_head_tibble = parse_call_text(one_no_ns)
@@ -23503,8 +23534,10 @@ def emit_stmts(
                         head_tbl = c_head_tibble[1][0].strip()
                         if head_tbl.lower() in _KNOWN_TIBBLE_NAMES:
                             head_n = c_head_tibble[1][1].strip() if len(c_head_tibble[1]) >= 2 else c_head_tibble[2].get("n", "6")
+                            base_df_vars = helper_ctx.get("base_data_frame_vars", set()) if helper_ctx is not None else set()
+                            style_arg = ", tibble_style=.false." if head_tbl.lower() in base_df_vars else ""
                             _wstmt(
-                                f"call print_tibble({head_tbl}, n={_int_bound_expr(r_expr_to_fortran(head_n))})",
+                                f"call print_tibble({head_tbl}, n={_int_bound_expr(r_expr_to_fortran(head_n))}{style_arg})",
                                 st.comment,
                             )
                             need_r_mod.add("print_tibble")
@@ -32586,6 +32619,9 @@ def expand_data_frame_assignments(stmts: list[object]) -> list[object]:
             out.append(st)
             continue
         rhs = st.expr.strip()
+        if st.name.lower() in _KNOWN_TIBBLE_NAMES:
+            out.append(st)
+            continue
         if re.fullmatch(r"[A-Za-z]\w*", rhs) and (
             rhs in _EXPANDED_DATA_FRAME_FIELDS or rhs.lower() in _EXPANDED_DATA_FRAME_FIELDS
         ):
@@ -35264,6 +35300,54 @@ def transpile_r_to_fortran(
         if _name_assigned_inside_loop(main_stmts, nm)
     }
     _DATA_FRAME_FORCE_MATERIALIZE = collect_model_data_frame_uses(main_stmts)
+    base_table_names: set[str] = set()
+    base_date_sources: list[str] = []
+    base_assignment_exprs: dict[str, list[str]] = {}
+    read_csv_names: dict[str, str] = {}
+    # Only opt ordinary read.csv objects into the mixed real-table backend when
+    # the script actually builds a Date/statistic-indexed numeric data frame.
+    # Existing numeric workflows use matrix-style indexing on read.csv results.
+    for st_table in main_stmts:
+        if not isinstance(st_table, Assign):
+            continue
+        rhs_table = re.sub(r"\b[A-Za-z]\w*::", "", st_table.expr.strip())
+        base_assignment_exprs.setdefault(st_table.name.lower(), []).append(st_table.expr)
+        c_table = parse_call_text(rhs_table)
+        if c_table is None:
+            continue
+        fn_table = c_table[0].lower()
+        if fn_table == "read.csv":
+            read_csv_names[st_table.name.lower()] = st_table.name
+        if fn_table == "data.frame" and c_table[1]:
+            data_keys = {
+                key.lower(): value
+                for key, value in c_table[2].items()
+                if key.lower() not in {
+                    "stringsasfactors", "check_names", "check.names", "row_names", "row.names"
+                }
+            }
+            if any(key in {"date", "statistic"} for key in data_keys):
+                base_table_names.add(st_table.name)
+                if "date" in data_keys:
+                    base_date_sources.append(data_keys["date"])
+    pending_base_names = [
+        name.lower()
+        for expr in base_date_sources
+        for name in re.findall(r"\b[A-Za-z]\w*\b", expr)
+    ]
+    seen_base_names: set[str] = set()
+    while pending_base_names:
+        name = pending_base_names.pop()
+        if name in seen_base_names:
+            continue
+        seen_base_names.add(name)
+        for expr in base_assignment_exprs.get(name, []):
+            pending_base_names.extend(
+                token.lower() for token in re.findall(r"\b[A-Za-z]\w*\b", expr)
+            )
+    for name in seen_base_names & read_csv_names.keys():
+        base_table_names.add(read_csv_names[name])
+    _KNOWN_TIBBLE_NAMES = {name.lower() for name in base_table_names}
     main_stmts = expand_data_frame_assignments(main_stmts)
     main_stmts = rename_reserved_main_names(main_stmts, {fn.name for fn in funcs})
     _STATIC_LS_NAMES = sorted(
@@ -36507,6 +36591,7 @@ def transpile_r_to_fortran(
         "matrix_rowname_exprs": collect_rownames_sources(stmts),
         "function_matrix_col_labels": {k.lower(): v for k, v in fn_matrix_col_labels.items()},
         "function_matrix_row_exprs": {k.lower(): v for k, v in fn_matrix_row_exprs.items()},
+        "base_data_frame_vars": {name.lower() for name in base_table_names},
     }
 
     assign_counts = infer_assigned_names(main_stmts)
@@ -37746,7 +37831,9 @@ def transpile_r_to_fortran(
     qr_vars: set[str] = set()
     nlm_vars: set[str] = set()
     t_test_vars: set[str] = set()
-    tibble_vars: set[str] = set()
+    tibble_vars: set[str] = {
+        name for name in infer_assigned_names(main_stmts) if name.lower() in _KNOWN_TIBBLE_NAMES
+    }
     main_vector_list_names: set[str] = set()
     main_object_list_vars: dict[str, str] = {}
     call_pat = re.compile(r"^([A-Za-z]\w*)\s*\(")
@@ -39083,6 +39170,17 @@ def transpile_r_to_fortran(
             logical_arrays.add(st_apply_main.name)
         else:
             real_arrays.add(st_apply_main.name)
+    tibble_names_l = {name.lower() for name in tibble_vars}
+    ints = {name for name in ints if name.lower() not in tibble_names_l}
+    int_arrays = {name for name in int_arrays if name.lower() not in tibble_names_l}
+    real_arrays = {name for name in real_arrays if name.lower() not in tibble_names_l}
+    real_scalars = {name for name in real_scalars if name.lower() not in tibble_names_l}
+    int_matrices = {name for name in int_matrices if name.lower() not in tibble_names_l}
+    real_matrices = {name for name in real_matrices if name.lower() not in tibble_names_l}
+    logical_arrays = {name for name in logical_arrays if name.lower() not in tibble_names_l}
+    logical_scalars = {name for name in logical_scalars if name.lower() not in tibble_names_l}
+    char_scalars = {name for name in char_scalars if name.lower() not in tibble_names_l}
+    char_arrays = {name for name in char_arrays if name.lower() not in tibble_names_l}
     if ints:
         pbody.w("integer :: " + ", ".join(sorted(ints)))
     if int_arrays:

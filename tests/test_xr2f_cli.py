@@ -4577,6 +4577,56 @@ def test_xr2f_real_tibble_workflow_compile_and_run(tmp_path: Path) -> None:
     assert "first" in proc.stdout
 
 
+def test_xr2f_base_data_frame_uses_real_table_backend_run(tmp_path: Path) -> None:
+    (tmp_path / "prices.csv").write_text(
+        "Date,A,B\n2026-01-01,10,20\n2026-01-02,11,18\n2026-01-03,12.1,19.8\n",
+        encoding="utf-8",
+    )
+    local_input = tmp_path / "xbase_data_frame_workflow.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'dat <- read.csv("prices.csv", stringsAsFactors = FALSE, check.names = FALSE)',
+                'assets <- c("A", "B")',
+                "selected <- dat[, assets, drop = FALSE]",
+                "x <- as.matrix(selected)",
+                "dates <- dat$Date",
+                "colnames(x) <- assets",
+                "out <- data.frame(Date = dates, x, check.names = FALSE, row.names = NULL)",
+                'rownames(x) <- c("first", "second", "third")',
+                'summary <- data.frame(statistic = c("first", "second", "third"), x, check.names = FALSE)',
+                'cat(nrow(out), "\\n")',
+                "print(head(out, 2))",
+                'cat(nrow(summary), "\\n")',
+                "print(summary)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xbase_data_frame_workflow.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert 'dat = read_csv_tibble_real("prices.csv", index_col="Date")' in out_text
+    assert "selected = tibble_real_select(dat, assets)" in out_text
+    assert "x = selected%real_cols" in out_text
+    assert 'row_label_name="Date"' in out_text
+    assert 'row_label_name="statistic"' in out_text
+    assert "2026-01-01" in proc.stdout
+    assert "# A tibble:" not in proc.stdout
+
+
 def test_xr2f_string_helper_keyword_args_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xstring_keywords.r"
     local_input.write_text(
@@ -9590,8 +9640,10 @@ def test_xr2f_read_csv_result_stays_matrix_rank(tmp_path: Path) -> None:
         "\n".join(
             [
                 'dat <- read.csv("prices.csv", stringsAsFactors = FALSE)',
+                "dates <- as.Date(dat$Date)",
                 "x <- dat[, 2:3]",
                 "print(dim(x))",
+                "print(dates)",
             ]
         )
         + "\n",
