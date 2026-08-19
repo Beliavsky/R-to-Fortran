@@ -1889,6 +1889,76 @@ _SUPPORTED_DPLYR_CALLS = {
     "dplyr::mutate",
 }
 
+_PURRR_TYPED_MAP_KINDS = {
+    "purrr::map_dbl": "real",
+    "purrr::map_int": "integer",
+    "purrr::map_lgl": "logical",
+}
+
+
+@dataclass(frozen=True)
+class _RestrictedTribble:
+    row_label_name: str
+    row_labels: list[str]
+    column_names: list[str]
+    values: list[str]
+    nrow: int
+    kind: str
+
+
+def _parse_restricted_tribble(txt: str) -> _RestrictedTribble | None:
+    """Parse a literal tribble with one character label column and numeric data."""
+    call = parse_call_text(txt.strip())
+    if call is None or call[0].lower() not in {"tribble", "tibble::tribble"}:
+        return None
+    if call[2]:
+        raise NotImplementedError("tribble() named arguments are unsupported")
+
+    args = call[1]
+    headers: list[str] = []
+    while len(headers) < len(args):
+        match = re.fullmatch(r"~\s*([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)", args[len(headers)].strip())
+        if match is None:
+            break
+        headers.append(match.group(1))
+    if len(headers) < 2:
+        raise NotImplementedError(
+            "tribble() currently requires a leading character label column and at least one numeric column"
+        )
+
+    cells = args[len(headers):]
+    if not cells or len(cells) % len(headers) != 0:
+        raise NotImplementedError("tribble() rows must contain one value for every declared column")
+    nrow = len(cells) // len(headers)
+    rows = [cells[i * len(headers):(i + 1) * len(headers)] for i in range(nrow)]
+
+    row_labels: list[str] = []
+    for row in rows:
+        label = _dequote_string_literal(row[0])
+        if label is None:
+            raise NotImplementedError(
+                "tribble() currently requires character literals in its first column for row labels"
+            )
+        row_labels.append(label)
+
+    numeric_cells = [cell.strip() for row in rows for cell in row[1:]]
+    if any(not (_is_int_literal(cell) or _is_real_literal(cell)) for cell in numeric_cells):
+        raise NotImplementedError(
+            "tribble() currently supports only numeric literals after the leading character column"
+        )
+    kind = "integer" if all(_is_explicit_r_int_literal(cell) for cell in numeric_cells) else "real"
+
+    # R and Fortran arrays are column-major, so flatten the data a column at a time.
+    values = [rows[i][j].strip() for j in range(1, len(headers)) for i in range(nrow)]
+    return _RestrictedTribble(
+        row_label_name=headers[0],
+        row_labels=row_labels,
+        column_names=headers[1:],
+        values=values,
+        nrow=nrow,
+        kind=kind,
+    )
+
 
 def _dplyr_call_info(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
     call = parse_call_text(txt.strip())
@@ -6545,7 +6615,33 @@ def classify_vars(
                 rhs_call_src = re.sub(r"\bt\.test\s*\(", "t_test(", rhs, flags=re.IGNORECASE)
                 cinfo = parse_call_text(rhs_call_src)
                 mark_array_uses(rhs)
-                if _ifelse_integer_coded(rhs):
+                purrr_map_kind = (
+                    _PURRR_TYPED_MAP_KINDS.get(cinfo[0].lower())
+                    if cinfo is not None
+                    else None
+                )
+                if purrr_map_kind == "integer":
+                    int_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif purrr_map_kind == "real":
+                    real_arrays.add(st.name)
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif purrr_map_kind == "logical":
+                    known_arrays.add(st.name)
+                    params.pop(st.name, None)
+                    ints.discard(st.name)
+                    int_arrays.discard(st.name)
+                    real_arrays.discard(st.name)
+                    real_scalars.discard(st.name)
+                elif _ifelse_integer_coded(rhs):
                     int_arrays.add(st.name)
                     known_arrays.add(st.name)
                     params.pop(st.name, None)
@@ -9393,7 +9489,9 @@ def inline_single_use_temporaries(stmts: list[object]) -> list[object]:
             c_inline_rhs = parse_call_text(st.expr.strip())
             if (
                 c_inline_rhs is not None
-                and c_inline_rhs[0].lower() in {"replicate", "xr2f_replicate_block"}
+                and c_inline_rhs[0].lower() in {
+                    "replicate", "xr2f_replicate_block", "tribble", "tibble::tribble"
+                }
             ):
                 i += 1
                 continue
@@ -10166,10 +10264,12 @@ def _infer_assignment_rank_hint(expr: str, inferred_ranks: dict[str, int]) -> in
             return 0
         return 0
 
-    if re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*\s*\(", expr_l):
+    if re.match(r"^[A-Za-z]\w*(?:\.[A-Za-z]\w*)*(?:::[A-Za-z]\w*(?:\.[A-Za-z]\w*)*)?\s*\(", expr_l):
         c_call = parse_call_text(expr)
         if c_call is not None:
             fn_name = c_call[0].lower()
+            if fn_name in _PURRR_TYPED_MAP_KINDS:
+                return 1
             if fn_name == "ifelse":
                 vals_ifelse = list(c_call[1]) + list(c_call[2].values())
                 return max(
@@ -22356,6 +22456,32 @@ def emit_stmts(
                 continue
             rhs_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", rhs)
             c_as_tibble = parse_call_text(rhs_no_ns)
+            tribble = _parse_restricted_tribble(rhs)
+            if tribble is not None:
+                integer_tibble = tribble.kind == "integer"
+                constructor = "tibble_integer" if integer_tibble else "tibble_real"
+                value_items = [r_expr_to_fortran(value) for value in tribble.values]
+                if integer_tibble:
+                    values_expr = "[" + ", ".join(value_items) + "]"
+                else:
+                    values_expr = "[real(kind=dp) :: " + ", ".join(value_items) + "]"
+                matrix_expr = (
+                    f"reshape({values_expr}, [{tribble.nrow}, {len(tribble.column_names)}])"
+                )
+                need_r_mod.update(
+                    {
+                        constructor,
+                        "r_tibble_integer_t" if integer_tibble else "r_tibble_real_t",
+                    }
+                )
+                _wstmt(
+                    f"{st.name} = {constructor}("
+                    f"{_character_array_literal_expr(tribble.column_names)}, {matrix_expr}, "
+                    f"{_character_array_literal_expr(tribble.row_labels)}, "
+                    f"row_label_name={_fortran_str_literal(tribble.row_label_name)})",
+                    st.comment,
+                )
+                continue
             if c_as_tibble is not None and c_as_tibble[0].lower() == "as_tibble":
                 inner_tibble = (
                     c_as_tibble[1][0].strip()
@@ -22674,6 +22800,21 @@ def emit_stmts(
                 o.w("end do")
                 o.pop()
                 o.w("end block")
+                continue
+            c_purrr_map = parse_call_text(rhs)
+            purrr_map_kind = (
+                _PURRR_TYPED_MAP_KINDS.get(c_purrr_map[0].lower())
+                if c_purrr_map is not None
+                else None
+            )
+            if purrr_map_kind is not None:
+                map_expr = _scalar_apply_lambda_to_fortran(rhs)
+                if map_expr is None:
+                    raise NotImplementedError(
+                        f"{c_purrr_map[0]}() currently requires a named user-defined scalar function "
+                        "or a one-argument function()/\\() lambda"
+                    )
+                _wstmt(f"{st.name} = {map_expr}", st.comment)
                 continue
             sapply_lam = _parse_sapply_shorthand_lambda(rhs)
             if sapply_lam is not None:
@@ -26190,6 +26331,12 @@ def emit_stmts(
         elif isinstance(st, ExprStmt):
             if re.match(r"^\s*(?:quit|q)\s*\(", st.expr, re.IGNORECASE):
                 continue
+            if re.match(
+                r"^\s*(?:library|require)\s*\(\s*(?:package\s*=\s*)?(?:tibble|['\"]tibble['\"])\s*\)\s*$",
+                st.expr,
+                re.IGNORECASE,
+            ):
+                continue
             if re.match(r"^\s*(?:colnames|rownames|dimnames|names|storage\.mode)\s*\(", st.expr, re.IGNORECASE):
                 continue
             if re.match(r"^\s*attr\s*\(.*\)\s*(?:<-|=)\s*.+$", st.expr.strip(), re.IGNORECASE):
@@ -29344,7 +29491,11 @@ def emit_function(
         ints, real_scalars, int_arrays, real_arrays, params = classify_vars(
             body_use, infer_assigned_names(body_use), known_arrays=known_arrays
         )
-        if re.search(r"\b(?:sapply|lapply)\s*\(", "\n".join(_collect_stmt_expr_texts(fn.body)), re.IGNORECASE):
+        if re.search(
+            r"\b(?:sapply|lapply|purrr::map_(?:dbl|int|lgl))\s*\(",
+            "\n".join(_collect_stmt_expr_texts(fn.body)),
+            re.IGNORECASE,
+        ):
             ints.add("i_sw")
         for st_date_local in body_use:
             if not isinstance(st_date_local, Assign):
@@ -30813,7 +30964,11 @@ def emit_function(
             char_scalars_loc.discard(nm)
             char_arrays_loc.discard(nm)
             params.pop(nm, None)
-        if re.search(r"\b(?:sapply|lapply|apply)\s*\(", "\n".join(_collect_stmt_expr_texts(body_use)), re.IGNORECASE):
+        if re.search(
+            r"\b(?:sapply|lapply|apply|purrr::map_(?:dbl|int|lgl))\s*\(",
+            "\n".join(_collect_stmt_expr_texts(body_use)),
+            re.IGNORECASE,
+        ):
             ints.add("i_sw")
         real_scalars.difference_update(real_arrays)
         real_arrays.difference_update(ints)
@@ -32302,7 +32457,8 @@ def infer_main_logical_scalars(stmts: list[object]) -> set[str]:
 
 def _parse_sapply_shorthand_lambda(expr: str) -> tuple[str, str, str] | None:
     cinfo = parse_call_text(expr.strip())
-    if cinfo is None or cinfo[0].lower() not in {"sapply", "lapply"} or len(cinfo[1]) < 2:
+    supported = {"sapply", "lapply", *_PURRR_TYPED_MAP_KINDS}
+    if cinfo is None or cinfo[0].lower() not in supported or len(cinfo[1]) < 2:
         return None
     x_src = cinfo[1][0].strip()
     lam_src = cinfo[1][1].strip()
@@ -32321,7 +32477,8 @@ def _scalar_apply_lambda_to_fortran(expr: str) -> str | None:
     info = _parse_sapply_shorthand_lambda(expr)
     if info is None:
         c_named = parse_call_text(expr.strip())
-        if c_named is None or c_named[0].lower() not in {"sapply", "lapply"}:
+        supported = {"sapply", "lapply", *_PURRR_TYPED_MAP_KINDS}
+        if c_named is None or c_named[0].lower() not in supported:
             return None
         pos_named, kw_named = c_named[1], c_named[2]
         x_src_named = (pos_named[0] if pos_named else kw_named.get("X", kw_named.get("x", ""))).strip()
@@ -32485,6 +32642,11 @@ def infer_main_logical_arrays(stmts: list[object], array_names: set[str]) -> set
             is_logical_vec = True
         else:
             c_user_log = parse_call_text(rhs)
+            if (
+                c_user_log is not None
+                and _PURRR_TYPED_MAP_KINDS.get(c_user_log[0].lower()) == "logical"
+            ):
+                is_logical_vec = True
             if (
                 c_user_log is not None
                 and _USER_FUNC_RETURN_KIND.get(c_user_log[0].lower()) == "logical"
@@ -38302,6 +38464,8 @@ def transpile_r_to_fortran(
             if c_fit_main is not None and c_fit_main[0].lower() == "as_tibble":
                 tibble_vars.add(st.name)
                 helper_ctx_main["need_r_mod"].update({"r_tibble_real_t", "read_csv_tibble_real"})
+            if c_fit_main is not None and c_fit_main[0].lower() == "tribble":
+                tibble_vars.add(st.name)
             if c_fit_main is not None and c_fit_main[0].lower() == "aggregate":
                 list_vars[st.name] = "aggregate_result_t"
                 helper_ctx_main["need_r_mod"].update({"aggregate", "aggregate_result_t", "print_aggregate_result"})
@@ -38391,7 +38555,7 @@ def transpile_r_to_fortran(
             rhs_tibble = re.sub(r"\b[A-Za-z]\w*::", "", st_tibble.expr.strip())
             c_tibble = parse_call_text(rhs_tibble)
             is_tibble = c_dplyr_tibble is not None
-            if c_tibble is not None and c_tibble[0].lower() in {"as_tibble", "add_column"}:
+            if c_tibble is not None and c_tibble[0].lower() in {"as_tibble", "add_column", "tribble"}:
                 is_tibble = True
             trailing_tibble = _split_trailing_r_subset(rhs_tibble)
             if trailing_tibble is not None and trailing_tibble[0].strip().lower() in {
@@ -38462,6 +38626,9 @@ def transpile_r_to_fortran(
         if direct_kind in {name.lower() for name in real_tibble_vars}:
             return "real"
         call_kind_plain = parse_call_text(rhs_kind_no_ns)
+        if call_kind_plain is not None and call_kind_plain[0].lower() == "tribble":
+            tribble_kind = _parse_restricted_tribble(rhs_kind)
+            return tribble_kind.kind if tribble_kind is not None else ""
         if call_kind_plain is not None and call_kind_plain[0].lower() == "as_tibble":
             inner_kind = _first_call_arg(call_kind_plain, "x")
             return "integer" if inner_kind in r_integer_matrix_names else "real"
@@ -39508,7 +39675,7 @@ def transpile_r_to_fortran(
         params.pop(st_arr1.name, None)
 
     if char_arrays or re.search(
-        r"\b(?:sapply|lapply|apply)\s*\(",
+        r"\b(?:sapply|lapply|apply|purrr::map_(?:dbl|int|lgl))\s*\(",
         "\n".join(_collect_stmt_expr_texts(main_stmts)),
         re.IGNORECASE,
     ):
@@ -61544,6 +61711,15 @@ def _find_r_library_calls(src: str) -> list[tuple[int, str]]:
     return out
 
 
+def _unsupported_r_library_calls(calls: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Return imports that are not no-op markers for an implemented package surface."""
+    supported = re.compile(
+        r"^\s*(?:library|require)\s*\(\s*(?:package\s*=\s*)?(?:tibble|['\"]tibble['\"])\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    return [(line, stmt) for line, stmt in calls if supported.fullmatch(stmt) is None]
+
+
 def _strip_r_strings_for_scan(line: str) -> str:
     out: list[str] = []
     quote: str | None = None
@@ -63342,6 +63518,9 @@ _R_LEAK_CALL_MESSAGES = {
     "lapply": "lapply() with a function argument that cannot be translated",
     "vapply": "vapply() with a function argument that cannot be translated",
     "mapply": "mapply() with a function argument that cannot be translated",
+    "map_dbl": "purrr::map_dbl() with a function argument that cannot be translated",
+    "map_int": "purrr::map_int() with a function argument that cannot be translated",
+    "map_lgl": "purrr::map_lgl() with a function argument that cannot be translated",
     "tapply": "tapply() with a function argument that cannot be translated",
     "rapply": "rapply() with a function argument that cannot be translated",
     "apply": "apply() with a function argument that cannot be translated",
@@ -64113,7 +64292,7 @@ def main() -> int:
                 return 1
             src = core_src
             print("note: via-core-r prepass applied")
-        lib_calls = _find_r_library_calls(src)
+        lib_calls = _unsupported_r_library_calls(_find_r_library_calls(src))
         if lib_calls:
             if not args.allow_library:
                 ln, stmt = lib_calls[0]
@@ -64322,7 +64501,7 @@ def main() -> int:
                 return 1
             src = core_src
             print("note: via-core-r prepass applied")
-        lib_calls = _find_r_library_calls(src)
+        lib_calls = _unsupported_r_library_calls(_find_r_library_calls(src))
         if lib_calls:
             if not args.allow_library:
                 ln, stmt = lib_calls[0]

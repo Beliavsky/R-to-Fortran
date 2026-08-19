@@ -271,7 +271,11 @@ call print_tibble(positive)
 | `print_tibble` | Print a compact tibble-style preview. Ordinary values use aligned fixed-point formatting; scientific notation is reserved for very small or large magnitudes. `decimal_places` controls displayed precision (default 6), `integer_row_labels` displays named, integer-valued rows without decimal notation, and `row_numbers` controls the leading ordinal column (default `.true.`). |
 
 The transpiler maps `tibble::as_tibble()` and `tibble::add_column()` in the
-restricted numeric-table workflow. It also supports explicit `dplyr::select()`,
+restricted numeric-table workflow. Literal `tibble::tribble()` calls may use a
+leading character column as row-label metadata followed by homogeneous numeric
+columns. Explicit `L` literals produce an integer tibble; other numeric literals
+produce a real tibble. `library(tibble)` is accepted for this restricted surface.
+It also supports explicit `dplyr::select()`,
 `dplyr::filter()`, and `dplyr::mutate()` calls, including native `|>` chains.
 Selection is limited to explicit names or `all_of()`, and filter/mutate data
 expressions operate on homogeneous real or integer columns. Real-valued

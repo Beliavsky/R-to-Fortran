@@ -233,6 +233,7 @@ The supported subset is intentionally focused on numerical scripts:
 - Matrix helpers such as `matrix`, `array`, `t`, `%*%`, `crossprod`, `tcrossprod`, `rowSums`, `colSums`, `det`, `kappa`, `diag`, `chol`, `forwardsolve`, `backsolve`, and `solve(a, b)` for selected cases.
 - `apply(x, 1, f)` and `apply(x, 2, f)` for selected matrix/array cases, including common reducers and some user-defined scalar callbacks.
 - Higher-order/vectorized helpers for selected static cases: `sapply`, `vapply`, `mapply`, `tapply`, `ave`, `aggregate`, `by`, `Filter`, `Find`, `Position`, `Negate`, and simple `Vectorize` aliases.
+- Namespace-qualified typed purrr maps: `purrr::map_dbl`, `purrr::map_int`, and `purrr::map_lgl` with named user-defined scalar functions or one-argument `function(x)`/`\\(x)` lambdas. See `example/purrr_typed_maps.R`. General list-returning `purrr::map` and formula lambdas are not supported.
 - Ordering and ranking helpers such as `sort`, `order`, and `rank` for selected vectors.
 - Random helpers such as `runif`, `rnorm`, and `set.seed`.
 - Optional use of R's RNG through an R-linked shim with `--r-rng`.
@@ -370,6 +371,13 @@ native `|>` pipe. `select()` accepts explicit column names or one
 predicates; and `mutate()` accepts named scalar or vector numeric expressions.
 Integer expressions preserve integer storage; a real-valued mutation promotes
 an integer tibble to a real tibble.
+Literal `tibble::tribble()` calls are supported when the first column contains
+character row labels and every remaining column is numeric. The first header is
+used as the row-label heading rather than as a heterogeneous data column. All
+numeric cells written with R's `L` suffix produce an integer tibble; otherwise
+they produce a real tibble. `library(tibble)` is accepted as a no-op package
+marker for this supported surface. Additional character columns and general
+mixed-type tibbles are rejected with an explicit diagnostic.
 `example/dplyr_real_tibble.R` is a self-contained demonstration of each verb
 and a piped workflow. `example/dplyr_integer_tibble.R` demonstrates preserved
 integer columns and explicit promotion. Running the sources with R requires the

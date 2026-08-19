@@ -848,6 +848,72 @@ def test_xr2f_sapply_shorthand_lambda_logical_mask_compile_and_run(tmp_path: Pat
     assert "pack(range_int, v)" in out_text
 
 
+def test_xr2f_namespaced_purrr_typed_maps_compile_and_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xpurrr_typed_maps.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "square <- function(x) x^2",
+                "x <- c(1.0, 2.0, 3.0, 4.0)",
+                "xi <- 1:4",
+                "doubled <- purrr::map_dbl(x, function(value) value * 2.0)",
+                "squared <- purrr::map_dbl(x, square)",
+                "shifted <- purrr::map_int(xi, \\(value) value + 1L)",
+                "even <- purrr::map_lgl(xi, function(value) value %% 2L == 0L)",
+                "print(doubled)",
+                "print(squared)",
+                "print(shifted)",
+                "print(even)",
+                'cat(length(doubled), length(squared), length(shifted), length(even), "\\n")',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xpurrr_typed_maps.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "real(kind=dp), allocatable :: doubled(:), squared(:)" in out_text
+    assert "integer, allocatable :: shifted(:), xi(:)" in out_text
+    assert "logical, allocatable :: even(:)" in out_text
+    assert "purrr::" not in out_text
+    assert "2 4 6 8" in proc.stdout
+    assert "1 4 9 16" in proc.stdout
+    assert "2 3 4 5" in proc.stdout
+    assert "F T F T" in proc.stdout
+    assert "4 4 4 4" in proc.stdout
+
+
+def test_xr2f_purrr_map_rejects_untranslatable_callback(tmp_path: Path) -> None:
+    local_input = tmp_path / "xpurrr_bad_map.r"
+    local_input.write_text(
+        "x <- purrr::map_dbl(1:3, list(1, 2, 3))\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "currently requires a named user-defined scalar function" in proc.stdout
+
+
 def test_xr2f_printing_r_function_emits_subroutine(tmp_path: Path) -> None:
     local_input = tmp_path / "xprint_subroutine.r"
     local_input.write_text(
@@ -4522,6 +4588,100 @@ def test_xr2f_as_tibble_read_csv_compile(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
     assert "type(r_tibble_real_t) :: tbl" in out_text
     assert 'tbl = read_csv_tibble_real("csv_in.csv")' in out_text
+
+
+def test_xr2f_library_tibble_and_real_tribble_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xreal_tribble.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "library(tibble)",
+                "tbl <- tribble(",
+                "  ~name, ~age, ~score,",
+                '  "Alice", 25, 90,',
+                '  "Bob", 31, 85,',
+                '  "Carol", 28, 94',
+                ")",
+                "print(tbl)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xreal_tribble.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(r_tibble_real_t) :: tbl" in out_text
+    assert "tbl = tibble_real(" in out_text
+    assert 'row_label_name="name"' in out_text
+    assert "library(" not in out_text
+    assert "<dbl>" in proc.stdout
+    assert "Alice" in proc.stdout
+
+
+def test_xr2f_namespaced_integer_tribble_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xinteger_tribble.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "tbl <- tibble::tribble(",
+                "  ~name, ~age, ~score,",
+                '  "Alice", 25L, 90L,',
+                '  "Bob", 31L, 85L',
+                ")",
+                "print(tbl)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xinteger_tribble.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(r_tibble_integer_t) :: tbl" in out_text
+    assert "tbl = tibble_integer(" in out_text
+    assert "<int>" in proc.stdout
+
+
+def test_xr2f_tribble_rejects_additional_character_columns(tmp_path: Path) -> None:
+    local_input = tmp_path / "xmixed_tribble.r"
+    local_input.write_text(
+        'x <- tibble::tribble(~name, ~group, ~score, "Alice", "A", 90)\n',
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "only numeric literals after the leading character column" in proc.stdout
 
 
 def test_xr2f_real_tibble_workflow_compile_and_run(tmp_path: Path) -> None:
