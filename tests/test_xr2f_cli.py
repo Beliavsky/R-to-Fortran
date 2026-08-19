@@ -3894,6 +3894,75 @@ def test_xr2f_data_shaping_named_args_compile(tmp_path: Path) -> None:
     assert "x = m1" not in out_text
 
 
+def test_xr2f_colsums_is_na_expanded_data_frame_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdata_frame_na_counts.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- c(1.0, NA, 3.0)",
+                "y <- c(NA, 2.0, 4.0)",
+                "dat <- data.frame(x = x, y = y)",
+                "print(colSums(is.na(dat)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdata_frame_na_counts.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "is_na(dat)" not in out_text
+    assert "is_na(x)" in out_text
+    assert "is_na(y)" in out_text
+    assert "1 1" in " ".join(proc.stdout.split())
+
+
+def test_xr2f_lm_uses_mutated_data_frame_copy_columns_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xlm_data_frame_copy.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "y <- c(3.0, 5.0, 7.0, 9.0)",
+                "x <- c(1.0, NA, 3.0, 4.0)",
+                "dat <- data.frame(y = y, x = x)",
+                "dat_imp <- dat",
+                "dat_imp$x[is.na(dat_imp$x)] <- mean(dat_imp$x, na.rm = TRUE)",
+                "print(summary(lm(y ~ x, data = dat_imp)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xlm_data_frame_copy.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "y_lm = dat_imp_y" in out_text
+    assert "x_lm(:, 1) = dat_imp_x" in out_text
+    assert "lm summary:" in proc.stdout
+
+
 def test_xr2f_in_operator_for_integer_real_character_and_logical_vectors(tmp_path: Path) -> None:
     local_input = tmp_path / "xin_probe.r"
     local_input.write_text(
@@ -4453,6 +4522,59 @@ def test_xr2f_as_tibble_read_csv_compile(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
     assert "type(r_tibble_real_t) :: tbl" in out_text
     assert 'tbl = read_csv_tibble_real("csv_in.csv")' in out_text
+
+
+def test_xr2f_real_tibble_workflow_compile_and_run(tmp_path: Path) -> None:
+    (tmp_path / "prices.csv").write_text(
+        "Date,A,B\n2026-01-01,10,20\n2026-01-02,11,18\n2026-01-03,12.1,19.8\n",
+        encoding="utf-8",
+    )
+    local_input = tmp_path / "xtibble_workflow.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                'tbl <- tibble::as_tibble(read.csv("prices.csv", check.names = FALSE))',
+                'assets <- c("A", "B")',
+                "selected <- tbl[, assets]",
+                "x <- as.matrix(selected)",
+                "keep <- rowSums(is.finite(x)) == ncol(x)",
+                "x <- x[keep, , drop = FALSE]",
+                "colnames(x) <- assets",
+                "dates <- tbl$Date",
+                "out <- tibble::as_tibble(x)",
+                "out <- tibble::add_column(out, Date = dates, .before = 1)",
+                "rownames(x) <- c(\"first\", \"second\", \"third\")",
+                'summary <- tibble::as_tibble(x, rownames = "statistic")',
+                "print(head(out, 2))",
+                'cat(nrow(summary), "\\n")',
+                "print(summary)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xtibble_workflow.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = out_path.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert 'read_csv_tibble_real("prices.csv", index_col="Date")' in out_text
+    assert "selected = tibble_real_select(tbl, assets)" in out_text
+    assert "x = selected%real_cols" in out_text
+    assert "count(ieee_is_finite(x), dim=2)" in out_text
+    assert 'row_label_name="Date"' in out_text
+    assert 'row_label_name="statistic"' in out_text
+    assert "2026-01-01" in proc.stdout
+    assert "first" in proc.stdout
 
 
 def test_xr2f_string_helper_keyword_args_compile(tmp_path: Path) -> None:

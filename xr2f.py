@@ -127,6 +127,7 @@ _KNOWN_RANK3_NAMES: set[str] = set()
 _ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
 _RANK3_SLICE_PRINT_LABELS: dict[str, tuple[str, str]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
+_KNOWN_TIBBLE_NAMES: set[str] = set()
 _LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _R_IDENT_RE = r"(?:[A-Za-z]\w*(?:\.[A-Za-z]\w*)*|\.+[A-Za-z_]\w*(?:\.[A-Za-z]\w*)*|\.\.[0-9]\w*)"
@@ -12768,6 +12769,11 @@ def r_expr_to_fortran(expr: str) -> str:
     )
     if m_df_field_subset is not None:
         obj_df, field_df, idx_df = m_df_field_subset.groups()
+        if obj_df.lower() in _KNOWN_TIBBLE_NAMES and field_df.lower() == "date":
+            idx_date = idx_df.strip()
+            if re.fullmatch(r"-\s*1[Ll]?", idx_date):
+                return f"{obj_df}%row_labels(2:)"
+            return f"{obj_df}%row_labels({_int_bound_expr(r_expr_to_fortran(idx_date))})"
         col_df = _expanded_data_frame_col_expr(obj_df, field_df)
         m_col_df = re.fullmatch(rf"{re.escape(obj_df)}\(:,\s*(\d+)\)", col_df or "", re.IGNORECASE)
         if m_col_df is not None:
@@ -12811,6 +12817,11 @@ def r_expr_to_fortran(expr: str) -> str:
         idx_dims_clean_subset = [d for d in idx_dims_subset if not re.match(r"^drop\s*=", d.strip(), re.IGNORECASE)]
         base_subset_name = base_subset.strip().lower()
         c_name_subset = parse_call_text(base_subset.strip())
+        if base_subset_name in _KNOWN_TIBBLE_NAMES and len(idx_dims_clean_subset) == 2:
+            row_src_tibble = idx_dims_clean_subset[0].strip()
+            col_src_tibble = idx_dims_clean_subset[1].strip()
+            if row_src_tibble == "" and col_src_tibble:
+                return f"tibble_real_select({r_expr_to_fortran(base_subset)}, {r_expr_to_fortran(col_src_tibble)})"
         if len(idx_dims_clean_subset) == 1 and re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
             name_idx_subset = _name_indices_from_subscript(base_subset.strip(), idx_dims_clean_subset[0].strip())
             if name_idx_subset is not None:
@@ -13322,6 +13333,9 @@ def r_expr_to_fortran(expr: str) -> str:
     m_order_field = re.match(r"^([A-Za-z]\w*)\s*\$\s*order\s*$", s, re.IGNORECASE)
     if m_order_field is not None:
         return f"{r_expr_to_fortran(m_order_field.group(1))}%order"
+    m_tibble_date = re.match(r"^([A-Za-z]\w*)\s*\$\s*Date\s*$", s, re.IGNORECASE)
+    if m_tibble_date is not None and m_tibble_date.group(1).lower() in _KNOWN_TIBBLE_NAMES:
+        return f"{r_expr_to_fortran(m_tibble_date.group(1))}%row_labels"
     m_asnum_loglik = re.match(r"^as\.numeric\s*\(\s*logLik\s*\((.*)\)\s*\)\s*$", s, re.IGNORECASE)
     if m_asnum_loglik is not None:
         fit_src = m_asnum_loglik.group(1).strip()
@@ -13428,12 +13442,21 @@ def r_expr_to_fortran(expr: str) -> str:
                 return folded_switch
         if nm_pre == "class":
             return '"acf"'
+        if nm_pre == "requirenamespace":
+            return ".true."
+        if nm_pre == "strrep":
+            text_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
+            count_src = pos_pre[1].strip() if len(pos_pre) >= 2 else c_pre[2].get("times", "").strip()
+            if text_src and count_src:
+                return f"repeat({r_expr_to_fortran(text_src)}, {_int_bound_expr(r_expr_to_fortran(count_src))})"
         if nm_pre == "mode":
             mode_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
             return _r_mode_literal_for_expr(mode_src)
         if nm_pre == "names":
             names_src = pos_pre[0].strip() if pos_pre else ""
             names_src_l = names_src.lower()
+            if names_src_l in _KNOWN_TIBBLE_NAMES:
+                return f"{r_expr_to_fortran(names_src)}%names"
             csv_src = _CSV_HEADER_SOURCES.get(names_src_l)
             if csv_src is not None:
                 return f"read_csv_header_names({r_expr_to_fortran(csv_src)})"
@@ -13447,6 +13470,10 @@ def r_expr_to_fortran(expr: str) -> str:
                 base_names_f = r_expr_to_fortran(names_src)
                 return f"r_paste0_int(\"\", r_seq_int(1, size({base_names_f})))"
             return "[character(len=1) :: ]"
+        if nm_pre == "as.matrix":
+            matrix_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
+            if matrix_src.lower() in _KNOWN_TIBBLE_NAMES:
+                return f"{r_expr_to_fortran(matrix_src)}%real_cols"
         if nm_pre in {"besselj", "bessely", "besseli", "besselk"}:
             if len(pos_pre) < 2:
                 raise NotImplementedError(f"{c_pre[0]} requires x and nu arguments")
@@ -17105,6 +17132,8 @@ def r_expr_to_fortran(expr: str) -> str:
     s = _replace_balanced_func_calls(s, "length", _length_repl)
     def _nrow_inner(inner: str) -> str:
         txt = inner.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", txt) and txt.lower() in _KNOWN_TIBBLE_NAMES:
+            return f"tibble_nrow({r_expr_to_fortran(txt)})"
         cmat = parse_call_text(txt)
         if cmat is not None and cmat[0].lower() == "matrix":
             _nm_m, pos_m, kw_m = cmat
@@ -17116,6 +17145,8 @@ def r_expr_to_fortran(expr: str) -> str:
         return f"size({r_expr_to_fortran(txt)}, 1)"
     def _ncol_inner(inner: str) -> str:
         txt = inner.strip()
+        if re.fullmatch(r"[A-Za-z]\w*", txt) and txt.lower() in _KNOWN_TIBBLE_NAMES:
+            return f"tibble_ncol({r_expr_to_fortran(txt)})"
         cmat = parse_call_text(txt)
         if cmat is not None and cmat[0].lower() == "matrix":
             _nm_m, pos_m, kw_m = cmat
@@ -18089,6 +18120,8 @@ def r_expr_to_fortran(expr: str) -> str:
     def _rowsums_to_fortran(inner: str) -> str:
         c_rs = parse_call_text("rowSums(" + inner.strip() + ")")
         t = (_first_call_arg(c_rs, "x") if c_rs is not None else None) or inner.strip()
+        if re.match(r"^(?:is\.finite|is_finite|ieee_is_finite|is\.na|is_na|is\.nan|is_nan)\s*\(", t, re.IGNORECASE):
+            return f"count({r_expr_to_fortran(t)}, dim=2)"
         m = re.match(r"^exp\s*\(\s*([A-Za-z]\w*)\s*-\s*([A-Za-z]\w*)\s*\)\s*$", t)
         if m:
             a_f = r_expr_to_fortran(m.group(1))
@@ -18109,6 +18142,8 @@ def r_expr_to_fortran(expr: str) -> str:
                     col_df = _expanded_data_frame_col_expr(df_nm, fld_df) or f"{df_nm}_{_sanitize_fortran_kwarg_name(fld_df)}"
                     vals_df.append(f"sum(merge(1, 0, is_na({col_df})))")
                 return "[" + ", ".join(vals_df) + "]"
+        if re.match(r"^(?:is\.finite|is_finite|ieee_is_finite|is\.na|is_na|is\.nan|is_nan)\s*\(", t, re.IGNORECASE):
+            return f"count({r_expr_to_fortran(t)}, dim=1)"
         m = re.match(r"^exp\s*\(\s*([A-Za-z]\w*)\s*-\s*([A-Za-z]\w*)\s*\)\s*$", t)
         if m:
             a_f = r_expr_to_fortran(m.group(1))
@@ -19514,6 +19549,13 @@ def emit_stmts(
             terms.append(term)
         return terms
 
+    def _lm_data_field_source(data_name: str, field: str) -> str:
+        if data_name and re.fullmatch(r"[A-Za-z]\w*", field.strip()):
+            expanded = _expanded_data_frame_col_expr(data_name, field.strip())
+            if expanded is not None:
+                return expanded
+        return field.strip()
+
     def _lm_design_columns(raw_terms: list[str], data_name: str = "") -> tuple[list[str], list[str], str]:
         labels: list[str] = []
         exprs: list[str] = []
@@ -19528,17 +19570,19 @@ def emit_stmts(
                 df_by_source[src_nm] = p_src
         for term in raw_terms:
             tnm = term.strip()
-            src_nm = _source_name_from_factor_expr(df_by_source.get(tnm, tnm))
+            term_src = _lm_data_field_source(data_name, df_by_source.get(tnm, tnm))
+            src_nm = _source_name_from_factor_expr(term_src)
             if not first_src:
                 first_src = src_nm
-            if re.fullmatch(r"[A-Za-z]\w*", src_nm) and src_nm in _CATEGORICAL_LABELS:
-                cat_labels = _CATEGORICAL_LABELS[src_nm]
+            categorical_name = tnm if tnm in _CATEGORICAL_LABELS else src_nm
+            if re.fullmatch(r"[A-Za-z]\w*", src_nm) and categorical_name in _CATEGORICAL_LABELS:
+                cat_labels = _CATEGORICAL_LABELS[categorical_name]
                 for level_idx, level in enumerate(cat_labels[1:], start=2):
-                    labels.append(f"{src_nm}{level}")
+                    labels.append(f"{tnm}{level}")
                     exprs.append(f"merge(1.0_dp, 0.0_dp, {r_expr_to_fortran(src_nm)} == {level_idx})")
                 continue
             labels.append(tnm)
-            exprs.append(r_expr_to_fortran(tnm))
+            exprs.append(r_expr_to_fortran(src_nm))
         return labels, exprs, first_src or (raw_terms[0].strip() if raw_terms else "")
 
     def _lm_anova_groups(raw_terms: list[str], data_name: str = "") -> tuple[list[str], list[int]]:
@@ -22051,8 +22095,46 @@ def emit_stmts(
                     )
                     _CSV_HEADER_SOURCES[st.name.lower()] = path_src
                     need_r_mod.update({"read_csv_tibble_real", "r_tibble_real_t"})
+                    tibble_index_cols = helper_ctx.get("tibble_index_cols", {}) if helper_ctx is not None else {}
+                    index_col = tibble_index_cols.get(st.name) if isinstance(tibble_index_cols, dict) else None
+                    index_actual = f', index_col="{index_col}"' if isinstance(index_col, str) and index_col else ""
                     _wstmt(
-                        f"{st.name} = read_csv_tibble_real({r_expr_to_fortran(path_src)})",
+                        f"{st.name} = read_csv_tibble_real({r_expr_to_fortran(path_src)}{index_actual})",
+                        st.comment,
+                    )
+                    continue
+                if inner_tibble:
+                    names_src = _LAST_COLNAME_SOURCES.get(inner_tibble.lower())
+                    if not isinstance(names_src, str) or not names_src.strip():
+                        raise NotImplementedError(
+                            "as_tibble() of a matrix requires known column names; assign colnames(x) first"
+                        )
+                    row_heading_src = c_as_tibble[2].get("rownames", "").strip()
+                    row_labels_src = _LAST_ROWNAME_SOURCES.get(inner_tibble.lower())
+                    need_r_mod.update({"tibble_real", "r_tibble_real_t"})
+                    if row_heading_src and isinstance(row_labels_src, str) and row_labels_src.strip():
+                        _wstmt(
+                            f"{st.name} = tibble_real({r_expr_to_fortran(names_src)}, "
+                            f"real({r_expr_to_fortran(inner_tibble)}, kind=dp), "
+                            f"{r_expr_to_fortran(row_labels_src)}, "
+                            f"row_label_name={r_expr_to_fortran(row_heading_src)})",
+                            st.comment,
+                        )
+                    else:
+                        _wstmt(
+                            f"{st.name} = tibble_real({r_expr_to_fortran(names_src)}, "
+                            f"real({r_expr_to_fortran(inner_tibble)}, kind=dp))",
+                            st.comment,
+                        )
+                    continue
+            if c_as_tibble is not None and c_as_tibble[0].lower() == "add_column":
+                base_tibble = c_as_tibble[1][0].strip() if c_as_tibble[1] else c_as_tibble[2].get(".data", "").strip()
+                date_src = c_as_tibble[2].get("Date", c_as_tibble[2].get("date", "")).strip()
+                if base_tibble and date_src and base_tibble.lower() in _KNOWN_TIBBLE_NAMES:
+                    need_r_mod.update({"tibble_real", "r_tibble_real_t"})
+                    _wstmt(
+                        f"{st.name} = tibble_real({base_tibble}%names, {base_tibble}%real_cols, "
+                        f"{r_expr_to_fortran(date_src)}, row_label_name=\"Date\")",
                         st.comment,
                     )
                     continue
@@ -22440,10 +22522,10 @@ def emit_stmts(
                     glm_family = "poisson" if re.match(r"^poisson\s*\(", fam_txt, re.IGNORECASE) else "binomial"
                 else:
                     glm_family = ""
-                yv = r_expr_to_fortran(form_split[0].strip())
                 rhs_terms = form_split[1].strip()
                 lm_has_intercept = _lm_rhs_has_intercept(rhs_terms)
                 data_name = kw_lm.get("data", "").strip()
+                yv = r_expr_to_fortran(_lm_data_field_source(data_name, form_split[0].strip()))
                 if rhs_terms == "." and data_name in data_frame_vars:
                     df_y, df_x = data_frame_vars[data_name]
                     x_terms = df_x
@@ -23411,6 +23493,22 @@ def emit_stmts(
                 st = PrintStmt(args=print_args, comment=st.comment)
                 if len(st.args) == 1:
                     one = st.args[0].strip()
+                    one_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", one)
+                    if one_no_ns.lower() in _KNOWN_TIBBLE_NAMES:
+                        _wstmt(f"call print_tibble({one_no_ns})", st.comment)
+                        need_r_mod.add("print_tibble")
+                        continue
+                    c_head_tibble = parse_call_text(one_no_ns)
+                    if c_head_tibble is not None and c_head_tibble[0].lower() == "head" and c_head_tibble[1]:
+                        head_tbl = c_head_tibble[1][0].strip()
+                        if head_tbl.lower() in _KNOWN_TIBBLE_NAMES:
+                            head_n = c_head_tibble[1][1].strip() if len(c_head_tibble[1]) >= 2 else c_head_tibble[2].get("n", "6")
+                            _wstmt(
+                                f"call print_tibble({head_tbl}, n={_int_bound_expr(r_expr_to_fortran(head_n))})",
+                                st.comment,
+                            )
+                            need_r_mod.add("print_tibble")
+                            continue
                     if _emit_vectorized_alias_call(one, st.comment):
                         continue
                     if _emit_outer_print(one, st.comment):
@@ -24891,10 +24989,12 @@ def emit_stmts(
                             m_form_csl = re.match(r"^([A-Za-z]\w*)\s*~\s*(.+)$", form_csl)
                             if not m_form_csl:
                                 raise NotImplementedError("coef(summary(lm(...))) requires formula like y ~ x1 + x2")
-                            y_csl = r_expr_to_fortran(m_form_csl.group(1).strip())
                             terms_csl = _split_lm_rhs_terms(m_form_csl.group(2).strip())
                             has_intercept_csl = _lm_rhs_has_intercept(m_form_csl.group(2).strip())
                             data_csl = kw_csl.get("data", "").strip()
+                            y_csl = r_expr_to_fortran(
+                                _lm_data_field_source(data_csl, m_form_csl.group(1).strip())
+                            )
                             _labels_csl, exprs_csl, _first_csl = _lm_design_columns(terms_csl, data_csl)
                             o.w("block")
                             o.push()
@@ -24937,8 +25037,10 @@ def emit_stmts(
                                 if helper_ctx is not None:
                                     helper_ctx["need_lm"] = True
                                 continue
-                            y_slm = r_expr_to_fortran(form_parts_slm[0].strip())
                             data_slm = kw_slm.get("data", "").strip()
+                            y_slm = r_expr_to_fortran(
+                                _lm_data_field_source(data_slm, form_parts_slm[0].strip())
+                            )
                             rhs_slm = form_parts_slm[1].strip()
                             terms_slm = _split_lm_rhs_terms(rhs_slm)
                             has_intercept_slm = _lm_rhs_has_intercept(rhs_slm)
@@ -24957,15 +25059,18 @@ def emit_stmts(
                                     o.w(f"ok_lm = ok_lm .and. .not. is_na({tv_slm})")
                                 o.w(f"n_lm = count(ok_lm)")
                             else:
-                                o.w(f"n_lm = size({y_slm})")
+                                o.w(f"y_lm = {y_slm}")
+                                o.w("n_lm = size(y_lm)")
                             o.w(f"p_lm = {len(exprs_slm)}")
-                            o.w("allocate(y_lm(n_lm), x_lm(n_lm, p_lm))")
+                            if use_na_omit:
+                                o.w("allocate(y_lm(n_lm), x_lm(n_lm, p_lm))")
+                            else:
+                                o.w("allocate(x_lm(n_lm, p_lm))")
                             if use_na_omit:
                                 o.w(f"y_lm = pack({y_slm}, ok_lm)")
                                 for j_slm, tv_slm in enumerate(exprs_slm, start=1):
                                     o.w(f"x_lm(:, {j_slm}) = pack({tv_slm}, ok_lm)")
                             else:
-                                o.w(f"y_lm = {y_slm}")
                                 for j_slm, tv_slm in enumerate(exprs_slm, start=1):
                                     o.w(f"x_lm(:, {j_slm}) = {tv_slm}")
                             if labels_lit_slm:
@@ -25778,6 +25883,8 @@ def emit_stmts(
                 o.pop()
             o.w("end select")
         elif isinstance(st, ExprStmt):
+            if re.match(r"^\s*(?:quit|q)\s*\(", st.expr, re.IGNORECASE):
+                continue
             if re.match(r"^\s*(?:colnames|rownames|dimnames|names|storage\.mode)\s*\(", st.expr, re.IGNORECASE):
                 continue
             if re.match(r"^\s*attr\s*\(.*\)\s*(?:<-|=)\s*.+$", st.expr.strip(), re.IGNORECASE):
@@ -31461,6 +31568,9 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
         if low.startswith("strsplit("):
             out.add(st.name)
             return
+        if re.match(r"^[A-Za-z]\w*\s*\$\s*Date(?:\s*\[.*\])?\s*$", rhs, re.IGNORECASE | re.DOTALL):
+            out.add(st.name)
+            return
         if low.startswith("list.files(") or low.startswith("list_files(") or low.startswith("dir("):
             out.add(st.name)
             return
@@ -31479,6 +31589,16 @@ def infer_main_character_arrays(stmts: list[object]) -> set[str]:
         if c_rhs is not None and c_rhs[0].lower() in {"rownames", "colnames", "names"}:
             out.add(st.name)
             return
+        if c_rhs is not None and c_rhs[0].lower() in {"head", "tail", "rev"}:
+            src = c_rhs[1][0].strip() if c_rhs[1] else c_rhs[2].get("x", "").strip()
+            src_call = parse_call_text(src)
+            if (
+                src.lower() in {x.lower() for x in out}
+                or src.lower() in _KNOWN_CHAR_VECTOR_NAMES
+                or (src_call is not None and src_call[0].lower() in {"names", "rownames", "colnames", "setdiff"})
+            ):
+                out.add(st.name)
+                return
         if c_rhs is not None and c_rhs[0].lower() == "ifelse":
             args_ifelse_chr = c_rhs[1]
             yes_chr = c_rhs[2].get("yes", args_ifelse_chr[1] if len(args_ifelse_chr) >= 2 else "")
@@ -34965,7 +35085,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _COMBN_SCALAR_CALLBACKS, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS, _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS, _KNOWN_TIBBLE_NAMES
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES, _CURRENT_DATE_NAMES
@@ -35034,6 +35154,7 @@ def transpile_r_to_fortran(
     _CURRENT_LOGICAL_SCALAR_NAMES = set()
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _KNOWN_CHAR_MATRIX_NAMES = set()
+    _KNOWN_TIBBLE_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
     _CUSTOM_INFIX_OPS = {}
@@ -37896,6 +38017,41 @@ def transpile_r_to_fortran(
                 _collect_main_object_list_assigns(st_obj.body)
 
     _collect_main_object_list_assigns(main_stmts)
+    changed_tibbles = True
+    while changed_tibbles:
+        changed_tibbles = False
+        for st_tibble in main_stmts:
+            if not isinstance(st_tibble, Assign) or st_tibble.name in tibble_vars:
+                continue
+            rhs_tibble = re.sub(r"\b[A-Za-z]\w*::", "", st_tibble.expr.strip())
+            c_tibble = parse_call_text(rhs_tibble)
+            is_tibble = False
+            if c_tibble is not None and c_tibble[0].lower() in {"as_tibble", "add_column"}:
+                is_tibble = True
+            trailing_tibble = _split_trailing_r_subset(rhs_tibble)
+            if trailing_tibble is not None and trailing_tibble[0].strip().lower() in {
+                name.lower() for name in tibble_vars
+            }:
+                is_tibble = True
+            if re.fullmatch(r"[A-Za-z]\w*", rhs_tibble) and rhs_tibble.lower() in {
+                name.lower() for name in tibble_vars
+            }:
+                is_tibble = True
+            if is_tibble:
+                tibble_vars.add(st_tibble.name)
+                changed_tibbles = True
+    _KNOWN_TIBBLE_NAMES = {name.lower() for name in tibble_vars}
+    if tibble_vars:
+        helper_ctx_main["tibble_vars"] = set(tibble_vars)
+        helper_ctx_main["need_r_mod"].update(
+            {"r_tibble_real_t", "tibble_nrow", "tibble_ncol", "tibble_real_select"}
+        )
+        tibble_text = "\n".join(_collect_stmt_expr_texts(main_stmts))
+        helper_ctx_main["tibble_index_cols"] = {
+            name: "Date"
+            for name in tibble_vars
+            if re.search(rf"\b{re.escape(name)}\s*\$\s*Date\b", tibble_text, re.IGNORECASE)
+        }
     for st_apply_main in main_stmts:
         if not isinstance(st_apply_main, Assign):
             continue

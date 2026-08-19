@@ -17,21 +17,21 @@ if (!("Date" %in% names(csv_tbl))) {
   stop("tibble_etf_returns: expected a Date column")
 }
 
-asset_names <- setdiff(names(csv_tbl), "Date")
-asset_names <- head(asset_names, 4)
-if (length(asset_names) < 1 || nrow(csv_tbl) < 2) {
+asset_names <- c("SPY", "EFA", "EEM", "EMB")
+if (nrow(csv_tbl) < 2) {
   stop("tibble_etf_returns: expected dated price columns")
 }
 
-price_tbl <- csv_tbl[, c("Date", asset_names)]
-price_matrix <- as.matrix(price_tbl[, asset_names])
+price_tbl <- csv_tbl[, asset_names]
+price_matrix <- as.matrix(price_tbl)
 return_matrix <- 100 * log(
   price_matrix[-1, , drop = FALSE] /
     price_matrix[-nrow(price_matrix), , drop = FALSE]
 )
 keep <- rowSums(is.finite(return_matrix)) == ncol(return_matrix)
 return_matrix <- return_matrix[keep, , drop = FALSE]
-return_dates <- price_tbl$Date[-1]
+colnames(return_matrix) <- asset_names
+return_dates <- csv_tbl$Date[-1]
 return_dates <- return_dates[keep]
 
 return_tbl <- tibble::as_tibble(return_matrix)
@@ -42,12 +42,14 @@ return_tbl <- tibble::add_column(
 )
 
 stats_matrix <- rbind(
-  n = rep(nrow(return_matrix), ncol(return_matrix)),
+  n = 1.0 * colSums(is.finite(return_matrix)),
   mean = colMeans(return_matrix),
   sd = apply(return_matrix, 2, sd),
   minimum = apply(return_matrix, 2, min),
   maximum = apply(return_matrix, 2, max)
 )
+colnames(stats_matrix) <- asset_names
+rownames(stats_matrix) <- c("n", "mean", "sd", "minimum", "maximum")
 stats_tbl <- tibble::as_tibble(stats_matrix, rownames = "statistic")
 
 cat("\n", strrep("=", 72), "\n", sep = "")
@@ -61,4 +63,5 @@ cat("\nFirst five scaled log returns:\n")
 print(head(return_tbl, 5))
 
 cat("\nReturn statistics (returns are multiplied by 100):\n")
-print(stats_tbl, n = Inf)
+cat("Statistic rows:", nrow(stats_tbl), "\n")
+print(stats_tbl)
