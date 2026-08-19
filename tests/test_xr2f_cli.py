@@ -4680,6 +4680,60 @@ def test_xr2f_namespaced_dplyr_real_tibble_verbs_and_pipe_run(tmp_path: Path) ->
     assert "76.000000" in proc.stdout
 
 
+def test_xr2f_namespaced_dplyr_integer_tibble_and_real_promotion_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdplyr_integer_tibble_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(c(1L, 2L, 3L, 4L, 10L, 20L, 30L, 40L, 5L, 4L, 3L, 2L), nrow = 4)",
+                'colnames(x) <- c("id", "value", "weight")',
+                "tbl <- tibble::as_tibble(x)",
+                "filtered <- dplyr::filter(tbl, value >= 20L, weight < 5L)",
+                "mutated <- dplyr::mutate(filtered, doubled = value * 2L)",
+                "selected <- mutated |>",
+                "  dplyr::select(id, doubled)",
+                "pipeline <- tbl |>",
+                "  dplyr::filter(value >= 20L, weight < 5L) |>",
+                "  dplyr::mutate(doubled = value * 2L) |>",
+                "  dplyr::select(id, doubled)",
+                "promoted <- dplyr::mutate(mutated, ratio = value / weight)",
+                "print(tbl)",
+                "print(selected)",
+                "print(pipeline)",
+                "print(promoted)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdplyr_integer_tibble_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "type(r_tibble_integer_t) :: filtered, mutated, pipeline, selected, tbl" in out_text
+    assert "type(r_tibble_real_t) :: promoted" in out_text
+    assert "tbl = tibble_integer(" in out_text
+    assert 'tibble_integer_col(tbl, "value")' in out_text
+    assert "tibble_integer_filter(tbl" in out_text
+    assert 'tibble_integer_mutate(mutated, "doubled"' in out_text
+    assert "tibble_integer_select(mutated" in out_text
+    assert "promoted = tibble_integer_to_real(mutated)" in out_text
+    assert 'tibble_real_mutate(promoted, "ratio"' in out_text
+    assert "<int>" in proc.stdout
+    assert "<dbl>" in proc.stdout
+    assert "20.000000" in proc.stdout
+
+
 def test_xr2f_unqualified_select_remains_a_user_function_run(tmp_path: Path) -> None:
     local_input = tmp_path / "xunqualified_dplyr_names_probe.r"
     local_input.write_text(

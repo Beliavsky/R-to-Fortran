@@ -364,13 +364,16 @@ R tibbles and serves as the initial translation target for restricted tibble
 support. Run it with `Rscript example/tibble_etf_returns.R <csv-path>`.
 
 Translation supports explicit `dplyr::select()`, `dplyr::filter()`, and
-`dplyr::mutate()` calls on real-only tibbles, including chains written with the
+`dplyr::mutate()` calls on homogeneous real or integer tibbles, including chains written with the
 native `|>` pipe. `select()` accepts explicit column names or one
 `all_of(character_vector)` expression; `filter()` accepts one or more logical
-predicates; and `mutate()` accepts named scalar or vector real expressions.
+predicates; and `mutate()` accepts named scalar or vector numeric expressions.
+Integer expressions preserve integer storage; a real-valued mutation promotes
+an integer tibble to a real tibble.
 `example/dplyr_real_tibble.R` is a self-contained demonstration of each verb
-and a piped workflow. Running the source with R requires the `tibble` and
-`dplyr` packages; its generated Fortran uses only `r_mod`.
+and a piped workflow. `example/dplyr_integer_tibble.R` demonstrates preserved
+integer columns and explicit promotion. Running the sources with R requires the
+`tibble` and `dplyr` packages; their generated Fortran uses only `r_mod`.
 Unqualified verb names are not claimed as dplyr calls. Tidy selection renaming,
 grouping, character columns, and dplyr control arguments such as `.by` and
 `.keep` are not yet supported.

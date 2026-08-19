@@ -228,11 +228,11 @@ Available helpers:
 
 Limitation: `r_dataframe_t` currently represents real-valued columns.  Mixed typed data-frame semantics are not a stable public runtime API yet.
 
-### Real-only tibbles
+### Homogeneous numeric tibbles
 
-`r_tibble_real_t` is an additive, direct-Fortran API for experimenting with a
-restricted tibble representation.  Every column is `real(kind=dp)`, column
-names must be nonempty and unique, and all columns share one row count.
+`r_tibble_real_t` and `r_tibble_integer_t` provide restricted homogeneous
+tibble representations. Every column in one table has the same numeric type,
+column names must be nonempty and unique, and all columns share one row count.
 Optional character row labels provide display metadata without introducing a
 heterogeneous data column.
 
@@ -251,22 +251,31 @@ call print_tibble(positive)
 | Helper | Purpose |
 |---|---|
 | `tibble_real(names, cols[, row_labels, row_label_name])` | Construct a real-only tibble from a matrix whose columns correspond to `names`, optionally with row labels and a descriptive row-label heading. |
+| `tibble_integer(names, cols[, row_labels, row_label_name])` | Construct an integer-only tibble with the same naming and row-label rules. |
 | `read_csv_tibble_real(file_path[, max_rows, max_cols, index_col])` | Read a numeric CSV with a header into a real-only tibble. `index_col` stores the original text values as row labels, uses the column name as their heading, and excludes that column from numeric data; with an index, `max_cols` counts retained data columns. |
+| `read_csv_tibble_integer(file_path[, max_rows, max_cols, index_col])` | Read an integer CSV, rejecting nonfinite, fractional, or default-integer-out-of-range data values. |
 | `tibble_nrow`, `tibble_ncol` | Return tibble dimensions. |
 | `tibble_real_col` | Extract a named real column. |
+| `tibble_integer_col` | Extract a named integer column. |
 | `tibble_real_filter` | Select rows using a logical mask. |
+| `tibble_integer_filter` | Select integer-tibble rows using a logical mask. |
 | `tibble_real_select` | Select and reorder explicitly named columns. |
+| `tibble_integer_select` | Select and reorder integer columns. |
 | `tibble_real_drop` | Remove explicitly named columns. |
+| `tibble_integer_drop` | Remove explicitly named integer columns. |
 | `tibble_real_mutate` | Add or replace a real column; scalar values are recycled to all rows. |
+| `tibble_integer_mutate` | Add or replace an integer column. A real argument returns a promoted `r_tibble_real_t`. |
+| `tibble_integer_to_real` | Explicitly promote every integer column to `real(kind=dp)`. |
 | `tibble_real_log_returns` | Compute adjacent-row log returns, preserving column names and omitting row pairs with nonfinite or nonpositive values. |
 | `tibble_real_stats` | Summarize each column as `n`, `mean`, `sd`, `minimum`, and `maximum` rows while preserving the input column names and labeling the row field `statistic`. |
 | `print_tibble` | Print a compact tibble-style preview. Ordinary values use aligned fixed-point formatting; scientific notation is reserved for very small or large magnitudes. `decimal_places` controls displayed precision (default 6), `integer_row_labels` displays named, integer-valued rows without decimal notation, and `row_numbers` controls the leading ordinal column (default `.true.`). |
 
 The transpiler maps `tibble::as_tibble()` and `tibble::add_column()` in the
-restricted real-table workflow. It also supports explicit `dplyr::select()`,
+restricted numeric-table workflow. It also supports explicit `dplyr::select()`,
 `dplyr::filter()`, and `dplyr::mutate()` calls, including native `|>` chains.
 Selection is limited to explicit names or `all_of()`, and filter/mutate data
-expressions operate on real columns. Character, logical, factor, date, list,
+expressions operate on homogeneous real or integer columns. Real-valued
+mutation promotes an integer tibble. Character, logical, factor, date, list,
 grouped, and other heterogeneous columns remain outside this representation.
 
 ## Model and Test Result Types

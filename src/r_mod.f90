@@ -57,9 +57,13 @@ public :: date_from_iso, date_from_iso_vec, date_from_yyyymmdd_vec, date_to_char
    & sys_getenv, file_rename, unlink_recursive
 public :: as_octmode, as_hexmode, as_roman, inttobits, str_to_int, str_to_real, fivenum
 public :: r_dataframe_t, table_char_t, table_char, data_frame_real, dataframe_real_col, print_dataframe, print_dataframe_head
-public :: r_tibble_real_t, tibble_real, tibble_nrow, tibble_ncol, tibble_real_col, &
+public :: r_tibble_real_t, r_tibble_integer_t, tibble_real, tibble_integer, &
+   & tibble_nrow, tibble_ncol, tibble_real_col, tibble_integer_col, &
    & tibble_real_filter, tibble_real_select, tibble_real_drop, tibble_real_mutate, &
-   & tibble_real_log_returns, tibble_real_stats, read_csv_tibble_real, print_tibble
+   & tibble_integer_filter, tibble_integer_select, tibble_integer_drop, &
+   & tibble_integer_mutate, tibble_integer_to_real, &
+   & tibble_real_log_returns, tibble_real_stats, read_csv_tibble_real, &
+   & read_csv_tibble_integer, print_tibble
 integer, parameter :: dp = real64
 logical :: print_int_like_default = .true.
 real(kind=dp) :: print_int_like_tol = 1000.0_dp * epsilon(1.0_dp)
@@ -108,10 +112,40 @@ type :: r_tibble_real_t
    real(kind=dp), allocatable :: real_cols(:,:)
 end type r_tibble_real_t
 
+type :: r_tibble_integer_t
+! Integer-only columnar table used by the restricted tibble API.
+   character(len=:), allocatable :: names(:)
+   character(len=:), allocatable :: row_labels(:)
+   character(len=:), allocatable :: row_label_name
+   integer, allocatable :: integer_cols(:,:)
+end type r_tibble_integer_t
+
+interface tibble_nrow
+   module procedure tibble_real_nrow
+   module procedure tibble_integer_nrow
+end interface tibble_nrow
+
+interface tibble_ncol
+   module procedure tibble_real_ncol
+   module procedure tibble_integer_ncol
+end interface tibble_ncol
+
 interface tibble_real_mutate
    module procedure tibble_real_mutate_vector
    module procedure tibble_real_mutate_scalar
 end interface tibble_real_mutate
+
+interface tibble_integer_mutate
+   module procedure tibble_integer_mutate_vector
+   module procedure tibble_integer_mutate_scalar
+   module procedure tibble_integer_mutate_real_vector
+   module procedure tibble_integer_mutate_real_scalar
+end interface tibble_integer_mutate
+
+interface print_tibble
+   module procedure print_tibble_real
+   module procedure print_tibble_integer
+end interface print_tibble
 
 type :: table_char_t
    character(len=:), allocatable :: gene(:)
@@ -20329,19 +20363,19 @@ else if (present(row_label_name)) then
 end if
 end function tibble_real
 
-pure integer function tibble_nrow(tbl) result(n)
+pure integer function tibble_real_nrow(tbl) result(n)
 type(r_tibble_real_t), intent(in) :: tbl
 
 n = 0
 if (allocated(tbl%real_cols)) n = size(tbl%real_cols, 1)
-end function tibble_nrow
+end function tibble_real_nrow
 
-pure integer function tibble_ncol(tbl) result(n)
+pure integer function tibble_real_ncol(tbl) result(n)
 type(r_tibble_real_t), intent(in) :: tbl
 
 n = 0
 if (allocated(tbl%real_cols)) n = size(tbl%real_cols, 2)
-end function tibble_ncol
+end function tibble_real_ncol
 
 function tibble_real_col(tbl, name) result(col)
 type(r_tibble_real_t), intent(in) :: tbl
@@ -20481,6 +20515,258 @@ allocate(values(tibble_nrow(tbl)), source=value)
 out = tibble_real_mutate_vector(tbl, name, values)
 end function tibble_real_mutate_scalar
 
+function tibble_integer(names, cols, row_labels, row_label_name) result(tbl)
+character(len=*), intent(in) :: names(:)
+integer, intent(in) :: cols(:,:)
+character(len=*), intent(in), optional :: row_labels(:)
+character(len=*), intent(in), optional :: row_label_name
+type(r_tibble_integer_t) :: tbl
+integer :: j, k, name_len, row_label_len
+
+if (size(names) /= size(cols, 2)) &
+   error stop "tibble_integer: number of names must match number of columns"
+do j = 1, size(names)
+   if (len_trim(names(j)) == 0) error stop "tibble_integer: column names must not be empty"
+   do k = 1, j - 1
+      if (trim(names(j)) == trim(names(k))) error stop "tibble_integer: duplicate column name"
+   end do
+end do
+name_len = 1
+do j = 1, size(names)
+   name_len = max(name_len, len_trim(names(j)))
+end do
+allocate(character(len=name_len) :: tbl%names(size(names)))
+tbl%names = names
+tbl%integer_cols = cols
+if (present(row_labels)) then
+   if (size(row_labels) /= size(cols, 1)) &
+      error stop "tibble_integer: number of row labels must match number of rows"
+   row_label_len = 1
+   do j = 1, size(row_labels)
+      row_label_len = max(row_label_len, len_trim(row_labels(j)))
+   end do
+   allocate(character(len=row_label_len) :: tbl%row_labels(size(row_labels)))
+   tbl%row_labels = row_labels
+   if (present(row_label_name)) then
+      if (len_trim(row_label_name) == 0) &
+         error stop "tibble_integer: row label name must not be empty"
+      tbl%row_label_name = trim(row_label_name)
+   end if
+else if (present(row_label_name)) then
+   error stop "tibble_integer: row label name requires row labels"
+end if
+end function tibble_integer
+
+pure integer function tibble_integer_nrow(tbl) result(n)
+type(r_tibble_integer_t), intent(in) :: tbl
+n = 0
+if (allocated(tbl%integer_cols)) n = size(tbl%integer_cols, 1)
+end function tibble_integer_nrow
+
+pure integer function tibble_integer_ncol(tbl) result(n)
+type(r_tibble_integer_t), intent(in) :: tbl
+n = 0
+if (allocated(tbl%integer_cols)) n = size(tbl%integer_cols, 2)
+end function tibble_integer_ncol
+
+function tibble_integer_col(tbl, name) result(col)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+integer, allocatable :: col(:)
+integer :: j
+
+do j = 1, tibble_ncol(tbl)
+   if (trim(tbl%names(j)) == trim(name)) then
+      col = tbl%integer_cols(:, j)
+      return
+   end if
+end do
+error stop "tibble_integer_col: column not found"
+end function tibble_integer_col
+
+function tibble_integer_filter(tbl, keep) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+logical, intent(in) :: keep(:)
+type(r_tibble_integer_t) :: out
+integer, allocatable :: cols(:,:)
+integer :: j
+
+if (size(keep) /= tibble_nrow(tbl)) &
+   error stop "tibble_integer_filter: mask length must match number of rows"
+allocate(cols(count(keep), tibble_ncol(tbl)))
+do j = 1, tibble_ncol(tbl)
+   cols(:, j) = pack(tbl%integer_cols(:, j), keep)
+end do
+if (allocated(tbl%row_labels)) then
+   out = tibble_integer(tbl%names, cols, pack(tbl%row_labels, keep))
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_integer(tbl%names, cols)
+end if
+end function tibble_integer_filter
+
+function tibble_integer_select(tbl, selected_names) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: selected_names(:)
+type(r_tibble_integer_t) :: out
+integer, allocatable :: cols(:,:)
+integer :: i, j
+logical :: found
+
+allocate(cols(tibble_nrow(tbl), size(selected_names)))
+do i = 1, size(selected_names)
+   found = .false.
+   do j = 1, tibble_ncol(tbl)
+      if (trim(tbl%names(j)) == trim(selected_names(i))) then
+         cols(:, i) = tbl%integer_cols(:, j)
+         found = .true.
+         exit
+      end if
+   end do
+   if (.not. found) error stop "tibble_integer_select: column not found"
+end do
+if (allocated(tbl%row_labels)) then
+   out = tibble_integer(selected_names, cols, tbl%row_labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_integer(selected_names, cols)
+end if
+end function tibble_integer_select
+
+function tibble_integer_drop(tbl, dropped_names) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: dropped_names(:)
+type(r_tibble_integer_t) :: out
+character(len=:), allocatable :: kept_names(:)
+logical, allocatable :: keep(:)
+integer :: i, j, name_len
+
+allocate(keep(tibble_ncol(tbl)), source=.true.)
+do i = 1, size(dropped_names)
+   do j = 1, tibble_ncol(tbl)
+      if (trim(tbl%names(j)) == trim(dropped_names(i))) keep(j) = .false.
+   end do
+end do
+name_len = 1
+if (allocated(tbl%names)) name_len = max(name_len, len(tbl%names))
+allocate(character(len=name_len) :: kept_names(count(keep)))
+kept_names = pack(tbl%names, keep)
+out = tibble_integer_select(tbl, kept_names)
+end function tibble_integer_drop
+
+function tibble_integer_mutate_vector(tbl, name, values) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+integer, intent(in) :: values(:)
+type(r_tibble_integer_t) :: out
+character(len=:), allocatable :: names(:)
+integer, allocatable :: cols(:,:)
+integer :: j, name_len, target
+
+if (size(values) /= tibble_nrow(tbl)) &
+   error stop "tibble_integer_mutate: column length must match number of rows"
+if (len_trim(name) == 0) error stop "tibble_integer_mutate: column name must not be empty"
+target = 0
+do j = 1, tibble_ncol(tbl)
+   if (trim(tbl%names(j)) == trim(name)) then
+      target = j
+      exit
+   end if
+end do
+if (target > 0) then
+   out = tbl
+   out%integer_cols(:, target) = values
+   return
+end if
+name_len = max(1, len_trim(name))
+if (allocated(tbl%names)) name_len = max(name_len, len(tbl%names))
+allocate(character(len=name_len) :: names(tibble_ncol(tbl) + 1))
+if (tibble_ncol(tbl) > 0) names(:tibble_ncol(tbl)) = tbl%names
+names(size(names)) = name
+allocate(cols(tibble_nrow(tbl), tibble_ncol(tbl) + 1))
+if (tibble_ncol(tbl) > 0) cols(:, :tibble_ncol(tbl)) = tbl%integer_cols
+cols(:, size(cols, 2)) = values
+if (allocated(tbl%row_labels)) then
+   out = tibble_integer(names, cols, tbl%row_labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_integer(names, cols)
+end if
+end function tibble_integer_mutate_vector
+
+function tibble_integer_mutate_scalar(tbl, name, value) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+integer, intent(in) :: value
+type(r_tibble_integer_t) :: out
+integer, allocatable :: values(:)
+
+allocate(values(tibble_nrow(tbl)), source=value)
+out = tibble_integer_mutate_vector(tbl, name, values)
+end function tibble_integer_mutate_scalar
+
+function tibble_integer_to_real(tbl) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+type(r_tibble_real_t) :: out
+real(kind=dp), allocatable :: cols(:,:)
+
+allocate(cols(tibble_nrow(tbl), tibble_ncol(tbl)))
+cols = real(tbl%integer_cols, kind=dp)
+if (allocated(tbl%row_labels)) then
+   out = tibble_real(tbl%names, cols, tbl%row_labels)
+   if (allocated(tbl%row_label_name)) out%row_label_name = tbl%row_label_name
+else
+   out = tibble_real(tbl%names, cols)
+end if
+end function tibble_integer_to_real
+
+function tibble_integer_mutate_real_vector(tbl, name, values) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+real(kind=dp), intent(in) :: values(:)
+type(r_tibble_real_t) :: out
+
+out = tibble_real_mutate(tibble_integer_to_real(tbl), name, values)
+end function tibble_integer_mutate_real_vector
+
+function tibble_integer_mutate_real_scalar(tbl, name, value) result(out)
+type(r_tibble_integer_t), intent(in) :: tbl
+character(len=*), intent(in) :: name
+real(kind=dp), intent(in) :: value
+type(r_tibble_real_t) :: out
+
+out = tibble_real_mutate(tibble_integer_to_real(tbl), name, value)
+end function tibble_integer_mutate_real_scalar
+
+function read_csv_tibble_integer(file_path, max_rows, max_cols, index_col) result(tbl)
+character(len=*), intent(in) :: file_path
+integer, intent(in), optional :: max_rows, max_cols
+character(len=*), intent(in), optional :: index_col
+type(r_tibble_integer_t) :: tbl
+type(r_tibble_real_t) :: real_tbl
+integer, allocatable :: cols(:,:)
+real(kind=dp) :: value
+integer :: i, j
+
+real_tbl = read_csv_tibble_real(file_path, max_rows, max_cols, index_col)
+allocate(cols(tibble_nrow(real_tbl), tibble_ncol(real_tbl)))
+do j = 1, tibble_ncol(real_tbl)
+   do i = 1, tibble_nrow(real_tbl)
+      value = real_tbl%real_cols(i, j)
+      if (.not. ieee_is_finite(value) .or. value < real(-huge(0), dp) .or. &
+          value > real(huge(0), dp) .or. value /= anint(value)) &
+         error stop "read_csv_tibble_integer: non-integer or out-of-range value"
+      cols(i, j) = int(value)
+   end do
+end do
+if (allocated(real_tbl%row_labels)) then
+   tbl = tibble_integer(real_tbl%names, cols, real_tbl%row_labels)
+   if (allocated(real_tbl%row_label_name)) tbl%row_label_name = real_tbl%row_label_name
+else
+   tbl = tibble_integer(real_tbl%names, cols)
+end if
+end function read_csv_tibble_integer
+
 function read_csv_tibble_real(file_path, max_rows, max_cols, index_col) result(tbl)
 character(len=*), intent(in) :: file_path
 integer, intent(in), optional :: max_rows
@@ -20612,7 +20898,7 @@ out = tibble_real(tbl%names, values, &
    row_label_name="statistic")
 end function tibble_real_stats
 
-subroutine print_tibble(tbl, n, integer_row_labels, decimal_places, row_numbers, tibble_style)
+subroutine print_tibble_real(tbl, n, integer_row_labels, decimal_places, row_numbers, tibble_style)
 type(r_tibble_real_t), intent(in) :: tbl
 integer, intent(in), optional :: n
 character(len=*), intent(in), optional :: integer_row_labels(:)
@@ -20717,7 +21003,71 @@ do i = 1, nshow
 end do
 if (use_tibble_style .and. nshow < tibble_nrow(tbl)) &
    write(*, '(a, i0, a)') "# ... with ", tibble_nrow(tbl) - nshow, " more rows"
-end subroutine print_tibble
+end subroutine print_tibble_real
+
+subroutine print_tibble_integer(tbl, n, integer_row_labels, decimal_places, row_numbers, tibble_style)
+type(r_tibble_integer_t), intent(in) :: tbl
+integer, intent(in), optional :: n
+character(len=*), intent(in), optional :: integer_row_labels(:)
+integer, intent(in), optional :: decimal_places
+logical, intent(in), optional :: row_numbers
+logical, intent(in), optional :: tibble_style
+integer :: field_width, i, j, nshow
+logical :: print_row_numbers, show_row_labels, use_tibble_style
+character(len=32) :: header_fmt, integer_fmt
+
+nshow = min(10, tibble_nrow(tbl))
+if (present(n)) nshow = min(tibble_nrow(tbl), max(0, n))
+print_row_numbers = .true.
+if (present(row_numbers)) print_row_numbers = row_numbers
+use_tibble_style = .true.
+if (present(tibble_style)) use_tibble_style = tibble_style
+if (present(decimal_places)) then
+   if (decimal_places < 0 .or. decimal_places > 15) &
+      error stop "print_tibble: decimal_places must be between 0 and 15"
+end if
+if (present(integer_row_labels)) then
+   if (.not. allocated(tbl%row_labels) .and. size(integer_row_labels) > 0) &
+      error stop "print_tibble: integer row labels require tibble row labels"
+end if
+field_width = 12
+write(header_fmt, '("(1x,a",i0,")")') field_width
+write(integer_fmt, '("(1x,i",i0,")")') field_width
+show_row_labels = allocated(tbl%row_labels)
+if (use_tibble_style) &
+   write(*, '(a, i0, a, i0)') "# A tibble: ", tibble_nrow(tbl), " x ", tibble_ncol(tbl)
+if (tibble_ncol(tbl) == 0) return
+if (print_row_numbers) write(*, '(6x)', advance='no')
+if (show_row_labels) then
+   if (allocated(tbl%row_label_name)) then
+      write(*, '(1x, a12)', advance='no') trim(tbl%row_label_name)
+   else
+      write(*, '(1x, a12)', advance='no') ".row"
+   end if
+end if
+do j = 1, tibble_ncol(tbl)
+   write(*, header_fmt, advance='no') trim(tbl%names(j))
+end do
+write(*, *)
+if (use_tibble_style) then
+   if (print_row_numbers) write(*, '(6x)', advance='no')
+   if (show_row_labels) write(*, '(1x, a12)', advance='no') ""
+   do j = 1, tibble_ncol(tbl)
+      write(*, header_fmt, advance='no') '<int>'
+   end do
+   write(*, *)
+end if
+do i = 1, nshow
+   if (print_row_numbers) write(*, '(i6)', advance='no') i
+   if (show_row_labels) write(*, '(1x, a12)', advance='no') trim(tbl%row_labels(i))
+   do j = 1, tibble_ncol(tbl)
+      write(*, integer_fmt, advance='no') tbl%integer_cols(i, j)
+   end do
+   write(*, *)
+end do
+if (use_tibble_style .and. nshow < tibble_nrow(tbl)) &
+   write(*, '(a, i0, a)') "# ... with ", tibble_nrow(tbl) - nshow, " more rows"
+end subroutine print_tibble_integer
 
 function dataframe_real_col(df, name) result(col)
 type(r_dataframe_t), intent(in) :: df

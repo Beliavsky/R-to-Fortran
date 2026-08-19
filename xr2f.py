@@ -128,6 +128,7 @@ _ARRAY_DIM_LABELS: dict[str, list[list[str]]] = {}
 _RANK3_SLICE_PRINT_LABELS: dict[str, tuple[str, str]] = {}
 _KNOWN_OBJECT_LIST_NAMES: set[str] = set()
 _KNOWN_TIBBLE_NAMES: set[str] = set()
+_KNOWN_INTEGER_TIBBLE_NAMES: set[str] = set()
 _LIST_FIELD_NAME_ALIASES: dict[str, str] = {}
 _DOTTED_VAR_RENAMES: dict[str, str] = {}
 _R_IDENT_RE = r"(?:[A-Za-z]\w*(?:\.[A-Za-z]\w*)*|\.+[A-Za-z_]\w*(?:\.[A-Za-z]\w*)*|\.\.[0-9]\w*)"
@@ -1897,10 +1898,10 @@ def _dplyr_call_info(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
 
 
 def _dplyr_data_mask_expr(expr: str, table_name: str, known_names: set[str]) -> str:
-    """Resolve unknown bare names as real columns within a guarded dplyr call."""
+    """Resolve unknown bare names as numeric columns within a guarded dplyr call."""
     if "$" in expr:
         raise NotImplementedError(
-            "dplyr data expressions currently use bare real column names; "
+            "dplyr data expressions currently use bare numeric column names; "
             "`.data$column` and character columns are unsupported"
         )
     reserved = {
@@ -1942,25 +1943,30 @@ def _dplyr_data_mask_expr(expr: str, table_name: str, known_names: set[str]) -> 
         is_call = after.startswith("(")
         is_kwarg = after.startswith("=") and not after.startswith("==")
         is_namespace = before == ":" or after.startswith("::")
+        is_integer_suffix = token.lower() == "l" and bool(before) and before.isdigit()
         if (
             token.lower() in reserved
             or token.lower() in known_l
             or is_call
             or is_kwarg
             or is_namespace
+            or is_integer_suffix
         ):
             out.append(token)
         else:
-            out.append(
-                f"tibble_real_col({table_name}, {_fortran_str_literal(token)})"
+            accessor = (
+                "tibble_integer_col"
+                if table_name.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
+                else "tibble_real_col"
             )
+            out.append(f"{accessor}({table_name}, {_fortran_str_literal(token)})")
         i = end
     return "".join(out)
 
 
 def _dplyr_select_names_expr(args: list[str]) -> str:
     if not args:
-        raise NotImplementedError("dplyr::select() requires at least one real column")
+        raise NotImplementedError("dplyr::select() requires at least one numeric column")
     if len(args) == 1:
         all_of = parse_call_text(args[0].strip())
         if all_of is not None and all_of[0].lower() == "all_of":
@@ -1979,7 +1985,7 @@ def _dplyr_select_names_expr(args: list[str]) -> str:
             labels.append(raw)
             continue
         raise NotImplementedError(
-            "dplyr::select() currently supports explicit real column names "
+            "dplyr::select() currently supports explicit numeric column names "
             "or one all_of(character_vector) expression"
         )
     return _character_array_literal_expr(labels)
@@ -12929,7 +12935,12 @@ def r_expr_to_fortran(expr: str) -> str:
             row_src_tibble = idx_dims_clean_subset[0].strip()
             col_src_tibble = idx_dims_clean_subset[1].strip()
             if row_src_tibble == "" and col_src_tibble:
-                return f"tibble_real_select({r_expr_to_fortran(base_subset)}, {r_expr_to_fortran(col_src_tibble)})"
+                selector_tibble = (
+                    "tibble_integer_select"
+                    if base_subset_name in _KNOWN_INTEGER_TIBBLE_NAMES
+                    else "tibble_real_select"
+                )
+                return f"{selector_tibble}({r_expr_to_fortran(base_subset)}, {r_expr_to_fortran(col_src_tibble)})"
         if len(idx_dims_clean_subset) == 1 and re.fullmatch(r"[A-Za-z]\w*", base_subset.strip()):
             name_idx_subset = _name_indices_from_subscript(base_subset.strip(), idx_dims_clean_subset[0].strip())
             if name_idx_subset is not None:
@@ -13581,7 +13592,12 @@ def r_expr_to_fortran(expr: str) -> str:
         if nm_pre == "as.matrix":
             matrix_src = pos_pre[0].strip() if pos_pre else c_pre[2].get("x", "").strip()
             if matrix_src.lower() in _KNOWN_TIBBLE_NAMES:
-                return f"{r_expr_to_fortran(matrix_src)}%real_cols"
+                component = (
+                    "integer_cols"
+                    if matrix_src.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
+                    else "real_cols"
+                )
+                return f"{r_expr_to_fortran(matrix_src)}%{component}"
         if nm_pre in {"besselj", "bessely", "besseli", "besselk"}:
             if len(pos_pre) < 2:
                 raise NotImplementedError(f"{c_pre[0]} requires x and nu arguments")
@@ -19167,6 +19183,8 @@ def emit_stmts(
     nlm_vars_ctx: set[str] = set()
     rle_vars_ctx: dict[str, str] = {}
     benchmark_vars: set[str] = set()
+    integer_tibble_vars: set[str] = set()
+    real_tibble_vars: set[str] = set()
     if helper_ctx is not None:
         nr = helper_ctx.get("need_r_mod")
         if isinstance(nr, set):
@@ -19213,6 +19231,12 @@ def emit_stmts(
         imv = helper_ctx.get("int_matrix_vars")
         if isinstance(imv, set):
             int_matrix_vars = imv
+        itv = helper_ctx.get("integer_tibble_vars")
+        if isinstance(itv, set):
+            integer_tibble_vars = itv
+        rtv = helper_ctx.get("real_tibble_vars")
+        if isinstance(rtv, set):
+            real_tibble_vars = rtv
         isv = helper_ctx.get("int_scalar_vars")
         if isinstance(isv, set):
             int_scalar_vars = isv
@@ -21920,8 +21944,10 @@ def emit_stmts(
             )
         if table_src.lower() not in _KNOWN_TIBBLE_NAMES:
             raise NotImplementedError(
-                f"{call_name}() currently supports only the restricted real-valued tibble type"
+                f"{call_name}() currently supports only restricted numeric tibble types"
             )
+        source_is_integer = table_src.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
+        result_is_integer = st.name.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
         data_args = list(pos[1:])
         known_names = (
             set(_STATIC_LS_NAMES)
@@ -21935,8 +21961,16 @@ def emit_stmts(
                     "dplyr::select() renaming and named arguments are not yet supported"
                 )
             selected_f = _dplyr_select_names_expr(data_args)
-            need_r_mod.update({"r_tibble_real_t", "tibble_real_select"})
-            _wstmt(f"{st.name} = tibble_real_select({table_src}, {selected_f})", stmt_comment)
+            if source_is_integer:
+                selected_expr = f"tibble_integer_select({table_src}, {selected_f})"
+                need_r_mod.update({"r_tibble_integer_t", "tibble_integer_select"})
+                if not result_is_integer:
+                    selected_expr = f"tibble_integer_to_real({selected_expr})"
+                    need_r_mod.update({"r_tibble_real_t", "tibble_integer_to_real"})
+            else:
+                selected_expr = f"tibble_real_select({table_src}, {selected_f})"
+                need_r_mod.update({"r_tibble_real_t", "tibble_real_select"})
+            _wstmt(f"{st.name} = {selected_expr}", stmt_comment)
             return True
         if call_name.lower() == "dplyr::filter":
             unsupported_kw = [name for name in kw if name != ".data"]
@@ -21951,23 +21985,43 @@ def emit_stmts(
                 for arg in data_args
             ]
             predicate_f = " .and. ".join(f"({expr})" for expr in predicates)
-            need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_filter"})
-            _wstmt(f"{st.name} = tibble_real_filter({table_src}, {predicate_f})", stmt_comment)
+            if source_is_integer:
+                filtered_expr = f"tibble_integer_filter({table_src}, {predicate_f})"
+                need_r_mod.update(
+                    {"r_tibble_integer_t", "tibble_integer_col", "tibble_integer_filter"}
+                )
+                if not result_is_integer:
+                    filtered_expr = f"tibble_integer_to_real({filtered_expr})"
+                    need_r_mod.update({"r_tibble_real_t", "tibble_integer_to_real"})
+            else:
+                filtered_expr = f"tibble_real_filter({table_src}, {predicate_f})"
+                need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_filter"})
+            _wstmt(f"{st.name} = {filtered_expr}", stmt_comment)
             return True
         if data_args:
             raise NotImplementedError(
-                "dplyr::mutate() currently requires named real-valued column expressions"
+                "dplyr::mutate() currently requires named numeric column expressions"
             )
         mutations = [(name, expr) for name, expr in kw.items() if name != ".data"]
         if not mutations:
-            raise NotImplementedError("dplyr::mutate() requires at least one named real column")
+            raise NotImplementedError("dplyr::mutate() requires at least one named numeric column")
         if any(name.startswith(".") for name, _expr in mutations):
             raise NotImplementedError(
                 "dplyr::mutate() control arguments such as `.by`, `.keep`, `.before`, and `.after` are unsupported"
             )
-        need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_mutate"})
-        if st.name != table_src:
-            _wstmt(f"{st.name} = {table_src}", stmt_comment)
+        if result_is_integer:
+            need_r_mod.update(
+                {"r_tibble_integer_t", "tibble_integer_col", "tibble_integer_mutate"}
+            )
+            if st.name != table_src:
+                _wstmt(f"{st.name} = {table_src}", stmt_comment)
+        else:
+            need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_mutate"})
+            if source_is_integer:
+                need_r_mod.update({"r_tibble_integer_t", "tibble_integer_to_real"})
+                _wstmt(f"{st.name} = tibble_integer_to_real({table_src})", stmt_comment)
+            elif st.name != table_src:
+                _wstmt(f"{st.name} = {table_src}", stmt_comment)
         prior_columns: set[str] = set()
         for column_name, expr in mutations:
             masked = _dplyr_data_mask_expr(
@@ -21976,11 +22030,18 @@ def emit_stmts(
                 known_names - prior_columns,
             )
             value_f = r_expr_to_fortran(masked)
-            _wstmt(
-                f"{st.name} = tibble_real_mutate({st.name}, "
-                f"{_fortran_str_literal(column_name)}, real({value_f}, kind=dp))",
-                "",
-            )
+            if result_is_integer:
+                _wstmt(
+                    f"{st.name} = tibble_integer_mutate({st.name}, "
+                    f"{_fortran_str_literal(column_name)}, int({value_f}))",
+                    "",
+                )
+            else:
+                _wstmt(
+                    f"{st.name} = tibble_real_mutate({st.name}, "
+                    f"{_fortran_str_literal(column_name)}, real({value_f}, kind=dp))",
+                    "",
+                )
             prior_columns.add(column_name.lower())
         return True
 
@@ -22326,19 +22387,29 @@ def emit_stmts(
                         )
                     row_heading_src = c_as_tibble[2].get("rownames", "").strip()
                     row_labels_src = _LAST_ROWNAME_SOURCES.get(inner_tibble.lower())
-                    need_r_mod.update({"tibble_real", "r_tibble_real_t"})
+                    integer_tibble = st.name.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
+                    constructor = "tibble_integer" if integer_tibble else "tibble_real"
+                    value_expr = r_expr_to_fortran(inner_tibble)
+                    if not integer_tibble:
+                        value_expr = f"real({value_expr}, kind=dp)"
+                    need_r_mod.update(
+                        {
+                            constructor,
+                            "r_tibble_integer_t" if integer_tibble else "r_tibble_real_t",
+                        }
+                    )
                     if row_heading_src and isinstance(row_labels_src, str) and row_labels_src.strip():
                         _wstmt(
-                            f"{st.name} = tibble_real({r_expr_to_fortran(names_src)}, "
-                            f"real({r_expr_to_fortran(inner_tibble)}, kind=dp), "
+                            f"{st.name} = {constructor}({r_expr_to_fortran(names_src)}, "
+                            f"{value_expr}, "
                             f"{r_expr_to_fortran(row_labels_src)}, "
                             f"row_label_name={r_expr_to_fortran(row_heading_src)})",
                             st.comment,
                         )
                     else:
                         _wstmt(
-                            f"{st.name} = tibble_real({r_expr_to_fortran(names_src)}, "
-                            f"real({r_expr_to_fortran(inner_tibble)}, kind=dp))",
+                            f"{st.name} = {constructor}({r_expr_to_fortran(names_src)}, "
+                            f"{value_expr})",
                             st.comment,
                         )
                     continue
@@ -22346,9 +22417,17 @@ def emit_stmts(
                 base_tibble = c_as_tibble[1][0].strip() if c_as_tibble[1] else c_as_tibble[2].get(".data", "").strip()
                 date_src = c_as_tibble[2].get("Date", c_as_tibble[2].get("date", "")).strip()
                 if base_tibble and date_src and base_tibble.lower() in _KNOWN_TIBBLE_NAMES:
-                    need_r_mod.update({"tibble_real", "r_tibble_real_t"})
+                    integer_tibble = st.name.lower() in _KNOWN_INTEGER_TIBBLE_NAMES
+                    constructor = "tibble_integer" if integer_tibble else "tibble_real"
+                    component = "integer_cols" if integer_tibble else "real_cols"
+                    need_r_mod.update(
+                        {
+                            constructor,
+                            "r_tibble_integer_t" if integer_tibble else "r_tibble_real_t",
+                        }
+                    )
                     _wstmt(
-                        f"{st.name} = tibble_real({base_tibble}%names, {base_tibble}%real_cols, "
+                        f"{st.name} = {constructor}({base_tibble}%names, {base_tibble}%{component}, "
                         f"{r_expr_to_fortran(date_src)}, row_label_name=\"Date\")",
                         st.comment,
                     )
@@ -35314,7 +35393,7 @@ def transpile_r_to_fortran(
 ) -> str:
     global _HAS_R_MOD, _FORTRAN_COMMENTS, _USER_FUNC_ARG_KIND, _USER_FUNC_ARG_INDEX, _USER_FUNC_ARG_RANK, _INFER_ARG_RANK_CACHE, _INFER_FUNCTION_INTEGER_NAMES_CACHE, _INFER_FUNCTION_INTEGER_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_ARRAY_NAMES_CACHE, _INFER_FUNCTION_REAL_MATRIX_NAMES_CACHE, _USER_FUNC_RETURN_RANK, _USER_FUNC_RETURN_KIND, _COMBN_SCALAR_CALLBACKS, _USER_FUNC_ELEMENTAL, _FUNC_DEFS_BY_NAME, _VECTORIZED_ALIASES, _VOID_FUNCTION_LIKE, _NLM_OBJECTIVE_NAMES, _NLM_CLOSURE_WRAPPERS, _FORCED_FUNC_ARG_RANKS, _INTEGRATE_OBJECTIVE_NAMES, _R_EXPRESSION_OBJECTS, _R_DERIVATIVE_OBJECTS, _CUSTOM_INFIX_OPS
     global _SUBROUTINE_FUNCTIONS, _LEXICAL_INOUT_ARGS, _LEXICALLY_MUTATED_LOCALS
-    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS, _KNOWN_TIBBLE_NAMES
+    global _KNOWN_VECTOR_NAMES, _KNOWN_NA_VECTOR_NAMES, _KNOWN_INT_NAMES, _KNOWN_INT_VECTOR_NAMES, _KNOWN_MATRIX_NAMES, _KNOWN_LOGICAL_VECTOR_NAMES, _CURRENT_LOGICAL_ARRAY_NAMES, _CURRENT_LOGICAL_SCALAR_NAMES, _KNOWN_LOGICAL_MATRIX_NAMES, _KNOWN_CHAR_VECTOR_NAMES, _KNOWN_CHAR_MATRIX_NAMES, _STATIC_LS_NAMES, _STATIC_LS_STR_LINES, _STATIC_LS_STR_RUNTIME_SCALARS, _STATIC_LS_STR_RUNTIME_VECTORS, _KNOWN_COMPLEX_VECTOR_NAMES, _KNOWN_COMPLEX_SCALAR_NAMES, _KNOWN_COMPLEX_MATRIX_NAMES, _KNOWN_NULL_NAMES, _NULL_ARRAY_SENTINELS, _KNOWN_TIBBLE_NAMES, _KNOWN_INTEGER_TIBBLE_NAMES
     global _KNOWN_RANK3_NAMES, _ARRAY_DIM_LABELS, _LIST_FIELD_NAME_ALIASES
     global _NAMED_VECTOR_NAMES, _NAMED_VECTOR_LABELS, _CATEGORICAL_LABELS, _CHAR_INDEX_ALIASES, _TABLE_LABELS, _FIT_TERM_LABELS, _OPTIM_RESULT_NAMES, _LAST_COLNAME_SOURCES, _LAST_ROWNAME_SOURCES, _LAST_MATRIX_COL_LABELS
     global _KNOWN_DATE_NAMES, _KNOWN_DATE_VECTOR_NAMES, _KNOWN_POSIXCT_NAMES, _CURRENT_DATE_NAMES
@@ -35384,6 +35463,7 @@ def transpile_r_to_fortran(
     _KNOWN_LOGICAL_MATRIX_NAMES = set()
     _KNOWN_CHAR_MATRIX_NAMES = set()
     _KNOWN_TIBBLE_NAMES = set()
+    _KNOWN_INTEGER_TIBBLE_NAMES = set()
     _R_EXPRESSION_OBJECTS = {}
     _R_DERIVATIVE_OBJECTS = {}
     _CUSTOM_INFIX_OPS = {}
@@ -38325,12 +38405,117 @@ def transpile_r_to_fortran(
             if is_tibble:
                 tibble_vars.add(st_tibble.name)
                 changed_tibbles = True
+
+    r_integer_matrix_names: set[str] = set()
+    for _ in range(max(1, len(int_matrices) + 1)):
+        changed_integer_matrices = False
+        for st_integer_matrix in main_stmts:
+            if not isinstance(st_integer_matrix, Assign):
+                continue
+            rhs_integer_matrix = st_integer_matrix.expr.strip()
+            if rhs_integer_matrix in r_integer_matrix_names:
+                if st_integer_matrix.name not in r_integer_matrix_names:
+                    r_integer_matrix_names.add(st_integer_matrix.name)
+                    changed_integer_matrices = True
+                continue
+            call_integer_matrix = parse_call_text(rhs_integer_matrix)
+            if call_integer_matrix is None or call_integer_matrix[0].lower() not in {"matrix", "array"}:
+                continue
+            data_integer_matrix = _first_call_arg(call_integer_matrix, "data")
+            data_kind_integer_matrix = (
+                _literal_c_kind(data_integer_matrix)
+                or _infer_assignment_kind_hint(data_integer_matrix, {})
+            )
+            if data_kind_integer_matrix == "integer" and st_integer_matrix.name not in r_integer_matrix_names:
+                r_integer_matrix_names.add(st_integer_matrix.name)
+                changed_integer_matrices = True
+        if not changed_integer_matrices:
+            break
+
+    def _integer_dplyr_value_expr(expr: str) -> bool:
+        txt = fscan.strip_redundant_outer_parens_expr(expr.strip())
+        if _is_int_literal(txt) or re.fullmatch(r"[A-Za-z]\w*", txt):
+            return True
+        if txt.startswith(("+", "-")):
+            return _integer_dplyr_value_expr(txt[1:])
+        call_int = parse_call_text(txt)
+        if call_int is not None:
+            if call_int[0].lower() in {"as.integer", "int"}:
+                return True
+            return False
+        for op_int in ["%/%", "%%", "*", "+", "-"]:
+            parts_int = _split_top_level_token(txt, op_int, from_right=True)
+            if parts_int is not None:
+                return all(_integer_dplyr_value_expr(part) for part in parts_int)
+        return False
+
+    integer_tibble_vars: set[str] = set()
+    real_tibble_vars: set[str] = set()
+    unresolved_tibble_vars = set(tibble_vars)
+
+    def _tibble_expr_kind(expr: str) -> str:
+        rhs_kind = expr.strip()
+        rhs_kind_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", rhs_kind)
+        direct_kind = rhs_kind_no_ns.lower()
+        if direct_kind in {name.lower() for name in integer_tibble_vars}:
+            return "integer"
+        if direct_kind in {name.lower() for name in real_tibble_vars}:
+            return "real"
+        call_kind_plain = parse_call_text(rhs_kind_no_ns)
+        if call_kind_plain is not None and call_kind_plain[0].lower() == "as_tibble":
+            inner_kind = _first_call_arg(call_kind_plain, "x")
+            return "integer" if inner_kind in r_integer_matrix_names else "real"
+        if call_kind_plain is not None and call_kind_plain[0].lower() == "add_column":
+            base_kind = _first_call_arg(call_kind_plain, ".data")
+            return _tibble_expr_kind(base_kind)
+        call_kind = _dplyr_call_info(rhs_kind)
+        if call_kind is None:
+            return ""
+        src_kind_expr = (
+            call_kind[1][0].strip()
+            if call_kind[1]
+            else call_kind[2].get(".data", "").strip()
+        )
+        source_kind = _tibble_expr_kind(src_kind_expr)
+        if source_kind != "integer" or call_kind[0].lower() != "dplyr::mutate":
+            return source_kind
+        mutations_kind = [
+            value for name, value in call_kind[2].items() if name != ".data"
+        ]
+        if mutations_kind and all(
+            _integer_dplyr_value_expr(value) for value in mutations_kind
+        ):
+            return "integer"
+        return "real"
+
+    for _ in range(max(1, len(tibble_vars) + 1)):
+        changed_kinds = False
+        for st_kind in main_stmts:
+            if not isinstance(st_kind, Assign) or st_kind.name not in unresolved_tibble_vars:
+                continue
+            kind_value = _tibble_expr_kind(st_kind.expr)
+            if kind_value:
+                (integer_tibble_vars if kind_value == "integer" else real_tibble_vars).add(st_kind.name)
+                unresolved_tibble_vars.discard(st_kind.name)
+                changed_kinds = True
+        if not changed_kinds:
+            break
+    real_tibble_vars.update(unresolved_tibble_vars)
     _KNOWN_TIBBLE_NAMES = {name.lower() for name in tibble_vars}
+    _KNOWN_INTEGER_TIBBLE_NAMES = {name.lower() for name in integer_tibble_vars}
     if tibble_vars:
         helper_ctx_main["tibble_vars"] = set(tibble_vars)
+        helper_ctx_main["integer_tibble_vars"] = set(integer_tibble_vars)
+        helper_ctx_main["real_tibble_vars"] = set(real_tibble_vars)
         helper_ctx_main["need_r_mod"].update(
-            {"r_tibble_real_t", "tibble_nrow", "tibble_ncol", "tibble_real_select"}
+            {"tibble_nrow", "tibble_ncol"}
         )
+        if real_tibble_vars:
+            helper_ctx_main["need_r_mod"].update({"r_tibble_real_t", "tibble_real_select"})
+        if integer_tibble_vars:
+            helper_ctx_main["need_r_mod"].update(
+                {"r_tibble_integer_t", "tibble_integer_select"}
+            )
         tibble_text = "\n".join(_collect_stmt_expr_texts(main_stmts))
         helper_ctx_main["tibble_index_cols"] = {
             name: "Date"
@@ -39405,8 +39590,12 @@ def transpile_r_to_fortran(
         pbody.w("complex(kind=dp), allocatable :: " + ", ".join(f"{x}(:,:)" for x in sorted(complex_matrices)))
     if t_test_vars:
         pbody.w("type(t_test_result_t) :: " + ", ".join(sorted(t_test_vars)))
-    if tibble_vars:
-        pbody.w("type(r_tibble_real_t) :: " + ", ".join(sorted(tibble_vars)))
+    integer_tibble_vars_decl = set(helper_ctx_main.get("integer_tibble_vars", set()))
+    real_tibble_vars_decl = set(tibble_vars) - integer_tibble_vars_decl
+    if integer_tibble_vars_decl:
+        pbody.w("type(r_tibble_integer_t) :: " + ", ".join(sorted(integer_tibble_vars_decl)))
+    if real_tibble_vars_decl:
+        pbody.w("type(r_tibble_real_t) :: " + ", ".join(sorted(real_tibble_vars_decl)))
     if char_scalars:
         pbody.w("character(len=:), allocatable :: " + ", ".join(sorted(char_scalars)))
     if char_arrays:
