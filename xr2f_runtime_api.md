@@ -262,9 +262,12 @@ call print_tibble(positive)
 | `tibble_real_stats` | Summarize each column as `n`, `mean`, `sd`, `minimum`, and `maximum` rows while preserving the input column names and labeling the row field `statistic`. |
 | `print_tibble` | Print a compact tibble-style preview. Ordinary values use aligned fixed-point formatting; scientific notation is reserved for very small or large magnitudes. `decimal_places` controls displayed precision (default 6), `integer_row_labels` displays named, integer-valued rows without decimal notation, and `row_numbers` controls the leading ordinal column (default `.true.`). |
 
-This API does not yet imply support for translating R `tibble()` or dplyr
-calls.  Character, logical, factor, date, list, and other heterogeneous
-columns remain outside this initial representation.
+The transpiler maps `tibble::as_tibble()` and `tibble::add_column()` in the
+restricted real-table workflow. It also supports explicit `dplyr::select()`,
+`dplyr::filter()`, and `dplyr::mutate()` calls, including native `|>` chains.
+Selection is limited to explicit names or `all_of()`, and filter/mutate data
+expressions operate on real columns. Character, logical, factor, date, list,
+grouped, and other heterogeneous columns remain outside this representation.
 
 ## Model and Test Result Types
 

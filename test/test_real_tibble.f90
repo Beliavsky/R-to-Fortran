@@ -27,6 +27,12 @@ if (trim(filtered%row_labels(1)) /= "row1" .or. &
 call assert_vector(tibble_real_col(filtered, "id"), [1.0_dp, 3.0_dp], &
    "real tibble filter values")
 
+filtered = tibble_real_filter(tbl, [.false., .false., .false., .false.])
+if (tibble_nrow(filtered) /= 0 .or. tibble_ncol(filtered) /= 3) &
+   error stop "real tibble zero-row filter dimensions failed"
+if (.not. allocated(filtered%row_labels) .or. size(filtered%row_labels) /= 0) &
+   error stop "real tibble zero-row filter labels failed"
+
 selected = tibble_real_select(tbl, [character(len=6) :: "weight", "value"])
 if (tibble_nrow(selected) /= 4 .or. tibble_ncol(selected) /= 2) &
    error stop "real tibble select dimensions failed"

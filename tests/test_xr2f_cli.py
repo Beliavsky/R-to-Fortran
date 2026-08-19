@@ -4627,6 +4627,87 @@ def test_xr2f_base_data_frame_uses_real_table_backend_run(tmp_path: Path) -> Non
     assert "# A tibble:" not in proc.stdout
 
 
+def test_xr2f_namespaced_dplyr_real_tibble_verbs_and_pipe_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xdplyr_real_tibble_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "x <- matrix(c(1, 2, 3, 4, 10, 20, 30, 40, 5, 4, 3, 2), nrow = 4)",
+                'colnames(x) <- c("id", "value", "weight")',
+                "tbl <- tibble::as_tibble(x)",
+                'wanted <- c("id", "value")',
+                "threshold <- 20",
+                "selected <- dplyr::select(tbl, weight, value)",
+                "selected_all <- dplyr::select(tbl, all_of(wanted))",
+                "filtered <- dplyr::filter(tbl, value >= threshold, weight < 5)",
+                "mutated <- dplyr::mutate(filtered, spread = value - weight, doubled = spread * 2)",
+                "piped <- tbl |>",
+                "  dplyr::filter(value > 10) |>",
+                "  dplyr::mutate(ratio = value / weight) |>",
+                "  dplyr::select(id, ratio)",
+                "print(selected)",
+                "print(selected_all)",
+                "print(mutated)",
+                "print(piped)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xdplyr_real_tibble_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = out_path.read_text(encoding="utf-8")
+    flat_out = " ".join(out_text.replace("&", " ").split())
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "dplyr::" not in out_text
+    assert 'tibble_real_select(tbl, [character(len=6) :: "weight", "value"])' in flat_out
+    assert "tibble_real_select(tbl, wanted)" in out_text
+    assert "tibble_real_filter(tbl" in out_text
+    assert 'tibble_real_col(tbl, "value")' in out_text
+    assert 'tibble_real_mutate(mutated, "spread"' in out_text
+    assert 'tibble_real_col(mutated, "spread")' in out_text
+    assert 'tibble_real_select(piped, [character(len=5) :: "id", "ratio"])' in flat_out
+    assert "76.000000" in proc.stdout
+
+
+def test_xr2f_unqualified_select_remains_a_user_function_run(tmp_path: Path) -> None:
+    local_input = tmp_path / "xunqualified_dplyr_names_probe.r"
+    local_input.write_text(
+        "\n".join(
+            [
+                "select <- function(x) x + 1",
+                "print(select(10))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "xunqualified_dplyr_names_probe.f90"
+
+    proc = subprocess.run(
+        [sys.executable, str(XR2F_PATH), str(local_input), "--out", str(out_path), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "11" in proc.stdout
+
+
 def test_xr2f_string_helper_keyword_args_compile(tmp_path: Path) -> None:
     local_input = tmp_path / "xstring_keywords.r"
     local_input.write_text(

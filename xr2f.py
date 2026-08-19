@@ -1829,7 +1829,10 @@ def _parse_for_head(line: str) -> tuple[str, str, str] | None:
 
 def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
     s = txt.strip()
-    m = re.match(r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)\s*\(", s)
+    m = re.match(
+        r"^([A-Za-z]\w*(?:\.[A-Za-z]\w*)*(?:::[A-Za-z]\w*(?:\.[A-Za-z]\w*)*)?)\s*\(",
+        s,
+    )
     if not m:
         return None
     nm = m.group(1)
@@ -1877,6 +1880,109 @@ def parse_call_text(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
                 continue
         pos.append(pt)
     return nm, pos, kw
+
+
+_SUPPORTED_DPLYR_CALLS = {
+    "dplyr::select",
+    "dplyr::filter",
+    "dplyr::mutate",
+}
+
+
+def _dplyr_call_info(txt: str) -> tuple[str, list[str], dict[str, str]] | None:
+    call = parse_call_text(txt.strip())
+    if call is None or call[0].lower() not in _SUPPORTED_DPLYR_CALLS:
+        return None
+    return call
+
+
+def _dplyr_data_mask_expr(expr: str, table_name: str, known_names: set[str]) -> str:
+    """Resolve unknown bare names as real columns within a guarded dplyr call."""
+    if "$" in expr:
+        raise NotImplementedError(
+            "dplyr data expressions currently use bare real column names; "
+            "`.data$column` and character columns are unsupported"
+        )
+    reserved = {
+        "true", "false", "na", "na_real_", "nan", "inf", "null",
+        "pi", "else", "if", "function",
+    }
+    known_l = {name.lower() for name in known_names}
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    escaped = False
+    while i < len(expr):
+        ch = expr[i]
+        if quote is not None:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        match = re.match(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", expr[i:])
+        if match is None:
+            out.append(ch)
+            i += 1
+            continue
+        token = match.group(0)
+        end = i + len(token)
+        before = expr[i - 1] if i > 0 else ""
+        after_text = expr[end:]
+        after = after_text.lstrip()
+        is_call = after.startswith("(")
+        is_kwarg = after.startswith("=") and not after.startswith("==")
+        is_namespace = before == ":" or after.startswith("::")
+        if (
+            token.lower() in reserved
+            or token.lower() in known_l
+            or is_call
+            or is_kwarg
+            or is_namespace
+        ):
+            out.append(token)
+        else:
+            out.append(
+                f"tibble_real_col({table_name}, {_fortran_str_literal(token)})"
+            )
+        i = end
+    return "".join(out)
+
+
+def _dplyr_select_names_expr(args: list[str]) -> str:
+    if not args:
+        raise NotImplementedError("dplyr::select() requires at least one real column")
+    if len(args) == 1:
+        all_of = parse_call_text(args[0].strip())
+        if all_of is not None and all_of[0].lower() == "all_of":
+            selected = _first_call_arg(all_of, "x")
+            if not selected:
+                raise NotImplementedError("dplyr::select(all_of()) requires a character vector")
+            return r_expr_to_fortran(selected)
+    labels: list[str] = []
+    for arg in args:
+        raw = arg.strip()
+        literal = _dequote_string_literal(raw)
+        if literal is not None:
+            labels.append(literal)
+            continue
+        if re.fullmatch(r"[A-Za-z]\w*(?:\.[A-Za-z]\w*)*", raw):
+            labels.append(raw)
+            continue
+        raise NotImplementedError(
+            "dplyr::select() currently supports explicit real column names "
+            "or one all_of(character_vector) expression"
+        )
+    return _character_array_literal_expr(labels)
 
 
 def _trycatch_primary_expr(src: str) -> str | None:
@@ -9154,6 +9260,8 @@ def _is_inline_temp_rhs(expr: str) -> bool:
     # complex vector printer rather than inlining into a flat write.
     c_t = parse_call_text(t)
     if c_t is not None and c_t[0].lower() == "fft":
+        return False
+    if c_t is not None and c_t[0].lower() in _SUPPORTED_DPLYR_CALLS:
         return False
     if t.startswith("c(") or (t.startswith("[") and t.endswith("]")):
         return False
@@ -21793,6 +21901,89 @@ def emit_stmts(
             return f"{_normalize_r_int_literal(txt)}.0_dp"
         return lowered
 
+    def _emit_dplyr_assignment(st: Assign) -> bool:
+        call = _dplyr_call_info(st.expr)
+        if call is None:
+            return False
+        call_name, pos, kw = call
+        table_src = pos[0].strip() if pos else kw.get(".data", "").strip()
+        stmt_comment = st.comment
+        nested_table_call = _dplyr_call_info(table_src)
+        if nested_table_call is not None:
+            if not _emit_dplyr_assignment(Assign(st.name, table_src, st.comment)):
+                return False
+            table_src = st.name
+            stmt_comment = ""
+        if not re.fullmatch(r"[A-Za-z]\w*", table_src):
+            raise NotImplementedError(
+                f"{call_name}() currently requires a named real tibble as its first argument"
+            )
+        if table_src.lower() not in _KNOWN_TIBBLE_NAMES:
+            raise NotImplementedError(
+                f"{call_name}() currently supports only the restricted real-valued tibble type"
+            )
+        data_args = list(pos[1:])
+        known_names = (
+            set(_STATIC_LS_NAMES)
+            | set(params)
+            | int_scalar_vars | real_scalar_vars | int_vector_vars | real_vector_vars
+            | logical_scalar_vars | logical_vector_vars | char_scalar_vars | char_vector_vars_ctx
+        )
+        if call_name.lower() == "dplyr::select":
+            if kw:
+                raise NotImplementedError(
+                    "dplyr::select() renaming and named arguments are not yet supported"
+                )
+            selected_f = _dplyr_select_names_expr(data_args)
+            need_r_mod.update({"r_tibble_real_t", "tibble_real_select"})
+            _wstmt(f"{st.name} = tibble_real_select({table_src}, {selected_f})", stmt_comment)
+            return True
+        if call_name.lower() == "dplyr::filter":
+            unsupported_kw = [name for name in kw if name != ".data"]
+            if unsupported_kw:
+                raise NotImplementedError(
+                    "dplyr::filter() named control arguments such as `.by` and `.preserve` are unsupported"
+                )
+            if not data_args:
+                raise NotImplementedError("dplyr::filter() requires at least one predicate")
+            predicates = [
+                r_expr_to_fortran(_dplyr_data_mask_expr(arg, table_src, known_names))
+                for arg in data_args
+            ]
+            predicate_f = " .and. ".join(f"({expr})" for expr in predicates)
+            need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_filter"})
+            _wstmt(f"{st.name} = tibble_real_filter({table_src}, {predicate_f})", stmt_comment)
+            return True
+        if data_args:
+            raise NotImplementedError(
+                "dplyr::mutate() currently requires named real-valued column expressions"
+            )
+        mutations = [(name, expr) for name, expr in kw.items() if name != ".data"]
+        if not mutations:
+            raise NotImplementedError("dplyr::mutate() requires at least one named real column")
+        if any(name.startswith(".") for name, _expr in mutations):
+            raise NotImplementedError(
+                "dplyr::mutate() control arguments such as `.by`, `.keep`, `.before`, and `.after` are unsupported"
+            )
+        need_r_mod.update({"r_tibble_real_t", "tibble_real_col", "tibble_real_mutate"})
+        if st.name != table_src:
+            _wstmt(f"{st.name} = {table_src}", stmt_comment)
+        prior_columns: set[str] = set()
+        for column_name, expr in mutations:
+            masked = _dplyr_data_mask_expr(
+                expr,
+                st.name,
+                known_names - prior_columns,
+            )
+            value_f = r_expr_to_fortran(masked)
+            _wstmt(
+                f"{st.name} = tibble_real_mutate({st.name}, "
+                f"{_fortran_str_literal(column_name)}, real({value_f}, kind=dp))",
+                "",
+            )
+            prior_columns.add(column_name.lower())
+        return True
+
     for st in stmts:
         _CURRENT_WARNING_STMT_TEXT = _warning_stmt_source_text(st)
         if isinstance(st, CommentStmt):
@@ -21807,6 +21998,8 @@ def emit_stmts(
             ):
                 target_f = f"{_sanitize_r_var_name(null_target[0])}%{_sanitize_r_var_name(null_target[1])}"
                 _wstmt(f"if (allocated({target_f})) deallocate({target_f})", st.comment)
+                continue
+            if _emit_dplyr_assignment(st):
                 continue
             c_symbolic_assign = parse_call_text(st.expr.strip())
             if c_symbolic_assign is not None and c_symbolic_assign[0].lower() in {"expression", "d"}:
@@ -37935,6 +38128,10 @@ def transpile_r_to_fortran(
             if fields_main is not None:
                 _register_main_list_fields(st.name, fields_main)
                 continue
+            c_dplyr_main = _dplyr_call_info(st.expr.strip())
+            if c_dplyr_main is not None:
+                tibble_vars.add(st.name)
+                helper_ctx_main["need_r_mod"].add("r_tibble_real_t")
             expr_main_no_ns = re.sub(r"\b[A-Za-z]\w*::", "", st.expr.strip())
             c_fit_main = parse_call_text(expr_main_no_ns)
             c_fit_primary_src = _trycatch_primary_expr(st.expr.strip())
@@ -38110,9 +38307,10 @@ def transpile_r_to_fortran(
         for st_tibble in main_stmts:
             if not isinstance(st_tibble, Assign) or st_tibble.name in tibble_vars:
                 continue
+            c_dplyr_tibble = _dplyr_call_info(st_tibble.expr.strip())
             rhs_tibble = re.sub(r"\b[A-Za-z]\w*::", "", st_tibble.expr.strip())
             c_tibble = parse_call_text(rhs_tibble)
-            is_tibble = False
+            is_tibble = c_dplyr_tibble is not None
             if c_tibble is not None and c_tibble[0].lower() in {"as_tibble", "add_column"}:
                 is_tibble = True
             trailing_tibble = _split_trailing_r_subset(rhs_tibble)
